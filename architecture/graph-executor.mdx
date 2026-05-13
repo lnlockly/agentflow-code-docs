@@ -1,0 +1,327 @@
+---
+title: "Graph executor (contract & spec)"
+description: "Every AgentFlow project is a DAG walk. Typed node handlers dispatch deterministic work; the coder-agent is the last resort, not the default."
+---
+
+# Graph executor
+
+## TL;DR
+
+Today maestro proposes a plan, then spawns coder agents that freestyle inside
+the workspace until they decide they're done. `agent_boilerplates.workflow_schema`
+([`db/schema.ts:1369`](https://github.com/lnlockly/agentflow-agents/blob/main/src/db/schema.ts#L1369))
+is a visual hint, not a runtime contract — symptoms are visitka projects
+that write `bot_token.txt` but no landing, `tg_bot` projects that ship with
+`bot_username=null` (see [bot-pool previous bug](/architecture/bot-pool#previous-bug-pre-194)),
+and ферма presets that never enable their poller.
+
+The graph executor turns `workflow_schema` into the execution backbone. The
+walker pulls a DAG, runs each node through a typed handler from a registry,
+and emits `node_started` / `node_finished` / `node_failed` / `edge_flowing`
+events into `project_events` + the `pipeline_runs` view. Deterministic work
+(scrape, scaffold, deploy, run migration, write file, expose Caddy route)
+lands in code; only nodes that genuinely need generative output (HTML copy,
+section text, voice script) call into `coder-agent-delegate`, which is the
+fallback handler. Same backbone for `landing`, `tg_bot`, `tg_profile_bundle`,
+`mini_app`, `spa`, and ферма runtime ticks — the kind only changes which
+handlers register and which per-kind error policy applies.
+
+## Contract
+
+```ts
+// src/services/graph-executor/types.ts (new)
+
+import type { ZodType } from 'zod';
+import type { ModelType } from '../ai-router/types.js';
+
+/**
+ * The minimum a node handler must declare. `kind` matches either:
+ *   - `agent_boilerplates.workflow_schema.nodes[].id` (e.g. 'scrape_tg',
+ *     'render_landing', 'deploy_caddy') for build-time graphs, OR
+ *   - a reserved namespace ('trigger.*', 'output.*', 'tg.*', 'agent.*')
+ *     for runtime graphs reused from flow-executor.ts.
+ *
+ * One registry, two graph sources (workflow_schema + flows.graph).
+ */
+export interface NodeHandler<I = unknown, O = unknown> {
+  kind: string;
+  inputSchema: ZodType<I>;
+  outputSchema: ZodType<O>;
+  /** Pure-ish: every side-effect goes through `ctx.*` so the walker can
+   *  observe (and the test harness can stub) every external touch. */
+  run(ctx: ExecCtx, input: I): Promise<O>;
+  /** Default: { max: 0, backoffMs: 0, idempotent: false }. Handlers that
+   *  declare `idempotent: true` are re-runnable on resume; the walker WILL
+   *  call them again after `node_failed` if max > 0. */
+  retryPolicy?: { max: number; backoffMs: number; idempotent: boolean };
+  /** Walker enforces a hard timeout via AbortSignal. Default 120s. */
+  timeoutSec?: number;
+}
+
+/**
+ * Everything a handler legitimately needs. The walker constructs this once
+ * per `run()` call; handlers MUST NOT reach around it (no direct
+ * `process.env.BOT_TOKEN_POOL`, no naked `callCodeExecTool` import) — that
+ * way the walker stays the single audit point for env / pod / LLM access.
+ */
+export interface ExecCtx {
+  projectId: number;
+  ownerUserId: number;
+  /** `proj-<slug>` — sanitised per
+   *  [`projects-pipeline.ts:478`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/projects-pipeline.ts#L478). */
+  workspaceProjectName: string;
+  /** Resolved by `loadTenantKubeconfig` once at walk start; passed to
+   *  code-exec callers so handlers never re-resolve. */
+  kubeconfigYaml: string;
+  /** Pre-bound to `{ownerUserId, project: workspaceProjectName}`; same
+   *  surface as today's `callCodeExecTool`. */
+  codeExec: <T = unknown>(tool: string, args: Record<string, unknown>) => Promise<T>;
+  /** Emits an event to `project_events` AND projectBus AND the pipeline_runs
+   *  steps[] stream. Walker fills `node_id`, `kind`, `step_id`; handler only
+   *  supplies the payload. */
+  emit(kind: NodeEventKind, payload: unknown): Promise<void>;
+  /** Routes through `ai-router/instrumented.invokeAI`. NEVER hardcode model id. */
+  llm: (modelType: ModelType, messages: LlmMessages, opts?: { system?: string; max_tokens?: number; temperature?: number }) => Promise<LlmResult>;
+  /** Output of every previously-run node, keyed by node id. Read-only.
+   *  Handlers template via `ctx.steps['<id>'].output.foo`. */
+  readonly steps: Readonly<Record<string, { output: unknown }>>;
+  /** AbortSignal from the walker's per-node timeout. */
+  signal: AbortSignal;
+  /** RAG breadcrumb. Set when this run was resumed from a previous failure. */
+  resumeOf?: number;
+}
+
+export type NodeEventKind =
+  | 'node_started'
+  | 'node_finished'
+  | 'node_failed'
+  | 'edge_flowing';
+
+export interface NodeEvent {
+  kind: NodeEventKind;
+  nodeId: string;
+  nodeKind: string;
+  payload: unknown;
+  ts: string;       // ISO
+  durationMs?: number;
+  error?: string;
+}
+
+export interface GraphWalker {
+  /** Single pass over the DAG. Returns an async iterable of events so the
+   *  caller can `for await` and stream to SSE (`/me/pipelines/:id/events`)
+   *  without buffering. Walker terminates after the last node fires its
+   *  terminal event; long-running ферма triggers are kicked by the poller
+   *  loop in `agent-trigger-worker.ts`, not by an in-process loop here. */
+  run(input: {
+    projectId: number;
+    workflowSchema: WorkflowSchema;       // shape mirrors agent_boilerplates.workflow_schema
+    ctxOverrides?: Partial<ExecCtx>;
+  }): AsyncIterable<NodeEvent>;
+}
+
+export interface WorkflowSchema {
+  nodes: Array<{ id: string; label?: string; icon?: string; config?: Record<string, unknown> }>;
+  edges: Array<{ from: string; to: string; label?: string }>;
+}
+```
+
+## Node handler registry
+
+File: `agentflow-agents/src/services/graph-executor/registry.ts` (new — task #7).
+
+```ts
+const registry = new Map<string, NodeHandler<any, any>>();
+
+export function registerHandler<I, O>(h: NodeHandler<I, O>): void {
+  if (registry.has(h.kind)) throw new Error(`duplicate_handler:${h.kind}`);
+  registry.set(h.kind, h);
+}
+
+export function resolveHandler(kind: string): NodeHandler<any, any> {
+  return registry.get(kind) ?? coderAgentDelegate;
+}
+```
+
+Registration happens at module load (`registry/index.ts` imports every
+handler file). Handlers live one-per-file under
+`src/services/graph-executor/handlers/<kind>.ts` — easy to grep, easy to
+diff. Existing logic is wrapped, not duplicated:
+
+| Node id | Handler delegates to | Source of truth |
+|---|---|---|
+| `scrape_tg` | `runBuildScrapeTgProfile` | [`build-node-wrappers.ts:59`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/build-node-wrappers.ts#L59) |
+| `render_landing` | coder-agent-delegate (slug `coder-landing`) | [`coder-tooluse.ts`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/coder-tooluse.ts) |
+| `deploy_caddy` / `deploy_landing` | `runBuildCaddyRoute` + `runtime-supervisor.deploy` | [`runtime-supervisor.ts`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/runtime-supervisor.ts), [`build-node-wrappers.ts:209`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/build-node-wrappers.ts#L209) |
+| `scaffold_bot` / `request_token` | `autoCreateTelegramBot` | [`auto-bot.ts:142`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/auto-bot.ts#L142) |
+| `wire_designapi` | `runBuildWireDesignapi` | [`build-node-wrappers.ts:127`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/build-node-wrappers.ts#L127) |
+| `deploy_bot` / `deploy` | `runBuildDeployBot` → `runtime-supervisor.deploy({source:'always_on'})` | [`build-node-wrappers.ts:147`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/build-node-wrappers.ts#L147) |
+| `smoke_test` | `bot-auto-tester` invoke | `src/services/bot-auto-tester.ts` |
+| `scaffold_aiogram` / `scaffold_nest` / `scaffold_prisma` / `scaffold_vite` | coder-agent-delegate (slug `coder-tg-bot` / `coder-backend` / `coder-spa`) | preset JSONs |
+| `seo_optimize` / `pick_theme` / `generate_sections` | coder-agent-delegate (slug `coder-landing`) | preset |
+| `self_heal_loop` | `runtime-supervisor-health.autoRetryCoder` wrapper | `src/services/runtime-supervisor-health.ts` |
+| `routes` / `tg_webapp_init` / `admin_panel` / `jwt_auth` / `billing_stripe` / `multi_tenant` / `booking_flow` | coder-agent-delegate (narrow brief, see below) | per-kind coder preset |
+| `trigger.tg.new_message` / `tg.send_text` / `llm.classify_intent` / `output.tag_chat` | re-export the existing flow-executor handler | [`flow-executor.ts:805`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/flow-executor.ts#L805) |
+
+`coder-agent-delegate` is the fallback handler — same signature as a typed
+handler, but `input`/`output` are `{brief: string, expects: string[]}` /
+`{files_written: string[], reply: string}`. It posts a narrow brief via
+`enqueueOwnerMessage` ([`projects-pipeline.ts:273`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/projects-pipeline.ts#L273)),
+constrained to one node's output (e.g. "Write a `pick_theme` decision into
+`/workspace/.runtime/theme.json` and reply with the path. Do NOT touch
+anything else.").
+
+## Execution semantics
+
+- **Topo order** — Kahn sort, identical to
+  [`flow-executor.topoSort`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/flow-executor.ts#L59).
+  Cycles → walker emits one `node_failed` with `reason: 'cycle_detected'`
+  for the whole graph (no partial run).
+- **Parallel where possible** — every node with `in_edges = 0` starts
+  concurrently; downstream nodes wait on `Promise.all` of upstream
+  outputs. The walker uses a per-node `Promise` map, no `await` in the
+  topo loop body.
+- **Retry policy** — per-handler. Default `max: 0`. Idempotent handlers
+  (every `build.*`, `auto-bot`, `runtime-supervisor.deploy`) declare
+  `{max: 2, backoffMs: 5_000, idempotent: true}`. Generative handlers
+  (coder-agent-delegate) declare `{max: 1, idempotent: false}` because
+  reruns produce new copy.
+- **Per-node timeout** — walker creates one `AbortController` per node,
+  fires `AbortError` after `handler.timeoutSec ?? 120` seconds. Handler
+  must forward `ctx.signal` into `fetch` / `callCodeExecTool` — the
+  walker checks `signal.aborted` between awaits and surfaces a
+  `node_failed` with `reason: 'timeout'`.
+- **Idempotency contract** — handler authors are on the hook. The walker
+  re-runs failed nodes on resume; if the handler isn't idempotent and
+  fails halfway, the project lands in an inconsistent state. Failure
+  mode signature: `[graph-executor] node <id> non-idempotent retry`
+  (logged when `retryPolicy.max > 0 && !idempotent`).
+- **`node_failed` policy** — walker decides per-kind (see table below).
+  `fail-fast` aborts the whole walk; `continue` records the failure and
+  proceeds with the children that don't depend on this node's output.
+
+## Per-kind policy
+
+| Kind | On node failure | Coder fallback | Notes |
+|---|---|---|---|
+| `landing` | fail-fast on `deploy_caddy`, continue on `seo_optimize` | yes on `pick_theme` / `generate_sections` / `seo_optimize` | `deploy_caddy` failure means no public URL; SEO can be retried by an owner-message |
+| `tg_bot` | fail-fast on `request_token` + `deploy`, continue on `smoke_test` | yes on `scaffold_aiogram` / `self_heal_loop` | smoke test failure → walker fires `coder-tg-bot` brief to auto-fix; matches today's auto-tester ladder |
+| `tg_profile_bundle` | fail-fast on `scrape_tg` + `deploy_landing` + `deploy_bot` | yes on `render_landing` / `wire_designapi` / `booking_flow` | scrape failure = no source data, render is impossible |
+| `spa` | fail-fast on `scaffold_nest` + `deploy`, continue on `admin_panel` + `multi_tenant` | yes on every `scaffold_*` + `admin_panel` | tenants ship without an admin panel rather than not at all |
+| `mini_app` | fail-fast on `scaffold_vite` + `deploy` | yes on `tg_webapp_init` + `routes` | manifest-light kind, mostly coder fallback |
+| `code_only` / `api` | fail-fast on `deploy` only | yes on everything else | research kinds are 1-2 nodes; fail-fast is overkill |
+| ферма (`agent_triggers.tg.new_message`) | continue on every lead-stage failure | n/a (no build-time graph) | walker runs once per poll tick from [`agent-trigger-worker.ts:318`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/agent-trigger-worker.ts#L318); a single lead failing doesn't abort the others |
+
+`continue-on-error` writes a `node_failed` event but lets the topo walk
+keep dispatching downstream nodes that don't transitively depend on the
+failed node's output. The walker computes the dependency closure at start
+time so the rule is deterministic.
+
+## Wiring into existing system
+
+Feature flag `FF_GRAPH_EXECUTOR` (off in prod at landing time). Layout:
+
+```
+FF_GRAPH_EXECUTOR=0   → projects-pipeline.ts:approveProject falls through
+                       to runProjectApprovalBackground (today's maestro
+                       freestyle, unchanged)
+FF_GRAPH_EXECUTOR=landing,tg_bot
+                     → walker runs for these kinds only; others still
+                       maestro
+FF_GRAPH_EXECUTOR=1   → walker runs for every kind with a registered
+                       workflow_schema; kinds without one fall back to
+                       maestro (preserves `code_only`, `research`)
+```
+
+Read by
+[`projects-pipeline.ts:approveProject`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/projects-pipeline.ts#L434).
+The fork happens AFTER provisioning — both paths use the same
+`workspaceProjectName` and `workspace_ready` event so the rest of the
+system is unaware of which executor ran.
+
+Event plumbing (no new tables):
+
+| Event | Sink today | Sink with walker |
+|---|---|---|
+| `node_started` / `node_finished` / `node_failed` | n/a (maestro emits free-form `log` rows) | `project_events.kind = 'node_<state>'`, `payload = {node_id, node_kind, output?, error?}` |
+| `edge_flowing` | n/a | `project_events.kind = 'edge_flowing'`, `payload = {from, to, label?}` — consumed only by `CanvasLive` SSE |
+| Step row in `pipeline_runs` | `plan_tasks` LATERAL agg ([view SQL](https://github.com/lnlockly/agentflow-agents/blob/main/migrations/2026-05-14a-pipeline-runs-view.sql)) | unchanged — we map `node_*` events to synthetic plan_tasks rows OR add a second LATERAL source (decision deferred until task #7) |
+
+`CanvasLive` ([`agentflow-landing/src/components/studio/CanvasLive.tsx:1`](https://github.com/lnlockly/agentflow-landing/blob/main/src/components/studio/CanvasLive.tsx#L1))
+already consumes `step_started` / `step_finished` / `edge_flowing` from
+the streamPipeline source — the walker emits the same event names so no
+frontend change is needed for read-only canvas. The interactive node
+popover ([`NodePopover.tsx`](https://github.com/lnlockly/agentflow-landing/blob/main/src/components/studio/NodePopover.tsx))
+reads the latest event payload for `nodeId` — already shape-compatible.
+
+## What blocks unconditional rollout
+
+1. **Handler coverage** — every node id in every shipped
+   `agent_boilerplates.workflow_schema` row needs a registry entry OR a
+   verified coder-agent-delegate brief. Task #8 enumerates 26 node ids
+   across the 5 seeded boilerplates ([`seed-boilerplate-workflows.ts`](https://github.com/lnlockly/agentflow-agents/blob/main/src/scripts/seed-boilerplate-workflows.ts)).
+2. **Coder brief contract** — `coder-tg-bot`, `coder-landing`, `coder-spa`
+   prompts must accept a `{node_id, output_expected: string[]}` envelope
+   and reply with a `FILES_WRITTEN: [...]` block. Today they freestyle;
+   change is ~30 lines per prompt.
+3. **CanvasLive event shape** — already compatible (PR
+   `lnlockly/agentflow-landing#149`). Verified above.
+4. **Coder timeout discipline** — walker enforces `timeoutSec` via
+   AbortSignal. Today coder-agent runs unbounded; we add a brief-side
+   "If you can't complete in N minutes, reply with `partial: true`"
+   sentinel. The walker treats `partial: true` as `node_failed` with
+   `reason: 'coder_partial'` so the per-kind policy decides retry.
+
+## Migration path
+
+1. **Phase 1** — walker built, `FF_GRAPH_EXECUTOR=0`. PR lands but does
+   nothing in prod. Unit tests exercise the registry, topo, retry,
+   per-kind policy.
+2. **Phase 2** — `FF_GRAPH_EXECUTOR=landing`. Easiest kind; only four
+   nodes, only one is generative. Monitor for 1 week:
+   `project_events.kind='node_failed'` per project ÷ approve count.
+3. **Phase 3** — `FF_GRAPH_EXECUTOR=landing,tg_bot`. `tg_bot` exercises
+   the `request_token` (auto-bot) handler — this is the path that fixed
+   the [pre-#194 perpetual-lease bug](/architecture/bot-pool#previous-bug-pre-194)
+   and the walker should keep it deterministic.
+4. **Phase 4** — add `tg_profile_bundle` (visitka). Most-failing kind
+   today; expect the walker to surface clearer failure signatures.
+5. **Phase 5** — ферма (`trigger.tg.new_message`). The walker runs once
+   per poll tick, terminates, lets the
+   [`agent-trigger-worker.ts:318`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/agent-trigger-worker.ts#L318)
+   loop schedule the next tick. No continuously-running walker process.
+6. **Phase 6** — remove maestro freestyle for kinds with graphs. Maestro
+   stays for `code_only` / `research` (no DAG).
+
+## Risks & open questions
+
+| Risk | Mitigation / open |
+|---|---|
+| Coder-agent doesn't know which path to write its output to | Brief envelope declares `output_expected: ['/workspace/.runtime/theme.json']`. Handler reads the file after the coder reply and validates against `outputSchema`. A reply without the file → `node_failed`. |
+| Sub-graphs (a node whose handler runs its own DAG) | Deferred. The walker is a single-level executor; recursion needs an explicit `kind: 'subgraph'` node + bounded depth. Revisit when a real use-case lands. |
+| ферма long-running poll | Walker runs once per tick. Poll loop owns scheduling. We do NOT spawn a long-lived walker per project. |
+| LLM cost from coder fallback | Each coder-agent-delegate call charges through `agent-invoke` (existing budget gates). Walker's per-node `retryPolicy.max` caps repeat charges. |
+| `pipeline_runs` view drift | Adding a `node_events` LATERAL source is an open question for task #7. For Phase 1-2 we map `node_*` events to synthetic `plan_tasks` rows so the view shape stays unchanged. |
+| Handler accidentally reads `process.env.BOT_TOKEN_POOL` directly | Lint rule (banned import) + code review. `ExecCtx` does not expose raw env; pool reads stay inside the `request_token` handler that wraps `autoCreateTelegramBot`. |
+| What happens to `projects.proposed_plan` | Walker ignores it. `workflow_schema` is the contract; proposed_plan stays for backward-compat with maestro freestyle until Phase 6. |
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Walker doesn't run despite FF on | `[graph-executor] kind <x> not in FF_GRAPH_EXECUTOR allowlist` | `projects-pipeline.ts:approveProject` flag parse |
+| Cycle in workflow_schema | `[graph-executor] cycle_detected nodes=[…]` | `seed-boilerplate-workflows.ts` — the seed has a bad edge |
+| Handler missing for node id | `[graph-executor] handler missing for kind=<id>, delegating to coder-agent` | Register a handler in `src/services/graph-executor/handlers/` OR verify the coder brief is enough |
+| Handler timed out | `[graph-executor] node <id> timed out after <N>s` | Bump `timeoutSec` on the handler OR investigate why the underlying call is slow |
+| Coder partial reply | `[graph-executor] coder_partial node=<id>` | Brief was too broad; tighten `output_expected` |
+| Walker emits but CanvasLive doesn't render | `streamPipeline: unknown event kind` (landing console) | Verify event kind matches `node_started`/`node_finished`/`node_failed`/`edge_flowing` exactly |
+| Continue-on-error skipped a child that should have run | `[graph-executor] dependency closure marked <child> unreachable from failure of <parent>` | Per-kind policy table — change to `fail-fast` or remove the edge |
+
+## Related
+
+- [Architecture: kinds](/architecture/kinds) — which kind has which graph
+- [Bot pool & auto-assign](/architecture/bot-pool) — `request_token` handler delegates here
+- [Визитка (tg_profile_bundle)](/architecture/visitka-tg-profile) — the kind with the longest graph
+- [Ферма (sales-funnel-tg-farm)](/architecture/ferma-sales-funnel) — one-tick walker per `agent-trigger-worker` cycle
+- [Runtime supervisor](/subsystems/runtime-supervisor) — `deploy_caddy` / `deploy_bot` / `deploy` handlers delegate here
+- [Add new kind](/runbooks/add-new-kind) — covers seeding `workflow_schema` for new kinds
