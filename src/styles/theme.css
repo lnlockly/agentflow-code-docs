@@ -1,0 +1,21 @@
+/* AgentFlow brand colors. Dark default. Accent: #d4ff00. */
+
+:root {
+  --sl-color-accent-low: #2a3300;
+  --sl-color-accent: #9bbf00;
+  --sl-color-accent-high: #d4ff00;
+}
+
+:root[data-theme='dark'] {
+  --sl-color-accent-low: #2a3300;
+  --sl-color-accent: #9bbf00;
+  --sl-color-accent-high: #e6ff66;
+  --sl-color-text-accent: #d4ff00;
+}
+
+:root[data-theme='light'] {
+  --sl-color-accent-low: #e6ff66;
+  --sl-color-accent: #9bbf00;
+  --sl-color-accent-high: #6a8200;
+  --sl-color-text-accent: #6a8200;
+}

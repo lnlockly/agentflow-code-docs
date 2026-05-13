@@ -13,7 +13,7 @@ description: "Три пути auth: x-api-key (af_live_, HMAC-SHA256), Bearer JW
 
 | Repo / path | Что делает |
 |---|---|
-| `agentflow-agents/src/middleware/auth.ts:16` | `SessionClaims` type — `{ user_id, email?, source: 'jwt'|'api_key'|'cookie' }`. |
+| `agentflow-agents/src/middleware/auth.ts:16` | `SessionClaims` type — `{ user_id, email?, source: 'jwt'\|'api_key'\|'cookie' }`. |
 | `agentflow-agents/src/middleware/auth.ts:24` | `COOKIE_NAME = 'af_session'`. |
 | `agentflow-agents/src/middleware/auth.ts:25` | `INTERNAL_HEADER = 'x-agentflow-secret'` — header для internal-only routes. |
 | `agentflow-agents/src/middleware/auth.ts:56` | `safeEqual` — timing-safe compare для HMAC и shared secrets. |

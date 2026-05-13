@@ -14,7 +14,7 @@ description: "Workspace classifier → build pipeline → s6 services → Procfi
 | Repo / path | Что делает |
 |---|---|
 | `agentflow-agents/src/services/runtime-supervisor.ts:59` | `SPA_SUBDIRS` — порядок поиска SPA root: `frontend, client, web, app, apps/web, packages/web, src`. |
-| `agentflow-agents/src/services/runtime-supervisor.ts:69` | `RuntimePlan` type — `{ kind: static|web|api|bot|worker|mixed|unknown, root?, processes? }`. |
+| `agentflow-agents/src/services/runtime-supervisor.ts:69` | `RuntimePlan` type — `{ kind: static\|web\|api\|bot\|worker\|mixed\|unknown, root?, processes? }`. |
 | `agentflow-agents/src/services/runtime-supervisor.ts:126` | `snapshotWorkspace` — рекурсивный listing `/workspace` (limit, gitignore-aware). |
 | `agentflow-agents/src/services/runtime-supervisor.ts:278` | `classify` — снапшот → RuntimePlan. Procfile override (если есть `/workspace/Procfile`). |
 | `agentflow-agents/src/services/runtime-supervisor.ts:608` | `autoBuildSpaIfNeeded` — обнаружив SPA без `dist/` → `npm run build` (с fallback на pnpm/yarn). |

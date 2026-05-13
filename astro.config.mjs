@@ -1,0 +1,124 @@
+// @ts-check
+import { defineConfig } from 'astro/config';
+import starlight from '@astrojs/starlight';
+import starlightLlmsTxt from 'starlight-llms-txt';
+
+// https://astro.build/config
+export default defineConfig({
+  site: 'https://code.agentflow.website',
+  integrations: [
+    starlight({
+      title: 'AgentFlow Code',
+      description:
+        'Internal RAG-style code documentation for AgentFlow. Read this and the linked sections to skip codebase grep.',
+      logo: {
+        light: './src/assets/logo-light.svg',
+        dark: './src/assets/logo-dark.svg',
+        replacesTitle: true,
+      },
+      favicon: '/favicon.svg',
+      customCss: ['./src/styles/theme.css'],
+      social: [
+        {
+          icon: 'github',
+          label: 'GitHub',
+          href: 'https://github.com/lnlockly/agentflow-code-docs',
+        },
+      ],
+      sidebar: [
+        {
+          label: 'Start Here',
+          items: [
+            { label: 'Code Map', slug: 'index' },
+            { label: 'Architecture Overview', slug: 'architecture/overview' },
+          ],
+        },
+        {
+          label: 'Products',
+          items: [
+            { label: 'Visitka — TG Profile', slug: 'architecture/visitka-tg-profile' },
+            { label: 'Bot Pool', slug: 'architecture/bot-pool' },
+            { label: 'Ferma Sales Funnel', slug: 'architecture/ferma-sales-funnel' },
+            { label: 'Kinds', slug: 'architecture/kinds' },
+            { label: 'TG Templates', slug: 'architecture/tg-templates' },
+            { label: 'Graph Executor', slug: 'architecture/graph-executor' },
+          ],
+        },
+        {
+          label: 'Subsystems',
+          items: [
+            { label: 'Code Exec MCP', slug: 'subsystems/code-exec-mcp' },
+            { label: 'Caddy Preview', slug: 'subsystems/caddy-preview' },
+            { label: 'Runtime Supervisor', slug: 'subsystems/runtime-supervisor' },
+            { label: 'LLM Router', slug: 'subsystems/llm-router' },
+            { label: 'Telegram MCP', slug: 'subsystems/tg-mcp' },
+            { label: 'Auth and Access', slug: 'subsystems/auth-and-access' },
+            { label: 'Projects Frontend', slug: 'subsystems/projects-frontend' },
+            { label: 'Graph Handlers', slug: 'subsystems/graph-handlers' },
+            { label: 'Feature Flags', slug: 'subsystems/feature-flags' },
+          ],
+        },
+        {
+          label: 'Flows',
+          items: [
+            { label: 'Create Project', slug: 'flows/create-project' },
+            { label: 'Auto-Bot Assign', slug: 'flows/auto-bot-assign' },
+            { label: 'Marketplace Hire', slug: 'flows/marketplace-hire' },
+            { label: 'Preview Deploy', slug: 'flows/preview-deploy' },
+            { label: 'Project Lifecycle', slug: 'flows/project-lifecycle' },
+            { label: 'Templates Marketplace', slug: 'flows/templates-marketplace' },
+            { label: 'Diploma Outreach + Build', slug: 'flows/diploma-outreach-and-build' },
+            { label: 'Graph Execution', slug: 'flows/graph-execution' },
+          ],
+        },
+        {
+          label: 'Runbooks',
+          items: [
+            { label: 'Debug Stuck Project', slug: 'runbooks/debug-stuck-project' },
+            { label: 'Add a New Kind', slug: 'runbooks/add-new-kind' },
+            { label: 'Ship a New Boilerplate', slug: 'runbooks/ship-new-boilerplate' },
+            { label: 'Update the RAG', slug: 'runbooks/update-rag-docs' },
+          ],
+        },
+      ],
+      plugins: [
+        starlightLlmsTxt({
+          projectName: 'AgentFlow Code',
+          description:
+            'Internal RAG for LLM agents working on AgentFlow. File refs, env vars, failure modes, flows.',
+          details:
+            'Use /llms-full.txt for the complete concatenated dump. Use the per-set files below when you only need one slice.',
+          optionalLinks: [
+            {
+              label: 'GitHub repo',
+              url: 'https://github.com/lnlockly/agentflow-code-docs',
+              description: 'Source of the docs — patch here when code changes.',
+            },
+          ],
+          customSets: [
+            {
+              label: 'Architecture',
+              description: 'Subsystem maps and product architectures.',
+              paths: ['architecture/**'],
+            },
+            {
+              label: 'Subsystems',
+              description: 'Code-level docs per subsystem (LLM router, MCPs, frontend, auth).',
+              paths: ['subsystems/**'],
+            },
+            {
+              label: 'Flows',
+              description: 'End-to-end request paths through the platform.',
+              paths: ['flows/**'],
+            },
+            {
+              label: 'Runbooks',
+              description: 'Incident playbooks and how-to guides.',
+              paths: ['runbooks/**'],
+            },
+          ],
+        }),
+      ],
+    }),
+  ],
+});

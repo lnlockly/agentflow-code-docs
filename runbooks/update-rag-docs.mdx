@@ -1,0 +1,85 @@
+---
+title: "Update the RAG"
+description: "How to add a new page, build locally, and deploy this RAG site."
+---
+
+# Update the RAG
+
+This site is built with [Astro Starlight](https://starlight.astro.build) and deployed to Cloudflare Pages from `lnlockly/agentflow-code-docs`. The `.mdx` source lives in the repo root under `architecture/`, `subsystems/`, `flows/`, and `runbooks/`. Starlight loads it through a custom `glob` loader in `src/content.config.ts` — agents keep reading the same paths via the `Read` tool.
+
+## TL;DR
+
+1. Patch or add the relevant `.mdx`.
+2. Add the new slug to the sidebar in `astro.config.mjs`.
+3. `npm run dev` → open `http://localhost:4321/` → verify the page renders.
+4. Open a PR. CI builds + deploys to Cloudflare Pages on merge.
+
+## Add a new page
+
+```bash
+# pick a section
+$EDITOR subsystems/<topic>.mdx
+```
+
+Use the standard template from `/Users/a1/Code/unimax_projects/fransh/agentflow/CLAUDE.md` — front-matter, TL;DR, Files (with line refs), Data flow, DB/Env/API, Failure modes, Related.
+
+Then wire it into the sidebar:
+
+```js
+// astro.config.mjs
+{
+  label: 'Subsystems',
+  items: [
+    // ...
+    { label: '<Topic>', slug: 'subsystems/<topic>' },
+  ],
+},
+```
+
+## Local preview
+
+```bash
+cd agentflow-code-docs
+npm install      # first time
+npm run dev      # http://localhost:4321
+```
+
+To inspect what the LLM endpoint will serve:
+
+```bash
+npm run build
+# served from dist/
+curl -s http://localhost:4321/llms-full.txt | wc -c   # during dev
+curl -s file://"$PWD/dist/llms-full.txt" | head -50   # post-build
+```
+
+## MDX gotchas
+
+- Bare `\{` and `\}` in body text must be escaped (the build script `scripts/escape-mdx-braces.mjs` does it idempotently — re-run it after a paste-heavy edit).
+- Inside markdown table cells, an unescaped `|` inside an inline-code span splits the cell. Escape with `\\|` or move the example out of the table.
+- Don't use Mintlify components like `<Note>` or `<Card>` — convert to plain markdown or Starlight `<Aside>` (`import { Aside } from '@astrojs/starlight/components'`).
+
+## Deploy
+
+- Push to `main` → GitHub Actions workflow `.github/workflows/deploy-cf-pages.yml` builds and pushes `dist/` to Cloudflare Pages.
+- First-time setup of the Pages project + DNS is in `README.md`.
+
+## LLM endpoints
+
+After build, Starlight + `starlight-llms-txt` emit:
+
+| Path | Purpose |
+|---|---|
+| `/llms.txt` | TOC of every page with summaries. |
+| `/llms-full.txt` | Every page concatenated — single fetch for the entire RAG. |
+| `/_llms-txt/architecture.txt` | Per-set slice — `architecture/**`. |
+| `/_llms-txt/subsystems.txt` | Per-set slice — `subsystems/**`. |
+| `/_llms-txt/flows.txt` | Per-set slice — `flows/**`. |
+| `/_llms-txt/runbooks.txt` | Per-set slice — `runbooks/**`. |
+
+LLM agents in long sessions should `WebFetch https://code.agentflow.website/llms-full.txt` once and keep the result in working context.
+
+## Related
+
+- [Architecture overview](/architecture/overview)
+- [Code Map](/)
