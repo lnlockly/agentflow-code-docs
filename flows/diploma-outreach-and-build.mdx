@@ -5,14 +5,93 @@ description: "Single DAG demonstrating AgentFlow's full power — TG outreach + 
 
 # Diploma showcase
 
-> **Status (2026-05-13):** ✅ end-to-end verified on project #581.
+> **Status (2026-05-14):** ✅ end-to-end verified on project #581 (v1 sequential).
 > Walker + handlers shipped in [PR #209](https://github.com/lnlockly/agentflow-agents/pull/209);
 > MCP unwrap regression caught and fixed in [PR #210](https://github.com/lnlockly/agentflow-agents/pull/210).
-> Real DM landed in `@MLM808` chat from `@avsee4` (account_id=4):
-> `message_id=390006, 2026-05-13T22:43:02Z, "Привет! Это AgentFlow diploma-flow..."`.
-> Measured latencies: `tg.get_user=235ms`, `tg.send_text=119ms`, `tg.wait_reply` polling on a 5min ceiling.
-> Sub-project branch (`project.create_sub` → `project.wait_done` → `tg.send_text:deliver`)
-> still gated on a real reply arriving from `@MLM808`.
+> **v2 (preemptive parallel)** lands in the same boilerplate row (id=31) via
+> `migrations/2026-05-14d-diploma-preemptive.sql` — see § "v2 Parallel preemptive"
+> below. v1 sections retained for historical context.
+
+## v2: Parallel preemptive build (current shape)
+
+**Why the rewrite.** v1 was sequential: outreach → wait_reply → classify → create_sub
+→ wait_done (5–10 min) → deliver. Build only started AFTER the user picked.
+v2 fires BOTH `project.create_sub` branches the moment the ack is sent, runs them
+in parallel with `tg.wait_reply`, and on classify just selects which already-finished
+sub-project to deliver. User-perceived deliver latency drops from 5–10 min to 5–10 s.
+
+```
+tg.get_user
+    ↓
+tg.send_text:pitch
+    ↓
+tg.send_text:ack
+    ├─→ project.create_sub:visitka ─→ project.wait_done:visitka ─┐
+    ├─→ project.create_sub:bot     ─→ project.wait_done:bot     ─┤
+    └─→ tg.wait_reply ─→ llm.classify_intent ────────────────────┤
+                                                                  ↓
+                                                       tg.send_text:deliver
+                                                                  ↓
+                                                       tg_lead_states.update
+```
+
+`tg.send_text:deliver` has in-degree=3 (both `wait_done` outputs + classify_intent).
+Walker semantics already handle multi-parent join — see
+[graph-executor.mdx § Walker](/architecture/graph-executor) (`frontier-based`,
+in-degree decrement on every parent finish). The first time all three reach 0
+simultaneously, deliver fires.
+
+### Walker enabling features (PR `feat/diploma-preemptive-parallel`)
+
+| Feature | File | What it adds |
+|---|---|---|
+| `substituteTemplates` | `agentflow-agents/src/services/graph-executor/templates.ts` | Resolves `{{ctx.projectId}}`, `{{ctx.ownerUserId}}`, `{{steps["<id>"].output.<path>}}` (and dot form for simple ids) before zod parses node config. Single-token strings preserve the underlying type, so `"{{ctx.projectId}}"` becomes a `number`. |
+| Walker integration | `agentflow-agents/src/services/graph-executor/walker.ts:313` | Calls `substituteTemplates(node.config, ctxView, stepsMutable)` before `handler.inputSchema.parse`. |
+| `text_by_intent` | `agentflow-agents/src/services/graph-executor/handlers/tg-composite.ts` | Optional map on `tg.send_text` config. Handler reads `ctx.steps[intent_source_id].output.intent` (default source: `llm.classify_intent`) and picks the matching template. Fallback chain: `text_by_intent[intent]` → `text_by_intent.default` → `text`. |
+| `parent_project_id` fallback | `agentflow-agents/src/services/graph-executor/handlers/project.ts:30` | `parent_project_id` is now optional in `project.create_sub` config. When omitted the handler uses `ctx.projectId`. Defensive — the boilerplate still templates it explicitly. |
+| `from_step` upstream resolution | `agentflow-agents/src/services/graph-executor/handlers/project.wait_done.ts:20-45` | `project.wait_done` gains optional `from_step: "<create_sub node id>"`. Handler reads `ctx.steps[from_step].output.sub_project_id` at runtime. Required for parallel sub-project DAGs — fixes the production zod-required bug seen on diploma run #581. |
+
+### v2 boilerplate config (id=31)
+
+`migrations/2026-05-14d-diploma-preemptive.sql` — one `UPDATE agent_boilerplates`,
+idempotent. Node ids use `:variant` suffix so the registry resolves to the base
+handler. Three string tokens carry the cross-node wiring:
+
+- `parent_project_id: "{{ctx.projectId}}"` (in both `project.create_sub` nodes)
+- `from_step: "project.create_sub:visitka"` on `project.wait_done:visitka` (and the `:bot` counterpart) — handler resolves `sub_project_id` from upstream output at runtime
+- `text_by_intent.<key>` strings reference `{{steps["project.wait_done:visitka"].output.preview_url}}` and `{{steps["project.wait_done:bot"].output.bot_username}}`
+
+### Why this works on the existing walker
+
+- The walker's frontier-based execution already runs every node with `in_degree==0`
+  concurrently via `Promise.all` ([`walker.ts:427`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/graph-executor/walker.ts#L427)).
+- Three out-edges from `tg.send_text:ack` produce three pending children with
+  `in_degree=1` each. After ack finishes, all three drop to 0 in the same loop
+  iteration and start concurrently.
+- `tg.send_text:deliver` has `in_degree=3`. The walker decrements once per parent
+  finish. The node only enters `ready` when all three parents are done — no
+  special handling required.
+
+### Failure modes specific to v2
+
+| Symptom | Log signature for grep | Fix |
+|---|---|---|
+| `parent_project_id` validation error | `ZodError: Required at parent_project_id` | Pre-PR walker — upgrade `agentflow-agents` to include `templates.ts` + handler fallback. |
+| `text_by_intent` template not substituted (literal `{{...}}` arrives at TG) | DM contains `https://{{steps[...]...}}` | The substituted value is `undefined` — upstream `project.wait_done:<branch>` failed or returned no `preview_url`. Check `project_events` of the sub-project for `preview_ready`. |
+| Deliver fires too early (only 2 of 3 parents done) | Should be impossible. If observed: `[graph-executor] node tg.send_text:deliver started attempt=1` while one parent still in `running` | Walker in-degree accounting bug — file an issue with the event chain dump. |
+| Both sub-projects finish but user never replies | Walker hangs on `tg.wait_reply`; `node_waiting` emitted; eventually `timed_out` | Per `tg.wait_reply` ceiling. Acceptable: the sub-projects exist at `/projects` and the owner can deliver them manually. |
+| Pool exhausted on `project.create_sub:bot` (no `BOT_TOKEN_POOL` entry free) | `auto-bot: no available bot tokens (pool exhausted)` on the sub-project | See [bot-pool reclaim ladder](/architecture/bot-pool). The visitka branch is unaffected. |
+
+### v2 acceptance criteria (verification)
+
+1. New project of `kind=tg_farm` (default boilerplate, no `workflow_override`) — within 10 s, both `node_started project.create_sub:visitka` AND `node_started project.create_sub:bot` events emitted in parallel.
+2. Both sub-projects finish independently. `project.wait_done:<branch>` blocks the deliver fan-in until each is done.
+3. After user reply + classify_intent — `tg.send_text:deliver` fires within seconds with the preview_url / bot_username from the matching wait_done branch.
+4. Idempotent re-run: the SQL is `UPDATE ... WHERE id=31`. Safe to re-apply.
+
+---
+
+## v1 (historical — sequential classify-then-build)
 
 ## TL;DR
 
