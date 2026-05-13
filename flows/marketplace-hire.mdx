@@ -1,0 +1,148 @@
+---
+title: "Marketplace hire flow (/me/marketplace/:slug/hire)"
+description: "How an owner attaches a published agent to a project and how required_secrets land in the Secrets pane."
+---
+
+# Marketplace hire flow
+
+## TL;DR
+
+`POST /me/marketplace/:slug/hire` idempotently attaches a public agent
+(`is_public_listing=true`) to one of the caller's projects. When the agent
+declares `required_secrets` and some are missing, the route pre-seeds stub
+rows into `project_secrets` and returns `400 missing_required_secrets` with
+`project_id` + `project_slug` so the frontend can deep-link to the Secrets
+pane. This makes the hire CTA functional for every action-kind agent that
+needs vendor keys (sales-funnel-tg-farm, lead-enricher, kwork-account-replier,
+etc.).
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/marketplace.ts:676` | `POST /me/marketplace/:slug/hire` — agent visibility check, project ownership check, required_secrets gating + pre-seed |
+| `agentflow-agents/src/routes/marketplace.ts:762` | `missing_required_secrets` 400 response — includes `missing[{key,why}]`, `project_id`, `project_slug` |
+| `agentflow-agents/src/routes/marketplace.ts:881` | `POST /me/marketplace/:slug/fork` — sibling endpoint (sales-funnel-tg-farm uses this when forked from a base template) |
+| `agentflow-agents/src/db/schema.ts:1072` | `project_secrets` table — sealed AES-256-GCM, unique on `(project_id, key)` |
+| `agentflow-agents/tests/unit/marketplace-hire-secrets.test.ts` | source-contract tests for the seed behavior |
+| `agentflow-landing/src/lib/agentsApi.ts:3686` | `hireAgentToProject(slug, projectId)` — parses 400 payload, exposes `project_slug` + `missing_secrets` |
+| `agentflow-landing/src/components/marketplace/HireDialog.tsx:75` | modal — on missing secrets, toast + `setTimeout(navigate(?tab=secrets), 1200)` |
+| `agentflow-landing/src/pages/WorkspaceV2.tsx:343` | reads `?tab=<id>` from `useSearchParams`, mirrors selection back via `setSearchParams(replace:true)` |
+
+## Data flow
+
+```
+Marketplace UI (MarketplaceDetail.tsx)
+        │ "Hire" button
+        ▼
+HireDialog.tsx ── hireAgentToProject(slug, projectId)
+        │ POST /me/marketplace/:slug/hire
+        │ body: { project_id, accept_terms: true }
+        ▼
+routes/marketplace.ts /hire
+        │
+        ├─ load agents row (is_public_listing=true)            → 404 not_listed
+        ├─ load projects row, ownerUserId === session.sub      → 403 forbidden
+        ├─ read agent.requiredSecrets  ─┐
+        │                               │
+        ├─ SELECT key,is_set FROM project_secrets WHERE project_id=:id
+        │                               │
+        ├─ missing = required.filter(r => !haveSet(r.key))
+        │       │
+        │       ├─ if missing.length > 0:
+        │       │       ├─ INSERT stub rows  (is_set=false, source='agent',
+        │       │       │   added_by_slug=agent.slug, why=r.why)  ← try/catch
+        │       │       │   skips keys that already have a row
+        │       │       └─ return 400 { error: 'missing_required_secrets',
+        │       │                       missing, project_id, project_slug, help }
+        │       │
+        │       └─ else continue ↓
+        │
+        ├─ INSERT (project_id, agent_id) ON CONFLICT DO NOTHING
+        ├─ if firstTime: agents.hireCount += 1
+        ├─ appendProjectEvent('agent_hired')
+        └─ return 200 { ok: true, hired: { agent_id, slug, project_id, project_slug, first_time } }
+
+──────── on 400 missing_required_secrets ────────
+HireDialog
+   ├─ toast "Не хватает ключей: TG_API_ID, TG_API_HASH…"
+   └─ setTimeout(1200ms) → navigate(`/account/projects/${project_id}?tab=secrets`)
+
+WorkspaceV2 mounts with ?tab=secrets
+   └─ activeTab='secrets' → SecretsPane shows the pre-seeded stub rows
+                            ready for the owner to paste values
+```
+
+## DB / Env / API
+
+- **Tables**: `agents` (read: `is_public_listing`, `required_secrets`, `slug`); `projects` (ownership check); `project_agents` (composite PK insert); `project_secrets` (read + stub insert, unique on `(project_id, key)`); `agents.hire_count` increment.
+- **Env**: `FF_AGENT_MARKETPLACE=1` — gate for the marketplace catalog routes (NOTE: `/hire` itself currently does NOT live behind this gate — only `GET /me/marketplace/agents` does; check this if hire silently 404s).
+- **Routes**:
+  - `POST /me/marketplace/:slug/hire` — body `{ project_id: number, accept_terms: true }`
+  - `POST /me/marketplace/:slug/fork` — sibling, for base templates
+  - `GET /marketplace/:slug` — public listing
+  - `POST /me/projects/:id/secrets` — Secrets pane upsert endpoint owner uses to fill values
+- **Frontend routes**: `/marketplace/:slug` (MarketplaceDetail) → `/account/projects/:id?tab=secrets` (WorkspaceV2 with deep-link)
+
+## Response shape
+
+### 200 (hired or idempotent re-hire)
+```json
+{
+  "ok": true,
+  "hired": {
+    "agent_id": 142,
+    "slug": "sales-funnel-tg-farm",
+    "project_id": 17,
+    "project_slug": "my-farm",
+    "first_time": true
+  }
+}
+```
+
+### 400 missing_required_secrets (canonical, since this PR)
+```json
+{
+  "ok": false,
+  "error": "missing_required_secrets",
+  "missing": [
+    { "key": "TG_API_ID",  "why": "Telegram API ID from my.telegram.org" },
+    { "key": "TG_API_HASH","why": "Telegram API hash" },
+    { "key": "TG_SESSION", "why": "StringSession from agentflow-tg-mcp add_phone flow" }
+  ],
+  "project_id": 17,
+  "project_slug": "my-farm",
+  "help": "Open the project Secrets pane and paste a value for each missing key, then retry."
+}
+```
+
+Side-effect: each entry in `missing` whose `key` did not already exist in
+`project_secrets` is INSERTed as a stub row (`is_set=false`,
+`source='agent'`, `added_by_slug=<agent.slug>`, `why=<entry.why>`,
+`value_encrypted=NULL`). The Secrets pane lists these rows immediately.
+
+## Frontend contract
+
+- `hireAgentToProject` sends `{ project_id, accept_terms: true }` — the backend zod schema requires `accept_terms: z.literal(true)`; omitting it returns 400 `bad_input`.
+- On 400, it reads `payload.missing` (canonical) with a fallback to `payload.missing_secrets` for forward-compat.
+- `HireResponse.missing_secrets` (frontend type alias) carries the same `{key,why}[]` shape as `PublicListingSecret[]`.
+- `HireDialog` does NOT navigate immediately — 1.2 s `setTimeout` keeps the toast on screen so the user reads which keys are needed.
+
+## Failure modes
+
+| Симптом | Лог-строка для grep | Где починить |
+|---|---|---|
+| User clicks "Hire", nothing happens, no toast | 400 with `error:'missing_required_secrets'` but old frontend reads `missing_secrets` (renamed `missing` on backend) | `agentflow-landing/src/lib/agentsApi.ts:3708` — confirm payload field name |
+| Toast fires, Secrets pane is empty | Stub-insert skipped because keys already had `is_set=true` rows but values are stale | `agentflow-agents/src/routes/marketplace.ts:756` — `haveKeys` set built from `r.isSet`; check is_set flag consistency |
+| `bad_input` 400 with detail mentioning `accept_terms` | Frontend caller didn't send `accept_terms:true` | `agentflow-landing/src/lib/agentsApi.ts:3691` — body must include `accept_terms: true` |
+| Deep-link lands on Preview tab not Secrets | `?tab=secrets` not honored | `agentflow-landing/src/pages/WorkspaceV2.tsx:350` — `VALID_TABS` list, search-param read |
+| 404 `not_listed` for a private agent | Agent's `is_public_listing=false`. Use `/fork` instead (base templates) | check `agents.is_public_listing` for the slug |
+| 403 `forbidden` | Caller is not the project owner (collaborators can't hire) | by design — hire is a financial commitment, owner-only |
+| Unique-violation in logs on /hire retries | Two parallel hires racing on stub insert | benign — caught by `try/catch` at marketplace.ts:743 |
+
+## Related
+
+- [Architecture: Ферма (sales-funnel-tg-farm)](/architecture/ferma-sales-funnel)
+- [Architecture overview](/architecture/overview)
+- [Subsystems: tg-mcp](/subsystems/tg-mcp)
+- [Subsystems: projects-frontend](/subsystems/projects-frontend)

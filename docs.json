@@ -59,6 +59,7 @@
             "pages": [
               "flows/create-project",
               "flows/auto-bot-assign",
+              "flows/marketplace-hire",
               "flows/preview-deploy",
               "flows/project-lifecycle"
             ]
