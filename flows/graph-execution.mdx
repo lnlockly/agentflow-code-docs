@@ -1,0 +1,119 @@
+---
+title: "Graph execution"
+description: "Что происходит между approve project и done, когда FF_GRAPH_EXECUTOR allowлистит kind: walker подгребает workflow_schema, гоняет topo-DAG через typed handlers, эмитит node_*/edge_flowing в project_events."
+---
+
+# Graph execution
+
+## TL;DR
+
+`FF_GRAPH_EXECUTOR=1` + `FF_GRAPH_EXECUTOR_KINDS=landing,tg_bot,…` форкают
+финальный dispatch `runProjectApprovalBackground` с maestro freestyle на
+`runGraphExecutorDispatch`. Walker берёт `agent_boilerplates.workflow_schema`
+для kind проекта, строит runtime-граф (in-degree, parents, children),
+прогоняет frontier-loop с `Promise.all` по нодам с нулевым in-degree,
+эмитит `node_started` / `node_finished` / `node_failed` / `edge_flowing` в
+`project_events` + `projectBus` + `pipeline_runs` SSE-bridge. Unknown
+`node.id` падает в coder-fallback (slug `coder-landing`). На любом
+`node_failed` walker по умолчанию fail-fast'ит весь walk (overridable через
+`failurePolicy.perNode`).
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/env.ts` | Parse `ffGraphExecutor` (1/0) + `ffGraphExecutorKinds` (CSV) |
+| `agentflow-agents/src/services/projects-pipeline.ts` | `isGraphExecutorEnabledFor(kind)` + `approveProject` fork |
+| `agentflow-agents/src/services/projects.ts:2293` | `runProjectApprovalBackground` branch: walker vs maestro |
+| `agentflow-agents/src/services/projects.ts:2313` | `runGraphExecutorDispatch` — load workflow_schema, drain walker, flip status |
+| `agentflow-agents/src/services/graph-executor/index.ts` | `runGraphExecutor` (AsyncGenerator) + `runGraphExecutorToCompletion` |
+| `agentflow-agents/src/services/graph-executor/walker.ts` | Topo + retry + per-node Abort + cycle detect |
+| `agentflow-agents/src/services/graph-executor/registry.ts` | `createRegistry` / `defaultRegistry` / `setCoderFallback` |
+| `agentflow-agents/src/services/graph-executor/coder-fallback.ts` | `__coder__` handler (default slug `coder-landing`) |
+| `agentflow-agents/src/services/graph-executor/events.ts` | `buildEmit` writes to project_events + projectBus + pipeline_runs |
+| `agentflow-agents/src/services/graph-executor/exec-ctx.ts` | `defaultBuildExecCtx` — codeExec + llm + coderInvoke binding |
+| `agentflow-agents/src/services/graph-executor/handlers/index.ts` | Side-effect import that registers every shipped handler |
+| `agentflow-agents/tests/unit/graph-executor/walker.test.ts` | 6 walker cases (DAG, fan-in, retry, fallback, resume, cycle) |
+
+## Data flow
+
+```
+POST /me/projects/:id/approve
+   ↓
+approveProject (projects-pipeline.ts)
+   ↓ isGraphExecutorEnabledFor(kind) === true → useGraphExecutor=true
+   ↓
+runProjectApprovalBackground (projects.ts:1682, useGraphExecutor flag)
+   ↓ workspace provisioning (unchanged from maestro path)
+   ↓ workspace_ready event
+   ↓
+runGraphExecutorDispatch (projects.ts:2313)
+   ↓ SELECT workflow_schema FROM agent_boilerplates WHERE kind = <project.kind>
+   ↓ no schema → fall back to maestro (greppable: '[graph-executor] no workflow_schema for kind=…')
+   ↓ emit graph_executor_started event
+   ↓
+runGraphExecutorToCompletion (graph-executor/index.ts)
+   ↓
+runWalker (walker.ts) [AsyncGenerator<NodeEvent>]
+   ↓ workflowSchemaSchema.parse → reject malformed
+   ↓ build NodeRuntime map (inDegree, parents, children, state)
+   ↓ pre-seed resumeSteps (state='done', inDegree-- on children)
+   ↓ build ExecCtx via defaultBuildExecCtx (codeExec, llm, coderInvoke)
+   ↓ cycle detect via BFS from roots → unreachable pending = cycle
+   ↓
+   ┌─── frontier loop ────────────────────────────────────────┐
+   │ ready = nodes where state='pending' && inDegree===0      │
+   │ if ready.length===0 → break                              │
+   │ mark them 'running'                                      │
+   │ Promise.all(ready.map(node => executeNode(node)))        │
+   │   for attempt in 1..retryPolicy.max+1:                   │
+   │     new AbortController + setTimeout(timeoutSec*1000)    │
+   │     emit node_started {attempt}                          │
+   │     parsed = inputSchema.parse(node.config)              │
+   │     output = await handler.run(ctx, parsed)              │
+   │     outputSchema.parse(output) → state='done'            │
+   │     emit node_finished {payload, durationMs}             │
+   │     break OR retry on throw OR emit node_failed          │
+   │ after node done:                                         │
+   │   for each child: emit edge_flowing + inDegree--         │
+   │ after node failed + failFast: masterController.abort()   │
+   └──────────────────────────────────────────────────────────┘
+   ↓ emit drain — caller's for await yields events as they go
+   ↓
+runGraphExecutorDispatch finishes:
+   if result.failures.length > 0 → projects.status='failed'
+   else → projects.status='done'
+   emit graph_executor_finished {events, failures}
+```
+
+## DB / Env / API
+
+- Tables touched: `project_events` (every NodeEvent), `projects.status` (running → done|failed), `agent_boilerplates.workflow_schema` (read-only).
+- Env:
+  - `FF_GRAPH_EXECUTOR` — `1` enables fork (default off).
+  - `FF_GRAPH_EXECUTOR_KINDS` — CSV allowlist, e.g. `landing,tg_bot`. Empty CSV with FF=1 means "every kind that has a workflow_schema". Single kind absent from allowlist → maestro freestyle path.
+- API surface: no new routes. SSE consumers (`/me/projects/:slug/stream`, `/me/pipelines/:id/events`) get extra `kind` values: `node_started`, `node_finished`, `node_failed`, `edge_flowing`, `graph_executor_started`, `graph_executor_finished`.
+- Frontend: `CanvasLive.tsx` already understands these event kinds — no FE change required for Phase 1.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| FF on but kind ignores walker | `[graph-executor] kind <x> not in FF_GRAPH_EXECUTOR_KINDS` | Add kind to `FF_GRAPH_EXECUTOR_KINDS` env var |
+| Walker enabled but kind has no schema | `[graph-executor] no workflow_schema for kind=<kind>` | `agentflow-agents/src/scripts/seed-boilerplate-workflows.ts` — add the seed row |
+| workflow_schema malformed | `ZodError` thrown from `workflowSchemaSchema.parse` (surfaces as `[graph-executor] dispatch_threw`) | Fix the boilerplate row; nodes need `id`, edges need `from`+`to` |
+| Cycle in graph | `[graph-executor] cycle_detected nodes=[a,b]` | Edge points back to ancestor; remove or invert |
+| Unknown handler kind | `[graph-executor] handler missing for kind=<id>, delegating to coder-agent` | Register handler in `src/services/graph-executor/handlers/<kind>.ts` — or accept fallback if intentional |
+| Handler retried max times then gave up | `[graph-executor] retry node_id=<id> attempt=<n>/<m> err=<msg>` followed by `node_failed` | Look at the err substring; raise `retryPolicy.max` or fix the underlying handler |
+| Handler hit timeout | `[graph-executor] node <id> timed out after <N>s` | Bump `timeoutSec` on the handler OR investigate why the underlying call is slow |
+| Walker aborted whole graph after one node | `fail_fast:<node_id>` (re-thrown internally) → emitted as `node_failed` | Override `failurePolicy.perNode[<id>].failFast=false` per kind |
+| Resume re-ran a node we expected to skip | Walker emits `node_started` for a node listed in `resumeSteps` | Handler must set `retryPolicy.idempotent: true` for idempotent_skip to kick in |
+| Status stayed `running` after walker drained | `[graph-executor] dispatch_threw` | Walker threw before flip — check stderr; status was left at running |
+| Pipeline_runs SSE missing node events | `emit_threw kind=<x>` | `events.ts:buildEmit` failed (DB or projectBus down) — non-fatal, walker keeps running |
+
+## Related
+
+- [Architecture: graph-executor](/architecture/graph-executor) — contract + per-kind policy + migration phases.
+- [Project lifecycle](/flows/project-lifecycle) — full state machine, healer loop, finalize gate. Graph-executor sits between `approved` and `done`/`failed` on kinds in the allowlist.
+- [Architecture: kinds](/architecture/kinds) — which kind has which workflow_schema.
+- [Bot pool & auto-assign](/architecture/bot-pool) — the `request_token` handler (when shipped) calls `auto-bot.ts` here.
