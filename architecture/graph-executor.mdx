@@ -249,6 +249,38 @@ anything else.").
   `fail-fast` aborts the whole walk; `continue` records the failure and
   proceeds with the children that don't depend on this node's output.
 
+## Templating (`{{...}}` substitution)
+
+Since `2026-05-14` (PR `feat/diploma-preemptive-parallel`) the walker runs
+[`substituteTemplates`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/graph-executor/templates.ts)
+on every node's `config` before `handler.inputSchema.parse`. This lets a
+boilerplate `workflow_schema` wire downstream nodes to upstream outputs
+without per-handler glue.
+
+| Token | Resolves to |
+|---|---|
+| `{{ctx.projectId}}` | parent walker's project id (number) |
+| `{{ctx.ownerUserId}}` | tenant id (number) |
+| `{{ctx.workspaceProjectName}}` | `proj-<slug>` (string) |
+| `{{steps["<node_id>"].output.<path>}}` | output of a finished upstream node — `<path>` is dot-separated. Quoted form supports IDs that contain dots or colons (`project.create_sub:visitka`). |
+| `{{steps.<id>.output.<path>}}` | dot form for simple IDs without dots/colons. |
+
+Type preservation: when the entire config field equals a single token
+(`"{{ctx.projectId}}"`), the raw value is returned, so a `z.number()`
+schema receives the unwrapped number. When the token is embedded inside
+a longer string (`"project={{ctx.projectId}}"`), the result is a string
+with JSON-stringified replacement for non-strings.
+
+Unknown tokens are left untouched — zod will surface a real validation
+error pointing at the offending field. Walker template module is dumb:
+no conditionals, no arithmetic, no loops. For intent-conditional
+delivery the diploma flow uses `tg.send_text.text_by_intent` instead of
+a templating extension — see
+[diploma flow § v2](/flows/diploma-outreach-and-build).
+
+File ref: `agentflow-agents/src/services/graph-executor/templates.ts`.
+Walker call site: `agentflow-agents/src/services/graph-executor/walker.ts:313`.
+
 ## Per-kind policy
 
 | Kind | On node failure | Coder fallback | Notes |

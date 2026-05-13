@@ -80,10 +80,10 @@ through to maestro for them.
 | `multi_tenant` | `handlers/spa.ts` | coder-backend delegate (X-Org-Id + Membership guard) | 1 / 3s / false | 600s |
 | `admin_panel` | `handlers/spa.ts` | coder-spa delegate (React admin under admin-frontend/) | 1 / 3s / false | 600s |
 | `tg.get_user` | `handlers/tg.get_user.ts` | MCP `telegram/get_user` (peer lookup → username/user_id) | 2 / 3s / true | 60s |
-| `tg.send_text` | `handlers/tg-composite.ts` | MCP `telegram/send_message`, peer fallback to upstream `tg.get_user.username` | 1 / 0s / false | 60s |
+| `tg.send_text` | `handlers/tg-composite.ts` | MCP `telegram/send_message`, peer fallback to upstream `tg.get_user.username`. Optional `text_by_intent` map (diploma v2 preemptive deliver) reads `ctx.steps[intent_source_id].output.intent` and picks the template — `intent_source_id` defaults to `llm.classify_intent`. | 1 / 0s / false | 60s |
 | `tg.wait_reply` | `handlers/tg-composite.ts` | MCP `telegram/get_history` cursor poll, emits `node_waiting` | 1 / 0s / true | 1800s |
 | `llm.classify_intent` | `handlers/tg-composite.ts` | `ctx.llm(ModelType.TEXT_LARGE)` → strict JSON intent | 1 / 0s / true | 60s |
-| `project.create_sub` | `handlers/project.ts` | `pipelines.startApproval` for child project | 1 / 3s / false | 60s |
+| `project.create_sub` | `handlers/project.ts` | `pipelines.startApproval` for child project. `parent_project_id` optional — handler falls back to `ctx.projectId`. | 1 / 3s / false | 60s |
 | `project.wait_done` | `handlers/project.wait_done.ts` | polls `projects.status` until terminal | 1 / 3s / true | 1800s |
 | `tg_lead_states.update` | `handlers/tg_lead_states.update.ts` | upserts row in `tg_lead_states` (idempotent) | 2 / 3s / true | 30s |
 | `setup_bot` | `handlers/tg-bot-extras.ts` | `auto-bot.autoCreateTelegramBot` (idempotent, shared by 4 tg_bot extras) | 2 / 5s / true | 180s |
@@ -112,7 +112,8 @@ without falling back. The coverage gate is enforced by
 | `agentflow-agents/src/services/graph-executor/handlers/tg-profile-bundle.ts` | `scrape_tg, deploy_landing, scaffold_bot, wire_designapi, deploy_bot, booking_flow` |
 | `agentflow-agents/src/services/graph-executor/handlers/mini-app.ts` | `scaffold_vite, tg_webapp_init, routes` |
 | `agentflow-agents/src/services/graph-executor/handlers/spa.ts` | `scaffold_nest, scaffold_prisma, jwt_auth, billing_stripe, multi_tenant, admin_panel` |
-| `agentflow-agents/src/services/graph-executor/handlers/tg-composite.ts` | `tg.send_text, tg.wait_reply, llm.classify_intent` (diploma composite primitives) |
+| `agentflow-agents/src/services/graph-executor/handlers/tg-composite.ts` | `tg.send_text` (+ `text_by_intent`), `tg.wait_reply, llm.classify_intent` (diploma composite primitives) |
+| `agentflow-agents/src/services/graph-executor/templates.ts` | `substituteTemplates` — resolves `{{ctx.projectId}}` / `{{steps["<id>"].output.<path>}}` on every node `config` before zod parse. See [graph-executor § Templating](/architecture/graph-executor#templating-%7B%7B%7D%7D-substitution). |
 | `agentflow-agents/src/services/graph-executor/handlers/tg-bot-extras.ts` | `setup_bot` + 16 coder-delegates for the 4 new tg_bot boilerplates |
 | `agentflow-agents/src/services/graph-executor/handlers/tg-marketing.ts` | `link_account` + 8 coder-delegates for the 2 tg_farm boilerplates |
 | `agentflow-agents/src/services/graph-executor/handlers/tg.get_user.ts` | `tg.get_user` (MCP peer lookup) |
