@@ -84,7 +84,7 @@ through to maestro for them.
 | `tg.wait_reply` | `handlers/tg-composite.ts` | MCP `telegram/get_history` cursor poll, emits `node_waiting` | 1 / 0s / true | 1800s |
 | `llm.classify_intent` | `handlers/tg-composite.ts` | `ctx.llm(ModelType.TEXT_LARGE)` → strict JSON intent | 1 / 0s / true | 60s |
 | `project.create_sub` | `handlers/project.ts` | `pipelines.startApproval` for child project. `parent_project_id` optional — handler falls back to `ctx.projectId`. | 1 / 3s / false | 60s |
-| `project.wait_done` | `handlers/project.wait_done.ts` | polls `projects.status` until terminal | 1 / 3s / true | 1800s |
+| `project.wait_done` | `handlers/project.wait_done.ts` | polls `projects.status` until terminal. Accepts either `project_id` (numeric, often template-resolved) OR `from_step: "<create_sub node id>"` — handler reads `ctx.steps[from_step].output.sub_project_id`. Required for parallel sub-project DAGs (diploma-preemptive). | 1 / 3s / true | 1800s |
 | `tg_lead_states.update` | `handlers/tg_lead_states.update.ts` | upserts row in `tg_lead_states` (idempotent) | 2 / 3s / true | 30s |
 | `setup_bot` | `handlers/tg-bot-extras.ts` | `auto-bot.autoCreateTelegramBot` (idempotent, shared by 4 tg_bot extras) | 2 / 5s / true | 180s |
 | `fetch_target_channel` / `register_callback` / `check_subscription` / `grant_or_deny` | `handlers/tg-bot-extras.ts` | coder-tg-bot delegate (subscription-gate flow) | 1 / 3s / false | 600s |
@@ -177,6 +177,7 @@ ctx.emit({ kind: 'node_finished', payload: { output } })
 | `scrape_tg` rejects with `scrape_tg_requires_username_or_brief` | grep handler source | Node config must include `username` or `brief` — fix the seed |
 | Coder reply missing `files_written` array | handler returns `files_written: []` and walker per-kind policy decides | If kind is `fail-fast` on this node, brief was too broad — tighten `output_expected` in the registration |
 | Duplicate handler registration on boot | `duplicate_handler:<kind>` thrown at module load | Two registrations for one `kind` — remove the second one |
+| `project.wait_done` zod fails with `project_id: required` (was production bug on diploma run #581) | `project.wait_done_no_project_id_resolved` (literal in handler) | Boilerplate must set either `project_id` (templated `{{steps["..."].output.sub_project_id}}`) or `from_step: "<create_sub node id>"`. Static `project_id` cannot be hardcoded for parallel sub-project DAGs. See `handlers/project.wait_done.ts:20-45` |
 
 ## Related
 

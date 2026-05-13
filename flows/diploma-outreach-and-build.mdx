@@ -49,6 +49,7 @@ simultaneously, deliver fires.
 | Walker integration | `agentflow-agents/src/services/graph-executor/walker.ts:313` | Calls `substituteTemplates(node.config, ctxView, stepsMutable)` before `handler.inputSchema.parse`. |
 | `text_by_intent` | `agentflow-agents/src/services/graph-executor/handlers/tg-composite.ts` | Optional map on `tg.send_text` config. Handler reads `ctx.steps[intent_source_id].output.intent` (default source: `llm.classify_intent`) and picks the matching template. Fallback chain: `text_by_intent[intent]` → `text_by_intent.default` → `text`. |
 | `parent_project_id` fallback | `agentflow-agents/src/services/graph-executor/handlers/project.ts:30` | `parent_project_id` is now optional in `project.create_sub` config. When omitted the handler uses `ctx.projectId`. Defensive — the boilerplate still templates it explicitly. |
+| `from_step` upstream resolution | `agentflow-agents/src/services/graph-executor/handlers/project.wait_done.ts:20-45` | `project.wait_done` gains optional `from_step: "<create_sub node id>"`. Handler reads `ctx.steps[from_step].output.sub_project_id` at runtime. Required for parallel sub-project DAGs — fixes the production zod-required bug seen on diploma run #581. |
 
 ### v2 boilerplate config (id=31)
 
@@ -57,7 +58,7 @@ idempotent. Node ids use `:variant` suffix so the registry resolves to the base
 handler. Three string tokens carry the cross-node wiring:
 
 - `parent_project_id: "{{ctx.projectId}}"` (in both `project.create_sub` nodes)
-- `project_id: "{{steps[\"project.create_sub:visitka\"].output.sub_project_id}}"` (and the `:bot` counterpart on the other branch)
+- `from_step: "project.create_sub:visitka"` on `project.wait_done:visitka` (and the `:bot` counterpart) — handler resolves `sub_project_id` from upstream output at runtime
 - `text_by_intent.<key>` strings reference `{{steps["project.wait_done:visitka"].output.preview_url}}` and `{{steps["project.wait_done:bot"].output.bot_username}}`
 
 ### Why this works on the existing walker
