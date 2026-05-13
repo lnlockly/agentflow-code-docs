@@ -4,8 +4,12 @@ import starlight from '@astrojs/starlight';
 import starlightLlmsTxt from 'starlight-llms-txt';
 
 // https://astro.build/config
+// `site` + `base` are set for the default GitHub Pages URL so the deploy
+// works immediately. When a CNAME for code.agentflow.website is added in
+// DNS, drop `base` and bump `site` to the custom domain — single-line edit.
 export default defineConfig({
-  site: 'https://code.agentflow.website',
+  site: 'https://lnlockly.github.io',
+  base: '/agentflow-code-docs',
   integrations: [
     starlight({
       title: 'AgentFlow Code',
