@@ -62,7 +62,8 @@
               "flows/auto-bot-assign",
               "flows/marketplace-hire",
               "flows/preview-deploy",
-              "flows/project-lifecycle"
+              "flows/project-lifecycle",
+              "flows/templates-marketplace"
             ]
           },
           {
