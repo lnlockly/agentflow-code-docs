@@ -1,31 +1,115 @@
 ---
 title: "Ферма (sales-funnel-tg-farm)"
-description: "Sales-funnel-tg-farm agent runtime + MTProto poller."
+description: "Sales-funnel-tg-farm preset — agent runtime, MTProto poller, lead-state machine, hire path."
 ---
 
 # Ферма (sales-funnel-tg-farm)
 
-> **TODO** — заполнить researcher-агентом. Стартовый skeleton.
-
 ## TL;DR
 
-(1-2 предложения)
+A marketplace preset (`is_public_listing=true`, showcase rank 7) that lets
+an owner attach a sales-funnel AI persona to their own Telegram account.
+The agent is `kind: action` — it polls inbound DMs via `agentflow-tg-mcp`
+(MTProto StringSession), classifies the lead through a flow with a
+`trigger.tg.new_message` node, replies + advances a state machine in
+`tg_lead_states`, and surfaces hot leads. The hire path is generic (works
+for every action-kind agent with `required_secrets`), but the runtime
+glue is sales-funnel-specific.
 
 ## Files
 
-| Repo / path | Что делает |
+| Path | Role |
 |---|---|
-| `agentflow-agents/src/...` | (file ref) |
+| `agentflow-agents/presets/sales-funnel-tg-farm.json` | preset (system prompt, required_secrets, MCP wiring) |
+| `agentflow-agents/src/routes/marketplace.ts:676` | `/me/marketplace/:slug/hire` — attach preset to a project, seed required_secrets |
+| `agentflow-agents/src/services/agent-trigger-worker.ts:233` | `getTgNewMessageNodeConfig` — locates `trigger.tg.new_message` node on a flow graph |
+| `agentflow-agents/src/services/agent-trigger-worker.ts:318` | `pollFlowTgNewMessage` — per-flow poller (get_dialogs → get_messages → executeFlow) |
+| `agentflow-agents/src/routes/agent-triggers.ts:26` | `FF_AGENT_TRIGGERS=1` feature gate (503 otherwise) |
+| `agentflow-agents/src/db/schema.ts:1765` | `agent_triggers` table — cron/event subscriptions, owner-scoped |
+| `agentflow-agents/src/db/schema.ts:2127` | `tg_lead_states` table — lead-state machine per `(owner_user_id, tg_account_id, tg_chat_peer)` |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/tools/accounts.py` | `add_phone` + `confirm_code` MTProto session bootstrap (Python, Telethon) |
+| `agentflow-landing/src/components/marketplace/HireDialog.tsx:75` | hire modal + secrets deep-link |
 
-## DB tables / env / API surface
+## Data flow
 
-(таблицы Postgres, env vars, REST endpoints)
+```
+Marketplace → HireDialog → /me/marketplace/sales-funnel-tg-farm/hire
+        │
+        ▼ (400 missing_required_secrets, stubs pre-seeded — see flows/marketplace-hire)
+WorkspaceV2 ?tab=secrets → SecretsPane shows 5 required keys:
+        ├─ TG_API_ID         (my.telegram.org)
+        ├─ TG_API_HASH       (my.telegram.org)
+        ├─ TG_SESSION        (StringSession from tg-mcp add_phone)
+        ├─ CALENDLY_LINK     (optional)
+        └─ ELEVENLABS_API_KEY(optional, voice)
+        │
+        ▼ owner pastes values → /me/projects/:id/secrets upserts is_set=true
+        │
+        ▼ retry /hire (now succeeds) → projectAgents row + agent_hired event
+        │
+        ▼ owner enables agent_triggers row (cron/event)
+        │   FF_AGENT_TRIGGERS=1 required
+        │
+        ▼ agent-trigger-worker → pollFlowTgNewMessage
+        │     ├─ tg-mcp get_dialogs(tg_account_id) — cursor in agent_triggers.cursor
+        │     ├─ for each new message → executeFlow(graph, { _trigger: 'tg.new_message', text, chat_peer, message_id })
+        │     └─ flow updates tg_lead_states.state (cold|warm|hot|booked|objection|spam)
+        ▼
+Frontend (TODO — gap #3 in audit): tg_lead_states dashboard pane
+```
+
+## DB / Env / API
+
+### Tables
+- **`agents`** — preset stored with `slug='sales-funnel-tg-farm'`, `is_public_listing=true`, `category='domain'`, `required_secrets=[TG_API_ID, TG_API_HASH, TG_SESSION, CALENDLY_LINK?, ELEVENLABS_API_KEY?]`.
+- **`project_secrets`** (schema.ts:1072) — sealed AES-256-GCM, unique `(project_id, key)`, `source ∈ {agent, owner, platform, user_brief}`.
+- **`agent_triggers`** (schema.ts:1765) — owner-scoped cron / `tg.new_message` subscriptions; `cursor` jsonb holds last seen `(dialog_id, message_id)`.
+- **`tg_lead_states`** (schema.ts:2127) — unique on `(owner_user_id, tg_account_id, tg_chat_peer)`; `state ∈ {cold|warm|hot|booked|objection|spam}`.
+
+### Env
+- `FF_AGENT_TRIGGERS=1` — required for `agent-triggers` routes + worker (501 otherwise)
+- `FF_AGENT_MARKETPLACE=1` — required for marketplace catalog list (note: `/hire` not gated)
+- `AGENTS_MASTER_KEY` — AES-256 master used by `sealProjectSecretValue`
+- `TG_MCP_URL` — Python tg-mcp HTTP endpoint
+- `TG_MCP_TOKEN` — bearer for tg-mcp
+
+### Routes
+- `POST /me/marketplace/sales-funnel-tg-farm/hire` — see `flows/marketplace-hire.mdx`
+- `POST /me/projects/:id/secrets` — upsert TG_*, CALENDLY_*, ELEVENLABS_* values
+- `POST /me/agent-triggers` — register `trigger.tg.new_message` cron
+- `GET /me/agent-triggers` — list owner subscriptions
+
+### MCP tools (agentflow-tg-mcp)
+- `add_phone(phone)` → returns `{ phone_code_hash }`
+- `confirm_code(phone, code, phone_code_hash)` → returns `{ string_session }` (paste this as `TG_SESSION`)
+- `get_dialogs(string_session, offset)` — paginated dialog list
+- `get_messages(string_session, dialog_id, min_id)` — incremental fetch
+- `send_message(string_session, peer, text)` — outbound reply
+
+## Audit gaps (as of 2026-05-13)
+
+| Gap | Status | Notes |
+|---|---|---|
+| Hire flow returned 400 but didn't pre-seed Secrets pane | ✅ Fixed in PR lnlockly/agentflow-agents#195 + agentflow-landing#160 | Generic across every action-kind agent |
+| No HTTP wrapper around tg-mcp `add_phone`/`confirm_code` + no React OTP modal | ❌ Open | Forces user to call MCP manually to generate `TG_SESSION` — biggest remaining UX gap |
+| No `tg_lead_states` dashboard in workspace | ❌ Open | Owner has no way to see classified leads; downstream of MTProto gap above |
+| WorkspaceV2 tab not URL-driven | ✅ Fixed (PR #160) | `?tab=secrets` deep-link now works |
 
 ## Failure modes
 
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
+| Hire button silently fails | `error: 'missing_required_secrets'` returned but old frontend reads `missing_secrets` | `agentflow-landing/src/lib/agentsApi.ts:3708` (post-#160 reads `missing`) |
+| Secrets pane empty after hire | Stub-insert skipped — race or pre-existing rows | `agentflow-agents/src/routes/marketplace.ts:743` (try/catch + `haveAnyRow` filter) |
+| `bad_input` on /hire | Missing `accept_terms:true` in body | `agentflow-landing/src/lib/agentsApi.ts:3691` |
+| Poller doesn't fire | `agent-triggers routes return 503` | set `FF_AGENT_TRIGGERS=1` in deployment env |
+| Poller fires but no new messages | `tg.new_message get_messages failed` | `agentflow-agents/src/services/agent-trigger-worker.ts:396` — usually TG_SESSION expired or proxy unreachable |
+| Lead state stuck in `cold` | `executeFlow` returns without `setLeadState` action | check flow graph has `set_lead_state` node downstream of `trigger.tg.new_message` |
+| `tg.new_message cursor read failed` in logs | jsonb cursor corrupted | `agentflow-agents/src/services/agent-trigger-worker.ts:361` |
 
 ## Related
 
+- [Flows: Marketplace hire](/flows/marketplace-hire)
+- [Subsystems: tg-mcp](/subsystems/tg-mcp)
+- [Architecture: kinds](/architecture/kinds) — `action` kind contract
 - [Architecture overview](/architecture/overview)
