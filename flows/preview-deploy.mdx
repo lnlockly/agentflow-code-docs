@@ -1,31 +1,113 @@
 ---
 title: "Preview deploy flow"
-description: "Как файлы попадают в preview pod."
+description: "Coder writes /workspace → runtime-supervisor classify/build → Caddy plan.json → placeholder probe → preview-gate → finalize."
 ---
 
 # Preview deploy flow
 
-> **TODO** — заполнить researcher-агентом. Стартовый skeleton.
-
 ## TL;DR
 
-(1-2 предложения)
+Coder-агент через `code-exec.write_file` пишет файлы в `/workspace`. Когда plan_task завершён, pool-worker post-build хук дёргает `runtime-supervisor.deploy`: classify → autoBuild SPA если нужно → write Procfile + s6 services → write `.runtime/plan.json` для Caddy → reload sidecar → HTTP probe. Перед `status=done` — `preview-gate.checkPreviewGate` (per-kind: api → /health, spa → root `<div id="root|app">`, mini_app → ≥1024b, landing → html markers) + placeholder hash deny-list. Placeholder hit ⇒ `preview_gate_blocked`, healer держит проект в running.
 
 ## Files
 
 | Repo / path | Что делает |
 |---|---|
-| `agentflow-agents/src/...` | (file ref) |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts:710` | `write_file` — kubectl exec → tee → `/workspace/<path>`. |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts:1890` | `expose_public` — финальный switch Caddy на static/proxy. |
+| `agentflow-agents/src/services/runtime-supervisor.ts:1146` | `buildPipeline` — classify → build → write supervisor → deploy. |
+| `agentflow-agents/src/services/runtime-supervisor.ts:608` | `autoBuildSpaIfNeeded` — `npm run build` для spa/landing/mini_app. |
+| `agentflow-agents/src/services/runtime-supervisor.ts:1485` | `deploy` — write `plan.json` + Caddy reload. |
+| `agentflow-agents/src/services/runtime-supervisor.ts:1725` | `postDeployHealthCheck` — HTTP probe. |
+| `agentflow-agents/src/services/pool-worker/post-build.ts:50` | `ensurePreviewIngressPlaceholder` — пишет Caddy stub перед первым успешным deploy. |
+| `agentflow-agents/src/services/pool-worker/post-build.ts:264` | `probePreviewReady` — wraps preview-placeholder.probePreviewUrl. |
+| `agentflow-agents/src/services/pool-worker/post-build.ts:325` | `finalizePreviewOnDone` — атомарно flip `status=done` если preview-gate ok. |
+| `agentflow-agents/src/services/pool-worker/post-build.ts:595` | `tryAutoStartHttpServer` — last-resort `http-server`/`python3 -m http.server` если backend сам не стартанул. |
+| `agentflow-agents/src/services/pool-worker/post-build.ts:1354` | `detectAndRepointPreview` — реактивный — если static kind отдаёт stub, но `dist/` появился — repoint Caddy. |
+| `agentflow-agents/src/services/pool-worker/preview-gate.ts:40` | `PreviewKind` type — `api | spa | landing | mini_app | tg_bot | code_only | null`. |
+| `agentflow-agents/src/services/pool-worker/preview-gate.ts:55` | `PreviewGateResult`. |
+| `agentflow-agents/src/services/pool-worker/preview-gate.ts:211` | `checkPreviewGate` — main entry. Per-kind dimensions. |
+| `agentflow-agents/src/services/pingers/preview-placeholder.ts:101` | `classifyPreviewProbe` — placeholder detection (title + hash + size). |
+| `agentflow-agents/src/services/pingers/preview-placeholder.ts:168` | `shouldHoldFinalizeForPlaceholder`. |
+| `agentflow-agents/src/services/pingers/healer-finalize.ts:37` | `tryFinalizeProjectFromPlan` — healer-driven финализация. Placeholder hold gate на line 94. |
+
+## Data flow
+
+```
+plan_task in_progress (coder agent)
+  ↓ code-exec.write_file -> kubectl exec -> tee /workspace/<path>
+  ↓ ... много write_file + exec ...
+plan_task → done
+
+pool-worker post-build (post-build.ts:325 finalizePreviewOnDone)
+  ↓
+runtime-supervisor.deploy chain (runtime-supervisor.ts:1146 buildPipeline)
+  ↓ classify → autoBuildSpaIfNeeded (line 608) — npm run build, fallback pnpm/yarn
+  ↓ detectRuntime (line 867)
+  ↓ writeS6Services (line 1371) — /workspace/.runtime/s6/<name>/run
+  ↓ deploy (line 1485) — write /workspace/.runtime/plan.json + Caddy reload
+  ↓ postDeployHealthCheck (line 1725) — HTTP /, /health
+  ↓ ok → project_events: 'runtime_supervisor_deployed'
+  ↓ fail → autoRetryCoder (line 1811) → open coder fix task
+
+ensurePreviewIngressPlaceholder (post-build.ts:50) — installed earlier
+  ↓ Caddy serves stub until plan.json arrives
+probePreviewReady (post-build.ts:264)
+  ↓ preview-placeholder.probePreviewUrl
+  ↓ classify: ready | placeholder | timeout
+
+checkPreviewGate (preview-gate.ts:211) — strict mode if PREVIEW_GATE_STRICT=true
+  per kind:
+    api       → GET /health  →  JSON { ok:true }
+    spa       → GET /        →  <div id="root|app"> selector + body ≥ 2048b
+    mini_app  → GET /        →  body ≥ 1024b + html markers
+    landing   → GET /        →  html markers, body ≥ 2048b
+    tg_bot    → no preview gate
+  retries: DEFAULT_MAX_RETRIES=3, backoff [1000, 2000, 5000]ms
+  ↓ pass → finalizePreviewOnDone (post-build.ts:325)
+  ↓        UPDATE projects SET status='done' WHERE id=$1 AND status='running'
+  ↓        project_events: 'project_finalized'
+  ↓ fail → project_events: 'preview_gate_blocked' → status stays 'running'
+
+Healer tick (60s) — services/pingers/healer-finalize.ts:37
+  ↓ tryFinalizeProjectFromPlan — retry на projects застрявших в running
+  ↓ shouldHoldFinalizeForPlaceholder (preview-placeholder.ts:168) — если stub → hold
+
+detectAndRepointPreview (post-build.ts:1354) — reactive
+  ↓ если static kind + workspace has /dist но Caddy всё ещё stub →
+  ↓ re-write plan.json → Caddy reload
+```
 
 ## DB tables / env / API surface
 
-(таблицы Postgres, env vars, REST endpoints)
+**DB:**
+- `projects` — `kind`, `preview_url`, `status` (draft→proposing→awaiting_approval→approved→running→done|failed|cancelled).
+- `project_events` — `runtime_supervisor_deployed`, `runtime_supervisor_failed`, `auto_build_*`, `preview_gate_blocked`, `preview_ready_final`, `project_finalized`, `screenshot_captured`.
+
+**Env:**
+- `PREVIEW_GATE_STRICT=true` — strict mode (по умолчанию on в prod).
+- `DEP_INSTALL_AGENT=1` — LLM fallback на failed `npm install`.
+- `FF_BOT_AUTO_TEST=1` — для tg_bot smoke-test через Jarvis.
+- `PREVIEW_GATE_DEFAULT_BODY_MIN_BYTES=2048`, `PREVIEW_GATE_DEFAULT_HEALTH_PATH=/health`.
+
+**API:**
+- `POST /internal/runtime-supervisor/deploy` (`routes/internal.ts:914`) — invoked by pool-worker.
+- `POST /internal/code-exec/write_file_b64` (`routes/internal.ts:947`) — programmatic write.
 
 ## Failure modes
 
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
+| Preview зависает на «Workspace ready» | `caddy_workspace_ready_title` или `preview_gate_blocked` | `services/pingers/preview-placeholder.ts:125`; `preview-gate.ts:211` |
+| Static SPA без dist | `auto_build_skipped` или `auto_build_failed` | `runtime-supervisor.ts:608` |
+| API kind отдаёт 200 но не /health | preview-gate fail `health_path_failed` | `preview-gate.ts:211` (per-kind api block) |
+| status=running, healer не финализирует | `stuck_project_detected` | `services/pingers/healer.ts:44` |
+| Repoint вечно повторяется | `placeholder_repoint_loop` | `services/pingers/placeholder-repoint.ts:94` |
+| Auto-serve cooldown в действии | `auto_serve_cooldown` | `pool-worker/constants.ts:66` (AUTO_SERVE_COOLDOWN_MS=5min) |
 
 ## Related
 
-- [Architecture overview](/architecture/overview)
+- [Caddy preview](/subsystems/caddy-preview)
+- [Runtime supervisor](/subsystems/runtime-supervisor)
+- [Project lifecycle](/flows/project-lifecycle)
+- [Debug stuck project](/runbooks/debug-stuck-project)

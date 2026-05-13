@@ -1,31 +1,148 @@
 ---
 title: "Debug stuck project"
-description: "Что делать если проект висит в running."
+description: "Step-by-step: проект висит в running / approved / awaiting_approval. SQL queries, log greps, manual recovery."
 ---
 
 # Debug stuck project
 
-> **TODO** — заполнить researcher-агентом. Стартовый skeleton.
-
 ## TL;DR
 
-(1-2 предложения)
+Стуки чаще всего в одном из 5 мест: (1) `approved` + 0 plan_tasks → auto-bot / scrape провал; (2) `running` + все tasks done но `status≠done` → preview-gate hold (placeholder); (3) `running` + task in_progress >15min → pod crash / kubectl exec hang; (4) `awaiting_approval` без `proposed_plan` → Maestro propose failed; (5) `paused_until > now()` → token-budget rate-limit. Этот runbook — точная последовательность SQL + grep команд для каждого случая.
 
 ## Files
 
 | Repo / path | Что делает |
 |---|---|
-| `agentflow-agents/src/...` | (file ref) |
+| `agentflow-agents/src/services/pingers/healer.ts:44` | `runHealerTick` — главный диагност. |
+| `agentflow-agents/src/services/pingers/healer-finalize.ts:37` | `tryFinalizeProjectFromPlan` — реактивная финализация. |
+| `agentflow-agents/src/services/pingers/preview-placeholder.ts:101` | `classifyPreviewProbe`. |
+| `agentflow-agents/src/services/pool-worker/claim.ts:33` | `runTick` — где видно paused_until / cancelled filter. |
+| `agentflow-agents/src/services/auto-bot.ts:299` | log marker `[auto-bot] getMe network error`. |
+| `agentflow-agents/src/services/projects.ts:1983` | log marker `auto_scrape_post_ws_failed`. |
+| `agentflow-agents/src/routes/internal.ts:685` | `POST /internal/projects/:id/admin-approve` — bypass. |
+
+## Diagnostic flow (по симптому)
+
+```
+1) Узнать текущий статус
+   SELECT id, status, kind, plan_id, workspace_project_name, paused_until,
+          bot_username, preview_url, updated_at
+     FROM projects WHERE id = :id;
+
+2) Лента событий
+   SELECT kind, payload, created_at
+     FROM project_events
+    WHERE project_id = :id
+    ORDER BY id DESC LIMIT 30;
+
+3) Plan tasks
+   SELECT id, assignee_slug, status, retry_depth, parent_task_id,
+          is_amendment_dispatch, depends_on, claimed_at
+     FROM plan_tasks WHERE plan_id = (SELECT plan_id FROM projects WHERE id = :id)
+    ORDER BY id ASC;
+```
+
+### Case A — `status='approved'`, 0 plan_tasks
+
+```
+project_events kind list?
+  ├─ есть 'workspace_ready' но нет 'plan_started':
+  │   └─ kind=tg_bot? → проверь auto-bot:
+  │        grep "\\[auto-bot\\] getMe network error" pod-logs   (auto-bot.ts:299)
+  │        grep "pool empty and FF_AUTO_BOT_CREATE_BOTFATHER"   (auto-bot.ts:161)
+  │        фикс: расширить BOT_TOKEN_POOL ИЛИ FF_AUTO_BOT_CREATE_BOTFATHER=1
+  │   └─ есть @handles в brief? → auto-scrape:
+  │        grep "auto_scrape_post_ws_failed"                     (projects.ts:1983)
+  │        фикс: дернуть Jarvis pod (kubectl exec ... — проверь Telethon session)
+  └─ нет 'workspace_ready':
+      grep "pod_provision_failed" / "failure_kind:.*node_cpu_exhausted"
+      → orphan sweep: ORPHAN_SWEEP_ENABLED=true (services/orphan-sweep.ts)
+      → или вручную: kubectl describe statefulset project-<slug>
+```
+
+### Case B — `status='running'`, все plan_tasks done
+
+```
+project_events последнее событие?
+  ├─ 'preview_gate_blocked':
+  │   curl -sI https://<slug>.preview.agentflow.dev/  → 200?
+  │   curl -s  https://<slug>.preview.agentflow.dev/  → body? title?
+  │     "Workspace ready" в HTML?     → Caddy всё ещё stub → placeholder-repoint
+  │       services/pingers/placeholder-repoint.ts:94 — должен подхватить sweep
+  │     SHA256 ∈ src/config/placeholder-hashes.json? → coder положил boilerplate как-есть
+  │     body < 2048b? → недостаточно контента, retry coder
+  │     api kind: GET /health → JSON {ok:true}?
+  │   → reload Caddy в pod'е: curl -X POST 127.0.0.1:2019/load (с plan.json payload)
+  └─ нет 'preview_gate_blocked' но всё-равно не финализит:
+      grep "stuck_project_detected"                              (healer.ts)
+      → ручной trigger: POST /internal/projects/:id/admin-approve   (routes/internal.ts:685)
+```
+
+### Case C — `plan_tasks` в `in_progress` > 15min
+
+```
+claimed_at старый (>15 min) → pod крэш во время выполнения
+   UPDATE plan_tasks SET status='pending', claimed_at=NULL WHERE id = :task_id;
+   (или дождаться pool-worker — он сам подхватывает на следующем тике, claim.ts:33)
+
+retry_depth > MAX_AUTO_RETRY?  → grep "auto_retry_cap_reached"
+   → запустить amendment dispatch вручную (maestro escalation)
+```
+
+### Case D — `status='awaiting_approval'`, `proposed_plan IS NULL`
+
+```
+grep "propose_project_plan_failed" в логах
+проверь budget: SELECT budget_cents_remaining FROM users WHERE id = project.owner_user_id;
+  → если 0 → POST /admin/users/:id/budget (routes/internal.ts:1098) restock
+проверь providers: SELECT slug, enabled FROM llm_provider_configs;
+```
+
+### Case E — `paused_until > now()`
+
+```
+SELECT paused_until FROM projects WHERE id = :id;
+  → auto-pinger очистит в положенное время (services/rate-limit.ts)
+  → можно вручную: UPDATE projects SET paused_until = NULL WHERE id = :id;
+```
 
 ## DB tables / env / API surface
 
-(таблицы Postgres, env vars, REST endpoints)
+**Полезные SQL views:**
+```sql
+-- Все застрявшие projects
+SELECT id, status, kind, updated_at,
+       extract(epoch from (now() - updated_at))/60 AS minutes_idle
+  FROM projects
+ WHERE status IN ('approved','running','awaiting_approval')
+   AND updated_at < now() - interval '20 minutes'
+ ORDER BY updated_at ASC;
 
-## Failure modes
+-- Stuck tasks
+SELECT pt.id, pt.plan_id, pt.assignee_slug, pt.status, pt.retry_depth, pt.claimed_at
+  FROM plan_tasks pt
+ WHERE pt.status = 'in_progress'
+   AND pt.claimed_at < now() - interval '15 minutes';
+```
+
+**Env / admin endpoints:**
+- `POST /internal/projects/:id/admin-approve` (`routes/internal.ts:685`) — force-approve bypass.
+- `POST /admin/users/:id/budget` (`routes/internal.ts:1098`) — restock budget.
+
+## Failure modes / fast fixes
 
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
+| Approved + 0 tasks | `[auto-bot] getMe network error` | `services/auto-bot.ts:299` |
+| Running + preview hold | `preview_gate_blocked` | `pool-worker/preview-gate.ts:211` |
+| Task in_progress >15 min | (нет — claimed_at старый) | manual UPDATE → pending |
+| Awaiting approval, no plan | `propose_project_plan_failed` | budget / providers |
+| Paused (token budget) | `rate_limit_paused` | `services/rate-limit.ts` |
+| Stuck warn в логах | `stuck_project_detected` | `services/pingers/healer.ts:44` |
+| Caddy всё ещё stub | `placeholder_repoint_skipped` | `services/pingers/placeholder-repoint.ts:94` |
 
 ## Related
 
-- [Architecture overview](/architecture/overview)
+- [Project lifecycle](/flows/project-lifecycle)
+- [Auto-bot assign](/flows/auto-bot-assign)
+- [Preview deploy](/flows/preview-deploy)

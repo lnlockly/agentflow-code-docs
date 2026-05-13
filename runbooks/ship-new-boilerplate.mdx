@@ -1,31 +1,108 @@
 ---
 title: "Ship a new boilerplate"
-description: "Добавить новый шаблон с workflow_schema."
+description: "Создать новый agent_boilerplates row: baked-in путь (быстро) ИЛИ git remote (fallback). Tests, smoke-deploy, rollout."
 ---
 
 # Ship a new boilerplate
 
-> **TODO** — заполнить researcher-агентом. Стартовый skeleton.
-
 ## TL;DR
 
-(1-2 предложения)
+Boilerplate — это шаблон проекта (репо или директория), который applyBoilerplate раскладывает в `/workspace` сразу после workspace_ready. Два пути доставки: **baked** — копируется из `/opt/agentflow/boilerplates/<kind>/` в pod-образе (~2s cp), и **git fallback** — `git clone <repo_url>` (30-90s). Чтобы добавить новый: (1) собрать репо/директорию с правильной структурой (package.json + Procfile или статика), (2) INSERT в `agent_boilerplates`, (3) если baked — bump pod-image, (4) smoke-test через `POST /me/projects { brief, kind }`.
 
 ## Files
 
 | Repo / path | Что делает |
 |---|---|
-| `agentflow-agents/src/...` | (file ref) |
+| `agentflow-agents/src/services/boilerplates.ts:100` | `listBoilerplates` — admin listing. |
+| `agentflow-agents/src/services/boilerplates.ts:120` | `getBoilerplate` — by slug. |
+| `agentflow-agents/src/services/boilerplates.ts:133` | `getBoilerplateByKind` — main lookup в applyBoilerplate path. |
+| `agentflow-agents/src/services/boilerplates.ts:157` | `VALID_KINDS` — массив ProjectKind значений. |
+| `agentflow-agents/src/services/boilerplates.ts:169` | `validateBoilerplateInput` — DTO check. |
+| `agentflow-agents/src/services/boilerplates.ts:191` | `createBoilerplate` — INSERT в `agent_boilerplates`. |
+| `agentflow-agents/src/services/boilerplates.ts:221` | `deleteBoilerplate`. |
+| `agentflow-agents/src/services/boilerplates.ts:275` | `applyBoilerplate` — baked path → git clone fallback. |
+| `agentflow-agents/src/services/runtime-supervisor.ts:278` | `classify` — boilerplate должен сматчиться (`unknown` → ручной Procfile). |
+| `agentflow-agents/src/services/runtime-supervisor.ts:1146` | `buildPipeline` — пройдёт build шаблона. |
+| `agentflow-agents/src/services/pool-worker/preview-gate.ts:211` | `checkPreviewGate` — должен пройти для boilerplate output. |
+
+## Step-by-step
+
+```
+1. Подготовить репо / директорию.
+   Минимальная структура:
+     package.json       (NPM пакет с scripts.start ИЛИ scripts.build)
+     Procfile           (если backend, формат: web: <cmd>)
+     .gitignore         (исключить node_modules, dist, .runtime)
+     README.md
+   Для static (spa/landing/mini_app):
+     index.html в корне ИЛИ frontend/index.html (SPA_SUBDIRS fallback).
+     vite.config / next.config / etc.
+
+2. Baked path (рекомендовано для топовых kinds):
+   В Dockerfile pod-runtime образа:
+     COPY ./boilerplates/<kind> /opt/agentflow/boilerplates/<kind>/
+   Bump image tag в helm chart / kustomize.
+
+3. Git fallback (для long-tail / experimental):
+   Push публично в Gitlab/GitHub:
+     git remote add origin <repo_url>
+     git push -u origin main
+
+4. INSERT row в agent_boilerplates:
+     INSERT INTO agent_boilerplates(
+       slug, kind, repo_url, default_branch, scaffold_steps, baked_path
+     ) VALUES (
+       '<unique_slug>', '<kind>',
+       'https://github.com/.../boilerplate-x.git',  -- nullable если только baked
+       'main',
+       '{...optional scaffold_steps JSON...}',
+       '/opt/agentflow/boilerplates/<kind>'         -- nullable если только git
+     );
+
+5. Smoke-test
+   POST /me/projects { brief: "test bp", kind: "<kind>" }   -- explicit kind override
+   GET  /me/projects/:id                                    -- ждём status=done
+   curl https://<slug>.preview.agentflow.dev/               -- проверить preview-gate pass
+
+6. Verify
+   - applyBoilerplate в логах: 'boilerplate_applied' + path source (baked vs git)
+   - runtime-supervisor classify правильный (не 'unknown')
+   - preview-gate ok (body min, selector, /health)
+
+7. Rollout
+   - prod: bump image (baked) или просто INSERT row (git fallback)
+   - monitor: project_events 'boilerplate_apply_failed' counter
+```
 
 ## DB tables / env / API surface
 
-(таблицы Postgres, env vars, REST endpoints)
+**DB:**
+- `agent_boilerplates` — `{ id, slug UNIQUE, kind, repo_url, default_branch, scaffold_steps jsonb, baked_path, created_at }`.
+  Defined in `src/db/schema.ts`.
+
+**Env:**
+- `BOILERPLATE_GIT_CLONE_TIMEOUT_MS` — таймаут на `git clone`.
+- `/opt/agentflow/boilerplates/` — baked-in путь в pod-image.
+
+**API:**
+- `GET /admin/boilerplates` (listBoilerplates).
+- `POST /admin/boilerplates` (createBoilerplate).
+- `DELETE /admin/boilerplates/:id` (deleteBoilerplate).
 
 ## Failure modes
 
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
+| applyBoilerplate упал (нет ни baked, ни repo_url) | `boilerplate_not_found` | `services/boilerplates.ts:133` (getBoilerplateByKind) |
+| `git clone` 30s+ → timeout | `boilerplate_git_clone_timeout` | `services/boilerplates.ts:275` — увеличить timeout или baked it |
+| Coder получает чужой шаблон | `boilerplate_slug_mismatch` | `services/boilerplates.ts:275` — slug vs kind |
+| Caddy отдаёт boilerplate index без правок | `placeholder_hash_match` | `src/config/placeholder-hashes.json` — добавить sha256 boilerplate'а в deny-list |
+| Build fails сразу на boilerplate | `auto_build_failed` | проверить `npm run build` локально |
+| Procfile не подхватился | `backend_server_detected_no_procfile` | `services/runtime-supervisor.ts:1251` — добавить Procfile в boilerplate |
 
 ## Related
 
-- [Architecture overview](/architecture/overview)
+- [Add new kind](/runbooks/add-new-kind)
+- [Architecture: kinds matrix](/architecture/kinds)
+- [Runtime supervisor](/subsystems/runtime-supervisor)
+- [Preview deploy](/flows/preview-deploy)
