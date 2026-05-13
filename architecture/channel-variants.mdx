@@ -1,0 +1,119 @@
+---
+title: "Channel variants matrix"
+description: "Diploma outreach DAG cloned across 4 channels — TG MTProto / TG Bot API / Instagram DM / VK. Same node shape, different IO handlers."
+---
+
+# Channel variants matrix
+
+## TL;DR
+
+The diploma DAG ([flows/diploma-outreach-and-build](/flows/diploma-outreach-and-build))
+is a composite of three primitives: outreach IO + LLM intent classification +
+sub-project build. The IO primitive is the channel-specific bit. We ship one
+boilerplate row per channel so the same DAG topology can hit Telegram MTProto,
+Telegram Bot API, Instagram Direct, or VK — picking up handlers from the
+[graph-executor registry](/architecture/graph-executor#node-handler-registry) where
+they exist, falling back to coder-agent where they don't.
+
+Migration `agentflow-agents/migrations/2026-05-14a-channel-variants.sql`
+adds 3 rows (ids 33, 34, 35) on top of the original diploma row (id=31).
+
+## The matrix
+
+| # | `name` | `kind` | `channel` | Outreach handler | Wait handler | Required secret(s) | Handler status |
+|---|---|---|---|---|---|---|---|
+| 1 | `diploma-outreach-build`     | `tg_farm` | `tg_mtproto`  | `tg.send_text` (MTProto via tg-mcp)      | `tg.wait_reply` (MTProto poll)      | `TG_API_ID`, `TG_API_HASH`, `TG_SESSION` (account 4) | shipped — typed handlers |
+| 2 | `person-outreach-tg-bot`     | `tg_bot`  | `tg_bot_api`  | `tg.send_text` w/ `config.via=bot_api`   | `tg.wait_reply` w/ `config.via=bot_api` | `BOT_TOKEN` (from `BOT_TOKEN_POOL` via `services/auto-bot.ts:autoCreateTelegramBot`) | typed handler routes by `via` (Bot API branch is a follow-up — currently coder-fallback) |
+| 3 | `person-outreach-instagram`  | `tg_farm` | `instagram`   | `ig.send_dm`                              | `ig.wait_reply`                      | `IG_USERNAME` + `IG_PASSWORD` or `IG_GRAPH_TOKEN` (placeholder — Secrets surface TBD) | coder-fallback (per-node `config.coder_brief`) |
+| 4 | `person-outreach-vk`         | `tg_farm` | `vk`          | `vk.send_message`                         | `vk.wait_reply`                      | `VK_ACCESS_TOKEN` (messages scope, placeholder) | coder-fallback |
+
+The downstream half of the DAG (`llm.classify_intent → project.create_sub →
+project.wait_done → tg_lead_states.update`) is identical across all four.
+Only the delivery node (`*.send_*:deliver`) changes shape to match the
+outreach channel.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/migrations/2026-05-13-diploma-boilerplate.sql:33` | Original diploma row (id=31, kind=`tg_farm`, channel=MTProto). |
+| `agentflow-agents/migrations/2026-05-14a-channel-variants.sql:33`  | Three new rows: `person-outreach-tg-bot` (id=33), `person-outreach-instagram` (id=34), `person-outreach-vk` (id=35). Idempotent `ON CONFLICT (kind, name) DO UPDATE`. |
+| `agentflow-agents/src/services/graph-executor/handlers/tg-composite.ts` | Reference call site for `tg.*` handlers — pattern via `mcpDirect.callTool('telegram', ...)`. `via=bot_api` branch needs adding for variant 2. |
+| `agentflow-agents/src/services/graph-executor/registry.ts` | Handler registry — unknown ids fall back to coder-agent-delegate. |
+| `agentflow-agents/src/services/graph-executor/coder-fallback.ts` | Picks up `config.coder_brief` per node when no typed handler exists. |
+| `agentflow-agents/src/services/kind-classifier.ts:21` | `ProjectKind` union. Channel variants 3 and 4 ride on `tg_farm` until a `social_outreach` kind lands. |
+| `agentflow-agents/src/services/auto-bot.ts:151` | `autoCreateTelegramBot` — leases a bot token from `BOT_TOKEN_POOL` for `kind ∈ {tg_bot, tg_profile_bundle}`. Variant 2 reuses this path. |
+
+## Data flow
+
+```plaintext
+POST /me/projects { name: 'person-outreach-tg-bot', kind: 'tg_bot' }
+        │
+        ▼  routes/projects.ts:573 — kind preset
+        │  workflow_schema copied from agent_boilerplates (id=33)
+        ▼
+   approveProject  →  graph-executor walker (FF gated)
+        │
+        ▼  walker.ts:topo-walk
+        │  for each node id:
+        │    registry.lookup(id) → typed handler
+        │    OR coder-fallback (id starts with `ig.` / `vk.` / unknown)
+        ▼
+   tg.get_user[via=bot_api]   →   tg.send_text[via=bot_api]   →   tg.wait_reply[via=bot_api]
+   ig.get_user (coder)         →   ig.send_dm (coder)          →   ig.wait_reply (coder)
+   vk.get_user (coder)         →   vk.send_message (coder)     →   vk.wait_reply (coder)
+        │
+        └─►  llm.classify_intent  →  project.create_sub  →  project.wait_done  →  *:deliver  →  tg_lead_states.update
+             (identical across all 4 variants)
+```
+
+## DB / Env / API
+
+- **Table:** `agent_boilerplates`
+- **Unique key:** `(kind, name)` — migration uses `ON CONFLICT DO UPDATE` for re-runs.
+- **CHECK constraint:** `kind IN ('landing','tg_bot','spa','api','code_only','mini_app','tg_profile_bundle','tg_farm')`. Variants 3 and 4 squat on `tg_farm` until a `social_outreach` kind ships.
+- **Routes:**
+  - `GET /me/boilerplates` — frontend `/templates` surfaces every row whose kind / category render in `kindToPreset`.
+  - `POST /me/projects { name: 'person-outreach-<channel>', kind: '<tg_bot|tg_farm>' }` — creates a project from the variant.
+- **Env (variant 2 only):** `BOT_TOKEN_POOL` (existing, used by `services/auto-bot.ts:autoCreateTelegramBot`).
+- **Env (variants 3, 4):** `INSTAGRAM_*` / `VK_*` secrets are placeholders. Per-owner Secrets surface is the durable answer; coder-fallback handlers read them from `ctx.secrets` once that surface lands.
+- **MCP tools (variant 1 only):** tg-mcp `send_message`, `wait_reply`, `get_full_user`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Variant 2 sends MTProto instead of Bot API | `[tg-composite] handler dispatched via=mtproto` for a `kind=tg_bot` project | `handlers/tg-composite.ts` — add `via` switch before `mcpDirect.callTool` |
+| Variant 2 fails with `bot can't initiate conversation with a user` | `Bad Request: bots can't send messages to users they haven't talked to` | Bot API can only DM users who `/start`ed the bot. `target_chat_id` in config must be a chat the bot already has access to. |
+| Variants 3, 4 stall at `ig.get_user` / `vk.get_user` | `[coder-fallback] no handler for kind=ig.get_user, delegating to coder-agent` | Expected on first run — coder writes the handler. After landing, register typed handler in `registry.ts` so subsequent runs are deterministic. |
+| Migration rejected with `kind_check violation` | `new row for relation "agent_boilerplates" violates check constraint "agent_boilerplates_kind_check"` | Variants 3, 4 use `tg_farm` — already in the check. If extending to a new kind value, patch the check alongside the INSERT. |
+| `GET /me/boilerplates` doesn't show the new rows | empty UI, no errors | RAG-tier issue — confirm row exists via `psql -tA -c "SELECT id, name FROM agent_boilerplates WHERE name LIKE 'person-outreach-%'"`. Then check `routes/boilerplates.ts` for category / kind filters. |
+
+## Coder-fallback contract for ig.* and vk.*
+
+Until typed handlers ship, graph-executor reads `config.coder_brief` per
+node and hands it to the coder-agent. The brief is plain Russian / English
+prose telling the coder what to implement. Example shipped today:
+
+```json
+{
+  "id": "ig.send_dm",
+  "config": {
+    "channel": "instagram",
+    "peer": "{{config.ig_username}}",
+    "text": "...",
+    "coder_brief": "Напиши handler ig.send_dm: принимает {peer, text, account}, отправляет DM через instagrapi direct_send или Graph API messages. Возвращает {ok, thread_id, message_id}. Учти flood-rate IG (60/час)."
+  }
+}
+```
+
+The coder-agent commits the new handler back to `agentflow-agents/src/services/graph-executor/handlers/` and registers it in `registry.ts`. Once landed, every future run of variants 3 and 4 picks up the typed handler — no more delegation.
+
+## Related
+
+- [Diploma showcase](/flows/diploma-outreach-and-build) — the source DAG (channel=MTProto).
+- [TG templates matrix](/architecture/tg-templates) — full template catalogue.
+- [Graph executor](/architecture/graph-executor) — walker + registry + coder-fallback.
+- [Project kinds](/architecture/kinds) — canonical kind enum.
+- [Bot pool & auto-assign](/architecture/bot-pool) — how variant 2 gets its `BOT_TOKEN`.
+- [Ship new boilerplate](/runbooks/ship-new-boilerplate) — runbook used for the migration.
