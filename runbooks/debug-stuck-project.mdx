@@ -20,6 +20,8 @@ description: "Step-by-step: проект висит в running / approved / awai
 | `agentflow-agents/src/services/auto-bot.ts:299` | log marker `[auto-bot] getMe network error`. |
 | `agentflow-agents/src/services/projects.ts:1983` | log marker `auto_scrape_post_ws_failed`. |
 | `agentflow-agents/src/routes/internal.ts:685` | `POST /internal/projects/:id/admin-approve` — bypass. |
+| `agentflow-agents/src/routes/internal.ts:534` | `POST /internal/tenant/:userId/expand-quota` — lift vcluster ResourceQuota. |
+| `agentflow-agents/src/services/expand-tenant-quota.ts:132` | `expandTenantQuota` service — kubectl patch + sts rollout-restart. |
 
 ## Diagnostic flow (по симптому)
 
@@ -98,6 +100,40 @@ grep "propose_project_plan_failed" в логах
 проверь providers: SELECT slug, enabled FROM llm_provider_configs;
 ```
 
+### Case F — `workspace_provision_retry attempt=N/8` без `workspace_ready`
+
+Workspace pod не поднимается: vcluster syncer не может создать STS / PVC.
+Чаще всего — переполненная per-tenant `code-exec-quota` ResourceQuota.
+
+```
+1) Подтвердить причину — syncer логи внутри vcluster pod:
+   kubectl -n af-tenant-<userId> logs user-<userId>-0 -c syncer --tail=200 \
+     | grep -i 'exceeded quota\|forbidden\|failed to create'
+   → ищем: `persistentvolumeclaims "..." is forbidden: exceeded quota:
+            code-exec-quota, requested: requests.storage=5Gi,
+            used: requests.storage=240Gi, limited: requests.storage=100Gi`
+
+2) Recovery через документированный endpoint:
+   curl -X POST -H "x-agentflow-secret: $INTERNAL_API_SECRET" \
+     'https://api.agentflow.website/internal/tenant/<userId>/expand-quota?storage=500Gi&pvc=100'
+   → ожидается 200 с {ok:true, applied:{...}, kicked_sts:[...]}
+   → endpoint автоматически rollout-restart'ит все stuck STSs
+
+3) Ручной bypass (если endpoint недоступен или вернул 500):
+   # admin kubeconfig vcluster'a лежит в syncer'е
+   kubectl -n af-tenant-<userId> exec user-<userId>-0 -c syncer -- \
+     wget -qO /tmp/kubectl https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl \
+     && chmod +x /tmp/kubectl
+   kubectl -n af-tenant-<userId> exec user-<userId>-0 -c syncer -- \
+     /tmp/kubectl --kubeconfig=/data/pki/admin.conf -n default \
+     patch resourcequota code-exec-quota --type=merge \
+     -p '{"spec":{"hard":{"persistentvolumeclaims":"100","requests.storage":"500Gi","limits.cpu":"80","limits.memory":"128Gi","pods":"80","requests.cpu":"32","requests.memory":"32Gi"}}}'
+   # потом kick stuck STSs:
+   kubectl -n af-tenant-<userId> exec user-<userId>-0 -c syncer -- \
+     /tmp/kubectl --kubeconfig=/data/pki/admin.conf -n default \
+     rollout restart sts/project-<name>
+```
+
 ### Case E — `paused_until > now()`
 
 ```
@@ -140,6 +176,8 @@ SELECT pt.id, pt.plan_id, pt.assignee_slug, pt.status, pt.retry_depth, pt.claime
 | Paused (token budget) | `rate_limit_paused` | `services/rate-limit.ts` |
 | Stuck warn в логах | `stuck_project_detected` | `services/pingers/healer.ts:44` |
 | Caddy всё ещё stub | `placeholder_repoint_skipped` | `services/pingers/placeholder-repoint.ts:94` |
+| `workspace_provision_retry` без `workspace_ready` | `exceeded quota: code-exec-quota` (vcluster syncer log) | `POST /internal/tenant/:userId/expand-quota` или ручной `kubectl patch` (см. Case F) |
+| expand-quota endpoint возвращает 500 | `Cannot read properties of undefined (reading 'url')` at `request.js#query` | агент-pod нужен передеплой с PR #208 (fix c.req.query binding). До деплоя — bypass через `kubectl exec user-<userId>-0 -c syncer` |
 
 ## Related
 
