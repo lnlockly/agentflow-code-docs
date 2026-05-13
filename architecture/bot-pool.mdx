@@ -86,6 +86,20 @@ re-leased (atomic detach старого + bind нового в одной functi
 - code-exec `exec` в pod target проекта — `printf > /workspace/bot_token.txt`.
 - code-exec `exec` в Jarvis pod — `python3 /workspace/bot_cli.py <name> <username>` для BotFather mint.
 
+## Previous bug (pre-#194)
+
+До `lnlockly/agentflow-agents#194` (`auto-bot.ts` коммит `111c035`) фильтр кандидатов был построен как `Set<string>` из `bot_username` ВСЕХ проектов, у которых это поле not-null — без учёта статуса.
+
+```ts
+// pre-fix (стало):
+const usedUsernames = new Set(rows.map(r => r.botUsername).filter(Boolean));
+const chosen = pool.find(e => !usedUsernames.has(e.username));
+```
+
+Эффект: lease трактовался как perpetual. После ~5 проектов `kind=tg_bot` (= размер пула в проде) каждый следующий получал `bot_username=null`, `BOT_TOKEN` не sealed, `bot.py` стартовал без токена и валился в loop. Symptom: проект #553 `AgentFlow Sales Bot` дошёл до `status=done` с `bot_username=null`, при наличии 5 entries в `BOT_TOKEN_POOL` и `FF_AUTO_BOT_CREATE=1` в проде.
+
+Fix: status-aware ladder ниже + atomic detach старого владельца. Pool теперь самоочищается по мере того, как старые проекты переходят в `failed`/`done`/etc.
+
 ## Reclaim ladder (cheap → expensive)
 
 ```
@@ -109,6 +123,7 @@ Probe network error → `false` (conservative — лучше попробова�
 
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
+| Pool exhausted после N исторических `tg_bot` проектов (= pool size), новые `tg_bot` доходят до `status=done` с `bot_username=null` | `auto-bot: no available bot tokens (pool exhausted` или `auto-bot: skipped N pool token(s) leased to a still-active project` | Reclaim ladder уже включён (`auto-bot.ts:261`). Если все pool entries у `running`/`approved` владельцев — расширить pool или заставить orphan'ы flip'нуться в `failed`. См. секцию "Previous bug" выше — это тот самый класс багов. |
 | Все pool токены active | `auto-bot: skipped N pool token(s) leased to a still-active project` | Расширить pool или подождать пока owner'ы перейдут в `done`/`failed`. |
 | Все pool токены 409 | `auto-bot: skipped N conflict-locked pool token(s)` | Wait 10 min for TG release или `kubectl delete pod` orphans. |
 | Pool пустой, BotFather off | `pool empty and FF_AUTO_BOT_CREATE_BOTFATHER off, skipping` | Расширить `BOT_TOKEN_POOL` или включить flag. |
