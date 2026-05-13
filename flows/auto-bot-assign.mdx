@@ -1,91 +1,140 @@
 ---
 title: "Auto-bot assign flow"
-description: "BOT_TOKEN_POOL → conflict probe → BotFather fallback → write /workspace/.env.bot → bot_assigned event."
+description: "BOT_TOKEN_POOL → reclaim ladder (dead → done+idle) → conflict probe → BotFather fallback → seal token → write /workspace/bot_token.txt → bot_assigned event."
 ---
 
 # Auto-bot assign flow
 
 ## TL;DR
 
-Когда у проекта kind ∈ {`tg_bot`, `tg_profile_bundle`}, после `workspace_ready` запускается `autoCreateTelegramBot`: тянет первый available токен из `BOT_TOKEN_POOL`, проверяет `getMe` + `getUpdates` (детектит 409 conflict — другой воркер уже сидит на этом токене), пишет `/workspace/.env.bot` через code-exec, апдейтит `projects.bot_username`, emits `bot_assigned`. Если pool пуст и включён `FF_AUTO_BOT_CREATE_BOTFATHER=1` — Jarvis pod через Telethon делает new bot @BotFather + получает токен.
+Когда у проекта `kind ∈ {tg_bot, tg_profile_bundle}`, после `workspace_ready` запускается `autoCreateTelegramBot`. Функция парсит `BOT_TOKEN_POOL`, строит карту текущих владельцев каждого `bot_username` из таблицы `projects`, и для каждого кандидата в пуле прогоняет ladder:
+
+1. **`getUpdates?timeout=0` probe** — если 409 Conflict, токен реально занят живым long-poller → skip.
+2. **owner status check** — если владелец в `running` / `approved` → skip (могут быть в рестарте, не yank'аем).
+3. **reclaim** — если владелец в `failed` / `cancelled` / `draft` / `awaiting_approval` (DEAD) или `done` + idle probe → отдаём токен новому проекту, atomically обнуляя `bot_username` / `bot_token` / `BOT_TOKEN` secret у старого + emit `bot_unassigned` event.
+
+Pool пустой / все заняты live-поллером + `FF_AUTO_BOT_CREATE_BOTFATHER=1` → Jarvis pod через Telethon делает `/newbot` у @BotFather. Токен сильно (AES-256-GCM) sealed в `projects.bot_token` + `project_secrets.BOT_TOKEN`, raw token падает в `/workspace/bot_token.txt` (chmod 600) внутри pod'а проекта — Procfile-supervisor читает его на следующем тике (~5с).
 
 ## Files
 
 | Repo / path | Что делает |
 |---|---|
-| `agentflow-agents/src/services/auto-bot.ts:50` | `probeBotInConflict` — `getUpdates(timeout=0)`; 409 ⇒ токен уже занят. |
-| `agentflow-agents/src/services/auto-bot.ts:76` | `createBotViaBotFather` — Jarvis Telethon диалог с @BotFather. |
-| `agentflow-agents/src/services/auto-bot.ts:114` | `writeBotTokenFile` — write `/workspace/.env.bot` через code-exec MCP. |
-| `agentflow-agents/src/services/auto-bot.ts:142` | `autoCreateTelegramBot` — main entry: pool → conflict probe → BotFather fallback → write env → event. |
-| `agentflow-agents/src/services/auto-bot.ts:161` | log marker `pool empty and FF_AUTO_BOT_CREATE_BOTFATHER off, skipping`. |
-| `agentflow-agents/src/services/auto-bot.ts:299` | log marker `[auto-bot] getMe network error`. |
-| `agentflow-agents/src/services/projects.ts:1682` | `runProjectApprovalBackground` — вызывает autoCreateTelegramBot на нужной стадии. |
+| `agentflow-agents/src/services/auto-bot.ts:50` | `probeBotInConflict(token)` — `getUpdates?timeout=0&offset=-1`, 4с AbortSignal. 409 ⇒ занят, 200 / network error ⇒ свободен. |
+| `agentflow-agents/src/services/auto-bot.ts:76` | `createBotViaBotFather` — Jarvis pod (`JARVIS_OWNER_USER_ID=1`, `JARVIS_WORKSPACE_PROJECT_NAME=proj-71506e1l`) exec `python3 /workspace/bot_cli.py` → парсит `TOKEN=` / `USERNAME=`. |
+| `agentflow-agents/src/services/auto-bot.ts:114` | `writeBotTokenFile` — `umask 077 && printf > /workspace/bot_token.txt && chmod 600` через code-exec MCP. **НЕ `.env.bot`.** |
+| `agentflow-agents/src/services/auto-bot.ts:142` | `autoCreateTelegramBot(projectId, projectName)` — main entry. |
+| `agentflow-agents/src/services/auto-bot.ts:161` | Log `pool empty and FF_AUTO_BOT_CREATE_BOTFATHER off, skipping`. |
+| `agentflow-agents/src/services/auto-bot.ts:184` | Idempotency guard — skip если `BOT_TOKEN` уже с `is_set=true` (placeholder-секрет от coder'а с `is_set=false` НЕ блокирует — overwrite через `placeholderSecretId`). |
+| `agentflow-agents/src/services/auto-bot.ts:229` | `ownerRows` SELECT — все проекты с `botUsername IS NOT NULL` кроме самого себя. |
+| `agentflow-agents/src/services/auto-bot.ts:244` | `DEAD_STATUSES = {failed, cancelled, draft, awaiting_approval}` — pool lease forfeit без probe. |
+| `agentflow-agents/src/services/auto-bot.ts:261` | Reclaim ladder loop по пулу. |
+| `agentflow-agents/src/services/auto-bot.ts:296` | `reclaimedFromOwner` — atomic detach: UPDATE projects, UPDATE project_secrets, emit `bot_unassigned`. |
+| `agentflow-agents/src/services/auto-bot.ts:319` | `bot_unassigned` event на старом проекте с payload `{username, reason: 'pool_reclaim', previous_status, new_project_id}`. |
+| `agentflow-agents/src/services/auto-bot.ts:349` | Log `no available tokens (pool exhausted, BotFather off/failed)`. |
+| `agentflow-agents/src/services/auto-bot.ts:369` | `getMe` валидация — только для pool-токенов (BotFather mint самовалидирующийся), 5с AbortSignal. |
+| `agentflow-agents/src/services/auto-bot.ts:447` | `bot_assigned` event — payload `{username, project_name, via: 'pool' | 'botfather'}`. **Ключ — `via`, НЕ `source`.** |
+| `agentflow-agents/src/services/auto-bot.ts:459` | `syncProjectEnvFile(projectId)` — пушит `BOT_TOKEN` в `/workspace/.env` для Procfile supervisor. |
+| `agentflow-agents/src/services/projects.ts:1682` | `runProjectApprovalBackground` — вызывает `autoCreateTelegramBot` после `workspace_ready` (≈line 2015) для kind `tg_bot` / `tg_profile_bundle`. |
 
 ## Data flow
 
 ```
 runProjectApprovalBackground (projects.ts:1682)
-  ↓ kind ∈ {tg_bot, tg_profile_bundle}  AND  FF_AUTO_BOT_CREATE=1
+  ↓ kind ∈ {tg_bot, tg_profile_bundle}  AND  workspace_ready emitted
 autoCreateTelegramBot (auto-bot.ts:142)
   ↓
-[1] Parse BOT_TOKEN_POOL env (JSON [{token,username}])
-  ↓ for each candidate in pool order:
-  ↓ getMe(token)
-  ↓   ok ✓
-  ↓ probeBotInConflict (auto-bot.ts:50)
-  ↓   getUpdates(timeout=0)
-  ↓   ↳ 409 Conflict → token занят другим pod'ом → skip
-  ↓   ↳ 200          → token свободен ✓
-  ↓ writeBotTokenFile (auto-bot.ts:114)
-  ↓   code-exec MCP → write_file /workspace/.env.bot
-  ↓ UPDATE projects SET bot_username=$1 WHERE id=$2
-  ↓ project_events: kind='bot_assigned', payload={username, source:'pool'}
-  ↓ return ok
-
-[2] Pool empty / all in conflict
-  ↓ if FF_AUTO_BOT_CREATE_BOTFATHER=1:
-  ↓   createBotViaBotFather (auto-bot.ts:76)
-  ↓     Jarvis pod (JARVIS_OWNER_USER_ID=1) Telethon session
-  ↓     отправляет /newbot → BotFather → name → username → получает token
-  ↓     writeBotTokenFile + UPDATE bot_username
-  ↓     project_events: 'bot_assigned', source: 'botfather'
-  ↓ else:
-  ↓   log "pool empty and FF_AUTO_BOT_CREATE_BOTFATHER off, skipping"
-  ↓   skipped без события — кодер потом возьмёт токен ручкой
+[0] Parse BOT_TOKEN_POOL (JSON [{token,username}]); allowBotFather = FF_AUTO_BOT_CREATE_BOTFATHER==='1'
+  ↓ pool.length==0 && !allowBotFather → log "pool empty and ... off, skipping"; return
+  ↓
+[1] Idempotency: SELECT project_secrets WHERE key='BOT_TOKEN'
+  ↓ if exists && is_set=true → log "already has populated BOT_TOKEN, skipping"; return
+  ↓ if exists && is_set=false → keep placeholderSecretId для UPDATE in-place
+  ↓
+[2] Load proj (owner_user_id, workspace_project_name) — нужен для writeBotTokenFile
+  ↓
+[3] Build ownerByUsername map: SELECT id,status,botUsername FROM projects WHERE id != $self AND botUsername IS NOT NULL
+  ↓
+[4] Reclaim ladder loop — for each entry in pool order:
+  ↓   owner = ownerByUsername.get(entry.username)
+  ↓   ownerIsDead   = owner && DEAD_STATUSES.has(owner.status)
+  ↓   ownerIsActive = owner && !ownerIsDead && owner.status !== 'done'
+  ↓   conflict = await probeBotInConflict(entry.token)  // GET /bot.../getUpdates?timeout=0
+  ↓   ↳ 409                          → push skippedConflict; continue
+  ↓   ↳ ownerIsActive (running/approved, no 409) → push skippedActive; continue
+  ↓   ↳ owner dead/done OR no owner  → chosen = entry; if owner: reclaimedFromOwner = ...; break
+  ↓
+[5] Reclaim atomic detach (если reclaimedFromOwner):
+  ↓   UPDATE projects SET bot_username=NULL, bot_token=NULL WHERE id=$old
+  ↓   UPDATE project_secrets SET is_set=false, masked='', value_encrypted=NULL,
+  ↓     why='Reclaimed by auto-bot pool ...' WHERE project_id=$old AND key='BOT_TOKEN'
+  ↓   project_events: kind='bot_unassigned', target=$old, payload={username, reason:'pool_reclaim', previous_status, new_project_id}
+  ↓   log "reclaimed @... from project N (status=..., no active poller)"
+  ↓
+[6] Pool exhausted (chosen==null):
+  ↓   if allowBotFather:
+  ↓     slug = projectName.alnum.lower.slice(0,18); rand4; username = `${slug}_${rand4}_bot`
+  ↓     createBotViaBotFather → Jarvis pod exec /workspace/bot_cli.py → TOKEN=, USERNAME=
+  ↓   else:
+  ↓     log "no available tokens (pool exhausted, BotFather off/failed)"; return
+  ↓
+[7] getMe валидация (только pool, не BotFather), 5с timeout
+  ↓   !data.ok → log "getMe failed for @..."; return
+  ↓   exception → log "getMe network error: ..."; return (approval flow продолжается без bot)
+  ↓
+[8] Seal + persist:
+  ↓   sealed = sealString(token)   // AES-256-GCM via seal.ts
+  ↓   if placeholderSecretId: UPDATE project_secrets SET ... in-place
+  ↓   else: INSERT project_secrets (project_id, key='BOT_TOKEN', value_encrypted=sealed, is_set=true, source='platform')
+  ↓   UPDATE projects SET bot_username=$1, bot_token=$sealed WHERE id=$projectId
+  ↓
+[9] writeBotTokenFile → code-exec MCP: umask 077 + printf > /workspace/bot_token.txt + chmod 600
+  ↓
+[10] project_events: kind='bot_assigned', payload={username, project_name, via:'pool'|'botfather'}
+  ↓
+[11] syncProjectEnvFile(projectId) — best-effort push в /workspace/.env
 ```
 
 ## DB tables / env / API surface
 
 **DB:**
-- `projects.bot_username` — устанавливается после успешного assign.
-- `project_events` — `bot_assigned` (`payload: {username, source: 'pool'|'botfather'}`).
-- `project_secrets` — здесь токен НЕ хранится; он живёт в `/workspace/.env.bot` (sealed на уровне k8s PVC).
+- `projects.bot_username` — устанавливается при assign, обнуляется при reclaim.
+- `projects.bot_token` — sealed (AES-256-GCM, см. `services/seal.ts`), nullable.
+- `project_secrets` (key=`BOT_TOKEN`) — sealed копия токена с `is_set=true`, `source='platform'`, `masked='AAAAA...XXXX'`. При reclaim: `is_set=false`, `value_encrypted=NULL`, `masked=''`, `why='Reclaimed by auto-bot pool — token re-leased to another project'`.
+- `project_events`:
+  - `bot_assigned` — payload `{username, project_name, via: 'pool' | 'botfather'}`.
+  - `bot_unassigned` — payload `{username, reason: 'pool_reclaim', previous_status, new_project_id}`.
+  - `log` (level=warn/info/error) — `auto-bot: skipped N conflict-locked …`, `auto-bot: skipped N pool token(s) leased to a still-active project …`, `auto-bot: reclaimed @… from project N …`, `auto-bot: minting via BotFather …`, `auto-bot: no available bot tokens …`, `auto-bot: getMe failed/network error …`.
 
 **Env:**
-- `FF_AUTO_BOT_CREATE=1` — глобальный switch (если выключен, шаг пропускается).
-- `FF_AUTO_BOT_CREATE_BOTFATHER=1` — BotFather fallback.
-- `BOT_TOKEN_POOL` — JSON `[{token, username}, ...]`. Порядок = приоритет.
-- `JARVIS_OWNER_USER_ID=1`, `JARVIS_WORKSPACE_PROJECT_NAME=proj-71506e1l` — singleton pod для Telethon операций.
-- `TG_MCP_URL` — endpoint Python tg-mcp (используется createBotViaBotFather).
+- `FF_AUTO_BOT_CREATE=1` — глобальный gate в `runProjectApprovalBackground` (если 0, шаг пропускается; `autoCreateTelegramBot` сама не читает этот флаг — gate на уровне caller'а).
+- `FF_AUTO_BOT_CREATE_BOTFATHER=1` — разрешает BotFather fallback (`allowBotFather` в `auto-bot.ts:146`).
+- `BOT_TOKEN_POOL` — JSON `[{token, username}, ...]`. Порядок = приоритет; первый кандидат, прошедший ladder, забирается.
+- `JARVIS_OWNER_USER_ID=1`, `JARVIS_WORKSPACE_PROJECT_NAME=proj-71506e1l` — singleton pod для Telethon /newbot.
 
-**API surface (внутренние вызовы):**
-- code-exec MCP `write_file` → `/workspace/.env.bot`.
-- tg-mcp `send_message` + `receive_message` для BotFather диалога.
+**API surface (internal):**
+- code-exec MCP `exec` → `umask 077 && printf > /workspace/bot_token.txt && chmod 600` в pod проекта.
+- code-exec MCP `exec` → `python3 /workspace/bot_cli.py "<name>" "<username>"` в Jarvis pod (BotFather путь).
+- Telegram Bot API `GET /bot<token>/getUpdates?timeout=0&offset=-1` (probe, 4с timeout).
+- Telegram Bot API `GET /bot<token>/getMe` (validation, 5с timeout, только pool токены).
 
 ## Failure modes
 
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
-| status=approved, 0 plan_tasks, kind=tg_bot | `[auto-bot] getMe network error` | `services/auto-bot.ts:299` (network / proxy) |
-| Все токены 409 заняты | `probe_bot_in_conflict` | расширить `BOT_TOKEN_POOL` |
-| Pool пустой, BotFather off | `pool empty and FF_AUTO_BOT_CREATE_BOTFATHER off, skipping` | `services/auto-bot.ts:161` (включить flag) |
-| BotFather диалог timeout | `botfather_dialog_timeout` | `services/auto-bot.ts:76` (Jarvis session expired → refresh) |
-| `.env.bot` не записался | `code_exec_write_file_failed` | `services/auto-bot.ts:114` (workdir invariant?) |
-| `bot_assigned` event есть, но coder не видит токен | wrong path / coder читает не `/workspace/.env.bot` | боллерплейт `agent_boilerplates` — fix dotenv path |
+| `status=done`, `bot_username=null`, фresh `tg_bot` project | `auto-bot: no available bot tokens (pool exhausted` | Расширить `BOT_TOKEN_POOL` или включить `FF_AUTO_BOT_CREATE_BOTFATHER=1`. Reclaim сам по себе уже включён. |
+| Все pool токены 409 (orphan pod ещё держит long-poll lock ~10 мин) | `auto-bot: skipped N conflict-locked pool token(s)` | Подождать TG release (~10 мин) или kill orphan pod (`kubectl delete pod`) и переретриггерить approval. |
+| Pool пустой, BotFather off | `pool empty and FF_AUTO_BOT_CREATE_BOTFATHER off, skipping` | `services/auto-bot.ts:161` — добавить токены или `FF_AUTO_BOT_CREATE_BOTFATHER=1`. |
+| Pool занят активными `running`/`approved` проектами | `auto-bot: skipped N pool token(s) leased to a still-active project` | Это by design (consistency over availability). Reaper должен flip'ать orphan'ы в `failed`. |
+| BotFather диалог timeout / нет TOKEN= | `[auto-bot] botfather: no TOKEN= in output` | `services/auto-bot.ts:103` — Jarvis Telethon session expired → re-login в `proj-71506e1l`. |
+| `/workspace/bot_token.txt` не записался | `[auto-bot] write bot_token.txt failed` | `services/auto-bot.ts:131` — pod scheduling, code-exec MCP down. Best-effort, не фатально (есть env-sync). |
+| `getMe` validation 5с timeout | `[auto-bot] getMe network error` / `auto-bot: getMe network error` | `services/auto-bot.ts:388` — api.telegram.org или egress proxy down. Approval продолжается без bot. |
+| `getMe` not ok (revoked token / wrong format) | `auto-bot: getMe failed for @<username>` | `services/auto-bot.ts:377` — токен инвалид, перевыпустить через @BotFather и заменить в `BOT_TOKEN_POOL`. |
+| Reclaim случился ошибочно (старый pod ещё жив) | `auto-bot: reclaimed @<username> from project N` + новый pod получает 409 | Probe не среагировал (race window). Перенастроить старый pod вручную, добавить токен обратно в pool. |
+| `bot_assigned` есть, но bot.py не видит токен | — | Coder читает не `/workspace/bot_token.txt` — поправить boilerplate (`agent_boilerplates/`), либо подождать ~5с пока `syncProjectEnvFile` (`auto-bot.ts:459`) докатит `/workspace/.env`. |
 
 ## Related
 
+- [Architecture: bot pool & auto-assign](/architecture/bot-pool)
 - [Create project flow](/flows/create-project)
 - [Architecture overview](/architecture/overview)
-- [Bot pool & auto-assign](/architecture/bot-pool)
 - [Debug stuck project](/runbooks/debug-stuck-project)
