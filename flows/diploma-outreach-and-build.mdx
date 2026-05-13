@@ -5,10 +5,14 @@ description: "Single DAG demonstrating AgentFlow's full power — TG outreach + 
 
 # Diploma showcase
 
-> **Status (2026-05-13):** spec-only. Walker + handler registry land in
-> tasks #7 / #8; this page declares the contract for the composite DAG
-> handlers required to turn the spec into a shippable boilerplate. No
-> code yet. Impl is task #13-followup.
+> **Status (2026-05-13):** ✅ end-to-end verified on project #581.
+> Walker + handlers shipped in [PR #209](https://github.com/lnlockly/agentflow-agents/pull/209);
+> MCP unwrap regression caught and fixed in [PR #210](https://github.com/lnlockly/agentflow-agents/pull/210).
+> Real DM landed in `@MLM808` chat from `@avsee4` (account_id=4):
+> `message_id=390006, 2026-05-13T22:43:02Z, "Привет! Это AgentFlow diploma-flow..."`.
+> Measured latencies: `tg.get_user=235ms`, `tg.send_text=119ms`, `tg.wait_reply` polling on a 5min ceiling.
+> Sub-project branch (`project.create_sub` → `project.wait_done` → `tg.send_text:deliver`)
+> still gated on a real reply arriving from `@MLM808`.
 
 ## TL;DR
 
