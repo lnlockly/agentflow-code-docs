@@ -100,6 +100,7 @@ description: "Полный набор статусов projects.status + пер�
 | Healer не нудит | `healer_cooldown_active` | `services/pingers/healer.ts:30` (HEALER_COOLDOWN_MIN) |
 | preview-gate вечно blocked | `preview_gate_blocked` | `pool-worker/preview-gate.ts:211` |
 | Cancel race с in_progress task | `owner_stop_race` | `pool-worker/claim.ts:88` (cancelled filter) |
+| approval-retry tick failed (bad SQL, every 60s; fixed) | `column pt.project_id does not exist` | `services/pingers/approval-retry.ts:83` — correlate `pt.plan_id = p.plan_id` (plans has no project_id; project→plan via projects.plan_id) |
 
 ## Related
 
