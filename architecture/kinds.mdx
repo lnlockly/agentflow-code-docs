@@ -48,6 +48,28 @@ For the matching create-time UI (5-tile kind picker), see the
 [Frontend entry section in Create project flow](/flows/create-project)
 and [Projects frontend](/subsystems/projects-frontend).
 
+### Templates marketplace card thumbnail
+
+`/templates` renders one card per row of `agent_boilerplates`. The thumbnail
+is the `workflow_schema` graph rendered at `variant="compact"` via
+`agentflow-landing/src/components/workflow/WorkflowDiagram.tsx:1` — the
+same component the workspace approve-screen uses, so a template card and
+the matching project card stay visually consistent.
+
+When the user clicks **Использовать шаблон**, the page maps the backend
+kind to the closest `CreateProjectModal` tile via `kindToPreset()` in
+`agentflow-landing/src/pages/Templates.tsx:57`:
+
+| Backend `kind` | Modal preset | Notes |
+|---|---|---|
+| `tg_profile_bundle` | `tg_profile_bundle` | direct |
+| `tg_bot` | `tg_bot` | direct |
+| `landing` | `landing` | direct |
+| `mini_app` | `mini_app` | direct |
+| `spa` / `api` / `code_only` | `null` → `UnsupportedKindNotice` | falls back to a small dialog with a "create from scratch" escape hatch |
+
+The flow then continues exactly like the [Create project flow](/flows/create-project) — modal banner names the picked template, intake form POSTs to `/me/projects` with a brief that mentions the template title so Maestro classifies sensibly.
+
 Note: **`tg_farm` is NOT a value in this enum.** The TG-ферма tile in
 the create modal navigates to `/agents/sales-funnel-tg-farm` instead of
 calling `POST /me/projects`; TG-ферма is an agent that runs on a TG

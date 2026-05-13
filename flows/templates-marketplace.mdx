@@ -1,0 +1,92 @@
+---
+title: "Templates marketplace (/templates)"
+description: "Project-boilerplate catalog with mini-DAG card thumbnails — click → CreateProjectModal preset → POST /me/projects."
+---
+
+# Templates marketplace
+
+## TL;DR
+
+`/templates` lists every row of `agent_boilerplates` returned by
+`GET /me/boilerplates`. Each card renders the boilerplate's `workflow_schema`
+as a compact SVG DAG thumbnail, so the owner can see *what the template
+builds* before committing. Click **Использовать шаблон** → opens
+`CreateProjectModal` pre-set to the boilerplate's `kind` with a banner naming
+the template. The intake form then POSTs to `/me/projects` exactly like the
+generic `/projects` flow.
+
+The detail route `/templates/:slug` reuses the same query cache and shows an
+interactive workflow with hover-on-node sync between the SVG graph and the
+node list, plus an inferred-secrets panel and a GitHub source link.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/pages/Templates.tsx:73` | `<Templates>` page — search + category tabs + card grid + `CreateProjectModal` hookup |
+| `agentflow-landing/src/pages/Templates.tsx:57` | `kindToPreset(kind)` — maps backend kind to `ProjectKind`; returns `null` for `spa`/`api`/`code_only` → `UnsupportedKindNotice` |
+| `agentflow-landing/src/pages/Templates.tsx:230` | `TemplateBoilerplateCard` — thumbnail + title + category badge + CTA |
+| `agentflow-landing/src/pages/TemplateDetail.tsx:1` | `/templates/:slug` detail page with hover-sync node list + inferred secrets |
+| `agentflow-landing/src/components/workflow/WorkflowDiagram.tsx:1` | shared SVG renderer (default + compact variants, optional `onNodeHover`) — also used by `WorkspaceV2` approve-screen |
+| `agentflow-landing/src/components/projects/CreateProjectModal.tsx:1` | renders the intake form; accepts `presetKind` + `presetBoilerplateTitle` to lock the kind picker and show a banner |
+| `agentflow-landing/src/lib/agentsApi.ts` | `listBoilerplates(kind?)` → `GET /me/boilerplates` returning `BoilerplateListing[]` |
+| `agentflow-landing/src/main.tsx` | route table — `/templates` + `/templates/:slug` lazy-loaded with `ErrorBoundary` |
+| `agentflow-landing/src/styles/templates.css` | scoped `.tmpl-*` styles, mobile-first grid (1 → 2 → 3 cols at 640/960px) |
+| `agentflow-agents/src/routes/projects.ts` | `GET /me/boilerplates` (PR #190) — returns rows of `agent_boilerplates` with `workflow_schema`, `default_features`, `category`, `skills` |
+
+## Data flow
+
+```
+Browser → /templates
+  │ useQuery(['boilerplates'])  (staleTime 5min, gated on isAuthenticated)
+  ▼
+GET /me/boilerplates  ─── agentflow-agents
+  │ returns [{ id, name, kind, title, description, category,
+  │            workflow_schema:{nodes,edges}, default_features, skills, ... }]
+  ▼
+Templates page renders cards
+  │ filter by activeTab.match (category|kind) + search term
+  │ thumbnail = <WorkflowDiagram variant="compact" />
+  ▼
+Click "Использовать шаблон"
+  │ pickedTemplate = boilerplate
+  │ kindToPreset(boilerplate.kind)
+  ▼
+  ├─ null  → <UnsupportedKindNotice/>  (spa/api/code_only escape hatch)
+  └─ kind  → <CreateProjectModal open presetKind={kind}
+                                  presetBoilerplateTitle={title}/>
+                │ banner: "Шаблон: <title>"
+                │ user fills brief
+                ▼
+              POST /me/projects  ────► standard create-project flow
+```
+
+The detail page (`/templates/:slug`) hydrates from the same
+`['boilerplates']` query cache — no second network call when the user
+clicks through from the grid.
+
+## DB / Env / API
+
+- **Tables:** `agent_boilerplates` — see [Add new kind runbook](/runbooks/add-new-kind) for the schema; relevant columns are `kind`, `category`, `workflow_schema` jsonb (`{nodes:[{id,label,role,icon?}], edges:[{from,to,label?}]}`), `default_features` text[], `skills` text[], `github_url`, `branch`, `subdir`.
+- **Env:** none new. `/me/boilerplates` reuses the existing `requireSession` middleware.
+- **Routes:** `GET /me/boilerplates[?kind=<value>]` → `{ ok: true, items: BoilerplateListing[] }`.
+- **Frontend routes:** `/templates`, `/templates/:slug` (slug = `boilerplate.name`).
+- **MCP tools:** none — pure read.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Empty marketplace with valid session | `[boilerplates] empty result` (route logs) | `agentflow-agents/src/routes/projects.ts` (seed migration / row visibility) |
+| Card thumbnail shows "Нет схемы" | `workflow_schema` is null on that row | `agentflow-agents/src/db/seed/boilerplates/` — add a schema for the kind |
+| Click "Использовать шаблон" opens `UnsupportedKindNotice` | `kindToPreset` returned `null` (kind in `{spa,api,code_only}`) | `agentflow-landing/src/components/projects/CreateProjectModal.tsx:48` — add a tile for the kind, then extend `kindToPreset` |
+| 401 on `/me/boilerplates` for signed-in user | `requireSession: 401 unauthorized` | session cookie / refresh; see [Auth and access](/subsystems/auth-and-access) |
+| Hover-sync stuck on a node after mouse leaves | `hoveredNodeId` not cleared | `TemplateDetail.tsx` `onMouseLeave` → `setHoveredNodeId(null)` |
+
+## Related
+
+- [Project kinds](/architecture/kinds) — per-kind UI surface table + presets
+- [Create project flow](/flows/create-project) — what happens after the modal submits
+- [Projects frontend](/subsystems/projects-frontend) — `CreateProjectModal` semantics, tile catalog
+- [Add new kind runbook](/runbooks/add-new-kind) — seed a boilerplate row + workflow_schema
+- [Ship new boilerplate runbook](/runbooks/ship-new-boilerplate)
