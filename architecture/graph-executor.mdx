@@ -5,6 +5,42 @@ description: "Every AgentFlow project is a DAG walk. Typed node handlers dispatc
 
 # Graph executor
 
+## Implementation status (2026-05-13)
+
+Walker + registry + coder-fallback shipped behind `FF_GRAPH_EXECUTOR` +
+`FF_GRAPH_EXECUTOR_KINDS` allowlist. PR `lnlockly/agentflow-agents#TBD`.
+
+| Subsystem | File | State |
+|---|---|---|
+| Types + contracts | `agentflow-agents/src/services/graph-executor/types.ts` | shipped |
+| Walker (topo + retry + cycle) | `agentflow-agents/src/services/graph-executor/walker.ts` | shipped |
+| Handler registry + fallback resolver | `agentflow-agents/src/services/graph-executor/registry.ts` | shipped |
+| Coder-agent fallback handler | `agentflow-agents/src/services/graph-executor/coder-fallback.ts` | shipped |
+| Event emit chain (DB + bus + pipeline_runs) | `agentflow-agents/src/services/graph-executor/events.ts` | shipped |
+| Production ExecCtx factory | `agentflow-agents/src/services/graph-executor/exec-ctx.ts` | shipped |
+| Public surface (`runGraphExecutor`) | `agentflow-agents/src/services/graph-executor/index.ts` | shipped |
+| Walker tests (6 cases) | `agentflow-agents/tests/unit/graph-executor/walker.test.ts` | green |
+| Handler tests (23 cases) | `agentflow-agents/tests/unit/graph-executor/handlers/*.test.ts` | green |
+| `approveProject` fork on FF | `agentflow-agents/src/services/projects-pipeline.ts` | shipped |
+| `runGraphExecutorDispatch` | `agentflow-agents/src/services/projects.ts:2313` | shipped |
+| FF parsing | `agentflow-agents/src/services/env.ts` (`ffGraphExecutor`, `ffGraphExecutorKinds`) | shipped |
+
+Implementation differences vs the original contract (below):
+
+- `DEFAULT_RETRY_POLICY = { max: 1, backoffMs: 3000, idempotent: false }`
+  (the spec said `max: 0`). One retry by default catches transient flakes
+  without doubling the cost ceiling.
+- `NodeHandler.inputSchema` / `outputSchema` typed as
+  `ZodType<T, ZodTypeDef, unknown>` so handler schemas can use `.default()`
+  + `.optional()` on inputs without breaking handler bodies.
+- Walker accepts a `buildCtx` factory (production = `defaultBuildExecCtx`,
+  tests = stub). Keeps `walker.ts` DB-free so it can be unit-tested.
+- Resume path (`resumeSteps: Record<id, { output }>`) decrements
+  in-degree on every child of a pre-seeded node so the next frontier
+  picks them up. Greppable: `[graph-executor] idempotent_skip node_id=…`.
+
+Failure-mode log strings live in `walker.ts` — see Failure modes below.
+
 ## TL;DR
 
 Today maestro proposes a plan, then spawns coder agents that freestyle inside

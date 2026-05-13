@@ -44,7 +44,11 @@ description: "Полный набор статусов projects.status + пер�
    ↓   autoScrapeFromBrief (optional)
    ↓   autoCreateTelegramBot (optional)
    ↓   scaffoldTgProfileBundle (optional)
-   ↓   runProjectExecutionBackground → execute_in_team → plan_tasks rows
+   ↓   FF_GRAPH_EXECUTOR + kind ∈ FF_GRAPH_EXECUTOR_KINDS:
+   ↓     runGraphExecutorDispatch (projects.ts:2313) → walker drains workflow_schema
+   ↓       (no plan_tasks; status flips done|failed directly — see /flows/graph-execution)
+   ↓   ELSE (maestro freestyle path):
+   ↓     runProjectExecutionBackground → execute_in_team → plan_tasks rows
 [running]
    ↓ pool-worker drains plan_tasks (claim.ts:33)
    ↓   on fail → auto-retry chain (retry_depth++, up to MAX_AUTO_RETRY=3)
