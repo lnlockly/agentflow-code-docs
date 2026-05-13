@@ -1,0 +1,125 @@
+---
+title: "TG templates matrix"
+description: "All Telegram-flavoured project templates AgentFlow ships — 4 original + 6 v2 additions, mapped to node ids and source agent presets."
+---
+
+# TG templates matrix
+
+## TL;DR
+
+The `/templates` marketplace and `CreateProjectModal` surface every row of
+`agent_boilerplates` whose `kind` starts with `tg_` or whose template scope
+is Telegram-adjacent. Migration `2026-05-13-tg-templates-v2.sql` brings the
+catalogue from 4 → 10 to match ASCN's TG line-up (cold-base mailing,
+AI-shiller, subscription-gate, join-request, voice-transcribe, content
+crossposter, plus our existing ферма / визитка / bot-full / mini-app
+trio).
+
+## The 10 TG templates
+
+| # | `name` | `kind` | `category` | Source agent preset | Node ids |
+|---|---|---|---|---|---|
+| 1 | `tg-profile-bundle` | `tg_profile_bundle` | `ai-visitka` | scrape+visitka scaffold | `scrape_tg → render_landing → deploy_landing`, `scrape_tg → scaffold_bot → wire_designapi → deploy_bot → booking_flow` |
+| 2 | `tg-bot-full` | `tg_bot` | `automation` | `coder-tg-bot.json` | `request_token → scaffold_aiogram → smoke_test → (self_heal_loop loop) → deploy` |
+| 3 | `tg-bot-minimal` | `tg_bot` | — | `coder-tg-bot.json` | same as `tg-bot-full` (lighter skills tag set) |
+| 4 | `mini-app-fullstack` | `mini_app` | `telegram-mini-app` | `coder-spa.json` + `coder-tg-bot.json` | `scaffold_vite → tg_webapp_init → routes → deploy` |
+| 5 | `tg-subscription-gate` | `tg_bot` | `marketing` | [`tg-subscription-checker.json`](https://github.com/lnlockly/agentflow-agents/blob/main/presets/tg-subscription-checker.json) | `setup_bot → fetch_target_channel → register_callback → check_subscription → grant_or_deny` |
+| 6 | `tg-voice-transcriber` | `tg_bot` | `utility` | [`tg-voice-transcriber.json`](https://github.com/lnlockly/agentflow-agents/blob/main/presets/tg-voice-transcriber.json) | `setup_bot → receive_voice → transcribe_whisper → format_text → reply_to_user` |
+| 7 | `tg-cold-mailer` | `tg_farm` | `marketing` | [`sales-funnel-tg-farm.json`](https://github.com/lnlockly/agentflow-agents/blob/main/presets/sales-funnel-tg-farm.json) + [`tg-account-operator.json`](https://github.com/lnlockly/agentflow-agents/blob/main/presets/tg-account-operator.json) | `link_account → import_leads → personalize_template → throttled_send → log_replies` |
+| 8 | `tg-ai-shiller` | `tg_farm` | `marketing` | [`tg-ai-shiller.json`](https://github.com/lnlockly/agentflow-agents/blob/main/presets/tg-ai-shiller.json) + `tg-account-operator.json` | `link_account → set_keywords → poll_chats → ai_compose_reply → send_reply` |
+| 9 | `tg-join-request-handler` | `tg_bot` | `admin` | new (coder-fallback) | `setup_bot → register_join_listener → store_metadata → notify_owner → auto_approve_or_queue` |
+| 10 | `tg-content-crossposter` | `tg_bot` | `content` | new (coder-fallback) | `setup_bot → poll_source_channel → ai_summarize → format_for_platform → post_to_linkedin_or_x` |
+
+## Files
+
+| Path | Role |
+|---|---|
+| [`agentflow-agents/migrations/2026-05-13-tg-templates-v2.sql`](https://github.com/lnlockly/agentflow-agents/blob/main/migrations/2026-05-13-tg-templates-v2.sql) | Inserts rows #5–#10 + extends `kind` CHECK with `tg_farm`. Idempotent (`ON CONFLICT DO UPDATE`). |
+| [`agentflow-agents/src/services/kind-classifier.ts:21`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/kind-classifier.ts#L21) | `ProjectKind` union — gained `tg_farm`. |
+| [`agentflow-agents/src/services/brief-analyzer.ts:80`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/brief-analyzer.ts#L80) | Regex rule for `ферма / cold-base / AI-shiller / воронка продаж` placed before `tg_bot`. |
+| [`agentflow-agents/src/services/maestro.ts:86`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/maestro.ts#L86) | propose-project-plan kind hint extended with `tg_farm` + `tg_profile_bundle` + `mini_app`. |
+| [`agentflow-agents/presets/tg-voice-transcriber.json`](https://github.com/lnlockly/agentflow-agents/blob/main/presets/tg-voice-transcriber.json) | Voice → ai-router transcription, chunks output to 4000 chars. |
+| [`agentflow-agents/presets/tg-ai-shiller.json`](https://github.com/lnlockly/agentflow-agents/blob/main/presets/tg-ai-shiller.json) | Keyword monitor across MTProto chats, 1 reply / chat / hour. |
+| [`agentflow-agents/src/scripts/seed-boilerplate-workflows.ts`](https://github.com/lnlockly/agentflow-agents/blob/main/src/scripts/seed-boilerplate-workflows.ts) | Local-dev seeder mirroring the migration. |
+
+## Data flow
+
+```
+User picks TG template on /templates           Templates.tsx:57
+   ↓ kindToPreset(kind) → CreateProjectModal preset
+POST /me/projects { brief, kind, title }       routes/projects.ts:573
+   ↓ kind already set → skip classifyBriefKind
+runProjectApprovalBackground (kind=tg_*)
+   ↓ provision pod → workspace_ready
+   ↓ autoCreateTelegramBot (kind ∈ tg_bot / tg_profile_bundle)
+   ↓ NOTE: kind=tg_farm skips Bot API — uses MTProto user account
+   ↓
+graph-executor walker (when FF_GRAPH_EXECUTOR enabled)
+   ↓ topo-walks workflow_schema.nodes
+   ↓ each id → registry lookup → handler OR coder-agent-delegate
+   ↓ emits node_started / node_finished / node_failed / edge_flowing
+```
+
+## DB / Env / API
+
+- **Table:** `agent_boilerplates` — `kind, name, title, description, github_url, branch, subdir, skills, workflow_schema jsonb, default_features jsonb, category` (see [`db/schema.ts:1353`](https://github.com/lnlockly/agentflow-agents/blob/main/src/db/schema.ts#L1353)).
+- **CHECK constraint:** `kind IN ('landing', 'tg_bot', 'spa', 'api', 'code_only', 'mini_app', 'tg_profile_bundle', 'tg_farm')`.
+- **Env:** `FF_GRAPH_EXECUTOR`, `FF_GRAPH_EXECUTOR_KINDS` — the walker that consumes `workflow_schema`. Until those flip on, the schemas are visual hints only.
+- **Routes:**
+  - `GET /me/boilerplates` — serves the marketplace cards.
+  - `POST /me/projects` — accepts `kind=tg_farm` since this PR.
+
+## New node ids needing handler coverage
+
+Owned by `node-handlers-expand` (task #8). The graph executor falls back to
+`coder-agent-delegate` for unregistered ids per
+[Graph executor §Node handler registry](/architecture/graph-executor#node-handler-registry),
+so projects still ship without registrations — but typed handlers are
+preferred for determinism.
+
+| Node id | Used by template | Suggested handler |
+|---|---|---|
+| `setup_bot` | #5, #6, #9, #10 | `autoCreateTelegramBot` wrapper (same as existing `request_token`) |
+| `fetch_target_channel` | #5 | Bot API `getChat` via `code-exec.exec curl` |
+| `register_callback` | #5 | aiogram callback_query registration in scaffold |
+| `check_subscription` | #5 | delegate to `tg-subscription-checker` preset |
+| `grant_or_deny` | #5 | reply with payload + role-grant SQL |
+| `receive_voice` | #6 | aiogram voice/audio/video-note handler |
+| `transcribe_whisper` | #6 | `ai-router.useModel(TRANSCRIPTION)` |
+| `format_text` | #6 | deterministic chunker (4000-char limit) |
+| `reply_to_user` | #6, #9 | Bot API `sendMessage` with `reply_to_message_id` |
+| `link_account` | #7, #8 | TG-MCP `add_phone` + `confirm_code` (already in `tg-account-operator`) |
+| `import_leads` | #7 | parse CSV / call `audience-service` import |
+| `personalize_template` | #7 | `ai-router.useModel(TEXT_LARGE)` w/ per-lead context |
+| `throttled_send` | #7 | TG-MCP `send_message` + 30-90s jitter |
+| `log_replies` | #7 | INSERT into `tg_lead_states` |
+| `set_keywords` | #8 | write project config (`projects.detail_meta.keywords`) |
+| `poll_chats` | #8 | TG-MCP `get_messages` per chat in spec |
+| `ai_compose_reply` | #8 | `ai-router.useModel(TEXT_LARGE)` |
+| `send_reply` | #8 | TG-MCP `send_message(reply_to=msg_id)` w/ 1-per-hour gate |
+| `register_join_listener` | #9 | aiogram `chat_join_request` handler |
+| `store_metadata` | #9 | INSERT into `tg_lead_states` w/ kind='join_request' |
+| `notify_owner` | #9 | DM owner via owner-channel resolver |
+| `auto_approve_or_queue` | #9 | `approveChatJoinRequest` or queue row |
+| `poll_source_channel` | #10 | Bot API `getChatHistory` or MTProto `iter_messages` |
+| `ai_summarize` | #10 | `ai-router.useModel(TEXT_LARGE)` with platform-specific shape |
+| `format_for_platform` | #10 | per-platform serializer (LinkedIn 1200, X 280-thread) |
+| `post_to_linkedin_or_x` | #10 | LinkedIn API / X v2 from owner secrets |
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `POST /me/projects {kind:'tg_farm'}` rejected | `classify_unknown_kind` | `services/kind-classifier.ts:31` — VALID_KINDS set |
+| Migration fails with `kind_check violation` | `new row for relation "agent_boilerplates" violates check constraint "agent_boilerplates_kind_check"` | re-apply `2026-05-13-tg-templates-v2.sql` — DROP+ADD inside transaction |
+| Cold-mailer scaffolds Bot API instead of MTProto | `[auto-bot] getMe network error` then `bot_assigned` | `services/projects.ts:1682` should skip `autoCreateTelegramBot` when `kind=tg_farm` (TODO — track in a follow-up; today the call no-ops because MTProto creds live elsewhere) |
+| Voice transcriber returns empty text | `[ai-router] TRANSCRIPTION model returned empty` | `subsystems/llm-router` — provider fallback ladder |
+
+## Related
+
+- [Project kinds](/architecture/kinds) — canonical enum (now includes `tg_farm`)
+- [Graph executor](/architecture/graph-executor) — runtime for `workflow_schema`
+- [Create project flow](/flows/create-project) — entry point (modal + classifier)
+- [Templates marketplace](/flows/templates-marketplace) — where the cards render
+- [Ферма (sales-funnel-tg-farm)](/architecture/ferma-sales-funnel) — original MTProto preset, now exposed as a template
+- [Add new kind](/runbooks/add-new-kind) — runbook used to ship `tg_farm`

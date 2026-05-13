@@ -1,6 +1,6 @@
 ---
 title: "Project kinds"
-description: "landing / spa / tg_bot / mini_app / tg_profile_bundle — что куда роутится."
+description: "landing / spa / tg_bot / mini_app / tg_profile_bundle / tg_farm — что куда роутится."
 ---
 
 # Project kinds
@@ -26,10 +26,13 @@ to a typed handler. Full per-node table:
 | `spa` (id=14 webapp-full) | `scaffold_nest → scaffold_prisma → jwt_auth → {billing_stripe, multi_tenant → admin_panel} → deploy` | fail-fast on `scaffold_nest` + `deploy`; continue on `admin_panel` + `multi_tenant` |
 | `mini_app` (id=6 mini-app-fullstack) | `scaffold_vite → tg_webapp_init → routes → deploy` | fail-fast on `scaffold_vite` + `deploy` |
 | `tg_profile_bundle` (id=18) | `scrape_tg → render_landing → deploy_landing` and `scrape_tg → scaffold_bot → wire_designapi → deploy_bot → booking_flow` | fail-fast on `scrape_tg`, `deploy_landing`, `deploy_bot`; continue on `booking_flow` |
-| `api` (id=4 stub) | empty — maestro freestyle until task #11 seeds | n/a |
+| `tg_farm` (cold-mailer + AI-shiller rows) | `link_account → import_leads → personalize_template → throttled_send → log_replies` (cold-mailer); `link_account → set_keywords → poll_chats → ai_compose_reply → send_reply` (AI-shiller) | fail-fast on `link_account` (no MTProto creds = full stop); continue on `log_replies` + `send_reply` |
+| `api` (id=4 stub) | empty — maestro freestyle | n/a |
 
-Empty seeds (`id ∈ {3, 4, 5, 8, 13}`) fall through to maestro until
-their `workflow_schema` ships in task #11.
+Task #11 shipped six new TG-flavoured boilerplates (subscription-gate,
+voice-transcriber, cold-mailer, AI-shiller, join-request-handler,
+content-crossposter) — see [TG templates matrix](/architecture/tg-templates)
+for the full catalogue and node-id map.
 
 ## Files
 
@@ -57,6 +60,7 @@ meta row:
 |---|---|---|---|
 | `tg_profile_bundle` | `IdCard` | `AI-визитка @<tg_username>` ‖ plain `AI-визитка` | `project.detail_meta.tg_username` ‖ `.username` ‖ `.source_username` |
 | `tg_bot` | `Bot` | `@<bot_username>` ‖ `Бот ещё не назначен` | `project.bot_username` |
+| `tg_farm` | `Users` | `MTProto · @<tg_username>` ‖ `Аккаунт не залинкован` | `project.detail_meta.tg_username` ‖ `.linked_account` |
 | `landing` / `mini_app` / `spa` / other | (none) | plain kind label | `project.kind` |
 
 `detail_meta` is the optional `Record<string, unknown>` on
@@ -84,16 +88,21 @@ kind to the closest `CreateProjectModal` tile via `kindToPreset()` in
 |---|---|---|
 | `tg_profile_bundle` | `tg_profile_bundle` | direct |
 | `tg_bot` | `tg_bot` | direct |
+| `tg_farm` | `tg_farm` | direct — opens MTProto-aware intake (TG_API_ID/HASH/SESSION) |
 | `landing` | `landing` | direct |
 | `mini_app` | `mini_app` | direct |
 | `spa` / `api` / `code_only` | `null` → `UnsupportedKindNotice` | falls back to a small dialog with a "create from scratch" escape hatch |
 
 The flow then continues exactly like the [Create project flow](/flows/create-project) — modal banner names the picked template, intake form POSTs to `/me/projects` with a brief that mentions the template title so Maestro classifies sensibly.
 
-Note: **`tg_farm` is NOT a value in this enum.** The TG-ферма tile in
-the create modal navigates to `/agents/sales-funnel-tg-farm` instead of
-calling `POST /me/projects`; TG-ферма is an agent that runs on a TG
-account, not a project kind.
+Note: **`tg_farm` joined the enum in task #11** (migration
+`2026-05-13-tg-templates-v2.sql`). The TG-ферма tile in the create
+modal now POSTs `kind=tg_farm` to `/me/projects` and provisions a real
+project row — the cold-mailer and AI-shiller boilerplates back this
+kind. The `/agents/sales-funnel-tg-farm` agent page still exists as the
+public agent listing, but it is no longer the only entry point.
+Backend skips `autoCreateTelegramBot` for `kind=tg_farm` (MTProto user
+account, not a Bot API bot). See [TG templates matrix](/architecture/tg-templates).
 
 ## Related
 
