@@ -109,6 +109,12 @@ export interface NodeHandler<I = unknown, O = unknown> {
 export interface ExecCtx {
   projectId: number;
   ownerUserId: number;
+  /** `projects.kind` — e.g. `tg_bot`, `tg_farm`, `landing`, `mini_app`,
+   *  `tg_profile_bundle`, `spa`. Null only on rows where kind is unset.
+   *  Handlers shared across multiple boilerplates (e.g. `link_account`
+   *  between cold-mailer and ai-shiller) branch on this via `PROJECT_KIND`
+   *  hints in the coder brief — never via `if (slug === ...)`. */
+  kind: string | null;
   /** `proj-<slug>` — sanitised per
    *  [`projects-pipeline.ts:478`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/projects-pipeline.ts#L478). */
   workspaceProjectName: string;
@@ -137,6 +143,7 @@ export type NodeEventKind =
   | 'node_started'
   | 'node_finished'
   | 'node_failed'
+  | 'node_waiting' // emitted by long-poll handlers (e.g. tg.wait_reply) before they block
   | 'edge_flowing';
 
 export interface NodeEvent {
