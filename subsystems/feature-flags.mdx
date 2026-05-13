@@ -1,0 +1,90 @@
+---
+title: "Feature flags"
+description: "DB-driven runtime toggles with 30s TTL cache. Replaces env-var rollout knobs so flips happen without kubectl set env + pod restart."
+---
+
+# Feature flags
+
+## TL;DR
+
+Single `feature_flags` table (`key` text PK, `value` jsonb, `updated_at`, `updated_by`) replaces env-var rollout knobs. Reads route through `services/feature-flags.ts` with a 30s in-process TTL cache; writes go through `PATCH /admin/feature-flags/:key` (admin-gated, audit-logged by the router-level `adminAuditMiddleware`). DB read failures fall back to the legacy env var per call site — zero-downtime migration. First flags migrated: `graph_executor.enabled` + `graph_executor.kinds` (was `FF_GRAPH_EXECUTOR` / `FF_GRAPH_EXECUTOR_KINDS`).
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/migrations/2026-05-14c-feature-flags.sql:13` | Table create + seed (`graph_executor.enabled=true`, `graph_executor.kinds=["landing","tg_bot","tg_profile_bundle","tg_farm"]`). |
+| `agentflow-agents/src/db/schema.ts` (`featureFlags`) | Drizzle table binding. |
+| `agentflow-agents/src/services/feature-flags.ts:80` | `getFlagBool(key, fallback)` — boolean with TTL cache + boolean coercion. |
+| `agentflow-agents/src/services/feature-flags.ts:93` | `getFlagJSON<T>(key, fallback)` — typed JSON with TTL cache. |
+| `agentflow-agents/src/services/feature-flags.ts:103` | `setFlag(key, value, updatedByUserId)` — upsert + local cache invalidation. |
+| `agentflow-agents/src/services/projects-pipeline.ts` (`isGraphExecutorEnabledFor`, `isGraphExecutorMasterEnabled`) | First consumer — graph-executor master switch + kind allowlist. |
+| `agentflow-agents/src/routes/admin.ts` (`/admin/feature-flags*` block) | List / read / upsert REST surface. |
+
+## Schema
+
+```sql
+CREATE TABLE feature_flags (
+  key         text PRIMARY KEY,
+  value       jsonb NOT NULL,
+  updated_at  timestamptz NOT NULL DEFAULT now(),
+  updated_by  integer  -- user_id, NULL for seed/system writes
+);
+```
+
+`updated_by` has no FK to `users(id)` so historical audit rows survive a user hard-delete.
+
+## Usage
+
+### Read
+
+```ts
+import { getFlagBool, getFlagJSON } from './services/feature-flags.js';
+
+const enabled = await getFlagBool('graph_executor.enabled', env.ffGraphExecutor);
+const kinds   = await getFlagJSON<string[]>('graph_executor.kinds', env.ffGraphExecutorKinds);
+```
+
+Both fall back to the supplied default when the row is missing OR the DB read errors. Cache is keyed per flag, TTL 30s, lazy refresh.
+
+### Write
+
+```bash
+curl -X PATCH \
+  -H "authorization: Bearer $JWT" \
+  -H "content-type: application/json" \
+  -d '{"value":["landing","tg_bot","tg_profile_bundle","tg_farm","mini_app"]}' \
+  https://agents.agentflow.website/admin/feature-flags/graph_executor.kinds
+```
+
+Response includes the row that was written. Cache invalidates locally on `setFlag`; cross-pod propagation is bounded by the 30s TTL on other pods.
+
+### List
+
+```bash
+curl -H "authorization: Bearer $JWT" https://agents.agentflow.website/admin/feature-flags
+```
+
+Returns every row sorted by key.
+
+## Cache discipline
+
+- Map keyed by flag name, value + `fetchedAt`.
+- Stale entries are evicted on the next read (no background timer).
+- `setFlag()` calls `cache.delete(key)` before returning. Cross-pod sync rides on the 30s TTL.
+- Test seam: `_resetFeatureFlagCacheForTests()`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Flag flip not picked up on a pod | n/a — wait up to 30s for cache TTL | `services/feature-flags.ts` `TTL_MS` |
+| DB unreachable, behaviour reverts to env defaults | `[feature-flags] db read failed key=<key>` | Postgres pod healthy? `kubectl -n franchise-factory get pod -l app=agentflow-postgres` |
+| Migration not applied on a fresh DB | `_app_migrations` row missing for `2026-05-14c-feature-flags.sql` | Migration runs on app boot — check `services/migrations-runner.ts` logs |
+| Admin write rejected with `bad_key` | `bad_key` HTTP 400 | Key must match `/^[a-z][a-z0-9._-]{0,127}$/` |
+| Admin write rejected with `missing_value` | HTTP 400 `missing_value` | Body must include a `value` field (any JSON shape) |
+
+## Related
+
+- [Graph executor](/architecture/graph-executor) — first consumer; `graph_executor.enabled` + `graph_executor.kinds` replace `FF_GRAPH_EXECUTOR` / `FF_GRAPH_EXECUTOR_KINDS`.
+- [Auth + access](/subsystems/auth-and-access) — `requireSession` + `requireAdmin` gate the admin endpoints.

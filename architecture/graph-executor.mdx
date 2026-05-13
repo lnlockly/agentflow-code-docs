@@ -5,10 +5,16 @@ description: "Every AgentFlow project is a DAG walk. Typed node handlers dispatc
 
 # Graph executor
 
-## Implementation status (2026-05-13)
+## Implementation status (2026-05-14)
 
-Walker + registry + coder-fallback shipped behind `FF_GRAPH_EXECUTOR` +
-`FF_GRAPH_EXECUTOR_KINDS` allowlist. PR `lnlockly/agentflow-agents#TBD`.
+Walker + registry + coder-fallback shipped. Master switch + per-kind
+allowlist now live in the DB-driven `feature_flags` table —
+`graph_executor.enabled` (bool) and `graph_executor.kinds` (string[]).
+Reads route through `services/feature-flags.ts` (30s TTL cache); writes
+through `PATCH /admin/feature-flags/:key`. The legacy
+`FF_GRAPH_EXECUTOR` / `FF_GRAPH_EXECUTOR_KINDS` env vars remain as
+graceful-degradation fallback when the DB read fails (zero-downtime
+migration). See [Feature flags](/subsystems/feature-flags).
 
 | Subsystem | File | State |
 |---|---|---|
@@ -255,19 +261,34 @@ time so the rule is deterministic.
 
 ## Wiring into existing system
 
-Feature flag `FF_GRAPH_EXECUTOR` (off in prod at landing time). Layout:
+Two DB-driven flags drive the rollout (see [Feature flags](/subsystems/feature-flags)):
 
 ```
-FF_GRAPH_EXECUTOR=0   → projects-pipeline.ts:approveProject falls through
-                       to runProjectApprovalBackground (today's maestro
-                       freestyle, unchanged)
-FF_GRAPH_EXECUTOR=landing,tg_bot
-                     → walker runs for these kinds only; others still
-                       maestro
-FF_GRAPH_EXECUTOR=1   → walker runs for every kind with a registered
-                       workflow_schema; kinds without one fall back to
-                       maestro (preserves `code_only`, `research`)
+feature_flags['graph_executor.enabled'] = false
+  → projects-pipeline.ts:approveProject falls through to
+    runProjectApprovalBackground (today's maestro freestyle, unchanged)
+
+feature_flags['graph_executor.enabled'] = true
+feature_flags['graph_executor.kinds']   = ["landing","tg_bot"]
+  → walker runs for these kinds only; others still maestro
+
+feature_flags['graph_executor.enabled'] = true
+feature_flags['graph_executor.kinds']   = ["landing","tg_bot","tg_profile_bundle","tg_farm",...]
+  → walker runs for every listed kind with a registered
+    workflow_schema; kinds without one fall back to maestro
+    (preserves `code_only`, `research`)
 ```
+
+Legacy `FF_GRAPH_EXECUTOR` / `FF_GRAPH_EXECUTOR_KINDS` env vars are the
+fallback when the DB read fails. Flip via:
+
+```bash
+curl -X PATCH -H "authorization: Bearer $JWT" -H "content-type: application/json" \
+  -d '{"value":["landing","tg_bot","tg_profile_bundle","tg_farm","mini_app"]}' \
+  https://agents.agentflow.website/admin/feature-flags/graph_executor.kinds
+```
+
+Up to 30s later (the TTL cache horizon) every pod picks up the new value.
 
 Read by
 [`projects-pipeline.ts:approveProject`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/projects-pipeline.ts#L434).
@@ -345,7 +366,7 @@ reads the latest event payload for `nodeId` — already shape-compatible.
 
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
-| Walker doesn't run despite FF on | `[graph-executor] kind <x> not in FF_GRAPH_EXECUTOR allowlist` | `projects-pipeline.ts:approveProject` flag parse |
+| Walker doesn't run despite flag on | `[graph-executor] kind <x> not in graph_executor.kinds allowlist` | Set `feature_flags['graph_executor.kinds']` via `PATCH /admin/feature-flags/graph_executor.kinds` |
 | Cycle in workflow_schema | `[graph-executor] cycle_detected nodes=[…]` | `seed-boilerplate-workflows.ts` — the seed has a bad edge |
 | Handler missing for node id | `[graph-executor] handler missing for kind=<id>, delegating to coder-agent` | Register a handler in `src/services/graph-executor/handlers/` OR verify the coder brief is enough |
 | Handler timed out | `[graph-executor] node <id> timed out after <N>s` | Bump `timeoutSec` on the handler OR investigate why the underlying call is slow |
@@ -361,3 +382,4 @@ reads the latest event payload for `nodeId` — already shape-compatible.
 - [Ферма (sales-funnel-tg-farm)](/architecture/ferma-sales-funnel) — one-tick walker per `agent-trigger-worker` cycle
 - [Runtime supervisor](/subsystems/runtime-supervisor) — `deploy_caddy` / `deploy_bot` / `deploy` handlers delegate here
 - [Add new kind](/runbooks/add-new-kind) — covers seeding `workflow_schema` for new kinds
+- [Feature flags](/subsystems/feature-flags) — DB-driven runtime toggles (master switch + kind allowlist live here)
