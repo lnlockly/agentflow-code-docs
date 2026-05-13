@@ -1,31 +1,96 @@
 ---
 title: "TG MCP (Telethon pool)"
-description: "Telethon sessions, FERNET blob, account pool."
+description: "Python MCP сервер для MTProto-операций: 24 tools (send/receive/scrape/smoke_test), Telethon StringSession + Fernet-blob persistence, LRU pool."
 ---
 
 # TG MCP (Telethon pool)
 
-> **TODO** — заполнить researcher-агентом. Стартовый skeleton.
-
 ## TL;DR
 
-(1-2 предложения)
+Отдельный Python 3.12 сервис (FastMCP + Telethon) выполняет MTProto-операции над user-owned TG-аккаунтами. Sessions хранятся как Fernet-encrypted blob в SQLite (`accounts.session_blob`); per-account-id lock + LRU `max_size=32` — TelethonPool не может одновременно держать тысячи коннектов. Auth — JWT HS256 (issued агентом-агентов), exempt routes `/health`, `/`, `/sse/messages`, OPTIONS. Все TS-сервисы внутри agentflow-agents ходят через `${TG_MCP_URL}`.
 
 ## Files
 
 | Repo / path | Что делает |
 |---|---|
-| `agentflow-agents/src/...` | (file ref) |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/server.py:29` | `MCPAuthMiddleware` — raw-ASGI middleware, JWT-verify, exempt list. |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/server.py:105` | `_register_tools` — регистрирует 24 MCP tools (send_message, receive_message, scrape_chat, smoke_test_bot, click_button, forward_message, pin/unpin, react_to_message, search_messages, download_media, get_message_stats, join_channel, leave_channel, get_chat_members, view_channel, get_me, whoami, update_profile, get_full_user, download_profile_photo, …). |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/server.py:597` | `build_app` — Starlette: mounts `/mcp` (streamable), `/sse` (SSE), `/health`, через `MCPAuthMiddleware`. |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/server.py:650` | `main` — uvicorn factory boot. |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/telethon_pool.py:30` | `TelethonPool` — LRU `max_size=32`. |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/telethon_pool.py:32` | per-account-id `asyncio.Lock` — один account, один in-flight call. |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/telethon_pool.py:39` | `_decode_session` — Fernet unwrap → StringSession. |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/telethon_pool.py:44` | `_persist_session` — Fernet wrap → UPDATE accounts.session_blob. |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/telethon_pool.py:57` | `client()` — async ctxmgr, yield TelegramClient. |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/crypto.py:8` | `wrap_bytes` — Fernet encrypt. |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/crypto.py:12` | `unwrap_bytes` — Fernet decrypt. |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/storage.py:9` | SQLite `SCHEMA` — `accounts` table (`session_blob BLOB`, `status`, unique (owner_user_id, phone)). |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/storage.py:28` | `Account` dataclass. |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/storage.py:70` | `upsert_pending` — добавить аккаунт со status='pending' (после code_request). |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/storage.py:90` | `store_session` — wrap StringSession и save в DB. |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/auth.py:11` | `Caller` dataclass — `{ owner_user_id, is_platform, … }`. |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/auth.py:26` | `authenticate` — JWT HS256 (verify_sub=False) → fallback X-MCP-Auth + explicit owner_user_id. |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/config.py` | env: `TG_API_ID`, `TG_API_HASH`, `FERNET_KEY`, `MCP_AUTH_SECRET`, `AUTH_JWT_SECRET`, `AGENTFLOW_AGENTS_URL`, `INTERNAL_API_SECRET`, `SESSION_DIR`, `DB_PATH`, `MCP_HOST=127.0.0.1`, `MCP_PORT=4500`. |
 
-## DB tables / env / API surface
+## Data flow
 
-(таблицы Postgres, env vars, REST endpoints)
+```
+Coder agent / Maestro / service в agentflow-agents
+   ↓ MCP client POST ${TG_MCP_URL}/mcp { tool: "send_message", args: {...} }
+   ↓ Authorization: Bearer <JWT HS256, sub=owner_user_id, secret=AUTH_JWT_SECRET>
+MCPAuthMiddleware (server.py:29)
+   ↓ verify JWT → set request.state.caller = Caller(owner_user_id=…)
+   ↓ exempt: /health, /, /sse/messages, OPTIONS
+FastMCP tool dispatch (_register_tools, server.py:105)
+   ↓
+TelethonPool.client(owner_user_id, phone)  — telethon_pool.py:57
+   ↓ acquire per-account-id lock (no concurrent calls for same account)
+   ↓ load Account from sqlite (storage.py)
+   ↓ _decode_session (Fernet unwrap, crypto.py:12)
+   ↓ TelegramClient(StringSession(...), api_id, api_hash) — connect/reuse
+   ↓ run MTProto operation
+   ↓ _persist_session (Fernet wrap) — save updated session
+   ↓ release lock
+   ↓ return tool result
+```
+
+## DB / env / API surface
+
+**SQLite (`DB_PATH`):**
+- `accounts` (`owner_user_id`, `phone`, `session_blob BLOB`, `status`, `auth_step`, `created_at`, `updated_at`). Unique (owner_user_id, phone).
+
+**Env:**
+- `TG_API_ID`, `TG_API_HASH` — Telegram developer credentials.
+- `FERNET_KEY` — base64 32B key для wrap/unwrap session blob.
+- `MCP_AUTH_SECRET` — старый X-MCP-Auth header secret (legacy fallback).
+- `AUTH_JWT_SECRET` — shared с agentflow-agents (HS256).
+- `AGENTFLOW_AGENTS_URL=http://agentflow-agents:4100` — куда тикает back-callback.
+- `INTERNAL_API_SECRET` — for callbacks `/internal/tg-callbacks` в agentflow-agents.
+- `SESSION_DIR` — на случай файловой Telethon-session (legacy).
+- `MCP_HOST=127.0.0.1`, `MCP_PORT=4500` — bind.
+
+**HTTP / MCP API:**
+- `GET /health` — exempt, returns `{ok: true}`.
+- `POST /mcp` — streamable HTTP transport (FastMCP streamable_app).
+- `GET /sse` / `POST /sse/messages` — SSE transport (FastMCP sse_app, messages path exempt).
+- 24 MCP tools — см. строки 105-469 server.py.
+
+**Callbacks → agentflow-agents:**
+- `POST /internal/tg-callbacks` (`agentflow-agents/src/routes/internal.ts:49`) — после получения нового сообщения через Telethon.
 
 ## Failure modes
 
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
+| `401 invalid_token` от MCP | `mcp_auth_jwt_invalid` | `server.py:29` (MCPAuthMiddleware) |
+| Session blob не расшифровался | `fernet_decrypt_failed` | `telethon_pool.py:39` (_decode_session) |
+| Несколько параллельных вызовов на один аккаунт | `account_lock_timeout` | `telethon_pool.py:32` (per-account lock) |
+| Pool переполнен | `telethon_pool_evict` (LRU eviction normal) | `telethon_pool.py:30` (max_size=32) |
+| Phone code expired | `phone_code_expired` | `_register_tools` (auth tools, server.py:105) |
+| Callback to agentflow-agents 500 | `tg_callback_send_failed` | `routes/internal.ts:49` |
 
 ## Related
 
 - [Architecture overview](/architecture/overview)
+- [Bot pool & auto-assign](/architecture/bot-pool)
+- [Sales Funnel TG Farm](/architecture/ferma-sales-funnel)

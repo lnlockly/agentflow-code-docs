@@ -1,31 +1,84 @@
 ---
 title: "Runtime supervisor"
-description: "autoBuildSpaIfNeeded + s6+Procfile."
+description: "Workspace classifier → build pipeline → s6 services → Procfile supervisor. Auto-build SPA, post-deploy health check, auto-retry coder."
 ---
 
 # Runtime supervisor
 
-> **TODO** — заполнить researcher-агентом. Стартовый skeleton.
-
 ## TL;DR
 
-(1-2 предложения)
+Платформенный «devops в коде»: после того как coder-агент кладёт файлы в `/workspace`, runtime-supervisor самостоятельно классифицирует проект (`static / web / api / bot / worker / mixed / unknown`), запускает build (npm/pnpm/yarn/pip/poetry), пишет Procfile + s6-services, деплоит через Caddy plan.json и проверяет health. На fail — emits `runtime_supervisor_failed` + `auto_build_failed`; pool-worker трактует это как retryable и переоткрывает task с patched bief.
 
 ## Files
 
 | Repo / path | Что делает |
 |---|---|
-| `agentflow-agents/src/...` | (file ref) |
+| `agentflow-agents/src/services/runtime-supervisor.ts:59` | `SPA_SUBDIRS` — порядок поиска SPA root: `frontend, client, web, app, apps/web, packages/web, src`. |
+| `agentflow-agents/src/services/runtime-supervisor.ts:69` | `RuntimePlan` type — `{ kind: static|web|api|bot|worker|mixed|unknown, root?, processes? }`. |
+| `agentflow-agents/src/services/runtime-supervisor.ts:126` | `snapshotWorkspace` — рекурсивный listing `/workspace` (limit, gitignore-aware). |
+| `agentflow-agents/src/services/runtime-supervisor.ts:278` | `classify` — снапшот → RuntimePlan. Procfile override (если есть `/workspace/Procfile`). |
+| `agentflow-agents/src/services/runtime-supervisor.ts:608` | `autoBuildSpaIfNeeded` — обнаружив SPA без `dist/` → `npm run build` (с fallback на pnpm/yarn). |
+| `agentflow-agents/src/services/runtime-supervisor.ts:867` | `detectRuntime` — выбирает node/python/bun version из lockfiles + package.json engines. |
+| `agentflow-agents/src/services/runtime-supervisor.ts:1146` | `buildPipeline` — full pipeline: install_deps → build → write supervisor → deploy. |
+| `agentflow-agents/src/services/runtime-supervisor.ts:1251` | `processesForPlan` — генерит список processes из Procfile / package.json scripts. |
+| `agentflow-agents/src/services/runtime-supervisor.ts:1371` | `writeS6Services` — пишет s6-overlay service definitions в `/workspace/.runtime/s6/`. |
+| `agentflow-agents/src/services/runtime-supervisor.ts:1485` | `deploy` — пишет `plan.json` для Caddy + nudge `kill -HUP` supervisor. |
+| `agentflow-agents/src/services/runtime-supervisor.ts:1725` | `postDeployHealthCheck` — HTTP probe + readiness check после deploy. |
+| `agentflow-agents/src/services/runtime-supervisor.ts:1811` | `autoRetryCoder` — на build/health fail сигналит pool-worker открыть retry task. |
+
+## Data flow
+
+```
+plan_task done (coder finished writing /workspace)
+   ↓ pool-worker post-build hook → POST /internal/runtime-supervisor/deploy
+runtime-supervisor.buildPipeline (line 1146)
+   ↓
+snapshotWorkspace          — list /workspace, detect lockfiles, package.json
+   ↓
+classify → RuntimePlan      — kind ∈ {static,web,api,bot,worker,mixed,unknown}
+   ↓ if kind=spa|landing|mini_app and no dist/ →
+autoBuildSpaIfNeeded        — npm run build (auto-detect manager)
+   ↓
+detectRuntime               — node 20 / python 3.12 / bun
+   ↓
+processesForPlan            — Procfile lines OR package.json scripts.start
+   ↓
+writeS6Services             — /workspace/.runtime/s6/<name>/run
+   ↓
+deploy                      — write /workspace/.runtime/plan.json + Caddy reload
+   ↓
+postDeployHealthCheck       — probe /, /health, expected status
+   ↓ fail → autoRetryCoder → emit runtime_supervisor_failed + open coder retry task
+   ↓ ok   → emit runtime_supervisor_deployed → preview-gate.checkPreviewGate
+```
 
 ## DB tables / env / API surface
 
-(таблицы Postgres, env vars, REST endpoints)
+**DB:**
+- `projects` — `workspace_project_name`, `kind`, `preview_url`.
+- `project_events` — append-only: `runtime_supervisor_deployed`, `runtime_supervisor_failed`, `runtime_supervisor_skipped`, `build_failed`, `auto_build_triggered`, `auto_build_succeeded`, `auto_build_failed`, `auto_build_skipped`, `backend_server_detected_no_procfile`.
+
+**Env:**
+- `PREVIEW_GATE_STRICT=true` — strict mode для preview-gate (см. caddy-preview).
+- `DEP_INSTALL_AGENT=1` — LLM fallback при failed install.
+- `RUNTIME_SUPERVISOR_BUILD_TIMEOUT_MS` — таймаут на build step.
+
+**API:**
+- `POST /internal/runtime-supervisor/deploy` (`agentflow-agents/src/routes/internal.ts:914`) — internal endpoint, требует `INTERNAL_API_SECRET`. Принимает `{ workspace_project_name }` → запускает buildPipeline.
 
 ## Failure modes
 
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
+| SPA задеплоилась без `dist/` | `auto_build_skipped` | `runtime-supervisor.ts:608` (autoBuildSpaIfNeeded) |
+| `npm run build` упал | `auto_build_failed` или `build_failed` | `runtime-supervisor.ts:1146` (buildPipeline) |
+| Backend стартанул, но no Procfile | `backend_server_detected_no_procfile` | `runtime-supervisor.ts:1251` (processesForPlan) |
+| Health-check таймаут | `runtime_supervisor_failed` + `post_deploy_health_failed` | `runtime-supervisor.ts:1725` (postDeployHealthCheck) |
+| Classifier выдаёт `unknown` | `classify_unknown_kind` | `runtime-supervisor.ts:278` (classify) — добавить heuristic |
+| Auto-retry chain не открыл task | `auto_retry_coder_skipped` | `runtime-supervisor.ts:1811` (autoRetryCoder) |
 
 ## Related
 
-- [Architecture overview](/architecture/overview)
+- [Caddy preview](/subsystems/caddy-preview)
+- [code-exec MCP](/subsystems/code-exec-mcp)
+- [Preview deploy flow](/flows/preview-deploy)

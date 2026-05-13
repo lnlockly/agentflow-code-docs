@@ -1,31 +1,105 @@
 ---
 title: "Project lifecycle"
-description: "draft → awaiting_approval → running → done | failed."
+description: "Полный набор статусов projects.status + переходы. Healer loop, auto-retry chain, finalize gate, stop/cancel."
 ---
 
 # Project lifecycle
 
-> **TODO** — заполнить researcher-агентом. Стартовый skeleton.
-
 ## TL;DR
 
-(1-2 предложения)
+`projects.status` — финитный автомат: **draft** → **proposing** → **awaiting_approval** → **approved** → **running** → (**done** | **failed** | **cancelled**). Между running и done стоит preview-gate (placeholder hold). Healer тикает каждые 60s — нудит Maestro когда нет прогресса (>10 min quiet), стопает на 15min cooldown. Auto-retry chain (MAX_AUTO_RETRY=3, MAX_AUTO_RETRY_NO_TOOLS=2) переподнимает failed tasks; превышение → amendment dispatch (maestro escalation, bypass per-plan cap).
 
 ## Files
 
 | Repo / path | Что делает |
 |---|---|
-| `agentflow-agents/src/...` | (file ref) |
+| `agentflow-agents/src/services/projects.ts:132` | `createProjectForUser` — initial row (status=draft). |
+| `agentflow-agents/src/services/projects.ts:221` | `appendProjectEvent` — единственная точка записи в `project_events`. |
+| `agentflow-agents/src/services/projects.ts:1682` | `runProjectApprovalBackground` — draft→running chain. |
+| `agentflow-agents/src/services/projects.ts:2294` | `runProjectExecutionBackground` — materialize plan + start pool drain. |
+| `agentflow-agents/src/services/pool-worker/claim.ts:33` | `runTick` — claim pending plan_tasks (MAX_CONCURRENT=4, MAX_PER_PLAN=4). |
+| `agentflow-agents/src/services/pool-worker/constants.ts:44` | `MAX_AUTO_RETRY = 3`. |
+| `agentflow-agents/src/services/pool-worker/constants.ts:52` | `MAX_AUTO_RETRY_NO_TOOLS = 2`. |
+| `agentflow-agents/src/services/pool-worker/dispatch.ts:102` | `pickViableFallback` — fallback agent slug при breaker open. |
+| `agentflow-agents/src/services/pool-worker/post-build.ts:325` | `finalizePreviewOnDone` — running→done gate. |
+| `agentflow-agents/src/services/pingers/healer.ts:28` | `HEALER_TICK_MS = 60_000`. |
+| `agentflow-agents/src/services/pingers/healer.ts:29` | `HEALER_QUIET_MIN = 10` — после стольких минут тишины поднимаем тревогу. |
+| `agentflow-agents/src/services/pingers/healer.ts:30` | `HEALER_COOLDOWN_MIN = 15`. |
+| `agentflow-agents/src/services/pingers/healer.ts:31` | `HEALER_PROGRESS_STALE_MIN = 15`. |
+| `agentflow-agents/src/services/pingers/healer.ts:44` | `runHealerTick` — main loop. |
+| `agentflow-agents/src/services/pingers/healer-finalize.ts:37` | `tryFinalizeProjectFromPlan` — финализация когда все plan_tasks done. |
+
+## Data flow / state machine
+
+```
+[draft] (createProjectForUser, projects.ts:132)
+   ↓ classifyBriefKind + spawn Maestro propose
+[proposing]
+   ↓ propose_project_plan MCP tool fills projects.proposed_plan
+[awaiting_approval]   ←—————┐
+   ↓ POST /me/projects/:id/approve
+[approved]
+   ↓ runProjectApprovalBackground (projects.ts:1682):
+   ↓   provisionWorkspaceWithRetry → workspace_ready event
+   ↓   autoScrapeFromBrief (optional)
+   ↓   autoCreateTelegramBot (optional)
+   ↓   scaffoldTgProfileBundle (optional)
+   ↓   runProjectExecutionBackground → execute_in_team → plan_tasks rows
+[running]
+   ↓ pool-worker drains plan_tasks (claim.ts:33)
+   ↓   on fail → auto-retry chain (retry_depth++, up to MAX_AUTO_RETRY=3)
+   ↓   exhaustion → amendment dispatch (is_amendment_dispatch=true → bypass MAX_PER_PLAN)
+   ↓ all plan_tasks → done
+   ↓ post-build: finalizePreviewOnDone (post-build.ts:325)
+   ↓   preview-gate.checkPreviewGate
+   ↓     pass → flip to [done] + event 'project_finalized'
+   ↓     fail → event 'preview_gate_blocked' → status stays [running]
+   ↓ healer ticks every 60s:
+   ↓   no progress > 15min → emit 'stuck_project_detected' warn
+   ↓   quiet > 10min → nudge Maestro (cooldown 15min)
+   ↓ all retries exhausted + no progress → [failed]
+   ↓ user POST /me/projects/:id/stop → bulk cancel pending tasks → [cancelled]
+
+[done] / [failed] / [cancelled] — terminal
+   ↓ may be re-approved? — no. user creates new project, может re-propose существующий
+       (mutates proposed_plan, обратно на [awaiting_approval]) — см. цикл вверху.
+```
 
 ## DB tables / env / API surface
 
-(таблицы Postgres, env vars, REST endpoints)
+**DB tables (lifecycle-anchor):**
+- `projects.status` ∈ {`draft`, `proposing`, `awaiting_approval`, `approved`, `running`, `done`, `failed`, `cancelled`}.
+- `projects.paused_until` — при превышении hourly token budget (pool-worker skip).
+- `plan_tasks.status` ∈ {`pending`, `in_progress`, `done`, `failed`, `cancelled`}.
+- `plan_tasks.retry_depth`, `parent_task_id`, `is_amendment_dispatch`, `depends_on int[]`.
+- `project_events` — append-only timeline.
+
+**Env (lifecycle tunables):**
+- `POOL_MAX_CONCURRENT=4`, `FF_MAX_TASKS_PER_PLAN=4` (legacy `POOL_MAX_PER_PLAN`).
+- `MAX_AUTO_RETRY=3`, `MAX_AUTO_RETRY_NO_TOOLS=2` (constants.ts:44, :52).
+- `HEALER_QUIET_MIN=10`, `HEALER_COOLDOWN_MIN=15`, `HEALER_PROGRESS_STALE_MIN=15`.
+- `PREVIEW_GATE_STRICT=true`.
+- `FF_SELF_HEAL_LOOP`.
+
+**API:**
+- `POST /me/projects` / `:id/approve` / `:id/stop` / `:id/re-propose`.
+- `GET /me/projects/:id` — status polling.
 
 ## Failure modes
 
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
+| Проект застрял в running | `stuck_project_detected` | `services/pingers/healer.ts:44` |
+| Все retry depth исчерпаны | `auto_retry_cap_reached` | `pool-worker/constants.ts:44` (MAX_AUTO_RETRY) |
+| Plan_task в in_progress навсегда (pod крэш) | `claimed_at_aged_out` | `pool-worker/claim.ts` (или сweep) |
+| Project paused_until не очищается | `rate_limit_paused` | `services/rate-limit.ts` (auto-pinger) |
+| Healer не нудит | `healer_cooldown_active` | `services/pingers/healer.ts:30` (HEALER_COOLDOWN_MIN) |
+| preview-gate вечно blocked | `preview_gate_blocked` | `pool-worker/preview-gate.ts:211` |
+| Cancel race с in_progress task | `owner_stop_race` | `pool-worker/claim.ts:88` (cancelled filter) |
 
 ## Related
 
-- [Architecture overview](/architecture/overview)
+- [Create project flow](/flows/create-project)
+- [Preview deploy](/flows/preview-deploy)
+- [Auto-bot assign](/flows/auto-bot-assign)
+- [Debug stuck project](/runbooks/debug-stuck-project)

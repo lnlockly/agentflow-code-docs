@@ -1,31 +1,80 @@
 ---
 title: "Caddy preview sidecar"
-description: "pick_root, placeholder gate (PR #191)."
+description: "Per-pod Caddy sidecar для preview URL: static / proxy / stub modes. plan.json switch, placeholder detection, pick_root SPA fallback."
 ---
 
 # Caddy preview sidecar
 
-> **TODO** — заполнить researcher-агентом. Стартовый skeleton.
-
 ## TL;DR
 
-(1-2 предложения)
+Каждый project-pod несёт Caddy sidecar на порту 8080. Читает `/workspace/.runtime/plan.json` и сам выбирает режим: **static** (раздаёт `dist/` или `pick_root` подкаталог), **proxy** (forward в backend на `127.0.0.1:PORT`), **stub** (HTML «Workspace ready — deploying...»). Stub-страница умышленно sha256-hashed в `placeholder-hashes.json`, чтобы preview-gate не финализировал проект, пока coder реально не запустил приложение.
 
 ## Files
 
 | Repo / path | Что делает |
 |---|---|
-| `agentflow-agents/src/...` | (file ref) |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/caddy.ts:29` | `PICK_ROOT_SUBDIR_BLOCK` — Caddyfile snippet, ищет `index.html` по `SPA_SUBDIRS` (`frontend, client, web, app, apps/web, packages/web, src`). |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/caddy.ts:57` | `PROCFILE_SUPERVISOR_SH` — s6-overlay-style supervisor скрипт для multi-process backend. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/caddy.ts:98` | `try_agent_install_deps` — fallback на LLM-агента когда `npm install`/`pip install` не справляется. Gate: `DEP_INSTALL_AGENT=1`. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/caddy.ts:129` | `auto_install_deps` — детектит lockfiles → запускает `npm ci`/`pnpm i`/`pip install -r requirements.txt`. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/caddy.ts:257` | `projectManifest` — собирает StatefulSet+Service yaml: PVC `/workspace`, Caddy sidecar, readiness/liveness probes. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/caddy.ts:544` | Workspace-ready HTML stub (lines 544-555) — отдаётся когда `plan.json` отсутствует. |
+| `agentflow-agents/src/services/pingers/preview-placeholder.ts:33` | `STATIC_PREVIEW_KINDS = ['spa','landing','mini_app']` — какие kinds детектят placeholder. |
+| `agentflow-agents/src/services/pingers/preview-placeholder.ts:41` | `TINY_BODY_BYTES = 800` — threshold под которым тело считается «placeholder-sized». |
+| `agentflow-agents/src/services/pingers/preview-placeholder.ts:69` | `loadPlaceholderHashes` — читает `src/config/placeholder-hashes.json` (sha256 deny-list). |
+| `agentflow-agents/src/services/pingers/preview-placeholder.ts:101` | `classifyPreviewProbe` — title regex `/Workspace ready/i` + hash + size. |
+| `agentflow-agents/src/services/pingers/preview-placeholder.ts:168` | `shouldHoldFinalizeForPlaceholder` — used by healer/finalize gate. |
+| `agentflow-agents/src/services/pingers/preview-placeholder.ts:199` | `probePreviewUrl` — GET + HEAD probe для placeholder/ready detection. |
+| `agentflow-agents/src/services/pingers/placeholder-repoint.ts:23` | `PLACEHOLDER_REPOINT_TICK_MS = 60_000` — sweep cadence. |
+| `agentflow-agents/src/services/pingers/placeholder-repoint.ts:94` | `runPlaceholderRepointSweep` — если static kind отдаёт stub а в `/workspace` уже есть `dist/` → reload Caddy. |
+
+## Data flow
+
+```
+expose_public tool / runtime-supervisor.deploy
+   ↓ writes /workspace/.runtime/plan.json { mode: "static" | "proxy", root | upstream }
+   ↓ reloads Caddy admin API: curl -X POST 127.0.0.1:2019/load
+Caddy reads plan.json on each request
+   ↓
+mode=static  → file_server { root /workspace/<root> } (PICK_ROOT_SUBDIR_BLOCK fallback)
+mode=proxy   → reverse_proxy 127.0.0.1:<PORT>
+plan.json missing → serve HTML stub (caddy.ts:544) "Workspace ready — deploying..."
+   ↓
+External client GET https://<slug>.preview.agentflow.dev/
+   ↓
+preview-placeholder.probePreviewUrl
+   ↓ title=/Workspace ready/  OR  sha256 ∈ deny-list  OR  body<800b  → placeholder=true
+   ↓ status=200 + body≥2048b + no markers           → ready=true
+preview-gate.checkPreviewGate (per-kind dimensions) → finalize or hold
+```
 
 ## DB tables / env / API surface
 
-(таблицы Postgres, env vars, REST endpoints)
+**DB:**
+- `projects.preview_url`, `projects.workspace_project_name` — anchor для probe.
+
+**Env:**
+- `PREVIEW_GATE_STRICT=true` — отказ финализировать на placeholder.
+- `DEP_INSTALL_AGENT=1` — fallback на LLM-агента при failed npm install.
+
+**Configs / API:**
+- `agentflow-agents/src/config/placeholder-hashes.json` — sha256 deny-list (stub HTML, default Caddy welcome, common boilerplate index pages).
+- Caddy admin API на `127.0.0.1:2019` (inside pod only).
+- Caddy listens 8080 (cluster) → ingress 80/443 наружу.
 
 ## Failure modes
 
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
+| Preview зависает на «Workspace ready...» | `caddy_workspace_ready_title` | `services/pingers/preview-placeholder.ts:125` |
+| Static SPA отдаёт 404 на subroutes | `pick_root_no_index_html` | `helpers/caddy.ts:29` (PICK_ROOT_SUBDIR_BLOCK) |
+| `dist/` собран но Caddy всё ещё stub | `placeholder_repoint_skipped` | `services/pingers/placeholder-repoint.ts:94` |
+| Sha256 совпал с известным boilerplate | `placeholder_hash_match` | `src/config/placeholder-hashes.json` |
+| `auto_install_deps` падает (peer deps) | `auto_install_deps_failed` | `helpers/caddy.ts:129` |
+| Body < TINY_BODY_BYTES | `tiny_body_placeholder` | `preview-placeholder.ts:41` |
 
 ## Related
 
-- [Architecture overview](/architecture/overview)
+- [Runtime supervisor](/subsystems/runtime-supervisor)
+- [code-exec MCP](/subsystems/code-exec-mcp)
+- [Preview deploy flow](/flows/preview-deploy)
