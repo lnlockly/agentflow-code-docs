@@ -55,7 +55,7 @@ pool-worker / agent — если drift → ERROR_MARKERS hit → autoRetry chain
 
 **DB:**
 - `projects` — `workspace_project_name`, `owner_user_id` (ACL anchor).
-- `project_secrets` — sealed AES-256-GCM, source ∈ {platform, user_brief, owner}, ключи: `BOT_TOKEN`, `OPENROUTER_API_KEY`, и т.д.
+- `project_secrets` — sealed AES-256-GCM, source ∈ \{platform, user_brief, owner\}, ключи: `BOT_TOKEN`, `OPENROUTER_API_KEY`, и т.д.
 
 **Env:**
 - `AGENTS_MASTER_KEY` — base64-32 master key для seal/unseal.

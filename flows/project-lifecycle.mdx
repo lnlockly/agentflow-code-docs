@@ -72,9 +72,9 @@ description: "Полный набор статусов projects.status + пер�
 ## DB tables / env / API surface
 
 **DB tables (lifecycle-anchor):**
-- `projects.status` ∈ {`draft`, `proposing`, `awaiting_approval`, `approved`, `running`, `done`, `failed`, `cancelled`}.
+- `projects.status` ∈ \{`draft`, `proposing`, `awaiting_approval`, `approved`, `running`, `done`, `failed`, `cancelled`\}.
 - `projects.paused_until` — при превышении hourly token budget (pool-worker skip).
-- `plan_tasks.status` ∈ {`pending`, `in_progress`, `done`, `failed`, `cancelled`}.
+- `plan_tasks.status` ∈ \{`pending`, `in_progress`, `done`, `failed`, `cancelled`\}.
 - `plan_tasks.retry_depth`, `parent_task_id`, `is_amendment_dispatch`, `depends_on int[]`.
 - `project_events` — append-only timeline.
 

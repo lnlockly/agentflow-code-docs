@@ -141,7 +141,7 @@ go through `ctx.codeExec` / `ctx.emit` / `ctx.llm` — never raw imports.
 | Field | Value |
 |---|---|
 | Source of truth | [`flow-executor.ts:615`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/flow-executor.ts#L615) `runLlmClassifyIntent` |
-| Today | Returns `{intent, confidence, reasoning, raw, model}` for a fixed taxonomy (`hot|warm|objection|cold|spam`) — sales-funnel preset |
+| Today | Returns `{intent, confidence, reasoning, raw, model}` for a fixed taxonomy (`hot\|warm\|objection\|cold\|spam`) — sales-funnel preset |
 | Extension required | Accept arbitrary `taxonomy: string[]` (already does); accept optional `clarify_max: number` + `clarify_send: { kind, config }` so the handler can resolve `ambiguous` by sending one clarification and re-polling `tg.wait_reply`. **Internal-only loop — no DAG cycle.** |
 | Input (extended) | `{ message: string, taxonomy: string[], clarify_max?: number, clarify_send?: { peer, account_id, text }, peer?: string, account_id?: number }` |
 | Output | `{ intent: 'visitka'\|'bot'\|'refuse'\|'ambiguous', confidence: number, reasoning: string, clarify_rounds: number, model: string }` |
@@ -417,7 +417,7 @@ After PR merges + handlers ship + boilerplate INSERT applied:
     `tg.send_text:deliver` pulses; @MLM808 receives a second DM with
     `готова твоя визитка: https://<slug>.preview.agentflow.website/`.
 11. `tg_lead_states.update` writes a row with `stage='booked',
-    meta={asset:'visitka', sub_project_id: N}`. Verify in
+    meta=\{asset:'visitka', sub_project_id: N\}`. Verify in
     `agentflow-agents` pod: `psql -c "SELECT stage, meta FROM
     tg_lead_states WHERE tg_chat_peer='MLM808' ORDER BY id DESC LIMIT 1;"`.
 

@@ -24,7 +24,7 @@ Coder-агент через `code-exec.write_file` пишет файлы в `/wo
 | `agentflow-agents/src/services/pool-worker/post-build.ts:325` | `finalizePreviewOnDone` — атомарно flip `status=done` если preview-gate ok. |
 | `agentflow-agents/src/services/pool-worker/post-build.ts:595` | `tryAutoStartHttpServer` — last-resort `http-server`/`python3 -m http.server` если backend сам не стартанул. |
 | `agentflow-agents/src/services/pool-worker/post-build.ts:1354` | `detectAndRepointPreview` — реактивный — если static kind отдаёт stub, но `dist/` появился — repoint Caddy. |
-| `agentflow-agents/src/services/pool-worker/preview-gate.ts:40` | `PreviewKind` type — `api | spa | landing | mini_app | tg_bot | code_only | null`. |
+| `agentflow-agents/src/services/pool-worker/preview-gate.ts:40` | `PreviewKind` type — `api \| spa \| landing \| mini_app \| tg_bot \| code_only \| null`. |
 | `agentflow-agents/src/services/pool-worker/preview-gate.ts:55` | `PreviewGateResult`. |
 | `agentflow-agents/src/services/pool-worker/preview-gate.ts:211` | `checkPreviewGate` — main entry. Per-kind dimensions. |
 | `agentflow-agents/src/services/pingers/preview-placeholder.ts:101` | `classifyPreviewProbe` — placeholder detection (title + hash + size). |

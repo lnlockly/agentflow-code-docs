@@ -32,7 +32,7 @@ Pool пустой / все заняты live-поллером + `FF_AUTO_BOT_CRE
 | `agentflow-agents/src/services/auto-bot.ts:319` | `bot_unassigned` event на старом проекте с payload `{username, reason: 'pool_reclaim', previous_status, new_project_id}`. |
 | `agentflow-agents/src/services/auto-bot.ts:349` | Log `no available tokens (pool exhausted, BotFather off/failed)`. |
 | `agentflow-agents/src/services/auto-bot.ts:369` | `getMe` валидация — только для pool-токенов (BotFather mint самовалидирующийся), 5с AbortSignal. |
-| `agentflow-agents/src/services/auto-bot.ts:447` | `bot_assigned` event — payload `{username, project_name, via: 'pool' | 'botfather'}`. **Ключ — `via`, НЕ `source`.** |
+| `agentflow-agents/src/services/auto-bot.ts:447` | `bot_assigned` event — payload `{username, project_name, via: 'pool' \| 'botfather'}`. **Ключ — `via`, НЕ `source`.** |
 | `agentflow-agents/src/services/auto-bot.ts:459` | `syncProjectEnvFile(projectId)` — пушит `BOT_TOKEN` в `/workspace/.env` для Procfile supervisor. |
 | `agentflow-agents/src/services/projects.ts:1682` | `runProjectApprovalBackground` — вызывает `autoCreateTelegramBot` после `workspace_ready` (≈line 2015) для kind `tg_bot` / `tg_profile_bundle`. |
 

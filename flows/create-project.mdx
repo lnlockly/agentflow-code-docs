@@ -14,9 +14,9 @@ description: "POST /me/projects → kind classify → Maestro propose → user a
 | Repo / path | Что делает |
 |---|---|
 | `agentflow-agents/src/routes/projects.ts:573` | `POST /me/projects` — создаёт row, спавнит Maestro propose. |
-| `agentflow-agents/src/services/projects.ts:132` | `createProjectForUser` — initial row insert (`status=draft`, `kind=null|classified`). |
+| `agentflow-agents/src/services/projects.ts:132` | `createProjectForUser` — initial row insert (`status=draft`, `kind=null\|classified`). |
 | `agentflow-agents/src/services/projects.ts:221` | `appendProjectEvent` — пишет в `project_events`. |
-| `agentflow-agents/src/services/kind-classifier.ts:21` | `ProjectKind` enum (`landing | tg_bot | spa | mini_app | tg_profile_bundle | tg_farm`). |
+| `agentflow-agents/src/services/kind-classifier.ts:21` | `ProjectKind` enum (`landing \| tg_bot \| spa \| mini_app \| tg_profile_bundle \| tg_farm`). |
 | `agentflow-agents/src/services/kind-classifier.ts:47` | `REGEX_CONFIDENCE = 0.85` — порог для regex match. |
 | `agentflow-agents/src/services/kind-classifier.ts:49` | `MIN_LLM_CONFIDENCE = 0.5` — порог для LLM-классификатора. |
 | `agentflow-agents/src/services/kind-classifier.ts:90` | `classifyBriefKind` — regex first, fallback LLM. |

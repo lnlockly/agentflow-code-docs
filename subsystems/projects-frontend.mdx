@@ -15,7 +15,7 @@ description: "How the user creates a project: CreateProjectModal kind picker + k
 |---|---|
 | `agentflow-landing/src/pages/ProjectsDashboard.tsx:43` | Mounts `<CreateProjectModal>`; the **New** button toggles `createOpen` state. |
 | `agentflow-landing/src/components/projects/CreateProjectModal.tsx:1` | The modal — `TILES` array, `KindGrid`, `KindIntake`, `IntakeForm`. |
-| `agentflow-landing/src/components/projects/CreateProjectModal.tsx:24` | `TileDef` discriminated union (`mode: 'project' | 'external'`) — TS-enforces that `external` tiles cannot reach `createProject`. |
+| `agentflow-landing/src/components/projects/CreateProjectModal.tsx:24` | `TileDef` discriminated union (`mode: 'project' \| 'external'`) — TS-enforces that `external` tiles cannot reach `createProject`. |
 | `agentflow-landing/src/components/projects/CreateProjectModal.tsx:48` | `TILES` const — 5 tiles. TG-ферма is the only `mode: 'external'` entry. |
 | `agentflow-landing/src/components/projects/CreateProjectModal.tsx:213` | `IntakeForm` per-kind brief/title shaping (see "Brief shaping" below). |
 | `agentflow-landing/src/components/projects/CreateProjectModal.tsx:393` | `normalizeUsername` — strips `@`, strips `https://t.me/`, validates `^[A-Za-z0-9_]{3,32}$`. |
