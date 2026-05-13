@@ -1,31 +1,154 @@
 ---
 title: "Project kinds"
-description: "landing / spa / tg_bot / mini_app / tg_profile_bundle — что куда роутится."
+description: "landing / spa / tg_bot / mini_app / tg_profile_bundle / api / mobile / code_only — что куда роутится, какой gate, какие сервисы поднимаются."
 ---
 
 # Project kinds
 
-> **TODO** — заполнить researcher-агентом. Стартовый skeleton.
-
 ## TL;DR
 
-(1-2 предложения)
+`ProjectKind` существует в ДВУХ местах с РАЗНОЙ ширью: registry на 8 значений (`kind-registry.ts:8`, валидирует API-input + boilerplates) и classifier на 5 значений (`kind-classifier.ts:21`, выбирает kind из брифа). `api`, `code_only`, `mobile` приняты в registry, но classifier их НЕ возвращает — они доступны только если клиент шлёт `kind:` explicit. От kind зависит: какой boilerplate clone'ится (`agent_boilerplates`), запускается ли auto-bot, запускается ли `scaffoldTgProfileBundle`, попадает ли проект под placeholder-gate (`STATIC_PREVIEW_KINDS = {landing, spa, mini_app}`), и запускается ли smoke-test (`FF_BOT_AUTO_TEST` для `tg_bot|mini_app`).
 
 ## Files
 
-| Repo / path | Что делает |
+| Path | Role |
 |---|---|
-| `agentflow-agents/src/...` | (file ref) |
+| `agentflow-agents/src/services/kind-registry.ts:8` | `PROJECT_KINDS` — единый источник правды для валидации: `tg_bot, landing, spa, api, mobile, mini_app, tg_profile_bundle, code_only` |
+| `agentflow-agents/src/services/kind-classifier.ts:21` | `ProjectKind` тип classifier'а — 5 значений (нет `api`/`mobile`/`code_only`) |
+| `agentflow-agents/src/services/kind-classifier.ts:51` | `KIND_DESCRIPTIONS` — что LLM показывают как описание каждого kind |
+| `agentflow-agents/src/services/brief-analyzer.ts` | `analyzeBrief` — regex preflight; `api`/`code_only` маппятся в `spa`, `parser` → `tg_bot` |
+| `agentflow-agents/src/services/boilerplates.ts:157` | `VALID_KINDS` для `agent_boilerplates` — 7 значений (без `mobile`) |
+| `agentflow-agents/src/services/boilerplates.ts:275` | `applyBoilerplate` — clone + `cp -r` в `/workspace` (НЕ rm -rf первым) |
+| `agentflow-agents/src/services/pingers/preview-placeholder.ts:33` | `STATIC_PREVIEW_KINDS = {landing, spa, mini_app}` — placeholder-gate сетка |
+| `agentflow-agents/src/services/pingers/preview-placeholder.ts:125` | `Workspace ready` title regex — `caddy_workspace_ready_title` reason |
+| `agentflow-agents/src/services/pool-worker/preview-gate.ts` | `PreviewKind` + gate result; soft-rollout под `PREVIEW_GATE_STRICT` |
+| `agentflow-agents/src/services/pingers/healer-finalize.ts` | `tryFinalizeProjectFromPlan` — идемпотентный финалайз; для placeholder'ных kind держит status=running |
+| `agentflow-agents/src/services/auto-bot.ts:142` | `autoCreateTelegramBot` — вызывается ТОЛЬКО для `tg_bot` и `tg_profile_bundle` (см. `projects.ts:2015`) |
+| `agentflow-agents/src/services/tg-visitka-scaffold.ts:563` | `scaffoldTgProfileBundle` — ТОЛЬКО для `tg_profile_bundle` (`projects.ts:2030`) |
+| `agentflow-agents/src/services/projects.ts:2615` | `FF_BOT_AUTO_TEST` smoke-test gate — ТОЛЬКО для `tg_bot` / `mini_app` |
+| `agentflow-agents/src/mcp-servers/team-manager/tools/propose-project-plan.ts:93` | Описания kind'ов для Maestro proposal'а (входной enum) |
 
-## DB tables / env / API surface
+## Matrix — what activates per kind
 
-(таблицы Postgres, env vars, REST endpoints)
+| Kind | In classifier? | Boilerplate | Auto-bot | Visitka scaffold | Placeholder gate | Smoke-test | Preview check |
+|---|---|---|---|---|---|---|---|
+| `landing` | ✅ | landing boilerplate | ❌ | ❌ | ✅ (static) | ❌ | Caddy `/workspace/dist` |
+| `spa` | ✅ | spa boilerplate (NestJS + React) | ❌ | ❌ | ✅ (static) | ❌ | Caddy `/workspace/dist` |
+| `tg_bot` | ✅ | tg_bot boilerplate (aiogram/grammy) | ✅ | ❌ | ❌ | ✅ (под `FF_BOT_AUTO_TEST=1`) | `getMe` + smoke-test |
+| `mini_app` | ✅ | mini_app boilerplate (Vite + TWA SDK) | ❌ | ❌ | ✅ (static) | ✅ (для kickstart UX) | Caddy + initData |
+| `tg_profile_bundle` | ✅ | (нет — заменён template'ом) | ✅ | ✅ | ❌ (не в `STATIC_PREVIEW_KINDS`) | ✅ | Caddy + `getMe` |
+| `api` | ❌ (regex → `spa`) | (registry-only) | ❌ | ❌ | ❌ | ❌ | `/health` probe |
+| `mobile` | ❌ | (нет в `VALID_KINDS` для boilerplate) | ❌ | ❌ | ❌ | ❌ | none |
+| `code_only` | ❌ (regex → `spa`) | code_only boilerplate | ❌ | ❌ | ❌ | ❌ | none |
+
+## kind selection flow
+
+```
+POST /me/projects { brief, kind?: ProjectKind | 'auto' }
+         ↓
+   if kind in PROJECT_KINDS  (kind-registry.ts:8 ALLOWED_KINDS_SET)
+         ↓                       ↓ no
+   use it explicit          400 invalid_kind
+         ↓
+   else kind === 'auto':
+     1. analyzeBrief (regex)            (brief-analyzer.ts)
+        — @handle + landing + bot       → tg_profile_bundle
+        — @handle + bot only            → tg_bot
+        — Telegram Web App / initData   → mini_app
+        — landing / promo / one-page    → landing
+        — auth+billing / dashboard      → spa
+        — api / endpoint / openapi      → spa  (api collapses here)
+        — parser / scraper              → tg_bot
+        confidence = 0.85
+     2. if regex confidence < 0.85 → invokeAI (TEXT_SMALL) с
+        KIND_DESCRIPTIONS из kind-classifier.ts:51
+     3. fallback → 'landing' (kind-classifier.ts:39)
+         ↓
+   projects.kind = <one of PROJECT_KINDS>
+         ↓
+   propose_project_plan MCP tool (enum strictly from PROJECT_KINDS)
+         ↓
+   approve → runProjectApprovalBackground (projects.ts:1682)
+         ↓
+   hook chain:
+     - autoScrapeFromBrief   (only when @handle present + FF_AUTO_SCRAPE_ON_CREATE)
+     - autoCreateTelegramBot (if kind ∈ {tg_bot, tg_profile_bundle})  ← projects.ts:2015
+     - scaffoldTgProfileBundle (if kind === 'tg_profile_bundle')      ← projects.ts:2030
+     - execute_in_team       (always)
+         ↓
+   pool-worker drains plan_tasks → invokeAgent per preset
+         ↓
+   on done: finalizePreviewOnDone
+         ↓
+   placeholder-gate (only if kind ∈ STATIC_PREVIEW_KINDS):
+     GET preview_url → classifyPreviewProbe (preview-placeholder.ts:60+)
+       layer 1: title regex `Workspace ready`
+       layer 2: body bytes ≤ TINY_BODY_BYTES (800)
+       layer 3: SHA-256 deny-list
+     → if placeholder: keep status=running, schedule healer retry
+     → else: status=done
+         ↓
+   for tg_bot|mini_app under FF_BOT_AUTO_TEST=1:
+     runBotSmokeTest → если no_mtproto_account_available → skip
+       иначе по результату — createSmokeFixTask или mark passed
+```
+
+## DB / env / API
+
+### DB
+- `projects.kind` validated против `PROJECT_KINDS` на insert (`routes/projects.ts:573`).
+- `agent_boilerplates.kind` validated против `VALID_KINDS` (`boilerplates.ts:157`) — 7 значений, mobile отсутствует (нет шаблона мобилки).
+- `projects.workspace_project_name` — k3s pod handle, всегда выставляется в `provisionWorkspaceWithRetry`.
+- `project_events`: `workspace_ready`, `bot_assigned`, `tg_visitka_scaffold`, `preview_check_failed`, `project_finalized`.
+
+### Env
+- `PREVIEW_GATE_STRICT` — если `1`, placeholder-detection блокирует finalize hard. Иначе soft-rollout (лог + продолжаем).
+- `FF_AUTO_BOT_CREATE` — мастер-флаг для auto-bot.
+- `FF_AUTO_BOT_CREATE_BOTFATHER` — fallback на BotFather mint когда пул пуст.
+- `FF_AUTO_SCRAPE_ON_CREATE` — auto-scrape после workspace_ready.
+- `FF_BOT_AUTO_TEST` — smoke-test gate.
+
+### API
+- `POST /me/projects` — `{brief, kind?}` (`routes/projects.ts:573`). `kind` опционален, default `auto`.
+- `GET /me/projects/:id` — поле `kind` в ответе.
+- `POST /me/projects/:id/approve` — стартует pipeline.
+- `GET /me/agent-boilerplates?kind=<kind>` — list, owner-scoped.
+- `POST /me/projects/:id/boilerplates/:bpId/apply` — clone + cp в `/workspace`.
+
+## Why classifier ≠ registry
+
+Classifier (5 kinds) — это **что мы умеем угадывать из брифа**. `api` / `code_only` / `mobile` без явного `kind:` в запросе никогда не попадут в проект автоматически:
+
+- `api` → regex маппит в `spa` (тот же full-stack бойлерплейт)
+- `code_only` → regex маппит в `spa` (workspace без preview-gate'а, но coder работает там же)
+- `mobile` → нет regex-сигнатур, нет LLM hint'а — пользователь должен ставить `kind:'mobile'` руками; нет boilerplate'а в `VALID_KINDS`, поэтому apply вернёт `invalid_kind`.
+
+Это сделано чтобы не плодить ложно-положительных `api` проектов из брифов вида «нужен сервер для бота».
 
 ## Failure modes
 
-| Симптом | Лог-строка для grep | Где починить |
+| Symptom | Log signature for grep | Where to fix |
 |---|---|---|
+| Project stuck в `awaiting_approval` потому что classifier упал | `kind-classifier: invokeAI failed` | `src/services/kind-classifier.ts` (fallback на `landing`) |
+| Apply boilerplate вернул `invalid_kind` | `validateBoilerplateInput → invalid_kind` | `src/services/boilerplates.ts:172` — kind не в `VALID_KINDS` (e.g. mobile) |
+| Placeholder-gate ложно блокирует custom landing | `caddy_workspace_ready_title` | `src/services/pingers/preview-placeholder.ts:125` + проверить что у coder'а реальный `<title>` в index.html |
+| `tg_profile_bundle` finalize'нулся с stub'ом | (нет — kind НЕ в `STATIC_PREVIEW_KINDS`) | Добавить в set, либо отдельно гейтить bundle (`preview-placeholder.ts:33`) |
+| Smoke-test упал | `bot_smoke_test_failed` | `src/services/bot-auto-tester.ts:64` (только tg_bot/mini_app под `FF_BOT_AUTO_TEST=1`) |
+| Smoke-test skip без MTProto | `no_mtproto_account_available` | `src/services/bot-auto-tester.ts` — owner нужен StringSession через `/me/tg-accounts` |
+| Auto-bot не сработал для tg_bot | `[auto-bot] pool empty and FF_AUTO_BOT_CREATE_BOTFATHER off, skipping` | `src/services/auto-bot.ts:161` |
+| `propose_project_plan` отверг kind | `invalid kind: not in PROJECT_KINDS` | `src/mcp-servers/team-manager/tools/propose-project-plan.ts:93` — drift между registry и proposer |
+
+## Gotchas
+
+- **Registry parity assertion at boot.** `server.ts` падает в стартапе если `PROJECT_KINDS` расходится с MCP-tool enum'ом. Добавляешь новый kind — синхронно обновляй `kind-registry.ts:8` + `boilerplates.ts:157` (`VALID_KINDS`) + `preview-placeholder.ts:33` (`STATIC_PREVIEW_KINDS` если static) + classifier'ный `ProjectKind` если хочешь автоопределение.
+- **`tg_profile_bundle` дважды.** Сначала auto-bot (потому что внутри bundle'а есть bot), потом scaffold (потому что внутри bundle'а есть landing). Порядок важен — `bot_username` пишется в `projects` ДО того как `scaffoldTgProfileBundle` дропает heredoc'и (`projects.ts:2015` → `:2030`).
+- **`applyBoilerplate` НЕ rm -rf'ит /workspace.** Если pod уже носит scraped artefacts (для `tg_profile_bundle`) — они переживут apply. Coder, который хочет clean slate, должен сам `find /workspace -mindepth 1 -delete` (`boilerplates.ts:267`).
+- **`code_only` ↔ `spa` collapse.** Если попросишь LLM «нужен скрипт-парсер на питоне», classifier выдаст `spa` (нет static preview ожиданий → проект пойдёт в done без preview-check'а; coder работает в `/workspace`, runs ad-hoc).
+- **`mini_app` placeholder-gate.** Хотя `mini_app` отдаётся через TWA Web App SDK (initData), preview всё равно проходит через Caddy → `/workspace/dist`. Поэтому `mini_app` в `STATIC_PREVIEW_KINDS`.
 
 ## Related
 
 - [Architecture overview](/architecture/overview)
+- [Визитка (tg_profile_bundle)](/architecture/visitka-tg-profile)
+- [Bot pool & auto-assign](/architecture/bot-pool)
+- [Ферма (sales-funnel-tg-farm)](/architecture/ferma-sales-funnel)

@@ -1,31 +1,136 @@
 ---
-title: "Бот pool + auto-assign"
-description: "BOT_TOKEN_POOL и auto-bot.ts: как раздаются токены."
+title: "Bot pool & auto-assign"
+description: "Как платформа выдаёт BOT_TOKEN проектам: BOT_TOKEN_POOL → BotFather fallback → brief-token-extract."
 ---
 
-# Бот pool + auto-assign
-
-> **TODO** — заполнить researcher-агентом. Стартовый skeleton.
+# Bot pool & auto-assign
 
 ## TL;DR
 
-(1-2 предложения)
+`autoCreateTelegramBot` (вызывается из approval-pipeline для `kind ∈ {tg_bot, tg_profile_bundle}`) идёт двумя путями: ① берёт первый свободный токен из `BOT_TOKEN_POOL` (JSON-env, формат `[{token, username}]`), пингует Telegram getUpdates чтобы убедиться что бот не залочен 409-Conflict orphan-полером; ② если пул пуст и `FF_AUTO_BOT_CREATE_BOTFATHER=1` — минтит свежего бота через BotFather прямо в Jarvis pod'е через Telethon. Параллельно `brief-token-extract.ts` ловит пользовательский токен в брифе и подставляет его раньше. После назначения raw-токен пишется в `/workspace/bot_token.txt` чтобы `bot.py` мог прочитать без env-injection.
 
 ## Files
 
-| Repo / path | Что делает |
+| Path | Role |
 |---|---|
-| `agentflow-agents/src/...` | (file ref) |
+| `agentflow-agents/src/services/auto-bot.ts:142` | `autoCreateTelegramBot(projectId, projectName)` — главная функция |
+| `agentflow-agents/src/services/auto-bot.ts:50` | `probeBotInConflict` — getUpdates 409 detector (4s AbortSignal) |
+| `agentflow-agents/src/services/auto-bot.ts:76` | `createBotViaBotFather` — Telethon-helper в Jarvis pod'е, regex `TOKEN=…/USERNAME=…` |
+| `agentflow-agents/src/services/auto-bot.ts:114` | `writeBotTokenFile` — drops raw token to `/workspace/bot_token.txt` (chmod 600) |
+| `agentflow-agents/src/services/auto-bot.ts:34` | `JARVIS_OWNER_ID` / `JARVIS_WORKSPACE` constants |
+| `agentflow-agents/src/services/brief-token-extract.ts:37` | `TG_TOKEN_RE = /\b(\d{8,12}):([A-Za-z0-9_-]{30,})\b/g` |
+| `agentflow-agents/src/services/brief-token-extract.ts:44` | `redactTelegramTokens` — заменяет на `[BOT_TOKEN_REDACTED]` |
+| `agentflow-agents/src/services/brief-token-extract.ts:79` | `verifyTokenViaGetMe` — 5s timeout |
+| `agentflow-agents/src/services/bot-auto-tester.ts:64` | `runBotSmokeTest(projectId)` — BFS через slash-commands + inline-keyboards |
+| `agentflow-agents/src/services/projects.ts:2015` | Hook site: `if (proj.kind === 'tg_bot' || proj.kind === 'tg_profile_bundle') await autoCreateTelegramBot(...)` |
+| `agentflow-agents/src/services/projects.ts:1702` | Early `extractUserTokenFromBrief` call (до auto-bot) — приоритет пользовательскому токену |
+| `agentflow-agents/src/services/self-heal-bot.ts` | `shouldRunBotSmokeTest` + `createSmokeFixTask` (FF_SELF_HEAL_LOOP) |
+| `agentflow-agents/src/services/env-file-sync.ts` | `syncProjectEnvFile` — пишет `/workspace/.env` с BOT_TOKEN после assignment |
+| `agentflow-agents/src/routes/projects.ts:3083` | `POST /me/projects/:id/bot-chat` — preview UI calls bot_handler.py |
+| `agentflow-agents/src/routes/projects.ts:3216` | `POST /me/projects/:id/bot/start` (gated `FF_AUTO_BOT_CREATE`) |
 
-## DB tables / env / API surface
+## Data flow
 
-(таблицы Postgres, env vars, REST endpoints)
+```
+runProjectApprovalBackground (services/projects.ts)
+   ↓ early step (services/projects.ts:1702)
+extractUserTokenFromBrief(brief)
+   ├─ regex match → verifyTokenViaGetMe (5s timeout)
+   │     ok? → seal+store project_secret(source='user_brief'),
+   │           projects.bot_username = getMe.result.username,
+   │           projects.brief = redactTelegramTokens(brief)   ← LLM никогда не видит raw
+   └─ no match / verify failed → fall through
+   ↓ workspace_ready emitted
+   ↓ kind ∈ {tg_bot, tg_profile_bundle}?
+autoCreateTelegramBot(projectId, projectName)
+   ↓ existing BOT_TOKEN secret with is_set=true?  → skip
+   ↓ parse BOT_TOKEN_POOL (JSON [{token,username}])
+   ↓ for each entry:
+       used_usernames (SELECT bot_username FROM projects)?  → skip
+       probeBotInConflict (getUpdates?timeout=0&offset=-1)
+          409 → skipped_conflict.push, continue
+          200 → chosen = entry, break
+   ↓ pool exhausted AND FF_AUTO_BOT_CREATE_BOTFATHER=1?
+createBotViaBotFather({name, username=`${slug}_${rand4}_bot`})
+   ├─ exec in Jarvis: `python3 /workspace/bot_cli.py "<name>" "<username>" 2>&1`
+   ├─ stdout regex `TOKEN=(\d{5,12}:[A-Za-z0-9_-]{30,})` + `USERNAME=(...)`
+   └─ trust printed USERNAME over input (BotFather may rename)
+   ↓ chosen → verify via getMe (skipped if just minted)
+   ↓ seal+store (UPSERT — handles placeholder row from coder add_project_secret is_set=false)
+   ↓ UPDATE projects SET bot_username=…, bot_token=sealed
+   ↓ writeBotTokenFile (/workspace/bot_token.txt, mode 600)
+   ↓ syncProjectEnvFile (best-effort — writes /workspace/.env)
+   ↓ appendProjectEvent 'bot_assigned' { username, via: 'pool'|'botfather' }
+```
+
+## Env
+
+| Var | Default | Notes |
+|---|---|---|
+| `BOT_TOKEN_POOL` | unset | JSON array `[{token, username}]`. Empty → BotFather path only. |
+| `FF_AUTO_BOT_CREATE` | unset | Включает «full bot autoflow»: scaffold stub bot.py для legacy tg_bot, `/bot/start`, `/bot/status`, `/run-bot-test` routes. Без него — legacy stub-echo path. |
+| `FF_AUTO_BOT_CREATE_BOTFATHER` | unset | Включает BotFather fallback в Jarvis. Без него `autoCreateTelegramBot` логирует `[auto-bot] pool empty and FF_AUTO_BOT_CREATE_BOTFATHER off, skipping` и проект остаётся без бота. |
+| `FF_BOT_AUTO_TEST` | unset | Включает smoke-test после `status=done` (см. `bot-auto-tester.ts`). |
+| `FF_SELF_HEAL_LOOP` | unset | Включает `createSmokeFixTask` — coder получает task если бот не отвечает. |
+| `JARVIS_OWNER_USER_ID` | `1` | Owner Jarvis pod'а (где запускается BotFather Telethon). |
+| `JARVIS_WORKSPACE_PROJECT_NAME` | `proj-71506e1l` | StatefulSet name Jarvis pod'а. |
+
+## DB tables
+
+- `project_secrets` (key='BOT_TOKEN'): `source ∈ {'platform','user_brief'}`, `is_set boolean`, `masked` (first5+last4), `value_encrypted` (sealed via `seal.ts`).
+- `projects.bot_username` text — public @-handle. **Может остаться null после `status=done`** если: ① auto-bot завершился без `chosen` (см. `auto-bot.ts:264`), ② getMe network error на verify step (`auto-bot.ts:299`), ③ BotFather mint вернул output без `TOKEN=` маркера (`auto-bot.ts:103`).
+- `projects.bot_token` — sealed дубль того же токена; кешируется для skip-проверки `is_set=true` (`auto-bot.ts:183`).
+
+## API surface
+
+| Route | Purpose |
+|---|---|
+| `POST /me/projects/:id/bot/start` | Запускает bot.py supervisor внутри pod'а (kubectl-exec). Gated `FF_AUTO_BOT_CREATE`. |
+| `POST /me/projects/:id/bot/stop` | Шлёт SIGTERM bot процессу. |
+| `GET /me/projects/:id/bot/status` | Tail логов + last-restart timestamp. |
+| `POST /me/projects/:id/bot-chat` | Sync-reply preview через `bot_handler.py reply <text>` (legacy fallback когда нет полноценного aiogram). |
+| `POST /me/projects/:id/run-bot-test` | Manual trigger smoke-test. |
+| `POST /me/projects/:id/resync-env` | Перезаписывает `/workspace/.env` (вызывает `syncProjectEnvFile`). |
+
+## Edge cases / gotchas
+
+- **Coder-агент кладёт placeholder secret до auto-bot.** Coder через `add_project_secret` может создать row с `is_set=false` (попросить owner'а вписать BOT_TOKEN сам). Старая версия `autoCreateTelegramBot` тогда делала early-return и проект жил без бота. Фикс: skip только когда `is_set=true`, иначе UPDATE in-place (`auto-bot.ts:172-186`, `:314-324`).
+- **409 Conflict на orphan-pod.** Telegram держит long-poll lock ~10 минут после смерти getUpdates процесса. Pool-токен может быть «свободен» в БД, но залочен. `probeBotInConflict` пингует getUpdates?timeout=0 — 409 → skip и попробовать следующий. Skipped токены логируются как warn-event для ops.
+- **getMe hang.** Был случай: hung api.telegram.org → `runProjectApprovalBackground` зависал 17+ мин, проект stuck `status=approved`. Фикс — 5s `AbortSignal.timeout(5000)` (`auto-bot.ts:281`). На ошибку — warn-event и approval продолжается без бота.
+- **BotFather username rename.** Запрошенный username может быть занят — BotFather переименует. Мы парсим `USERNAME=` маркер из stdout, **не** input (`auto-bot.ts:99`).
+- **brief-token-extract идёт ДО auto-bot.** Если юзер вкинул свой token в бриф — мы verify + seal + redact, и потом `autoCreateTelegramBot` видит `is_set=true` и skip'ает. LLM никогда не видит raw-token: `projects.brief` сохраняется уже после `redactTelegramTokens`.
+- **bot_token.txt важнее env.** `aiogram bot.py` спавнится внутри pod'а supervisor'ом, env-vars приходят на exec-time только. Файл `/workspace/bot_token.txt` (mode 600) — fallback path в обоих template'ах (`tg-visitka-scaffold.ts:333`, `services/projects.ts:2070`).
 
 ## Failure modes
 
-| Симптом | Лог-строка для grep | Где починить |
+| Symptom | Log signature for grep | Where to fix |
 |---|---|---|
+| Pool пуст, BotFather off | `[auto-bot] pool empty and FF_AUTO_BOT_CREATE_BOTFATHER off, skipping` | `src/services/auto-bot.ts:161` |
+| Все токены залочены | `auto-bot: skipped` (substring `conflict-locked pool token`) | `src/services/auto-bot.ts:238` |
+| getMe network hang | `[auto-bot] getMe network error:` | `src/services/auto-bot.ts:299` |
+| BotFather output без TOKEN= | `[auto-bot] botfather: no TOKEN= in output:` | `src/services/auto-bot.ts:103` |
+| BotFather exec exception | `[auto-bot] botfather create exception:` | `src/services/auto-bot.ts:105` |
+| Pool JSON broken | `[auto-bot] BOT_TOKEN_POOL is not valid JSON` | `src/services/auto-bot.ts:157` |
+| bot_token.txt write failed | `[auto-bot] write bot_token.txt failed:` | `src/services/auto-bot.ts:131` |
+| Final no-token state | `[auto-bot] no available tokens (pool exhausted, BotFather off/failed)` | `src/services/auto-bot.ts:260` |
+| Smoke-test без MTProto аккаунта | `no_mtproto_account_available` (skipped поле в BotTestReport) | `src/services/bot-auto-tester.ts` |
+| env sync warn | `[auto-bot] syncProjectEnvFile(` | `src/services/auto-bot.ts:371` |
+
+## Why bot_username can stay null after status=done
+
+Все коды-возврата `autoCreateTelegramBot` это **early `return;`**, не throw. Поэтому approval-pipeline продолжается, plan_tasks выполняются, проект финализируется как `done`. Без бота. Места возврата:
+
+- `auto-bot.ts:163` — pool empty + BotFather off
+- `auto-bot.ts:184` — already populated (skip)
+- `auto-bot.ts:201` — project row not found
+- `auto-bot.ts:264` — pool exhausted AND BotFather failed/disabled
+- `auto-bot.ts:293` — getMe ok=false
+- `auto-bot.ts:304` — getMe network/timeout error
+
+Чтобы пофиксить «безбоговый done»: либо ужесточить approval-pipeline (treat auto-bot failure as fatal для tg_bot), либо завести self-heal pinger который повторяет назначение через X минут — сейчас такого пинга нет.
 
 ## Related
 
+- [Визитка (tg_profile_bundle)](/architecture/visitka-tg-profile)
+- [Project kinds matrix](/architecture/kinds)
 - [Architecture overview](/architecture/overview)

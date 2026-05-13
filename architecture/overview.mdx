@@ -1,31 +1,119 @@
 ---
 title: "Architecture overview"
-description: "5-минутный тур по платформе AgentFlow."
+description: "5-минутный тур по платформе AgentFlow: репозитории, сервисы, request flow."
 ---
 
 # Architecture overview
 
-> **TODO** — заполнить researcher-агентом. Стартовый skeleton.
-
 ## TL;DR
 
-(1-2 предложения)
+AgentFlow — multi-tenant платформа для autonomous AI-агентов: юзер пишет бриф → Maestro предлагает план команды → юзер аппрувит → пул-воркер исполняет команды coder/auditor/operator-агентов в Kubernetes-подах. Three независимых репозитория: **agentflow-agents** (Hono backend + MCP servers + pool-worker), **agentflow-landing** (React SPA), **agentflow-tg-mcp** (Python/Telethon MCP для MTProto-операций над TG-аккаунтами юзеров).
 
-## Files
+## Multi-repo layout
 
-| Repo / path | Что делает |
+| Repo | Stack | Roles |
+|---|---|---|
+| `agentflow-agents/` | Hono 4, Node 20, Drizzle ORM, Postgres, MCP | REST API, MCP servers, pool-worker, agent-trigger-worker |
+| `agentflow-landing/` | React 19 + Vite 7, Tailwind | Frontend SPA, edge SSR (vercel.json), Playwright e2e |
+| `agentflow-tg-mcp/` | Python 3.12, Telethon, FastMCP, Starlette | MTProto pool (StringSession per account), tools для send/receive/scrape/smoke_test |
+
+## Top-level services внутри agentflow-agents
+
+| Path | Role |
 |---|---|
-| `agentflow-agents/src/...` | (file ref) |
+| `agentflow-agents/src/server.ts:428` | Hono app boot, mounts routes, starts agent-trigger worker (`FF_AGENT_TRIGGERS=1`) |
+| `agentflow-agents/src/routes/projects.ts:573` | `POST /me/projects` — creates project row (status=draft) и запускает Maestro propose в background |
+| `agentflow-agents/src/services/projects.ts:1682` | `runProjectApprovalBackground` — provision pod → workspace_ready → scrape → auto-bot → scaffold → execute |
+| `agentflow-agents/src/services/projects.ts:2294` | `runProjectExecutionBackground` — execute_in_team MCP tool → pool-worker drains plan_tasks |
+| `agentflow-agents/src/services/pool-worker/index.ts` | Drains `plan_tasks` queue, invokes agent presets через `invokeAgent` |
+| `agentflow-agents/src/services/agent-trigger-worker.ts:462` | Tick every 30s — cron / schedule_once / flow-cron / tg.new_message poller |
+| `agentflow-agents/src/services/kind-classifier.ts:21` | LLM/regex classifier — выбирает `ProjectKind` из брифа |
+| `agentflow-agents/src/services/auto-bot.ts:142` | Pool-based BOT_TOKEN assignment для tg_bot / tg_profile_bundle проектов |
+| `agentflow-agents/src/services/tg-visitka-scaffold.ts:563` | Template applier для kind=tg_profile_bundle |
+| `agentflow-agents/src/mcp-servers/team-manager/tools/propose-project-plan.ts` | MCP tool: Maestro заполняет `projects.proposed_plan` |
+| `agentflow-agents/src/mcp-servers/team-manager/tools/execute-in-team.ts` | MCP tool: создаёт `plans` + `plan_tasks` rows из проложенного плана |
 
-## DB tables / env / API surface
+## Data flow — typical project lifecycle
 
-(таблицы Postgres, env vars, REST endpoints)
+```
+POST /me/projects { brief }                       (routes/projects.ts:573)
+    ↓ creates row, status='draft', spawns Maestro propose
+runMaestroProposeBackground (services/projects.ts)
+    ↓ Maestro → propose_project_plan MCP tool
+projects.proposed_plan = {agents, steps, auditor_slug}, status='awaiting_approval'
+    ↓
+POST /me/projects/:id/approve                     (routes/projects.ts)
+    ↓ approveProject (services/projects-pipeline.ts) → runProjectApprovalBackground
+provisionWorkspaceWithRetry → workspace_ready event
+    ↓
+autoScrapeFromBrief (services/auto-scrape.ts)     — only when brief has @handles
+    ↓
+materializeScrapedArtifactsInPod                  — drops /workspace/scraped_*.json
+    ↓
+autoCreateTelegramBot                              — only kind ∈ {tg_bot, tg_profile_bundle}
+    ↓
+scaffoldTgProfileBundle                            — only kind=tg_profile_bundle
+    ↓
+runProjectExecutionBackground (services/projects.ts:2294)
+    ↓ execute_in_team MCP → plan_tasks rows
+pool-worker drains, invokes agent presets via invokeAgent
+    ↓ on done/failed → finalizePreviewOnDone + Caddy-placeholder gate
+project_events: 'project_finalized' kind, status=done|failed|cancelled
+```
+
+## Key invariants
+
+- **Skeleton stored in `projects.proposed_plan` (jsonb)**, materialized into `plans` + `plan_tasks` only on approve. Re-propose mutates `proposed_plan` без удаления старых задач.
+- **Coder-agent работает в pod'е проекта**, не в API-поде. Все file/exec идут через `code-exec` MCP server, который kubectl-exec'ит внутрь StatefulSet pod'а (`projects.workspace_project_name`).
+- **Jarvis** — singleton pod (`proj-71506e1l`, owner user 1) который хостит платформенные Telethon-сессии: scrape, BotFather mint, smoke-test через owner's MTProto accounts.
+- **Preview placeholder gate** ловит «Workspace ready» Caddy-stub для static kinds (`landing|spa|mini_app`) и держит status=running вместо ложного done.
+- **Feature flags**: `FF_AUTO_BOT_CREATE`, `FF_AUTO_BOT_CREATE_BOTFATHER`, `FF_AUTO_SCRAPE_ON_CREATE`, `FF_AGENT_TRIGGERS`, `FF_FLOWS`, `FF_TG_SALES_FUNNEL`, `FF_BOT_AUTO_TEST`, `FF_SELF_HEAL_LOOP`, `PREVIEW_GATE_STRICT`.
+
+## Tech stack
+
+| Layer | Tech |
+|---|---|
+| Backend | Node 20, Hono 4, Drizzle ORM, Postgres 16, Pino |
+| MCP layer | streamable-http transport, FastMCP (Python) + custom JSON-RPC (TS) |
+| Pod runtime | k3s, StatefulSet per project, PVC `/workspace`, Caddy sidecar для preview |
+| Frontend | React 19, Vite 7, Tailwind, Playwright |
+| TG MTProto | Telethon (Python 3.12), StringSession persistence в Postgres |
+| LLM | OpenRouter SDK, ai-router instrumented (`ModelType.TEXT_SMALL` / `TEXT_BIG` / etc.) |
+
+## DB tables (high-traffic)
+
+| Table | Purpose | Defined at |
+|---|---|---|
+| `projects` | Один user-goal: kind, status, plan_id, workspace_project_name, bot_username, preview_url | `src/db/schema.ts` |
+| `project_events` | Append-only timeline (workspace_ready, plan_started, bot_assigned, project_finalized…) | `src/db/schema.ts` |
+| `project_secrets` | Sealed key/value, source ∈ {platform, user_brief, owner} | `src/db/schema.ts` |
+| `plans` / `plan_tasks` | Materialized proposed_plan; pool-worker queue | `src/db/schema.ts` |
+| `agents` / `agent_boilerplates` | Agent presets и GitHub-scaffolds для coder | `src/db/schema.ts` |
+| `agent_triggers` | cron / webhook / schedule_once / tg_event | `src/db/schema.ts:1772` |
+| `flows` / `flow_runs` | DAG-graph executor (Sales Funnel + cron flows) | `src/db/schema.ts` |
+| `tg_links` / `tg_event_cursor` / `tg_lead_states` | Telegram kickstart bot bindings + Sales Funnel cursor + per-chat state | `src/db/schema.ts:1108`, `:1148`, `:2127` |
+| `tg_access_grants` / `tg_link_tokens` | Bot kickstart deeplinks + API-key minting | `src/db/schema.ts:1224`, `:1124` |
+
+## Env / config
+
+- `JARVIS_OWNER_USER_ID` / `JARVIS_WORKSPACE_PROJECT_NAME` — singleton pod для BotFather / scrape (default `1` / `proj-71506e1l`).
+- `BOT_TOKEN_POOL` — JSON `[{token,username}]` для auto-bot.
+- `TG_MCP_URL` — endpoint Python tg-mcp server'а (`${TG_MCP_URL}` в preset MCP block).
+- `AGENTFLOW_INTERNAL` — base URL для internal MCP routes (code-exec, self).
 
 ## Failure modes
 
-| Симптом | Лог-строка для grep | Где починить |
+| Symptom | Log signature for grep | Where to fix |
 |---|---|---|
+| Project stuck status=approved, 0 plan_tasks | `[auto-bot] getMe network error` | `src/services/auto-bot.ts:299` |
+| Preview returns Caddy stub | `caddy_workspace_ready_title` | `src/services/pingers/preview-placeholder.ts:125` |
+| Auto-scrape skipped silently | `auto_scrape_post_ws_failed` | `src/services/projects.ts:1983` |
+| Trigger tick stuck | `agent_trigger_tick_failed` | `src/services/agent-trigger-worker.ts:465` |
+| Pool empty, BotFather off | `[auto-bot] pool empty and FF_AUTO_BOT_CREATE_BOTFATHER off, skipping` | `src/services/auto-bot.ts:161` |
 
 ## Related
 
-- [Architecture overview](/architecture/overview)
+- [Визитка (tg_profile_bundle)](/architecture/visitka-tg-profile)
+- [Bot pool & auto-assign](/architecture/bot-pool)
+- [Sales Funnel TG Farm](/architecture/ferma-sales-funnel)
+- [Project kinds matrix](/architecture/kinds)

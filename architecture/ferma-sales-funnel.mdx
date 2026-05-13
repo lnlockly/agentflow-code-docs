@@ -1,31 +1,142 @@
 ---
 title: "Ферма (sales-funnel-tg-farm)"
-description: "Sales-funnel-tg-farm agent runtime + MTProto poller."
+description: "Воронка продаж поверх MTProto-аккаунтов: trigger.tg.new_message → classify → branch (hot|warm|objection|cold|spam) → reply. Anti-ban first."
 ---
 
 # Ферма (sales-funnel-tg-farm)
 
-> **TODO** — заполнить researcher-агентом. Стартовый skeleton.
-
 ## TL;DR
 
-(1-2 предложения)
+`sales-funnel-tg-farm` — preset-агент с `kind=action`, который НЕ свободно беседует, а исполняет 15-нодовый DAG из `presets/sales-funnel-tg-farm.json` через `flow-executor`. Poller `processFlowTgNewMessageTriggers` (раз в 30s) дергает Python `agentflow-tg-mcp` → `telegram.get_dialogs` + `telegram.get_messages`, фильтрует по highwater-cursor (`tg_event_cursor.bot_id = 'flow:<flow_id>'`), и на каждое новое inbound зовёт `executeFlow` с `input = {chat_id, account_id, message, message_id, _trigger: 'tg.new_message'}`. Граф классифицирует intent через TEXT_SMALL, ветвится на 5 веток, тегирует lead в `tg_lead_states`. Двойной feature-gate `FF_FLOWS=1` + `FF_TG_SALES_FUNNEL=1` — без одного из двух poller silently no-op'ит.
 
 ## Files
 
-| Repo / path | Что делает |
+| Path | Role |
 |---|---|
-| `agentflow-agents/src/...` | (file ref) |
+| `agentflow-agents/presets/sales-funnel-tg-farm.json:1` | Preset с `workflow_schema` — 15 нод, 5 веток, requiredSecrets (TG_API_ID/TG_API_HASH/TG_SESSION/CALENDLY_LINK/ELEVENLABS_API_KEY) |
+| `agentflow-agents/src/services/agent-trigger-worker.ts:338` | `processFlowTgNewMessageTriggers` — poller, single-process, тикает каждые 30s |
+| `agentflow-agents/src/services/agent-trigger-worker.ts:462` | `startAgentTriggerWorker` — boot из `server.ts` под `FF_AGENT_TRIGGERS=1` |
+| `agentflow-agents/src/services/agent-trigger-worker.ts:405` | `executeFlow(...)` callsite — `calledVia: 'webhook'`, input shape выше |
+| `agentflow-agents/src/routes/agent-triggers.ts:44` | `createTriggerSchema` discriminatedUnion: `cron \| webhook \| schedule_once \| tg_event` |
+| `agentflow-agents/src/routes/agent-triggers.ts:32` | Feature gate: возвращает 503 если `FF_AGENT_TRIGGERS !== '1'` |
+| `agentflow-agents/src/db/schema.ts:1108` | `tg_links` — bot-kickstart bindings (chat_id ↔ owner) |
+| `agentflow-agents/src/db/schema.ts:1148` | `tg_event_cursor` — highwater per `bot_id`; для flow-poller'а ключ = `flow:<flow_id>` |
+| `agentflow-agents/src/db/schema.ts:2127` | `tg_lead_states` — UNIQUE (owner_user_id, account_id, peer), state ∈ {cold,warm,hot,booked,objection,spam} + idx по state/flow |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/tools/messages.py:98` | `get_dialogs` — список диалогов по `account_id`, limit |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/tools/messages.py:213` | `get_messages` — последние N сообщений в peer'е |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/tools/messages.py:60` | `send_message` — outbound через MTProto от лица аккаунта |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/tools/accounts.py:137` | `list_accounts` — какие StringSession-аккаунты доступны owner'у |
 
-## DB tables / env / API surface
+## Data flow
 
-(таблицы Postgres, env vars, REST endpoints)
+```
+                ┌───────────────────────────────────────────┐
+                │ Owner publishes preset → /me/agents/      │
+                │ sales-funnel-tg-farm/flows POST           │
+                └────────────────────┬──────────────────────┘
+                                     ↓
+            POST /me/agents/:slug/triggers (FF_AGENT_TRIGGERS=1)
+                       type=tg_event  +  tg_filter
+                                     ↓
+                  flows.enabled=true, graph stored
+                                     ↓
+[every 30s] startAgentTriggerWorker → runTriggerTick
+                                     ↓
+        processFlowTgNewMessageTriggers (FF_FLOWS + FF_TG_SALES_FUNNEL)
+                                     ↓
+   db.select(flows where enabled) → extractFlowTgNewMessage(graph)
+                                     ↓
+       cursor = tg_event_cursor[`flow:${flow.id}`].last_event_id
+                                     ↓
+   mcp telegram.get_dialogs(account_id, limit=max_chats_per_tick)
+                                     ↓ per peer
+   mcp telegram.get_messages(account_id, peer, limit=5)
+                                     ↓ filter m.id > lastSeen && !m.out
+   executeFlow({flowId, ownerUserId, graph,
+                input: {chat_id, account_id, message, message_id,
+                        _trigger:'tg.new_message'},
+                calledVia:'webhook'})
+                                     ↓
+   flow-executor walks DAG:
+     trigger.tg.new_message  →  llm.classify_intent (TEXT_SMALL)
+                                     ↓
+                              logic.branch on output.branch
+              ┌───────┬───────┬───────┴────────┬───────┐
+              ▼       ▼       ▼                ▼       ▼
+            hot    warm   objection          cold    spam
+       (typing →                            (delay
+        text+              (asset.retrieve_   60–
+        Calendly+           clip → voice/    300s →
+        agent.invoke)       video →           short
+                            agent.invoke)     tease)
+              │       │       │                │       │
+              └───────┴───────┴────────┬───────┘       │
+                                       ▼               ▼
+                            output.tag_chat → UPSERT tg_lead_states
+                                       ↓
+                cursor bump → tg_event_cursor.last_event_id = max(m.id)
+```
+
+## DB tables
+
+| Table | Purpose | Keys |
+|---|---|---|
+| `tg_links` (`schema.ts:1108`) | Kickstart-привязка bot ↔ chat (используется для inbox-стороны, не для outbound funnel) | (bot_id, chat_id) |
+| `tg_event_cursor` (`schema.ts:1148`) | Highwater per bot/flow для idempotency | bot_id PK; flow-poller хранит `flow:<id>` |
+| `tg_lead_states` (`schema.ts:2127`) | Per-chat funnel state | UNIQUE (owner_user_id, account_id, peer); idx по state, flow_id |
+| `flows` / `flow_runs` (`schema.ts`) | DAG graph + execution log | flows.enabled gate; flow_runs.status ∈ {running,done,failed} |
+| `agent_triggers` (`schema.ts:1772`) | Cron/webhook/schedule_once/tg_event rows | По одному на flow для tg_event |
+
+## Env / feature flags
+
+| Var | Default | Effect |
+|---|---|---|
+| `FF_AGENT_TRIGGERS` | off | Открывает CRUD `/me/agents/:slug/triggers` + boot'ит `agent-trigger-worker` (`server.ts:428`) |
+| `FF_FLOWS` | off | Включает flow-executor. Без него `processFlowTgNewMessageTriggers` сразу `return` (`agent-trigger-worker.ts:339`) |
+| `FF_TG_SALES_FUNNEL` | off | Дополнительный gate для TG-poller'а (`agent-trigger-worker.ts:340`) |
+| `TG_MCP_URL` | — | Endpoint Python `agentflow-tg-mcp` сервера; зовётся через `mcpDirect.callTool('telegram', ...)` |
+| `TG_API_ID` / `TG_API_HASH` / `TG_SESSION` | — | Per-account secrets, paste в Settings → Provider Keys, scope=`tg_account` |
+| `CALENDLY_LINK` | optional | Без него `tg.schedule_call` падает в text-fallback |
+| `ELEVENLABS_API_KEY` | optional | Только если хочешь TTS на лету; иначе pre-recorded `/workspace/assets/voice/*.ogg` |
+
+## API surface
+
+- `POST /me/agents/:slug/triggers` — `{type:'tg_event', tg_event_type:'tg.new_message', tg_filter?:{account_id}}` (`routes/agent-triggers.ts:44`). 503 если флаг off.
+- `GET /me/agents/:slug/triggers` — list, owner-scoped.
+- `PATCH /me/agents/:slug/triggers/:id` — toggle `enabled`, обновить `tg_filter` / `input_template`.
+- `DELETE /me/agents/:slug/triggers/:id` — удаление trigger row (flow остаётся).
+- `GET /me/flow-runs/:id` — статус выполнения отдельного запуска funnel'а.
+
+## Anti-ban правила (зашиты в `system` prompt'е preset'а)
+
+1. `poll_interval_ms ≥ 30_000` (default 60_000). Заасертано в `extractFlowTgNewMessage` config validation.
+2. `tg.send_typing` 3–10s ПЕРЕД каждым `tg.send_text` — выглядит как живой.
+3. Cold-branch: `delay.human_like {min_ms: 60000, max_ms: 300000}` ПЕРЕД выходящим — не палится частой реакцией.
+4. Outbound только на inbound (`trigger.tg.new_message`). Холодных рассылок funnel НЕ делает — для prospecting'а отдельный `tg-poster-operator`.
+5. На `FloodWait > 300s` flow_run падает в `failed`; auto-retry выключен — owner видит в `/me/flow-runs/:id`.
 
 ## Failure modes
 
-| Симптом | Лог-строка для grep | Где починить |
+| Symptom | Log signature for grep | Where to fix |
 |---|---|---|
+| Poller silent — funnel не реагирует | (нет логов — оба gate'а off) | Включить `FF_FLOWS=1` + `FF_TG_SALES_FUNNEL=1`. См. `agent-trigger-worker.ts:339-340` |
+| Cursor не читается | `tg.new_message cursor read failed` | `agent-trigger-worker.ts:359` — Postgres соединение / drift в `tg_event_cursor` |
+| MCP не отвечает (dialogs) | `tg.new_message get_dialogs failed` | `agent-trigger-worker.ts:375` — `TG_MCP_URL` reachable? Аккаунт залогинен? |
+| MCP не отвечает (messages) | `tg.new_message get_messages failed` | `agent-trigger-worker.ts:394` (DEBUG-level, потеря отдельного peer'а не фатальна) |
+| Flow упал на отдельном сообщении | `tg.new_message executeFlow failed` | `agent-trigger-worker.ts:419` — смотри `flow_runs.error` |
+| Cursor не записался | `tg.new_message cursor write failed` | `agent-trigger-worker.ts:440` — означает что в следующий tick может быть дубль `executeFlow` |
+| Tick целиком отвалился | `agent_trigger_tick_failed` | `agent-trigger-worker.ts:465` — обернутый ошибкой error на boot/runtime |
+
+## Gotchas
+
+- **Single-process poller.** `startAgentTriggerWorker` запускается только в основном API-pod'е. Если масштабируешь Hono горизонтально — добавь leader-election или поставь `FF_AGENT_TRIGGERS=1` ровно на одном реплике.
+- **`tg_lead_states` ключ — (owner, account, peer).** Один и тот же peer для двух разных TG-аккаунтов одного owner'а тегируется независимо.
+- **`m.out` фильтруется на стороне Node.** Если MTProto вернёт outgoing messages (например после `send_message`), они НЕ повторно триггерят flow.
+- **`since_strategy: 'highwater'`** — флоу не отрабатывает историю при первом включении. Если нужно — поставь `since_strategy: 'all'` в конфиге узла `trigger.tg.new_message` (но осторожно: на свежем аккаунте может прогнать тысячу диалогов).
+- **`asset.retrieve_clip` best-effort.** Возвращает `{asset_url: null}` если в `agent_resources` нет матчинга — узел `tg.send_voice` тогда fallback'ает в `tg.send_text` с тем же содержимым (см. preset `system` prompt).
 
 ## Related
 
 - [Architecture overview](/architecture/overview)
+- [Project kinds matrix](/architecture/kinds)
+- [Bot pool & auto-assign](/architecture/bot-pool)

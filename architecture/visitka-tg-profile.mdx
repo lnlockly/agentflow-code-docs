@@ -1,31 +1,121 @@
 ---
 title: "Визитка (tg_profile_bundle)"
-description: "AI-визитка из TG-профиля: pipeline, файлы, gotchas."
+description: "AI-визитка из TG-профиля: scrape → scaffold landing+bot → coder polish. Gotchas + почему превью часто показывает placeholder."
 ---
 
 # Визитка (tg_profile_bundle)
 
-> **TODO** — заполнить researcher-агентом. Стартовый skeleton.
-
 ## TL;DR
 
-(1-2 предложения)
+`kind=tg_profile_bundle` — один project = landing-визитка по @username + assistant-bot отвечающий «от лица» владельца + `/book` wizard, всё в одном pod'е. Скрейп профиля делает Jarvis Telethon перед первым ходом coder'а; платформенный scaffold (`tg-visitka-scaffold.ts`) кладёт работающий frontend+backend в `/workspace`, coder только полирует. Preview часто остаётся «Workspace ready», потому что coder либо не сделал `npm run build`, либо построил не в `/workspace/dist` — см. Failure modes.
 
 ## Files
 
-| Repo / path | Что делает |
+| Path | Role |
 |---|---|
-| `agentflow-agents/src/...` | (file ref) |
+| `agentflow-agents/src/services/tg-visitka-scaffold.ts:563` | `scaffoldTgProfileBundle` — heredoc-applier, drops 13 файлов под `/workspace/` через `code-exec.exec` |
+| `agentflow-agents/src/services/tg-visitka-scaffold.ts:598` | `TG_VISITKA_REQUIRED_PATHS` — список файлов, который тесты используют для проверки полноты scaffold'а |
+| `agentflow-agents/src/services/projects.ts:2030` | Hook site: `if (proj.kind === 'tg_profile_bundle') scaffoldTgProfileBundle({...})` (после auto-bot, до execute_in_team) |
+| `agentflow-agents/src/services/auto-scrape.ts:1` | `autoScrapeFromBrief` — извлекает @-handle из брифа и вызывает Jarvis Telethon |
+| `agentflow-agents/src/services/scrape-script.ts` | `SCRAPE_TARGET_PY` — Telethon-скрипт, который запускается в Jarvis pod'е |
+| `agentflow-agents/src/services/kind-classifier.ts:56` | LLM-описание: tg_profile_bundle wins when brief has @handle + landing + bot |
+| `agentflow-agents/src/services/kind-registry.ts:15` | Объявление `tg_profile_bundle` в `PROJECT_KINDS` |
+| `agentflow-agents/src/services/boilerplates.ts:163` | `VALID_KINDS` для `agent_boilerplates` — kind может быть `tg_profile_bundle`, но preset в presets/ для **coder-агентов** называется `coder-landing` / `coder-tg-bot` (нет отдельного preset под bundle) |
+| `agentflow-agents/src/mcp-servers/team-manager/tools/propose-project-plan.ts:93` | Описание kind для Maestro: «landing-визитка + бот-ассистент в одном проекте» |
+| `agentflow-agents/src/services/pingers/preview-placeholder.ts:33` | `STATIC_PREVIEW_KINDS = {'landing','spa','mini_app'}` — **tg_profile_bundle сюда НЕ включён**, поэтому placeholder-gate для него не срабатывает |
 
-## DB tables / env / API surface
+## Data flow
 
-(таблицы Postgres, env vars, REST endpoints)
+```
+POST /me/projects { brief="@username сделай мне визитку и бота" }
+        ↓
+kind-classifier.ts → kind=tg_profile_bundle (regex matches @handle + landing + bot)
+        ↓
+runMaestroProposeBackground → proposed_plan
+        ↓
+POST /me/projects/:id/approve → runProjectApprovalBackground
+        ↓
+provisionWorkspaceWithRetry → workspace_ready event
+        ↓
+autoScrapeFromBrief: Jarvis exec Telethon → project_artifacts (JSON + avatar b64)
+        ↓
+materializeScrapedArtifactsInPod: → /workspace/scraped_<u>.json + /workspace/public/<u>_avatar.jpg
+        ↓
+autoCreateTelegramBot: pool entry → projects.bot_username + BOT_TOKEN secret
+        ↓
+scaffoldTgProfileBundle(projectId, ownerUserId, workspaceProjectName)
+   ├─ writes frontend/ (Vite+React, App.tsx, app.css, vite.config.ts)
+   ├─ writes backend/ (bot.py aiogram, profile_loader.py)
+   ├─ writes scripts/build-profile.sh (renders profile.json + копирует avatar)
+   ├─ writes Procfile: `web: build → http.server 8080` + `bot: python3 backend/bot.py`
+   └─ each file guarded by `[ ! -f path ]` — НЕ перетирает coder'ские правки
+        ↓
+runProjectExecutionBackground → coder агент дополирует / запускает npm install + build + deploy
+```
 
-## Failure modes
+## DB / Env / API
 
-| Симптом | Лог-строка для grep | Где починить |
+### DB
+- `projects.kind = 'tg_profile_bundle'` (validated в `kind-registry.ts:8`, `boilerplates.ts:163`).
+- `project_artifacts` rows: kind=`scrape`, `meta.photo_b64` base64-encoded avatar, capped 512 KiB (`PHOTO_MAX_BYTES` в `auto-scrape.ts:48`).
+- `project_events`: `workspace_ready`, `auto_scrape_post_ws_failed`, `tg_visitka_scaffold` (info), `tg_visitka_scaffold_failed`, `tg_visitka_scaffold_exception`.
+
+### Env
+- `JARVIS_OWNER_USER_ID` (default `1`) / `JARVIS_WORKSPACE_PROJECT_NAME` (default `proj-71506e1l`) — pod где живёт Telethon scrape.
+- `FF_AUTO_SCRAPE_ON_CREATE=1` — без него scrape skip.
+- `BOT_TOKEN_POOL` (auto-bot пользуется тем же путём что и `tg_bot`).
+- `FF_AUTO_BOT_CREATE_BOTFATHER=1` — fallback на BotFather mint если пул пуст.
+
+### API
+- `POST /me/projects` — bundle проект создаётся как любой другой; classifier выбирает kind=tg_profile_bundle автоматически или клиент шлёт `kind: 'tg_profile_bundle'` explicit.
+- `POST /me/projects/:id/approve` — стартует scaffold (см. flow выше).
+- `GET /me/projects/:id` — поле `kind` и `workspace_project_name` в ответе.
+- `GET /me/projects/:id/files` — после scaffold'а вернёт `frontend/`, `backend/`, `Procfile`, `scripts/build-profile.sh`.
+
+## Что coder-agent ДОЛЖЕН сделать
+
+Procfile, который scaffold кладёт, ожидает что в `/workspace/dist` лежат финальные ассеты. Шаг web в Procfile делает это явно:
+
+```
+web: bash scripts/build-profile.sh && cd frontend && npm install --no-audit --no-fund && npm run build && cd .. && (cd dist && python3 -m http.server 8080)
+```
+
+`vite.config.ts` (внутри scaffold'а на `tg-visitka-scaffold.ts:262`) указывает `build: { outDir: '../dist', emptyOutDir: true }`. То есть финальная цель — **/workspace/dist/index.html** с реальным контентом, а Caddy preview-sidecar забирает оттуда.
+
+## Почему preview часто остаётся placeholder
+
+| Корневая причина | Как проявляется | Где починить |
 |---|---|---|
+| Coder забыл запустить `npm install + npm run build` | `/workspace/dist` пуст или отсутствует — Caddy fallback'ает на свой stub `<title>Workspace ready</title>` | `src/services/tg-visitka-scaffold.ts:471` (Procfile) — убедиться что web-line запустилась успешно |
+| Procfile web падает на `npm install` (out-of-space, registry timeout) | Pod logs: `npm ERR! code ENOSPC` или `network timeout` | Pod resources / увеличить PVC / прокси |
+| `vite build` пишет в `frontend/dist`, а сервер ждёт `/workspace/dist` | Caddy видит `/workspace/dist` пустым | Уже исправлено в scaffold: `build.outDir: '../dist'` (`tg-visitka-scaffold.ts:262`). Если coder перезаписал `vite.config.ts` — вернуть `'../dist'` |
+| `tg_profile_bundle` НЕ в `STATIC_PREVIEW_KINDS` | Placeholder gate (PR #191 family — preview-placeholder.ts) **не блокирует** finalize, поэтому проект уезжает в `status=done` с stub'ом | `src/services/pingers/preview-placeholder.ts:33` — добавить `tg_profile_bundle` в set, либо отдельно гейтить bundle |
+| Coder-agent не запустил deploy step | preview_url null, dashboard показывает Caddy default | `src/services/pool-worker/post-build.ts` — deploy-finalize hook, и проверить landed `plan_tasks` |
+| Avatar не materialize'нулся → `<img>` 404 | `materialize_scraped_failed: …` в project_events | `src/services/projects.ts:1998` (catch) + auto-scrape pipeline |
+| LLM helper отсутствует → бот отвечает шаблоном | `[bot] designapi helper failed: …` | Helper-installer (`installDesignapiHelper`) — `src/services/designapi-helper.ts` |
+
+## Failure modes (log strings)
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Scaffold упал | `tg_visitka_scaffold_failed: exit=` | `src/services/tg-visitka-scaffold.ts:585` |
+| Scaffold exception | `tg_visitka_scaffold_exception:` | `src/services/tg-visitka-scaffold.ts:592` |
+| Scrape после workspace_ready упал | `auto_scrape_post_ws_failed:` | `src/services/projects.ts:1983` |
+| Артефакты не докинуты в pod | `materialize_scraped_failed:` | `src/services/projects.ts:1998` |
+| Auto-bot не нашёл свободного токена | `auto-bot: no available bot tokens (pool exhausted, BotFather unavailable)` | `src/services/auto-bot.ts:263` |
+| Бот не отвечает (нет helper'а) | `[bot] designapi helper failed:` | `src/services/tg-visitka-scaffold.ts:384` (template) |
+| Preview = placeholder | `caddy_workspace_ready_title` | `src/services/pingers/preview-placeholder.ts:125` |
+
+## Что зашито в template (читай scaffold.ts ПЕРЕД тем как править bot.py)
+
+- `backend/bot.py` (`tg-visitka-scaffold.ts:305`): aiogram 3.x, `BOT_TOKEN` берётся из env или `/workspace/bot_token.txt`. LLM-callout через `subprocess.run(['python3', '/workspace/.tools/designapi.py', ...])` — **никогда не хардкодить модель**. Fallback: deterministic «Записал ваш вопрос…» когда helper отсутствует.
+- `backend/profile_loader.py` (`tg-visitka-scaffold.ts:39`): нормализует `/workspace/scraped_*.json` в `{username, display_name, title, about, audience_size, avatar_path, posts[]}`. Берёт первый файл по `sorted(glob)`.
+- `frontend/src/App.tsx` (`tg-visitka-scaffold.ts:112`): hero + posts grid + CTA-кнопки. Аватар по `./avatar.jpg`, profile по `./profile.json`.
+- `scripts/build-profile.sh` (`tg-visitka-scaffold.ts:288`): рендерит `frontend/public/profile.json` и копирует `*_avatar.jpg` из `/workspace/public/` в `frontend/public/`.
+- `Procfile` — два процесса (web + bot), supervisor поднимает оба.
 
 ## Related
 
+- [Bot pool & auto-assign](/architecture/bot-pool)
+- [Project kinds matrix](/architecture/kinds)
 - [Architecture overview](/architecture/overview)
