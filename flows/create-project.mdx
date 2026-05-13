@@ -100,9 +100,59 @@ pool-worker startPoolWorker drains plan_tasks  — pool-worker/index.ts:38
 | Kind classify даёт `null` | `classify_unknown_kind` | `services/kind-classifier.ts:90` |
 | Pool worker не подхватывает | `pool_tick_failed` или paused | `services/pool-worker/claim.ts:33` (paused gate) |
 
+## Frontend entry: CreateProjectModal
+
+The user-facing entry point is **not** the Studio prompt anymore. The
+`/projects` dashboard mounts `CreateProjectModal`, a 5-tile kind picker
+that pre-classifies the project kind on the client and POSTs
+`{ brief, kind, title }` to `/me/projects` directly — the backend can skip
+`classifyBriefKind` because `kind` is already set.
+
+| File | Role |
+|---|---|
+| `agentflow-landing/src/pages/ProjectsDashboard.tsx:43` | Mounts the modal; "New" button toggles `createOpen`. |
+| `agentflow-landing/src/components/projects/CreateProjectModal.tsx:48` | `TILES` array (5 tiles). |
+| `agentflow-landing/src/components/projects/CreateProjectModal.tsx:24` | `TileDef` discriminated union (`mode: 'project' \| 'external'`). |
+| `agentflow-landing/src/components/projects/CreateProjectModal.tsx:213` | `IntakeForm.handleSubmit` — per-kind brief/title shaping. |
+| `agentflow-landing/src/lib/agentsApi.ts:754` | `createProject(brief, title, _, _, kind, _)` → `POST /me/projects`. |
+
+The five tiles map to backend kinds (see [Project kinds](/architecture/kinds)
+for the canonical enum):
+
+| Tile | `mode` | Backend `kind` | Title shape |
+|---|---|---|---|
+| AI-визитка | `project` | `tg_profile_bundle` | `AI-визитка @<username>` |
+| Telegram-бот | `project` | `tg_bot` | `<bot name>` |
+| **TG-ферма** | `external` | — (NOT a backend kind) | — navigates to `/agents/sales-funnel-tg-farm` |
+| Лендинг | `project` | `landing` | first line ≤ 60 chars |
+| Mini App | `project` | `mini_app` | first line ≤ 60 chars |
+
+The TG-ферма tile is the only `mode: 'external'` entry. Clicking it
+calls `onClose()` then `navigate('/agents/sales-funnel-tg-farm')` — no
+project row is created. The TS discriminated union prevents
+`createProject({ kind: 'tg_farm' })` from compiling, so the frontend
+cannot accidentally POST an unknown kind. The target route is currently
+a TBD landing tagged with a `TODO(team ship-base/ferma-auditor)` comment
+in the TILES array — it may 404 in production until the
+sales-funnel-tg-farm agent page ships.
+
+The `tg_bot` intake has **no BOT_TOKEN field** — the platform drains a
+token from `BOT_TOKEN_POOL` after `workspace_ready` via
+`agentflow-agents/src/services/auto-bot.ts:142`. See
+[Auto-bot assign](/flows/auto-bot-assign).
+
+Mobile: tile grid uses `grid-template-columns: repeat(auto-fit, minmax(220px, 1fr))`
+so it collapses 3 → 2 → 1 column down to 360px viewport without a media
+query.
+
+For full frontend behaviour and the `ProjectCard` kind-accent, see
+[Projects frontend](/subsystems/projects-frontend).
+
 ## Related
 
 - [Architecture overview](/architecture/overview)
+- [Project kinds](/architecture/kinds)
+- [Projects frontend](/subsystems/projects-frontend)
 - [Auto-bot assign](/flows/auto-bot-assign)
 - [Project lifecycle](/flows/project-lifecycle)
 - [Preview deploy](/flows/preview-deploy)

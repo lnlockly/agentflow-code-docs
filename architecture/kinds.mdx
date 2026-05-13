@@ -26,6 +26,36 @@ description: "landing / spa / tg_bot / mini_app / tg_profile_bundle — что �
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
 
+## Per-kind UI surface
+
+The `/projects` dashboard renders kind-aware accents on each card via the
+`KindAccent` helper in `agentflow-landing/src/components/projects/ProjectCard.tsx:38`.
+Each kind has its own lucide icon and an inline context line in the card
+meta row:
+
+| Backend `kind` | Icon (lucide) | Subtitle | Source field |
+|---|---|---|---|
+| `tg_profile_bundle` | `IdCard` | `AI-визитка @<tg_username>` ‖ plain `AI-визитка` | `project.detail_meta.tg_username` ‖ `.username` ‖ `.source_username` |
+| `tg_bot` | `Bot` | `@<bot_username>` ‖ `Бот ещё не назначен` | `project.bot_username` |
+| `landing` / `mini_app` / `spa` / other | (none) | plain kind label | `project.kind` |
+
+`detail_meta` is the optional `Record<string, unknown>` on
+`ProjectSummary` (`agentflow-landing/src/lib/agentsApi.ts:506`) populated
+by Виртуоз / scrape jobs. When the scraper has not yet written the
+handle, the accent falls back to the plain kind label without throwing.
+
+For the matching create-time UI (5-tile kind picker), see the
+[Frontend entry section in Create project flow](/flows/create-project)
+and [Projects frontend](/subsystems/projects-frontend).
+
+Note: **`tg_farm` is NOT a value in this enum.** The TG-ферма tile in
+the create modal navigates to `/agents/sales-funnel-tg-farm` instead of
+calling `POST /me/projects`; TG-ферма is an agent that runs on a TG
+account, not a project kind.
+
 ## Related
 
 - [Architecture overview](/architecture/overview)
+- [Projects frontend](/subsystems/projects-frontend)
+- [Create project flow](/flows/create-project)
+- [Add new kind](/runbooks/add-new-kind)
