@@ -1,0 +1,153 @@
+---
+title: "Graph executor — node handlers"
+description: "Typed handler registry: every node id in agent_boilerplates.workflow_schema maps to a handler that wraps an existing service or delegates to a coder agent with a tight brief."
+---
+
+# Graph executor — node handlers
+
+## TL;DR
+
+The walker resolves each `WorkflowNode.id` to a typed handler via
+`defaultRegistry.resolve(kind)`. 22 unique node ids ship across the 5
+seeded boilerplates; each has a handler under
+`src/services/graph-executor/handlers/<group>.ts`. Deterministic work
+(deploy, scrape, smoke-test, request_token) wraps an existing service in
+≤20 LOC. Generative work (pick_theme, scaffold_*, *_flow) goes to a
+per-node coder-delegate with a tight `OUTPUT_EXPECTED` envelope so the
+walker can validate the result.
+
+Contract: [`architecture/graph-executor.mdx`](/architecture/graph-executor).
+
+## Boilerplate × node id matrix
+
+Source: prod `agent_boilerplates.workflow_schema` (10 rows, 5 seeded).
+
+| id | kind | name | nodes |
+|---|---|---|---|
+| 3  | spa | vite-react-ts | (empty — stub) |
+| 4  | api | fastapi-best-practices | (empty — stub) |
+| 5  | landing | vite-react-tailwind-min | (empty — stub) |
+| 6  | mini_app | mini-app-fullstack | `scaffold_vite, tg_webapp_init, routes, deploy` |
+| 8  | landing | vite-react-tailwind-shadcn | (empty — stub) |
+| 12 | tg_bot | tg-bot-full | `request_token, scaffold_aiogram, smoke_test, self_heal_loop, deploy` |
+| 13 | tg_bot | tg-bot-minimal | (empty — stub) |
+| 14 | spa | webapp-full | `scaffold_nest, scaffold_prisma, jwt_auth, billing_stripe, multi_tenant, admin_panel, deploy` |
+| 15 | landing | landing-full | `pick_theme, generate_sections, seo_optimize, deploy_caddy` |
+| 18 | tg_profile_bundle | tg-profile-bundle | `scrape_tg, render_landing, deploy_landing, scaffold_bot, wire_designapi, deploy_bot, booking_flow` |
+
+Empty `workflow_schema` rows ship with a stub graph; the walker falls
+through to maestro for them until task #11 (TG-templates expansion)
+seeds the remaining 5.
+
+## Handler registry
+
+| node id | file | wraps | retry (max / backoff / idempotent) | timeout |
+|---|---|---|---|---|
+| `deploy` | `handlers/shared.ts` | `runtime-supervisor.deploy(projectId, ownerUserId, {source:'always_on'})` | 2 / 5s / true | 600s |
+| `deploy_caddy` | `handlers/landing.ts` | `build-node-wrappers.runBuildCaddyRoute` → code-exec `expose_public` | 2 / 5s / true | 120s |
+| `deploy_landing` | `handlers/tg-profile-bundle.ts` | `runtime-supervisor.deploy({source:'flag_gated'})` | 2 / 5s / true | 600s |
+| `deploy_bot` | `handlers/tg-profile-bundle.ts` | `runtime-supervisor.deploy({source:'always_on'})` | 2 / 5s / true | 600s |
+| `scrape_tg` | `handlers/tg-profile-bundle.ts` | `build-node-wrappers.runBuildScrapeTgProfile` → `auto-scrape.scrapeOneTarget` / `autoScrapeFromBrief` | 2 / 5s / true | 240s |
+| `request_token` | `handlers/tg-bot.ts` | `auto-bot.autoCreateTelegramBot` (pool → BotFather fallback) | 2 / 5s / true | 180s |
+| `smoke_test` | `handlers/tg-bot.ts` | `bot-auto-tester.runBotSmokeTest` | 1 / 10s / true | 240s |
+| `self_heal_loop` | `handlers/tg-bot.ts` | `self-heal-bot.createSmokeFixTask` (reads `ctx.steps['smoke_test'].output.report`) | 0 / 0s / false | 60s |
+| `wire_designapi` | `handlers/tg-profile-bundle.ts` | `build-node-wrappers.runBuildWireDesignapi` → designapi-helper agent | 1 / 5s / false | 90s |
+| `pick_theme` | `handlers/landing.ts` | coder-landing delegate (writes `/workspace/.runtime/theme.json`) | 1 / 3s / false | 600s |
+| `generate_sections` | `handlers/landing.ts` | coder-landing delegate (9 section TSX components) | 1 / 3s / false | 600s |
+| `seo_optimize` | `handlers/landing.ts` | coder-landing delegate (meta + sitemap.xml + robots.txt) | 1 / 3s / false | 600s |
+| `render_landing` | `handlers/landing.ts` | coder-landing delegate (renders from `ctx.steps.scrape_tg.output`) | 1 / 3s / false | 600s |
+| `scaffold_aiogram` | `handlers/tg-bot.ts` | coder-tg-bot delegate (bot.py + Procfile) | 1 / 3s / false | 600s |
+| `scaffold_bot` | `handlers/tg-profile-bundle.ts` | coder-tg-bot delegate (in-place bot inside the visitka bundle) | 1 / 3s / false | 600s |
+| `booking_flow` | `handlers/tg-profile-bundle.ts` | coder-backend delegate (SQLite `bookings` + TG handler) | 1 / 3s / false | 600s |
+| `scaffold_vite` | `handlers/mini-app.ts` | coder-spa delegate (Vite + React + @twa-dev/sdk) | 1 / 3s / false | 600s |
+| `tg_webapp_init` | `handlers/mini-app.ts` | coder-spa delegate (initData validation + tma-auth route) | 1 / 3s / false | 600s |
+| `routes` | `handlers/mini-app.ts` | coder-spa delegate (react-router + TG BackButton/MainButton) | 1 / 3s / false | 600s |
+| `scaffold_nest` | `handlers/spa.ts` | coder-backend delegate (NestJS 11 skeleton) | 1 / 3s / false | 600s |
+| `scaffold_prisma` | `handlers/spa.ts` | coder-backend delegate (Prisma 6 + User/Org/Membership) | 1 / 3s / false | 600s |
+| `jwt_auth` | `handlers/spa.ts` | coder-backend delegate (passport-jwt + /auth routes) | 1 / 3s / false | 600s |
+| `billing_stripe` | `handlers/spa.ts` | coder-backend delegate (Stripe Checkout + webhook) | 1 / 3s / false | 600s |
+| `multi_tenant` | `handlers/spa.ts` | coder-backend delegate (X-Org-Id + Membership guard) | 1 / 3s / false | 600s |
+| `admin_panel` | `handlers/spa.ts` | coder-spa delegate (React admin under admin-frontend/) | 1 / 3s / false | 600s |
+
+Coder-fallback (`kind: '__coder__'`,
+[`graph-executor/coder-fallback.ts:39`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/graph-executor/coder-fallback.ts#L39))
+fires only for unknown node ids — registered handlers above resolve
+without falling back. The coverage gate is enforced by
+[`tests/unit/graph-executor/handlers/registry-coverage.test.ts`](https://github.com/lnlockly/agentflow-agents/blob/main/tests/unit/graph-executor/handlers/registry-coverage.test.ts).
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/graph-executor/handlers/index.ts` | Registration entry point — `import './<group>.js'` for each handler file (side-effect imports trigger `defaultRegistry.register(...)`) |
+| `agentflow-agents/src/services/graph-executor/handlers/shared.ts` | `deploy` (one handler covers tg_bot/spa/mini_app deploy) |
+| `agentflow-agents/src/services/graph-executor/handlers/landing.ts` | `pick_theme, generate_sections, seo_optimize, render_landing, deploy_caddy` |
+| `agentflow-agents/src/services/graph-executor/handlers/tg-bot.ts` | `request_token, scaffold_aiogram, smoke_test, self_heal_loop` |
+| `agentflow-agents/src/services/graph-executor/handlers/tg-profile-bundle.ts` | `scrape_tg, deploy_landing, scaffold_bot, wire_designapi, deploy_bot, booking_flow` |
+| `agentflow-agents/src/services/graph-executor/handlers/mini-app.ts` | `scaffold_vite, tg_webapp_init, routes` |
+| `agentflow-agents/src/services/graph-executor/handlers/spa.ts` | `scaffold_nest, scaffold_prisma, jwt_auth, billing_stripe, multi_tenant, admin_panel` |
+| `agentflow-agents/tests/unit/graph-executor/handlers/registry-coverage.test.ts` | Asserts every seeded node id resolves without falling back |
+| `agentflow-agents/tests/unit/graph-executor/handlers/coder-delegate.test.ts` | Asserts brief envelope shape per coder-delegate handler |
+| `agentflow-agents/tests/unit/graph-executor/handlers/deterministic.test.ts` | Asserts retry policy + source-level delegation for deterministic handlers |
+
+## Data flow
+
+```
+WorkflowSchema (from agent_boilerplates row)
+        │
+        ▼
+walker.run({ projectId, workflowSchema })
+        │
+        ▼ Kahn topo sort, parallel where in_edges = 0
+NodeKind ── resolveHandler(kind) ──► defaultRegistry.resolve
+                                          │
+        ┌─────────────────────────────────┴──────────────────────────────────┐
+        ▼                                                                    ▼
+deterministic handler                                           coder-delegate handler
+  (deploy, scrape_tg, smoke_test,                                 (pick_theme, scaffold_*,
+   request_token, deploy_caddy, …)                                 booking_flow, …)
+        │                                                                    │
+        ▼                                                                    ▼
+wraps existing service                                          ctx.coderInvoke({
+(runtime-supervisor.deploy,                                       slug, brief,
+ auto-bot.autoCreateTelegramBot,                                  expects: [files...],
+ bot-auto-tester.runBotSmokeTest,                                 timeoutMs })
+ build-node-wrappers.run*)                                                  │
+        │                                                                    ▼
+        │                                                          coder-tg-bot / coder-landing /
+        ▼                                                          coder-spa / coder-backend
+output validated against handler.outputSchema (zod)
+        │
+        ▼
+ctx.emit({ kind: 'node_finished', payload: { output } })
+```
+
+## DB / Env / API
+
+- Tables: none new — uses `project_events`, `projects`, `project_secrets`, `pipeline_runs` view.
+- Env:
+  - `BOT_TOKEN_POOL` — read inside `request_token` → `auto-bot.autoCreateTelegramBot` only. Handlers never touch process.env directly.
+  - `FF_AUTO_BOT_CREATE_BOTFATHER` — same.
+  - `RUNTIME_SUPERVISOR_ENABLED` — gates the `flag_gated` path used by `deploy_landing`.
+- Routes: none new. Events stream via `GET /me/pipelines/:id/events` SSE (consumed by `CanvasLive`).
+- MCP tools called by handlers: `code-exec.expose_public` (deploy_caddy), `code-exec.exec` (transitively via wrappers).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Node falls through to coder-fallback in prod | `[graph-executor] handler missing for kind=<id>, delegating to coder-agent` | Add handler under `handlers/<group>.ts` and re-run `tests/unit/graph-executor/handlers/registry-coverage.test.ts` |
+| `request_token` returns assigned=true but bot has no `BOT_TOKEN` secret | `[auto-bot] pool empty and FF_AUTO_BOT_CREATE_BOTFATHER off, skipping` | Refill pool OR set the flag; see [bot-pool](/architecture/bot-pool) |
+| `smoke_test` output has `report.skipped` | `bot_smoke_skipped` in `project_events` | Tester unavailable (no TG account). Configure a tester account; not a handler bug |
+| `self_heal_loop` returns task_created=false skipped=`no_smoke_report_in_steps` | `no_smoke_report_in_steps` (literal in handler) | Upstream `smoke_test` didn't run before `self_heal_loop` — fix the edge in `agent_boilerplates.workflow_schema` |
+| `scrape_tg` rejects with `scrape_tg_requires_username_or_brief` | grep handler source | Node config must include `username` or `brief` — fix the seed |
+| Coder reply missing `files_written` array | handler returns `files_written: []` and walker per-kind policy decides | If kind is `fail-fast` on this node, brief was too broad — tighten `output_expected` in the registration |
+| Duplicate handler registration on boot | `duplicate_handler:<kind>` thrown at module load | Two registrations for one `kind` — remove the second one |
+
+## Related
+
+- [Graph executor (contract & spec)](/architecture/graph-executor)
+- [Bot pool & auto-assign](/architecture/bot-pool) — `request_token` handler
+- [Визитка (tg_profile_bundle)](/architecture/visitka-tg-profile) — `scrape_tg + render_landing + scaffold_bot + booking_flow` chain
+- [Kinds](/architecture/kinds) — per-kind DAG to handler map
+- [Runtime supervisor](/subsystems/runtime-supervisor) — `deploy*` family

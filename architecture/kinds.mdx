@@ -11,6 +11,26 @@ description: "landing / spa / tg_bot / mini_app / tg_profile_bundle — что �
 
 (1-2 предложения)
 
+## DAG → handler map
+
+Each `agent_boilerplates` row carries a `workflow_schema = {nodes, edges}`.
+The graph executor resolves every node id through `defaultRegistry`
+([`src/services/graph-executor/registry.ts:71`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/graph-executor/registry.ts#L71))
+to a typed handler. Full per-node table:
+[Graph handlers](/subsystems/graph-handlers).
+
+| Kind | Seeded DAG (nodes in topo order) | Per-kind on-failure |
+|---|---|---|
+| `landing` (id=15 landing-full) | `pick_theme → generate_sections → seo_optimize → deploy_caddy` | fail-fast on `deploy_caddy`; continue on `seo_optimize` |
+| `tg_bot` (id=12 tg-bot-full) | `request_token → scaffold_aiogram → smoke_test ↔ self_heal_loop → deploy` | fail-fast on `request_token` + `deploy`; continue on `smoke_test` (auto-fix loop) |
+| `spa` (id=14 webapp-full) | `scaffold_nest → scaffold_prisma → jwt_auth → {billing_stripe, multi_tenant → admin_panel} → deploy` | fail-fast on `scaffold_nest` + `deploy`; continue on `admin_panel` + `multi_tenant` |
+| `mini_app` (id=6 mini-app-fullstack) | `scaffold_vite → tg_webapp_init → routes → deploy` | fail-fast on `scaffold_vite` + `deploy` |
+| `tg_profile_bundle` (id=18) | `scrape_tg → render_landing → deploy_landing` and `scrape_tg → scaffold_bot → wire_designapi → deploy_bot → booking_flow` | fail-fast on `scrape_tg`, `deploy_landing`, `deploy_bot`; continue on `booking_flow` |
+| `api` (id=4 stub) | empty — maestro freestyle until task #11 seeds | n/a |
+
+Empty seeds (`id ∈ {3, 4, 5, 8, 13}`) fall through to maestro until
+their `workflow_schema` ships in task #11.
+
 ## Files
 
 | Repo / path | Что делает |
