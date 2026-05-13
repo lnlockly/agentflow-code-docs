@@ -1,0 +1,477 @@
+---
+title: "Diploma: outreach → intent → sub-build composite"
+description: "Single DAG demonstrating AgentFlow's full power — TG outreach + LLM intent classification + sub-project creation + delivery."
+---
+
+# Diploma showcase
+
+> **Status (2026-05-13):** spec-only. Walker + handler registry land in
+> tasks #7 / #8; this page declares the contract for the composite DAG
+> handlers required to turn the spec into a shippable boilerplate. No
+> code yet. Impl is task #13-followup.
+
+## TL;DR
+
+One DAG, one screenshot, the whole platform.
+
+The owner picks `TG-outreach → AI-build (diploma)` from the templates
+marketplace. The graph wakes up @avsee4 (the owner's own TG session,
+account_id=4 in the [tg-mcp pool](/subsystems/tg-mcp)), DMs @MLM808 an
+AgentFlow pitch, waits for a reply, classifies intent with TEXT_SMALL,
+and — when the reply is "хочу визитку" or "хочу бота" — spawns a child
+project of the matching kind ([`tg_profile_bundle`](/architecture/visitka-tg-profile)
+or `tg_bot`) whose brief advertises @MLM808 himself. When the sub-project
+flips to `status=done`, the parent DAG closes the loop by DMing the
+preview URL / bot username back to @MLM808.
+
+That's the demo: outreach (ферма primitives) + AI classification
+(flow-executor primitives) + sub-project creation (`/me/projects`
+internal call) + delivery (back to TG) — all in one
+`workflow_schema` consumed by the
+[graph executor](/architecture/graph-executor) and rendered live on
+`CanvasLive` while it runs.
+
+## Workflow DAG
+
+```
+trigger.manual
+  │ (optional: trigger.cron "0 10 * * *" — daily 10:00 outreach)
+  ▼
+tg.get_user[account_id=4, peer=@MLM808]
+  │ output: {username, first_name, bio, photo_url}
+  ▼
+tg.send_text[account_id=4, peer=@MLM808,
+             text="<rendered pitch using {{contact.first_name}}>"]
+  │ output: {message_id}
+  ▼
+tg.wait_reply[account_id=4, peer=@MLM808,
+              since_message_id={{steps.tg.send_text.output.message_id}},
+              timeout_ms=86_400_000  (24h)]
+  │ output: {received, message:{id,text}, waited_ms}
+  ▼
+llm.classify_intent[message="{{steps.tg.wait_reply.output.message.text}}",
+                    taxonomy=["visitka","bot","refuse","ambiguous"],
+                    clarify_max=2,
+                    clarify_send=tg.send_text(account_id=4, peer=@MLM808)]
+  │ output: {intent, confidence, reasoning, clarify_rounds}
+  ▼
+  ├─ intent == "visitka"
+  │     ▼
+  │   project.create_sub[kind="tg_profile_bundle",
+  │                      brief=<visitka template>,
+  │                      parent_project_id={{ctx.projectId}},
+  │                      seed={"detail_meta":{"tg_username":"MLM808"}}]
+  │     │ output: {sub_project_id, sub_project_slug}
+  │     ▼
+  │   project.wait_done[project_id={{steps.project.create_sub.output.sub_project_id}},
+  │                     timeout_ms=1_800_000  (30 min)]
+  │     │ output: {status, preview_url, bot_username?}
+  │     ▼
+  │   tg.send_text[account_id=4, peer=@MLM808,
+  │                text="готова твоя визитка: {{steps.project.wait_done.output.preview_url}}"]
+  │     ▼
+  │   tg_lead_states.update[stage="booked",
+  │                         meta={"asset":"visitka",
+  │                               "sub_project_id":{{...}}}]
+  │
+  ├─ intent == "bot"
+  │     ▼
+  │   project.create_sub[kind="tg_bot",
+  │                      brief=<bot template>,
+  │                      parent_project_id={{ctx.projectId}}]
+  │     ▼
+  │   project.wait_done[...]
+  │     ▼
+  │   tg.send_text[text="готов твой бот: @{{steps.project.wait_done.output.bot_username}}"]
+  │     ▼
+  │   tg_lead_states.update[stage="booked", meta={"asset":"bot"}]
+  │
+  └─ intent == "refuse"
+        ▼
+      tg_lead_states.update[stage="refused", meta={"reason":<reasoning>}]
+```
+
+Branch fan-out uses the [per-kind on-failure policy](/architecture/graph-executor#per-kind-policy)
+`fail-fast` on `project.create_sub`/`project.wait_done` (no delivery if
+the sub-project never lands) and `continue` on `tg_lead_states.update`
+(audit-only, don't fail the demo over a stage write).
+
+The `ambiguous` branch is **not** an edge in the DAG. Per
+[graph-executor.mdx — Risks](/architecture/graph-executor#risks--open-questions)
+the walker doesn't loop; the `llm.classify_intent` handler absorbs the
+clarify loop internally (`clarify_max=2` config), sends the
+"визитка или бота?" prompt via the injected `clarify_send` action, and
+re-polls `tg.wait_reply` against the same peer. The handler returns a
+terminal intent (`visitka` | `bot` | `refuse`) or `ambiguous` after the
+cap — in which case the graph terminates with a `node_failed
+reason='intent_unresolved'`. No DAG cycle, walker happy.
+
+## New node handlers required
+
+Every node id below MUST be declared per the
+[NodeHandler contract](/architecture/graph-executor#contract). `kind`,
+`inputSchema`, `outputSchema`, `retryPolicy`, `timeoutSec`. Side-effects
+go through `ctx.codeExec` / `ctx.emit` / `ctx.llm` — never raw imports.
+
+### 1. `tg.send_text` — existing, re-exported
+
+| Field | Value |
+|---|---|
+| Source of truth | [`flow-executor.ts:455`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/flow-executor.ts#L455) `runTgSendText` |
+| Delegates to | tg-mcp `send_message` ([`messages.py:60`](https://github.com/lnlockly/agentflow-tg-mcp/blob/main/src/agentflow_tg_mcp/tools/messages.py#L60)) |
+| Input | `{ peer: string, text: string, account_id?: number, reply_to?: number }` |
+| Output | `{ ok: true, message_id: number, ... }` (tg-mcp passthrough) |
+| Retry | `{ max: 2, backoffMs: 5_000, idempotent: false }` — re-sending dupes the DM; rely on flood-wait detection (see Failure modes) |
+| Timeout | 15s |
+| Notes | The teammate brief called this `tg.send_dm`. The platform name is `tg.send_text` — DAG uses the existing kind, no alias |
+
+### 2. `tg.wait_reply` — existing, re-exported
+
+| Field | Value |
+|---|---|
+| Source of truth | [`flow-executor.ts:575`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/flow-executor.ts#L575) `runTgWaitReply` |
+| Input | `{ peer: string, since_message_id?: number, account_id?: number, timeout_ms?: number, poll_interval_ms?: number }` |
+| Output | `{ received: boolean, message?: {id,text}, waited_ms, timed_out?: true }` |
+| Retry | `{ max: 0, idempotent: true }` — single in-handler poll loop, no walker-level retry |
+| Timeout | `timeoutSec = (timeout_ms / 1000) + 30` (handler enforces its own cap; walker is the outer ceiling) |
+| Gotcha | Today's hard ceiling in flow-executor is **30 min** ([`flow-executor.ts:580`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/flow-executor.ts#L580)). The diploma DAG wants 24h. Two options: (a) bump the ceiling for graph-executor wrap, (b) async-suspend the walker (`node_waiting` event, resume on inbound webhook). **Option (a) is acceptable for the diploma demo (k3s worker stays up); option (b) is the right long-term answer and is flagged in graph-executor.mdx → Risks "ферма long-running poll" as future work.** Spec assumes (a) for v1 |
+
+### 3. `llm.classify_intent` — existing kind, extended config
+
+| Field | Value |
+|---|---|
+| Source of truth | [`flow-executor.ts:615`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/flow-executor.ts#L615) `runLlmClassifyIntent` |
+| Today | Returns `{intent, confidence, reasoning, raw, model}` for a fixed taxonomy (`hot|warm|objection|cold|spam`) — sales-funnel preset |
+| Extension required | Accept arbitrary `taxonomy: string[]` (already does); accept optional `clarify_max: number` + `clarify_send: { kind, config }` so the handler can resolve `ambiguous` by sending one clarification and re-polling `tg.wait_reply`. **Internal-only loop — no DAG cycle.** |
+| Input (extended) | `{ message: string, taxonomy: string[], clarify_max?: number, clarify_send?: { peer, account_id, text }, peer?: string, account_id?: number }` |
+| Output | `{ intent: 'visitka'\|'bot'\|'refuse'\|'ambiguous', confidence: number, reasoning: string, clarify_rounds: number, model: string }` |
+| Retry | `{ max: 1, idempotent: false }` — LLM call costs; one walker-level retry only |
+| Timeout | 60s × (1 + clarify_max) — handler ceiling: 180s for clarify_max=2 |
+| Failure surface | Returns `intent='ambiguous'` after `clarify_max` rounds → per-kind policy in the diploma boilerplate maps this to `fail-fast` with `reason='intent_unresolved'` |
+
+### 4. `tg.get_user` — NEW handler
+
+| Field | Value |
+|---|---|
+| File | `agentflow-agents/src/services/graph-executor/handlers/tg.get_user.ts` (new) |
+| Delegates to | tg-mcp `get_full_user` ([`server.py:105`](https://github.com/lnlockly/agentflow-tg-mcp/blob/main/src/agentflow_tg_mcp/server.py#L105)) |
+| Input | `{ peer: string, account_id: number }` |
+| Output | `{ username: string, first_name: string, last_name?: string, bio?: string, photo_url?: string, user_id: number }` |
+| Retry | `{ max: 2, backoffMs: 3_000, idempotent: true }` |
+| Timeout | 15s |
+| Idempotency | Pure read; safe to retry |
+| Side-effects | None — output goes into `ctx.steps['tg.get_user'].output` for template rendering downstream |
+
+### 5. `project.create_sub` — NEW handler
+
+| Field | Value |
+|---|---|
+| File | `agentflow-agents/src/services/graph-executor/handlers/project.create_sub.ts` (new) |
+| Delegates to | `createProject({ ownerUserId, brief, kind, teamId, ... })` — direct service-layer call from [`routes/projects.ts:573`](https://github.com/lnlockly/agentflow-agents/blob/main/src/routes/projects.ts#L573) factored into `services/projects.ts` so the handler doesn't HTTP-self-call. Then `approveProject(subId)` ([`projects-pipeline.ts:434`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/projects-pipeline.ts#L434)) to kick the walker on the child |
+| Input | `{ kind: 'tg_profile_bundle' \| 'tg_bot' \| 'landing' \| ..., brief: string, parent_project_id: number, seed?: { detail_meta?: Record<string,unknown> } }` |
+| Output | `{ sub_project_id: number, sub_project_slug: string }` |
+| Retry | `{ max: 0, idempotent: false }` — retry would create a duplicate sub-project |
+| Timeout | 30s (the create+approve fork is fast; the long part is `wait_done` downstream) |
+| Side-effects | (a) INSERT into `projects` with `owner_user_id = ctx.ownerUserId`, `team_id = parent.team_id`; (b) emit `project_events.kind='sub_project_created'` on parent with `payload={sub_project_id, sub_project_slug, kind, brief_preview}`; (c) `approveProject` on the sub → second walker spawn |
+| Open question (impl) | **No `parent_project_id` column exists on `projects` today** (grep `parentProjectId` in `db/schema.ts` returns 0 hits). Two options: (a) add column + index in a follow-up migration; (b) audit-only via `project_events` row on the parent. **Spec picks (b) for v1** — the relationship is event-sourced; the parent walker holds the child id in `ctx.steps`. Add column if/when we need cross-project queries (e.g. "list all sub-projects of X") |
+
+### 6. `project.wait_done` — NEW handler
+
+| Field | Value |
+|---|---|
+| File | `agentflow-agents/src/services/graph-executor/handlers/project.wait_done.ts` (new) |
+| Delegates to | `SELECT status, bot_username, detail_meta FROM projects WHERE id=$1` + `SELECT preview_url FROM project_events WHERE project_id=$1 AND kind='preview_ready' ORDER BY id DESC LIMIT 1` |
+| Input | `{ project_id: number, timeout_ms?: number, poll_interval_ms?: number }` |
+| Output | `{ status: 'done' \| 'failed', preview_url?: string, bot_username?: string, finished_at: string }` |
+| Retry | `{ max: 0, idempotent: true }` — single internal poll loop |
+| Timeout | `timeoutSec = (timeout_ms / 1000) + 30`; default 30 min |
+| Idempotency | Pure read; safe to interrupt + resume — `since_event_id` cursor optional |
+| Failure surface | `status='failed'` → emit `node_failed` with `reason='sub_project_failed'`; diploma per-kind policy = fail-fast |
+| Open question | **Long-poll vs async-suspend.** Same as `tg.wait_reply` — handler holds the walker process for up to 30 min. Acceptable on k3s with a dedicated worker; future task: walker `node_waiting` event + resume from a webhook so the parent DAG doesn't pin a coroutine for 30 min |
+
+### 7. `tg_lead_states.update` — NEW handler
+
+| Field | Value |
+|---|---|
+| File | `agentflow-agents/src/services/graph-executor/handlers/tg_lead_states.update.ts` (new) |
+| Delegates to | UPSERT into `tg_lead_states` ([`schema.ts:2127`](https://github.com/lnlockly/agentflow-agents/blob/main/src/db/schema.ts#L2127)) on `(owner_user_id, tg_account_id, tg_chat_peer)` |
+| Input | `{ peer: string, tg_account_id: number, stage: 'cold' \| 'warm' \| 'hot' \| 'booked' \| 'objection' \| 'spam' \| 'refused', meta?: Record<string, unknown> }` |
+| Output | `{ row_id: number, stage: string, was_insert: boolean }` |
+| Retry | `{ max: 2, backoffMs: 1_000, idempotent: true }` — UPSERT |
+| Timeout | 10s |
+| Note | `'refused'` is not in today's `tg_lead_states.state` CHECK constraint — `ferma-sales-funnel.mdx` lists `cold\|warm\|hot\|booked\|objection\|spam`. Adding `refused` requires a migration. **Spec proposes:** use `'objection'` with `meta.outcome='refused'` until a migration is approved separately. The DAG below uses `objection` + meta to stay compatible |
+
+### 8. `trigger.manual` — already implied
+
+The owner clicks "Use template" → backend creates the project +
+seeds the workflow_schema → `approveProject` triggers walker on
+the parent. The walker treats every node with `in_degree=0` as a
+manual-trigger node; no explicit `trigger.manual` handler is required
+in v1. (Per [graph-executor.mdx](/architecture/graph-executor#node-handler-registry)
+`trigger.*` namespace is reserved; an explicit handler can land later
+to emit `node_started` for the trigger row in CanvasLive.)
+
+### 9. `trigger.cron` — DEFERRED
+
+The teammate spec lists `trigger.cron(daily 10:00)` as an optional
+alternative entry. Cron triggers live in `agent_triggers`
+([`schema.ts:1765`](https://github.com/lnlockly/agentflow-agents/blob/main/src/db/schema.ts#L1765))
+and fire via [`agent-trigger-worker.ts:318`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/agent-trigger-worker.ts#L318).
+For the diploma demo we ship **`trigger.manual` only**; cron is a
+follow-up that wraps `agent_triggers.kind='cron'` to enqueue an
+`approveProject` per tick. Mark cron support as **task #13-cron-followup**.
+
+## Sub-project brief templating
+
+`project.create_sub` renders its `brief` string from the parent
+walker's `ctx.steps['tg.get_user'].output` via simple `{{contact.*}}`
+substitution. No Mustache, no Jinja — plain `.replace(/\{\{contact\.(\w+)\}\}/g, ...)`.
+The walker exposes `ctx.steps` read-only ([`graph-executor.mdx` line 124](/architecture/graph-executor#contract))
+so the handler reads + renders deterministically.
+
+### Visitka brief template
+
+```
+AI-визитка для пользователя @{{contact.username}}. Сделай ему mini-site:
+имя ({{contact.first_name}} {{contact.last_name}}), био
+({{contact.bio}}), ссылки из профиля. Внизу — большой блок
+"Хочешь так же? Жми → @AgentFlow_bot". Тёмная тема, минимализм.
+```
+
+Rendered brief flows into the child `tg_profile_bundle` project's
+`projects.brief` column. Its [own DAG](/architecture/kinds#dag--handler-map)
+(`scrape_tg → render_landing → deploy_landing` + `scrape_tg →
+scaffold_bot → wire_designapi → deploy_bot → booking_flow`) does the
+real work. `detail_meta.tg_username='MLM808'` is seeded so
+[ProjectCard `KindAccent`](/architecture/kinds#per-kind-ui-surface)
+shows `AI-визитка @MLM808` while the build runs.
+
+### Bot brief template
+
+```
+Telegram-бот для @{{contact.username}}. Назначение: отвечает на типовые
+вопросы клиентов про услуги {{contact.first_name}}, собирает контакты,
+рекламирует @{{contact.username}} как эксперта. В каждом ответе —
+сноска "Сделано на AgentFlow → @AgentFlow_bot".
+```
+
+Flows into the child `tg_bot` project's brief. Its DAG
+(`request_token → scaffold_aiogram → smoke_test ↔ self_heal_loop →
+deploy`) builds and deploys; the parent waits on `project.wait_done`
+which surfaces `projects.bot_username` once `request_token` resolves.
+
+### Outreach pitch (parent DAG)
+
+The `tg.send_text` node config:
+
+```
+text: "Привет, {{contact.first_name}}! Делаю эксперимент: AgentFlow —
+платформа, которая собирает Telegram-ботов и AI-визитки за минуты.
+Хочешь покажу — соберу тебе бесплатно? Скажи 'визитка' или 'бот'."
+```
+
+Hard-coded in the boilerplate `workflow_schema` so every demo run uses
+the same copy until we A/B test variants.
+
+## Boilerplate row (DRAFT MIGRATION — DO NOT APPLY)
+
+```sql
+-- DRAFT (do not apply — graph-executor walker FF=0 in prod, handlers not yet shipped)
+-- File path when ready: agentflow-agents/migrations/2026-05-XX-diploma-boilerplate.sql
+INSERT INTO agent_boilerplates
+  (kind, name, title, description, github_url, branch, subdir,
+   skills, workflow_schema, default_features, category)
+VALUES (
+  'tg_farm',                                  -- composite kind; see "Kind decision" below
+  'diploma-outreach-build',
+  'TG-outreach → AI-build (diploma)',
+  'Пишет в Telegram твоему лиду, классифицирует ответ AI, и собирает '
+    || 'ему визитку или бота на лету. End-to-end showcase AgentFlow.',
+  'https://github.com/lnlockly/agentflow-agents',  -- handlers live in main repo
+  'main',
+  NULL,
+  '["telegram","outreach","ai-classification","sub-project","composite"]'::jsonb,
+  $${
+    "nodes": [
+      {"id":"tg.get_user",          "label":"Подтянуть профиль @MLM808",   "icon":"User"},
+      {"id":"tg.send_text",         "label":"Отправить питч",              "icon":"Send"},
+      {"id":"tg.wait_reply",        "label":"Ждать ответ (≤24ч)",          "icon":"Hourglass"},
+      {"id":"llm.classify_intent",  "label":"AI: визитка / бот / отказ?",  "icon":"Brain"},
+      {"id":"project.create_sub",   "label":"Создать sub-project",          "icon":"FolderPlus"},
+      {"id":"project.wait_done",    "label":"Ждать build",                  "icon":"Loader"},
+      {"id":"tg.send_text:deliver", "label":"Отправить ссылку",             "icon":"Link"},
+      {"id":"tg_lead_states.update","label":"Зафиксировать стадию",         "icon":"Database"}
+    ],
+    "edges": [
+      {"from":"tg.get_user",        "to":"tg.send_text"},
+      {"from":"tg.send_text",       "to":"tg.wait_reply"},
+      {"from":"tg.wait_reply",      "to":"llm.classify_intent"},
+      {"from":"llm.classify_intent","to":"project.create_sub",   "label":"visitka|bot"},
+      {"from":"llm.classify_intent","to":"tg_lead_states.update","label":"refuse"},
+      {"from":"project.create_sub", "to":"project.wait_done"},
+      {"from":"project.wait_done",  "to":"tg.send_text:deliver"},
+      {"from":"tg.send_text:deliver","to":"tg_lead_states.update"}
+    ]
+  }$$::jsonb,
+  '["AI-outreach @avsee4 → @MLM808","AI-классификация ответа","Авто-создание визитки или бота","Доставка ссылки в TG","Обновление tg_lead_states"]'::jsonb,
+  'composite-demo'
+);
+```
+
+Branch labels (`visitka|bot` vs `refuse`) are consumed by the
+graph-executor walker's edge-condition resolver — the handler output
+`{intent}` is matched against the edge `label` lexically (per
+[graph-executor.mdx — Execution semantics](/architecture/graph-executor#execution-semantics)).
+**Open question for task #13-impl:** the walker today does Kahn topo
+without conditional-edge filtering. Edge-condition support is a
+walker addition — flag this as a hard dependency before the boilerplate
+goes live.
+
+### Kind decision: why `tg_farm`?
+
+`agent_boilerplates.kind` is the discriminator used by
+[`kindToPreset`](/flows/templates-marketplace) to map a template to a
+`CreateProjectModal` preset. The diploma DAG isn't a `tg_bot`, isn't a
+`landing`, isn't a `tg_profile_bundle` — it's an *action* that spawns
+those. The closest existing slot is `tg_farm` (matches the ферма
+preset's spirit: an action-kind agent running on a user TG account
+that triggers downstream effects).
+
+Caveat: [`kinds.mdx`](/architecture/kinds#per-kind-ui-surface) notes
+**`tg_farm` is NOT a value in the project-kind enum** — it's used today
+only for the ферма agent slug, not for project creation. Two options:
+
+1. **Add `tg_farm` to the project-kind enum** (small migration) + add a
+   tile to `CreateProjectModal`. The diploma project then shows in
+   `/projects` like any other kind.
+2. **Route the diploma boilerplate through the marketplace hire path**
+   (`/me/marketplace/diploma-outreach-build/hire`) instead of
+   `/me/projects` — reuses the existing
+   [marketplace-hire flow](/flows/marketplace-hire) for required-secrets
+   pre-seeding (TG_API_ID/HASH/SESSION already on `account_id=4`, so the
+   `missing_required_secrets` 400 won't fire for the owner).
+
+**Spec recommends option 2** — zero schema changes, reuses the secrets
+pre-seed UX, and the template card in `/templates` can deep-link to
+`/marketplace/diploma-outreach-build` instead of opening
+`CreateProjectModal`. The kind on the boilerplate row stays a string
+the marketplace card doesn't care about.
+
+## Required secrets
+
+| Key | Source | Status for owner (account_id=4) |
+|---|---|---|
+| `TG_API_ID` | `my.telegram.org` | already set (account_id=4 in tg-mcp pool) |
+| `TG_API_HASH` | `my.telegram.org` | already set |
+| `TG_SESSION` | tg-mcp `add_phone` → `confirm_code` | already set (`accounts.session_blob` non-null, status=active) |
+| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | platform fallback | covered by [llm-router](/subsystems/llm-router) default chain |
+
+Verified via `kubectl -n franchise-factory exec deploy/agentflow-agents
+-- env | grep TG_` and the tg-mcp `accounts` SELECT confirming
+`owner_user_id=1, phone=+79036340462, status=active` (memory from
+2026-05-13 session). No `missing_required_secrets` 400 expected on
+hire.
+
+## Walker / per-kind policy
+
+Add a row to the [per-kind on-failure policy](/architecture/graph-executor#per-kind-policy)
+table under `tg_farm` (or whatever kind label we land on):
+
+| Node | Policy | Rationale |
+|---|---|---|
+| `tg.get_user` | continue | Bio/photo are nice-to-have for templating; fall back to plain `@username` |
+| `tg.send_text` (outreach) | fail-fast | If we can't DM, there's nothing else to do |
+| `tg.wait_reply` | fail-fast on `timed_out=true` | 24h with no reply = lead is cold; emit `node_failed reason='no_reply_24h'` and let `tg_lead_states.update` (via secondary edge) mark stage |
+| `llm.classify_intent` | fail-fast on `intent='ambiguous'` after `clarify_max` | Defensive — no infinite clarify loop |
+| `project.create_sub` | fail-fast | No sub-project, no delivery — short-circuit |
+| `project.wait_done` | fail-fast on `status='failed'`, fail-fast on timeout | Same |
+| `tg.send_text:deliver` | continue | Delivery failure logs, doesn't undo the sub-project |
+| `tg_lead_states.update` | continue | Audit-only |
+
+## Verification plan (owner runbook)
+
+After PR merges + handlers ship + boilerplate INSERT applied:
+
+1. Open `https://app.agentflow.website/templates`.
+2. Find **TG-outreach → AI-build (diploma)** card. Confirm DAG
+   thumbnail renders 8 nodes (see `agent_boilerplates.workflow_schema`).
+3. Click **Использовать шаблон** → if option 2 (recommended): the card
+   navigates to `/marketplace/diploma-outreach-build` → click **Hire**
+   → `POST /me/marketplace/diploma-outreach-build/hire` with
+   `{project_id, accept_terms:true}` (the owner picks an existing
+   project to attach, or a fresh shell is created).
+4. Workspace opens on the **Canvas** tab. The walker emits
+   `node_started` for `tg.get_user` within 1 s — CanvasLive pulses the
+   first node green.
+5. **Phone check (owner):** within 2–3 s of the canvas reaching
+   `tg.send_text`, @avsee4 sends a real DM to @MLM808 with the
+   rendered pitch. Owner verifies on a second device.
+6. **Reply on @MLM808's phone**: type `хочу визитку` and send.
+7. CanvasLive: `tg.wait_reply` finishes (`received: true`), then
+   `llm.classify_intent` pulses, then the `visitka` branch lights up.
+8. `project.create_sub` finishes within ~10 s — a new sub-project
+   appears at `/projects` (parent → see `project_events kind='sub_project_created'`).
+9. The sub-project's own walker runs `tg_profile_bundle` DAG: 3–6 min
+   to `status='done'` per [visitka-tg-profile](/architecture/visitka-tg-profile).
+10. `project.wait_done` flips green on the parent canvas;
+    `tg.send_text:deliver` pulses; @MLM808 receives a second DM with
+    `готова твоя визитка: https://<slug>.preview.agentflow.website/`.
+11. `tg_lead_states.update` writes a row with `stage='booked',
+    meta={asset:'visitka', sub_project_id: N}`. Verify in
+    `agentflow-agents` pod: `psql -c "SELECT stage, meta FROM
+    tg_lead_states WHERE tg_chat_peer='MLM808' ORDER BY id DESC LIMIT 1;"`.
+
+**Target end-to-end:** 5–8 min from "Hire" click to delivered preview
+URL. Screenshot the canvas mid-run for the diploma deck.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Fix |
+|---|---|---|
+| Outreach silently fails (no DM lands) | `[graph-executor] node tg.send_text failed` + `tg.send_text floodwait` / `account_lock_timeout` | Per-handler retry already declared (`max:2`); on `floodwait` honour the wait seconds (handler reads `tg-mcp` error.retry_after) |
+| 24h no reply | `[graph-executor] node tg.wait_reply timed out after Ns` + handler `timed_out:true` | Per-kind policy = fail-fast; the parent DAG's `tg_lead_states.update` secondary edge marks the lead `objection meta.outcome='no_reply'`. Owner sees the graph stopped on canvas |
+| Sub-project hangs > 30 min | `[graph-executor] node project.wait_done timed out after Ns` | Walker emits `node_failed reason='timeout'`. Investigate the sub-project's own DAG via `/projects/<sub_id>` |
+| Classification stuck on `ambiguous` (≥ `clarify_max`) | `llm.classify_intent: ambiguous clarify_rounds=N hit cap` (greppable substring to add in the handler) | Hard cap terminates; spec choice. Tune `clarify_max` or improve the system prompt |
+| Walker doesn't render conditional branch | `[graph-executor] edge label '<intent>' did not match handler output` | Walker edge-condition matcher missing — task #13-impl prereq |
+| Sub-project DAG fails (e.g. `scrape_tg` 403 on @MLM808 private bio) | parent walker sees `project.wait_done status='failed'`, emits `node_failed reason='sub_project_failed'` | Re-run by re-hiring (idempotent on `project_agents` PK) — the parent project gets a fresh walker pass |
+| `tg.get_user` returns null bio | handler returns `{ bio: '' }`, template renders empty section | Acceptable. Brief template tolerates empty `{{contact.bio}}` — the visitka coder fills with a placeholder |
+| Edge-condition resolver matches multiple branches | `[graph-executor] ambiguous_edge_match node=llm.classify_intent intent=visitka` | Walker enforces single-match; investigate boilerplate edge labels |
+| Loop in graph (mis-edited boilerplate) | `[graph-executor] cycle_detected nodes=[…]` | The clarify retry must NOT be an edge — it lives inside `llm.classify_intent`. Re-check seeded `workflow_schema` |
+| Delivery DM blocked by @MLM808's privacy | `tg.send_text: USER_PRIVACY_RESTRICTED` (or tg-mcp passthrough) | Per-kind policy = continue on `tg.send_text:deliver` — sub-project still exists, owner sees it at `/projects` |
+
+## Open questions / impl gates
+
+These need to be resolved before task #13-impl can ship:
+
+1. **Walker edge-condition matching** — does the [walker](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/graph-executor/walker.ts)
+   today filter edges by `edge.label === handler_output.<field>`? If
+   not, this is a prereq enhancement. (Task #7 owner to confirm.)
+2. **`tg.wait_reply` ceiling bump from 30 min → 24h** — flow-executor
+   caps at 30 min ([line 580](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/flow-executor.ts#L580)).
+   Either bump it for graph-executor wrap only, or implement
+   walker-level async-suspend.
+3. **`tg_lead_states.state` CHECK constraint** — does the column
+   accept `refused`? If not, the spec uses `objection meta.outcome='refused'`
+   (no migration needed). Confirm via psql `\d tg_lead_states`.
+4. **Sub-project audit linkage** — event-only (`project_events
+   kind='sub_project_created'`) vs new `projects.parent_project_id`
+   column. Spec picks event-only for v1.
+5. **Kind discriminator** — option 1 (add `tg_farm` to project-kind
+   enum) vs option 2 (route via marketplace hire). Spec picks option 2.
+6. **`llm.classify_intent` extension** — accepting `clarify_send` +
+   `clarify_max` is a config-shape change; today's call sites
+   (sales-funnel preset) don't pass them, so backward-compat is
+   trivial (`clarify_max ?? 0` → today's behaviour).
+
+## Related
+
+- [Architecture: graph-executor](/architecture/graph-executor) — walker contract
+- [Architecture: ферма (sales-funnel-tg-farm)](/architecture/ferma-sales-funnel) — TG poller + tg_lead_states
+- [Architecture: визитка (tg_profile_bundle)](/architecture/visitka-tg-profile) — sub-project kind
+- [Architecture: bot-pool](/architecture/bot-pool) — `request_token` for the `tg_bot` sub-project
+- [Architecture: kinds](/architecture/kinds) — kind enum + per-kind UI accents
+- [Flows: create-project](/flows/create-project) — `POST /me/projects` contract
+- [Flows: marketplace-hire](/flows/marketplace-hire) — recommended entry path
+- [Flows: templates-marketplace](/flows/templates-marketplace) — card grid + click handoff
+- [Subsystems: tg-mcp](/subsystems/tg-mcp) — Telethon pool, `send_message`, `get_full_user`
+- [Subsystems: llm-router](/subsystems/llm-router) — `invokeAI(TEXT_SMALL)` for classify_intent

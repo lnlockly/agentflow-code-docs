@@ -63,7 +63,8 @@
               "flows/marketplace-hire",
               "flows/preview-deploy",
               "flows/project-lifecycle",
-              "flows/templates-marketplace"
+              "flows/templates-marketplace",
+              "flows/diploma-outreach-and-build"
             ]
           },
           {
