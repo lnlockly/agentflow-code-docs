@@ -39,7 +39,8 @@
               "architecture/visitka-tg-profile",
               "architecture/bot-pool",
               "architecture/ferma-sales-funnel",
-              "architecture/kinds"
+              "architecture/kinds",
+              "architecture/graph-executor"
             ]
           },
           {
