@@ -1,31 +1,107 @@
 ---
 title: "Auth + access"
-description: "JWT, API key, af_session cookie."
+description: "Три пути auth: x-api-key (af_live_, HMAC-SHA256), Bearer JWT, af_session cookie. Per-IP brute-force ban, platform-admin guard, project ACL, API-key rate-limit tiers."
 ---
 
 # Auth + access
 
-> **TODO** — заполнить researcher-агентом. Стартовый skeleton.
-
 ## TL;DR
 
-(1-2 предложения)
+`requireSession` middleware пробует три пути в порядке: **x-api-key** (`af_live_*` HMAC-SHA256 lookup) → **Bearer JWT** (HS256) → **af_session cookie**. После N подряд invalid auth с одного IP — 429 `too_many_auth_failures`. Platform-admin gate (`requireAdmin`) кэшит лукап на 60s. Project access: owner OR platform_admin. API-key tiers (PRO 300 RPM / FREE 60 RPM) — опциональный gate за `FF_API_KEY_TIERS=1`.
 
 ## Files
 
 | Repo / path | Что делает |
 |---|---|
-| `agentflow-agents/src/...` | (file ref) |
+| `agentflow-agents/src/middleware/auth.ts:16` | `SessionClaims` type — `{ user_id, email?, source: 'jwt'|'api_key'|'cookie' }`. |
+| `agentflow-agents/src/middleware/auth.ts:24` | `COOKIE_NAME = 'af_session'`. |
+| `agentflow-agents/src/middleware/auth.ts:25` | `INTERNAL_HEADER = 'x-agentflow-secret'` — header для internal-only routes. |
+| `agentflow-agents/src/middleware/auth.ts:56` | `safeEqual` — timing-safe compare для HMAC и shared secrets. |
+| `agentflow-agents/src/middleware/auth.ts:77` | `RAW_KEY_PREFIX = 'af_live_'`. |
+| `agentflow-agents/src/middleware/auth.ts:86` | `hashApiKey` — HMAC-SHA256(raw_key, AGENTS_MASTER_KEY) → hex hash для DB lookup. |
+| `agentflow-agents/src/middleware/auth.ts:103` | `findUserByApiKey` — `SELECT user FROM api_keys WHERE hash=? AND revoked_at IS NULL`. |
+| `agentflow-agents/src/middleware/auth.ts:151` | `requireSession` — main gate. Tries x-api-key → Bearer JWT → cookie. Brute-force ban: 429 после порога. |
+| `agentflow-agents/src/middleware/auth.ts:241` | `requireAdmin` — wraps requireSession + isPlatformAdmin. |
+| `agentflow-agents/src/middleware/auth.ts:253` | `requireInternalSecret` — sole check для internal endpoints (compare с `INTERNAL_API_SECRET`). |
+| `agentflow-agents/src/services/access.ts:26` | `isPlatformAdmin` — DB lookup с 60s in-process cache. |
+| `agentflow-agents/src/services/access.ts:39` | `userCanAccessProject` — owner OR platform_admin. |
+| `agentflow-agents/src/services/access.ts:56` | `userCanDispatchAgent` — analogous для agent-trigger / cron. |
+| `agentflow-agents/src/middleware/api-key-rate-limit.ts:114` | `defaultLimitFor` — читает `API_KEY_RPM_PRO=300`, `API_KEY_RPM_FREE=60`. Feature flag `FF_API_KEY_TIERS=1`. Возвращает 429 `rate_limited`. |
+
+## Data flow
+
+```
+HTTP request → Hono middleware chain
+   ↓
+requireSession (middleware/auth.ts:151)
+   ├─ if header x-api-key present
+   │    ↓ check brute-force ban (per IP)
+   │    ↓ hashApiKey(raw) → findUserByApiKey
+   │    ↓ ok → claims.source='api_key' → next
+   │    ↓ fail → bump IP counter, 401 invalid_api_key
+   │
+   ├─ else if Authorization: Bearer <jwt>
+   │    ↓ verify HS256 with AUTH_JWT_SECRET
+   │    ↓ ok → claims.source='jwt' → next
+   │    ↓ fail → 401 jwt_invalid
+   │
+   ├─ else if Cookie: af_session=<jwt>
+   │    ↓ verify HS256
+   │    ↓ ok → claims.source='cookie' → next
+   │    ↓ fail → 401 bad_session
+   │
+   └─ else 401 unauthenticated
+
+Route handler reads c.get('session') → SessionClaims
+   ↓ per-route ACL:
+userCanAccessProject(user_id, project_id)  — access.ts:39
+   ↓ project.owner_user_id === user_id  OR  isPlatformAdmin(user_id)
+   ↓ deny → 403 forbidden
+
+Optional: FF_API_KEY_TIERS=1 →
+   api-key-rate-limit middleware → 429 rate_limited if RPM exceeded
+```
 
 ## DB tables / env / API surface
 
-(таблицы Postgres, env vars, REST endpoints)
+**DB:**
+- `users` — `id`, `email`, `is_platform_admin` boolean.
+- `api_keys` — `{ id, user_id, hash (HMAC-SHA256 hex), prefix, label, tier?, revoked_at?, last_used_at }`.
+- (см. `src/db/schema.ts`)
+
+**Env:**
+- `AGENTS_MASTER_KEY` — base64-32, используется и для api-key HMAC, и для seal/unseal.
+- `AUTH_JWT_SECRET` — HS256 secret (shared с tg-mcp).
+- `INTERNAL_API_SECRET` — for `/internal/*` и x-agentflow-secret header.
+- `FF_API_KEY_TIERS=1` — включает per-tier RPM limits.
+- `API_KEY_RPM_PRO=300`, `API_KEY_RPM_FREE=60` — лимиты.
+- `BRUTE_FORCE_WINDOW_MS`, `BRUTE_FORCE_LIMIT` — за сколько подряд invalid auth блокируем IP.
+
+**API surface:**
+- `requireSession` mounted на all `/me/*`, `/admin/*` routes (`server.ts:428` mount table).
+- `requireAdmin` — `/admin/*` strict.
+- `requireInternalSecret` — `/internal/*` (см. `routes/internal.ts:49+`).
+
+**Error codes (HTTP):**
+- 401 `unauthenticated` — нет креденшла.
+- 401 `invalid_api_key` / `jwt_invalid` / `bad_session` — auth-specific.
+- 429 `too_many_auth_failures` — brute-force ban hit.
+- 429 `rate_limited` — RPM exceeded.
+- 500 `jwt_not_configured` — `AUTH_JWT_SECRET` отсутствует в env.
+- 403 `forbidden` — ACL deny.
 
 ## Failure modes
 
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
+| Лавинообразные 401 от одного IP | `too_many_auth_failures` | `middleware/auth.ts:151` (brute-force gate) |
+| Все api-keys внезапно отвергаются | `jwt_not_configured` или `AGENTS_MASTER_KEY missing` | env config; `middleware/auth.ts:86` |
+| Platform admin не виден | `is_platform_admin_cache_stale` | `services/access.ts:26` — invalidate / restart pod |
+| Owner не может открыть свой project | `acl_owner_mismatch` | `services/access.ts:39` (userCanAccessProject) |
+| 429 rate_limited при низкой нагрузке | `api_key_rpm_exceeded` | `middleware/api-key-rate-limit.ts:114` — поднять `API_KEY_RPM_*` |
+| Internal endpoint не пускает (свой сервис) | `internal_secret_mismatch` | check `INTERNAL_API_SECRET` aligned между API-pod и runtime-supervisor / tg-mcp |
 
 ## Related
 
 - [Architecture overview](/architecture/overview)
+- [LLM router](/subsystems/llm-router)

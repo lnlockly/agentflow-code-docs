@@ -1,31 +1,108 @@
 ---
 title: "Create project flow"
-description: "POST /me/projects → propose → approve → execute."
+description: "POST /me/projects → kind classify → Maestro propose → user approve → provision pod → scrape → auto-bot → scaffold → execute."
 ---
 
 # Create project flow
 
-> **TODO** — заполнить researcher-агентом. Стартовый skeleton.
-
 ## TL;DR
 
-(1-2 предложения)
+Юзер шлёт бриф → `POST /me/projects` → создаётся row `status=draft` + в background стартует Maestro propose; Maestro заполняет `proposed_plan` (jsonb) → `status=awaiting_approval`. На `POST /me/projects/:id/approve` запускается approval chain: provision pod → workspace_ready → auto-scrape (если есть @handles) → auto-bot (для tg_bot/tg_profile_bundle) → scaffold (только tg_profile_bundle) → execute_in_team → pool-worker drains `plan_tasks`.
 
 ## Files
 
 | Repo / path | Что делает |
 |---|---|
-| `agentflow-agents/src/...` | (file ref) |
+| `agentflow-agents/src/routes/projects.ts:573` | `POST /me/projects` — создаёт row, спавнит Maestro propose. |
+| `agentflow-agents/src/services/projects.ts:132` | `createProjectForUser` — initial row insert (`status=draft`, `kind=null|classified`). |
+| `agentflow-agents/src/services/projects.ts:221` | `appendProjectEvent` — пишет в `project_events`. |
+| `agentflow-agents/src/services/kind-classifier.ts:21` | `ProjectKind` enum (`landing | tg_bot | spa | mini_app | tg_profile_bundle`). |
+| `agentflow-agents/src/services/kind-classifier.ts:47` | `REGEX_CONFIDENCE = 0.85` — порог для regex match. |
+| `agentflow-agents/src/services/kind-classifier.ts:49` | `MIN_LLM_CONFIDENCE = 0.5` — порог для LLM-классификатора. |
+| `agentflow-agents/src/services/kind-classifier.ts:90` | `classifyBriefKind` — regex first, fallback LLM. |
+| `agentflow-agents/src/mcp-servers/team-manager/tools/propose-project-plan.ts` | MCP tool: Maestro заполняет `projects.proposed_plan`. |
+| `agentflow-agents/src/services/projects.ts:1301` | `provisionWorkspaceWithRetry` — kubectl apply StatefulSet + PVC + wait ready. |
+| `agentflow-agents/src/services/projects.ts:1682` | `runProjectApprovalBackground` — full chain: provision → scrape → auto-bot → scaffold → execute. |
+| `agentflow-agents/src/services/auto-scrape.ts` | autoScrapeFromBrief — детектит @handles, запускает scrape через Jarvis Telethon. |
+| `agentflow-agents/src/services/auto-bot.ts:142` | `autoCreateTelegramBot` — pool BOT_TOKEN или BotFather fallback. |
+| `agentflow-agents/src/services/tg-visitka-scaffold.ts:563` | Template applier для tg_profile_bundle. |
+| `agentflow-agents/src/services/projects.ts:2294` | `runProjectExecutionBackground` — execute_in_team MCP tool → создаёт `plan_tasks`. |
+| `agentflow-agents/src/mcp-servers/team-manager/tools/execute-in-team.ts` | MCP tool: создаёт `plans` + `plan_tasks` rows. |
+| `agentflow-agents/src/services/pool-worker/index.ts:38` | `startPoolWorker` — drains queue. |
+
+## Data flow
+
+```
+POST /me/projects { brief }                 routes/projects.ts:573
+   ↓ requireSession
+createProjectForUser → projects row (status=draft)
+   ↓ classifyBriefKind(brief) — regex → LLM fallback
+   ↓ status='proposing'  +  spawn runMaestroProposeBackground
+runMaestroProposeBackground
+   ↓ Maestro agent → propose_project_plan MCP tool
+projects.proposed_plan = { agents, steps, auditor_slug }
+   ↓ status='awaiting_approval'  +  project_events: 'plan_proposed'
+
+User clicks Approve → POST /me/projects/:id/approve
+   ↓
+runProjectApprovalBackground (projects.ts:1682)
+   ↓
+provisionWorkspaceWithRetry (projects.ts:1301)
+   ↓ kubectl apply -f <StatefulSet+Service+PVC>
+   ↓ kubectl wait --for=condition=ready pod/project-<slug>-0
+   ↓ project_events: 'workspace_ready'
+   ↓
+autoScrapeFromBrief                     — only if brief has @handles
+   ↓ Jarvis Telethon → scrape into /workspace/scraped_*.json
+   ↓ project_events: 'auto_scrape_done' (or 'auto_scrape_post_ws_failed')
+   ↓
+autoCreateTelegramBot                   — only kind ∈ {tg_bot, tg_profile_bundle}
+   ↓ tries BOT_TOKEN_POOL → falls back to BotFather (if FF_AUTO_BOT_CREATE_BOTFATHER=1)
+   ↓ project_events: 'bot_assigned'
+   ↓
+scaffoldTgProfileBundle                 — only kind=tg_profile_bundle
+   ↓ копирует template в /workspace
+   ↓
+runProjectExecutionBackground (projects.ts:2294)
+   ↓ execute_in_team MCP tool → INSERT plans + plan_tasks rows
+   ↓ project_events: 'plan_started'
+   ↓
+pool-worker startPoolWorker drains plan_tasks  — pool-worker/index.ts:38
+```
 
 ## DB tables / env / API surface
 
-(таблицы Postgres, env vars, REST endpoints)
+**DB:**
+- `projects` — `id, owner_user_id, kind, status, brief, proposed_plan jsonb, plan_id, workspace_project_name, bot_username, preview_url`.
+- `project_events` — `{ project_id, kind: workspace_ready|plan_proposed|plan_started|bot_assigned|auto_scrape_done|…, payload jsonb, created_at }`.
+- `plans` / `plan_tasks` — materialized из proposed_plan.
+
+**Env:**
+- `FF_AUTO_BOT_CREATE`, `FF_AUTO_BOT_CREATE_BOTFATHER`, `FF_AUTO_SCRAPE_ON_CREATE` — toggles.
+- `JARVIS_OWNER_USER_ID=1`, `JARVIS_WORKSPACE_PROJECT_NAME=proj-71506e1l` — singleton pod для платформенных Telethon операций.
+- `BOT_TOKEN_POOL` — JSON `[{token,username}]`.
+- `AGENTFLOW_INTERNAL` — base URL для internal MCP routes.
+
+**API:**
+- `POST /me/projects` — create + propose.
+- `POST /me/projects/:id/approve` — kick off approval chain.
+- `GET /me/projects/:id` — status polling.
+- `POST /internal/projects/:id/admin-approve` (`routes/internal.ts:685`) — bypass approve для платформ-админа.
 
 ## Failure modes
 
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
+| status=draft + 0 events | `propose_project_plan_failed` | `services/projects.ts:1682` (Maestro propose chain) |
+| status=approved, 0 plan_tasks | `[auto-bot] getMe network error` | `services/auto-bot.ts:299` |
+| Pod не поднимается | `pod_provision_failed` или `failure_kind: node_cpu_exhausted` | `services/projects.ts:1301` (provisionWorkspaceWithRetry) |
+| Auto-scrape silently skipped | `auto_scrape_post_ws_failed` | `services/projects.ts:1983` |
+| Kind classify даёт `null` | `classify_unknown_kind` | `services/kind-classifier.ts:90` |
+| Pool worker не подхватывает | `pool_tick_failed` или paused | `services/pool-worker/claim.ts:33` (paused gate) |
 
 ## Related
 
 - [Architecture overview](/architecture/overview)
+- [Auto-bot assign](/flows/auto-bot-assign)
+- [Project lifecycle](/flows/project-lifecycle)
+- [Preview deploy](/flows/preview-deploy)

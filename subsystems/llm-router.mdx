@@ -1,31 +1,86 @@
 ---
 title: "LLM router"
-description: "db-driven providers, ModelType.TEXT_LARGE, fallback chain."
+description: "Mini-registry с приоритетом, owner-scoped провайдерами и fallback chain. Budget gate, agent_usage record, DB-driven providers."
 ---
 
 # LLM router
 
-> **TODO** — заполнить researcher-агентом. Стартовый skeleton.
-
 ## TL;DR
 
-(1-2 предложения)
+Все LLM-вызовы внутри agentflow-agents идут через `invokeAI()` → mini-registry, которая выбирает провайдера по `ModelType` (`TEXT_SMALL`/`TEXT_BIG`/`EMBEDDING_*` и т.п.), приоритету (desc) и owner_user_id-скоупу. Перед вызовом — budget gate (`assertUserBudget`), после — запись в `agent_usage`. DB-таблица `llm_provider_configs` позволяет добавлять providers (anthropic-compat или openai-compat) без деплоя — `refreshDbProviders` тикает каждые N секунд и подкидывает новые handlers в registry.
 
 ## Files
 
 | Repo / path | Что делает |
 |---|---|
-| `agentflow-agents/src/...` | (file ref) |
+| `agentflow-agents/src/ai-router/registry.ts:50` | `registerModel` — добавить provider в registry с priority + owner scope. |
+| `agentflow-agents/src/ai-router/registry.ts:79` | `unregisterModel` — снять provider (используется при refresh DB providers). |
+| `agentflow-agents/src/ai-router/registry.ts:118` | `getProviderHandler` — lookup по slug. |
+| `agentflow-agents/src/ai-router/registry.ts:158` | `useModel` — main entry: probe-then-route, preferred provider, candidate fallback chain. |
+| `agentflow-agents/src/ai-router/registry.ts:243` | `listProviders` — debug endpoint backing. |
+| `agentflow-agents/src/ai-router/instrumented.ts:112` | `invokeAI` — wraps useModel с budget gate + usage record + Sentry span. |
+| `agentflow-agents/src/ai-router/types.ts:25` | `ModelType` enum — `TEXT_SMALL`, `TEXT_BIG`, `EMBEDDING_BASE`, и т.д. |
+| `agentflow-agents/src/ai-router/types.ts:52` | `AiCallContext` — `{ user_id, project_id?, agent_slug?, model_type }`. |
+| `agentflow-agents/src/ai-router/types.ts:181` | `TextGenerationResult` — `{ text, usage, model, provider }`. |
+| `agentflow-agents/src/ai-router/types.ts:225` | `ProviderRegistration` — shape для registerModel. |
+| `agentflow-agents/src/ai-router/bootstrap.ts:21` | `bootstrapAiRouter` — стартовая регистрация (bge-m3, claudecodeapi, designapi, elevenlabs, legacy-callwithfallback, optional xAI). |
+| `agentflow-agents/src/llm-providers/db-driven.ts:45` | `LlmProviderConfigRow` — schema row type. |
+| `agentflow-agents/src/llm-providers/db-driven.ts:80` | `aggregateOpenaiStream` — utility для openai-compat streaming chunks. |
+| `agentflow-agents/src/llm-providers/db-driven.ts:153` | `makeAnthropicCompatHandler` — фабрика handler'а для anthropic-style API. |
+| `agentflow-agents/src/llm-providers/db-driven.ts:379` | `makeOpenaiCompatHandler` — фабрика для OpenAI-compatible. |
+| `agentflow-agents/src/llm-providers/db-driven.ts:454` | `refreshDbProviders` — pulls DB, diff против registry, register/unregister. |
+| `agentflow-agents/src/llm-providers/db-driven.ts:522` | `registerDbProviders` — initial load + periodic refresh setup. |
+
+## Data flow
+
+```
+Agent / service вызывает invokeAI({ ctx, model_type, messages, max_tokens })
+   ↓
+instrumented.invokeAI (line 112)
+   ↓ assertUserBudget(ctx.user_id, estimated_cost) → BudgetExceededError → emit budget_cap_hit
+   ↓
+registry.useModel (registry.ts:158)
+   ↓ select providers WHERE supports(model_type) AND (owner=null OR owner=ctx.user_id)
+   ↓ ORDER BY priority DESC, registered_at ASC
+   ↓ try first → on rate_limit / 5xx → try next (candidate fallback chain)
+provider handler (anthropic-compat | openai-compat | custom)
+   ↓ POST upstream API → parse → return TextGenerationResult
+   ↓
+instrumented.invokeAI logs to agent_usage:
+   { user_id, project_id, model, provider, prompt_tokens, completion_tokens, cost_usd }
+   ↓
+return result
+```
 
 ## DB tables / env / API surface
 
-(таблицы Postgres, env vars, REST endpoints)
+**DB:**
+- `llm_provider_configs` — `{ slug, kind: anthropic_compat|openai_compat, base_url, api_key_sealed, model_id, priority, owner_user_id?, supports_model_types[], max_tokens, enabled }`.
+- `agent_usage` — append-only usage log: `{ user_id, project_id, agent_slug, model, provider, prompt_tokens, completion_tokens, cost_usd, created_at }`.
+- `users.budget_cents_remaining` — counter, decremented в budget gate.
+
+**Env:**
+- `XAI_API_KEY` — opt-in registration for xAI provider в bootstrap.
+- `OPENROUTER_API_KEY` — legacy fallback (ai-router/bootstrap.ts:21).
+- `LLM_DB_REFRESH_MS` — cadence для refreshDbProviders.
+
+**API surface:**
+- `invokeAI(ctx, opts)` — единственная точка входа из application кода.
+- `useModel(...)` — низкоуровневый bypass (без budget gate; для системных вызовов вроде embed-on-write).
+- `POST /admin/users/:id/budget` (`routes/internal.ts:1098`) — restock budget.
 
 ## Failure modes
 
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
+| Budget exceeded — agent застрял | `BudgetExceededError` или `budget_cap_hit` | `ai-router/instrumented.ts:112` |
+| Ни один provider не отвечает | `AiRouterError: no_provider_for_model` | `ai-router/registry.ts:158` (useModel) |
+| Все рейт-лимитнули | `ai_router_all_candidates_failed` | `ai-router/registry.ts:158` (fallback chain) |
+| DB provider не подтянулся | `refresh_db_providers_failed` | `llm-providers/db-driven.ts:454` |
+| Owner-scoped provider не виден | `provider_owner_mismatch` | `ai-router/registry.ts:158` (filter clause) |
+| Stream aggregate упал в середине | `aggregate_openai_stream_failed` | `llm-providers/db-driven.ts:80` |
 
 ## Related
 
 - [Architecture overview](/architecture/overview)
+- [Auth & access](/subsystems/auth-and-access)

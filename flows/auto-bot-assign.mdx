@@ -1,31 +1,91 @@
 ---
 title: "Auto-bot assign flow"
-description: "workspace_ready event → auto-bot.ts → token from pool."
+description: "BOT_TOKEN_POOL → conflict probe → BotFather fallback → write /workspace/.env.bot → bot_assigned event."
 ---
 
 # Auto-bot assign flow
 
-> **TODO** — заполнить researcher-агентом. Стартовый skeleton.
-
 ## TL;DR
 
-(1-2 предложения)
+Когда у проекта kind ∈ {`tg_bot`, `tg_profile_bundle`}, после `workspace_ready` запускается `autoCreateTelegramBot`: тянет первый available токен из `BOT_TOKEN_POOL`, проверяет `getMe` + `getUpdates` (детектит 409 conflict — другой воркер уже сидит на этом токене), пишет `/workspace/.env.bot` через code-exec, апдейтит `projects.bot_username`, emits `bot_assigned`. Если pool пуст и включён `FF_AUTO_BOT_CREATE_BOTFATHER=1` — Jarvis pod через Telethon делает new bot @BotFather + получает токен.
 
 ## Files
 
 | Repo / path | Что делает |
 |---|---|
-| `agentflow-agents/src/...` | (file ref) |
+| `agentflow-agents/src/services/auto-bot.ts:50` | `probeBotInConflict` — `getUpdates(timeout=0)`; 409 ⇒ токен уже занят. |
+| `agentflow-agents/src/services/auto-bot.ts:76` | `createBotViaBotFather` — Jarvis Telethon диалог с @BotFather. |
+| `agentflow-agents/src/services/auto-bot.ts:114` | `writeBotTokenFile` — write `/workspace/.env.bot` через code-exec MCP. |
+| `agentflow-agents/src/services/auto-bot.ts:142` | `autoCreateTelegramBot` — main entry: pool → conflict probe → BotFather fallback → write env → event. |
+| `agentflow-agents/src/services/auto-bot.ts:161` | log marker `pool empty and FF_AUTO_BOT_CREATE_BOTFATHER off, skipping`. |
+| `agentflow-agents/src/services/auto-bot.ts:299` | log marker `[auto-bot] getMe network error`. |
+| `agentflow-agents/src/services/projects.ts:1682` | `runProjectApprovalBackground` — вызывает autoCreateTelegramBot на нужной стадии. |
+
+## Data flow
+
+```
+runProjectApprovalBackground (projects.ts:1682)
+  ↓ kind ∈ {tg_bot, tg_profile_bundle}  AND  FF_AUTO_BOT_CREATE=1
+autoCreateTelegramBot (auto-bot.ts:142)
+  ↓
+[1] Parse BOT_TOKEN_POOL env (JSON [{token,username}])
+  ↓ for each candidate in pool order:
+  ↓ getMe(token)
+  ↓   ok ✓
+  ↓ probeBotInConflict (auto-bot.ts:50)
+  ↓   getUpdates(timeout=0)
+  ↓   ↳ 409 Conflict → token занят другим pod'ом → skip
+  ↓   ↳ 200          → token свободен ✓
+  ↓ writeBotTokenFile (auto-bot.ts:114)
+  ↓   code-exec MCP → write_file /workspace/.env.bot
+  ↓ UPDATE projects SET bot_username=$1 WHERE id=$2
+  ↓ project_events: kind='bot_assigned', payload={username, source:'pool'}
+  ↓ return ok
+
+[2] Pool empty / all in conflict
+  ↓ if FF_AUTO_BOT_CREATE_BOTFATHER=1:
+  ↓   createBotViaBotFather (auto-bot.ts:76)
+  ↓     Jarvis pod (JARVIS_OWNER_USER_ID=1) Telethon session
+  ↓     отправляет /newbot → BotFather → name → username → получает token
+  ↓     writeBotTokenFile + UPDATE bot_username
+  ↓     project_events: 'bot_assigned', source: 'botfather'
+  ↓ else:
+  ↓   log "pool empty and FF_AUTO_BOT_CREATE_BOTFATHER off, skipping"
+  ↓   skipped без события — кодер потом возьмёт токен ручкой
+```
 
 ## DB tables / env / API surface
 
-(таблицы Postgres, env vars, REST endpoints)
+**DB:**
+- `projects.bot_username` — устанавливается после успешного assign.
+- `project_events` — `bot_assigned` (`payload: {username, source: 'pool'|'botfather'}`).
+- `project_secrets` — здесь токен НЕ хранится; он живёт в `/workspace/.env.bot` (sealed на уровне k8s PVC).
+
+**Env:**
+- `FF_AUTO_BOT_CREATE=1` — глобальный switch (если выключен, шаг пропускается).
+- `FF_AUTO_BOT_CREATE_BOTFATHER=1` — BotFather fallback.
+- `BOT_TOKEN_POOL` — JSON `[{token, username}, ...]`. Порядок = приоритет.
+- `JARVIS_OWNER_USER_ID=1`, `JARVIS_WORKSPACE_PROJECT_NAME=proj-71506e1l` — singleton pod для Telethon операций.
+- `TG_MCP_URL` — endpoint Python tg-mcp (используется createBotViaBotFather).
+
+**API surface (внутренние вызовы):**
+- code-exec MCP `write_file` → `/workspace/.env.bot`.
+- tg-mcp `send_message` + `receive_message` для BotFather диалога.
 
 ## Failure modes
 
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
+| status=approved, 0 plan_tasks, kind=tg_bot | `[auto-bot] getMe network error` | `services/auto-bot.ts:299` (network / proxy) |
+| Все токены 409 заняты | `probe_bot_in_conflict` | расширить `BOT_TOKEN_POOL` |
+| Pool пустой, BotFather off | `pool empty and FF_AUTO_BOT_CREATE_BOTFATHER off, skipping` | `services/auto-bot.ts:161` (включить flag) |
+| BotFather диалог timeout | `botfather_dialog_timeout` | `services/auto-bot.ts:76` (Jarvis session expired → refresh) |
+| `.env.bot` не записался | `code_exec_write_file_failed` | `services/auto-bot.ts:114` (workdir invariant?) |
+| `bot_assigned` event есть, но coder не видит токен | wrong path / coder читает не `/workspace/.env.bot` | боллерплейт `agent_boilerplates` — fix dotenv path |
 
 ## Related
 
+- [Create project flow](/flows/create-project)
 - [Architecture overview](/architecture/overview)
+- [Bot pool & auto-assign](/architecture/bot-pool)
+- [Debug stuck project](/runbooks/debug-stuck-project)

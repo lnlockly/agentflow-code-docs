@@ -1,31 +1,109 @@
 ---
 title: "Add a new project kind"
-description: "Step-by-step: расширение kinds enum + classifier."
+description: "Step-by-step: расширение ProjectKind enum, classifier rules, boilerplate, preview-gate dimensions, runtime classifier."
 ---
 
 # Add a new project kind
 
-> **TODO** — заполнить researcher-агентом. Стартовый skeleton.
-
 ## TL;DR
 
-(1-2 предложения)
+Чтобы добавить новый `ProjectKind` (например `discord_bot`, `web_api`), нужно тронуть 5 мест: (1) `ProjectKind` enum + classifier (`services/kind-classifier.ts:21`), (2) boilerplate row в `agent_boilerplates` (см. `services/boilerplates.ts`), (3) preview-gate per-kind dimension (`services/pool-worker/preview-gate.ts:211`), (4) runtime-supervisor classify heuristic если автостарт нетривиальный (`services/runtime-supervisor.ts:278`), (5) auto-bot / scaffold ветки если нужны (`services/projects.ts:1682`). Финал — миграция БД (если меняется enum-check) + e2e тест.
 
-## Files
+## Files (что трогать)
 
-| Repo / path | Что делает |
+| Repo / path | Что менять |
 |---|---|
-| `agentflow-agents/src/...` | (file ref) |
+| `agentflow-agents/src/services/kind-classifier.ts:21` | Добавить значение в `ProjectKind` type. |
+| `agentflow-agents/src/services/kind-classifier.ts:90` | `classifyBriefKind` — добавить regex pattern (REGEX_CONFIDENCE=0.85) и/или LLM prompt branch. |
+| `agentflow-agents/src/services/kind-classifier.ts:47` | `REGEX_CONFIDENCE`, `MIN_LLM_CONFIDENCE=0.5` (line 49) — тюнить если confidence для нового kind низкий. |
+| `agentflow-agents/src/services/boilerplates.ts:157` | `VALID_KINDS` — добавить значение. |
+| `agentflow-agents/src/services/boilerplates.ts:169` | `validateBoilerplateInput` — accept new kind. |
+| `agentflow-agents/src/services/boilerplates.ts:191` | `createBoilerplate` — добавить row в `agent_boilerplates`. |
+| `agentflow-agents/src/services/boilerplates.ts:275` | `applyBoilerplate` — путь `/opt/agentflow/boilerplates/<kind>/` (baked) → git clone fallback. |
+| `agentflow-agents/src/services/pool-worker/preview-gate.ts:40` | `PreviewKind` type — добавить значение. |
+| `agentflow-agents/src/services/pool-worker/preview-gate.ts:211` | `checkPreviewGate` — добавить per-kind block (health check / selector / body min). |
+| `agentflow-agents/src/services/runtime-supervisor.ts:69` | `RuntimePlan` — расширить если нужны новые поля. |
+| `agentflow-agents/src/services/runtime-supervisor.ts:278` | `classify` — heuristic для нового kind (lockfile / framework signature). |
+| `agentflow-agents/src/services/pingers/preview-placeholder.ts:33` | `STATIC_PREVIEW_KINDS` — добавить если новый kind рендерит static. |
+| `agentflow-agents/src/services/projects.ts:1682` | `runProjectApprovalBackground` — auto-bot / scaffold ветки. |
+| `agentflow-agents/db/migrations/` | Если `kind` колонна с CHECK constraint — миграция. |
+
+## Step-by-step
+
+```
+1. ProjectKind enum
+   services/kind-classifier.ts:21
+   export type ProjectKind = 'landing' | 'tg_bot' | 'spa' | 'mini_app'
+                            | 'tg_profile_bundle' | '<NEW_KIND>';
+
+2. Classifier rule (regex + LLM prompt)
+   services/kind-classifier.ts:90 — добавь regex с REGEX_CONFIDENCE=0.85
+   Для LLM — расширь system prompt list of kinds.
+
+3. Boilerplate
+   git: создать /opt/agentflow/boilerplates/<NEW_KIND>/ в image (Dockerfile),
+        ИЛИ — добавить row в DB:
+   INSERT INTO agent_boilerplates(slug, kind, repo_url, default_branch, scaffold_steps)
+     VALUES (...);
+   services/boilerplates.ts:157 — VALID_KINDS array.
+   services/boilerplates.ts:275 — applyBoilerplate путь.
+
+4. Preview-gate
+   services/pool-worker/preview-gate.ts:40 — добавить в PreviewKind.
+   services/pool-worker/preview-gate.ts:211 — case block:
+     case '<NEW_KIND>':
+       — health_path? body_min_bytes? selector? markers?
+   Defaults: DEFAULT_BODY_MIN_BYTES=2048, DEFAULT_HEALTH_PATH='/health',
+             DEFAULT_MAX_RETRIES=3, RETRY_BACKOFF_MS=[1000,2000,5000].
+
+5. Runtime classifier (если backend startup нетривиальный)
+   services/runtime-supervisor.ts:278 — classify(): добавить heuristic.
+   Если есть стандартный Procfile в boilerplate — heuristic не нужен.
+
+6. Approval ветки (auto-bot / scaffold / scrape)
+   services/projects.ts:1682 — runProjectApprovalBackground:
+     if (kind === '<NEW_KIND>') { ... scaffold + setup hooks ... }
+
+7. DB миграция (если enum-check exists)
+   agentflow-agents/db/migrations/00XX-add-kind.sql
+
+8. Tests
+   - unit: classifier regex hit на sample briefs.
+   - e2e: POST /me/projects { brief } → ожидаемый kind в proposed_plan.
+
+9. Docs
+   - architecture/kinds.mdx — добавить строку.
+   - этот runbook — оставить ссылкой.
+```
 
 ## DB tables / env / API surface
 
-(таблицы Postgres, env vars, REST endpoints)
+**DB:**
+- `projects.kind` — TEXT (без enum в реальности; classifier выбирает значение).
+- `agent_boilerplates(slug, kind, repo_url, default_branch, scaffold_steps jsonb)`.
+
+**Env:**
+- `DEP_INSTALL_AGENT=1` — если новый kind требует нестандартного install (LLM fallback).
+- `PREVIEW_GATE_STRICT=true` — preview-gate должен пройти для нового kind.
+
+**API:**
+- `POST /me/projects/boilerplates` (admin) — создать boilerplate row.
+- `POST /me/projects { brief, kind?: '<NEW_KIND>' }` — explicit override classifier.
 
 ## Failure modes
 
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
+| Classifier выдаёт `unknown` на твоём brief | `classify_unknown_kind` | `services/kind-classifier.ts:90` — добавить regex / LLM hint |
+| Confidence ниже threshold | `classify_low_confidence` | `services/kind-classifier.ts:47/49` — нюхать порог |
+| Boilerplate не нашёлся | `boilerplate_not_found` | `services/boilerplates.ts:133` (getBoilerplateByKind) |
+| Preview-gate всегда blocked | `preview_gate_blocked` + `unknown_kind` | `pool-worker/preview-gate.ts:211` — добавить case |
+| Runtime classify `unknown` | `classify_unknown_kind` (RuntimePlan) | `services/runtime-supervisor.ts:278` |
+| DB CHECK constraint fail | postgres error 23514 | миграция enum-check |
 
 ## Related
 
-- [Architecture overview](/architecture/overview)
+- [Ship new boilerplate](/runbooks/ship-new-boilerplate)
+- [Architecture: kinds matrix](/architecture/kinds)
+- [Project lifecycle](/flows/project-lifecycle)
+- [Preview deploy](/flows/preview-deploy)

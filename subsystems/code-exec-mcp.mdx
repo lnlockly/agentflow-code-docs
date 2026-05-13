@@ -1,31 +1,87 @@
 ---
 title: "code-exec MCP"
-description: "write_file path, workspace-resolve, invariants."
+description: "Streamable-HTTP MCP сервер для file/exec операций внутри pod'а проекта. Workdir invariant, write_file/exec/expose, workspace-resolve."
 ---
 
 # code-exec MCP
 
-> **TODO** — заполнить researcher-агентом. Стартовый skeleton.
-
 ## TL;DR
 
-(1-2 предложения)
+Streamable-HTTP MCP сервер, который kubectl-exec'ит команды внутрь StatefulSet pod'а проекта (`project-<slug>-0` в vcluster). Один процесс на API-под, multi-tenant: каждая tool-call резолвит `workspace_project_name` → `projects` row → проверяет ACL, AES-расшифровывает `project_secrets`, прокидывает в `exec`. Workdir invariant (`WORKDIR_STRICT`) ловит дрейф `/workspace` между write_file и exec, surfaces typed errors (`WORKSPACE_DRIFT`, `workdir_invariant_failed`, `empty_workspace_on_expose`) которые pool-worker трактует как retryable.
 
 ## Files
 
 | Repo / path | Что делает |
 |---|---|
-| `agentflow-agents/src/...` | (file ref) |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts:710` | `write_file` — text write через base64 → kubectl exec → tee. Записывает в pod-ный `/workspace`. |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts:859` | `write_file_b64` — двоичная запись (изображения, PDF, бинарники). |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts:1008` | `upload_to_storage` — push в Garage S3 (CDN бакет `agentflow-public`). |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts:1213` | `exec` — shell в pod'е. Timeout, stdout/stderr capture, workdir invariant pre/post checks. |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts:1411` | `start_service` — wraps `nohup` + Procfile-style supervisor, лог в `/workspace/.runtime/logs/`. |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts:1749` | `expose_internal` — поднимает Caddy proxy mode внутри namespace (no public ingress). |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts:1890` | `expose_public` — финальный публичный URL: проверка `/workspace` non-empty → Caddy static/proxy mode → ingress reconcile. |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts:2968` | `handleCodeExecMcp` — Streamable HTTP transport handler. |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts:2977` | `callCodeExecTool` — internal entrypoint (используется runtime-supervisor для programmatic вызовов). |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/workspace-resolve.ts:33` | `resolveProjectByWorkspace` — `workspace_project_name` → project row + owner check. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/workspace-resolve.ts:75` | `loadProjectSecretValues` — AES-расшифровка `project_secrets` для подстановки в exec env. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/workspace-resolve.ts:225` | `checkInvariant` — pre/post snapshot `/workspace`, detect drift. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/workspace-resolve.ts:397` | `assertWorkspaceMatches` — emits `WORKSPACE_DRIFT` typed error если workdir не совпадает. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/workspace-resolve.ts:556` | `workdirStrictEnabled` — env-flag `WORKDIR_STRICT=1` gate. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/kubectl.ts:40` | `kubectlExec` — kubeconfig tmp (0600) → spawn → SIGKILL on timeout → unlink finally. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/kubectl.ts:158` | `kubectlRunInCluster` — exec в обычном (host) k8s. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/kubectl.ts:238` | `kubectlRun` — generic wrapper с PATH-only env. |
+
+## Data flow
+
+```
+Coder agent (Eliza/Maestro) → MCP client (streamable-http)
+   ↓ POST /mcp { tool: "write_file", args: { workspace_project_name, path, content } }
+handleCodeExecMcp (index.ts:2968)
+   ↓
+resolveProjectByWorkspace (workspace-resolve.ts:33)
+   ↓ acl check: project.owner_user_id == caller.user_id
+loadProjectSecretValues — AES-256-GCM unseal через AGENTS_MASTER_KEY
+   ↓
+checkInvariant (pre) — snapshot /workspace inode/mtime
+   ↓
+kubectlExec — kubectl exec -n <ns> project-<slug>-0 -- sh -c '<cmd>'
+   ↓
+checkInvariant (post) — если drift → WORKSPACE_DRIFT typed error
+   ↓ return { ok, stdout, stderr, drift? }
+pool-worker / agent — если drift → ERROR_MARKERS hit → autoRetry chain
+```
 
 ## DB tables / env / API surface
 
-(таблицы Postgres, env vars, REST endpoints)
+**DB:**
+- `projects` — `workspace_project_name`, `owner_user_id` (ACL anchor).
+- `project_secrets` — sealed AES-256-GCM, source ∈ {platform, user_brief, owner}, ключи: `BOT_TOKEN`, `OPENROUTER_API_KEY`, и т.д.
+
+**Env:**
+- `AGENTS_MASTER_KEY` — base64-32 master key для seal/unseal.
+- `WORKDIR_STRICT=1` — включает invariant detection.
+- `KUBECONFIG_PATH` — путь к kubeconfig для vcluster (per-user).
+- `AGENTFLOW_INTERNAL` — base URL для internal callbacks (runtime-supervisor → code-exec).
+
+**API surface:**
+- `POST /mcp` — streamable-http MCP transport (mounted в `server.ts`).
+- Tools: `write_file`, `write_file_b64`, `upload_to_storage`, `exec`, `start_service`, `expose_internal`, `expose_public`, `read_file`, `list_dir`, `delete_path`.
+- Statics: `STATIC_PREVIEW_KINDS = ['spa','landing','mini_app']` (workspace-resolve.ts:567), `BUILD_OUTPUT_DIRS = ['dist','build','out','public']` (workspace-resolve.ts:563).
 
 ## Failure modes
 
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
+| Coder пишет в `/workspace/src/`, потом `exec npm run build` падает с ENOENT | `WORKSPACE_DRIFT` | `helpers/workspace-resolve.ts:397` (assertWorkspaceMatches) |
+| `expose_public` отдаёт 500 на пустой workdir | `empty_workspace_on_expose` | `index.ts:1890` (expose_public) |
+| Agent пишет файл в wrong cwd | `workdir_invariant_failed` | `helpers/workspace-resolve.ts:225` (checkInvariant) |
+| `kubectl exec` висит | `kubectl_exec_timeout` | `helpers/kubectl.ts:40` (SIGKILL after timeout) |
+| Decrypt fail на secrets | `seal_unseal_failed` | `services/seal.ts:88` (unsealString) |
+| ACL bypass попытка | `code_exec_acl_denied` | `helpers/workspace-resolve.ts:33` (resolveProjectByWorkspace) |
 
 ## Related
 
 - [Architecture overview](/architecture/overview)
+- [Runtime supervisor](/subsystems/runtime-supervisor)
+- [Caddy preview](/subsystems/caddy-preview)
+- [Auth & access](/subsystems/auth-and-access)
