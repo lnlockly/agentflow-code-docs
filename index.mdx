@@ -1,0 +1,40 @@
+---
+title: "AgentFlow Code Map"
+description: "RAG-style internal documentation for AgentFlow platform code."
+---
+
+# AgentFlow Code Map
+
+This is the internal code-level documentation. **Not for end users** — public product docs live at [docs.agentflow.website](https://docs.agentflow.website).
+
+## What lives here
+
+- **Architecture overview** — 5 minute tour of the whole platform
+- **Products** — visitka, bot, ferma — what files build each
+- **Subsystems** — code-exec MCP, Caddy preview, LLM router, TG MCP
+- **Flows** — step-by-step paths through the system (with file refs)
+- **Runbooks** — how to diagnose and fix common issues
+
+## For LLM agents
+
+Fetch the concatenated dump at `/llms-full.txt` for full context in one request.
+Use `/llms.txt` for the table of contents.
+
+## Repo layout (multi-repo workspace)
+
+| Repo | Role |
+|------|------|
+| `agentflow-agents` | Backend Hono server, MCP servers, project lifecycle, LLM router |
+| `agentflow-landing` | React 19 + Vite frontend (this is the user-facing app) |
+| `agentflow-api` | Token launchpad service (separate from agents) |
+| `agentflow-tg-mcp` | Python Telethon MCP server for MTProto |
+| `agentflow-mcp-server` | Node MCP wrapper over `/me/projects` REST |
+| `agentflow-bot` | Public Telegram bot (intake + announcements) |
+| `agentflow-docs` | Public Mintlify docs (lnlockly/docs) |
+| `agentflow-code-docs` | **This repo** — internal code docs |
+
+## Conventions in this doc set
+
+- Every file ref is in the form `repo/path/to/file.ts:lineNumber` so it pastes straight into `Read` or `Grep`.
+- Failure modes section lists exact log strings to grep for.
+- "Related" footer at the bottom of each page links to neighbours.

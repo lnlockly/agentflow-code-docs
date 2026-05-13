@@ -1,0 +1,77 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "AgentFlow Code",
+  "description": "Internal code-level documentation for AgentFlow. RAG-style architecture map for LLM agents.",
+  "colors": {
+    "primary": "#d4ff00",
+    "light": "#e6ff66",
+    "dark": "#9bbf00"
+  },
+  "favicon": "/favicon.svg",
+  "appearance": {
+    "default": "dark"
+  },
+  "fonts": {
+    "family": "Inter"
+  },
+  "icons": {
+    "library": "lucide"
+  },
+  "background": {
+    "decoration": "gradient"
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Code Map",
+        "groups": [
+          {
+            "group": "Start Here",
+            "pages": [
+              "index",
+              "architecture/overview"
+            ]
+          },
+          {
+            "group": "Products",
+            "pages": [
+              "architecture/visitka-tg-profile",
+              "architecture/bot-pool",
+              "architecture/ferma-sales-funnel",
+              "architecture/kinds"
+            ]
+          },
+          {
+            "group": "Subsystems",
+            "pages": [
+              "subsystems/code-exec-mcp",
+              "subsystems/caddy-preview",
+              "subsystems/runtime-supervisor",
+              "subsystems/llm-router",
+              "subsystems/tg-mcp",
+              "subsystems/auth-and-access"
+            ]
+          },
+          {
+            "group": "Flows",
+            "pages": [
+              "flows/create-project",
+              "flows/auto-bot-assign",
+              "flows/preview-deploy",
+              "flows/project-lifecycle"
+            ]
+          },
+          {
+            "group": "Runbooks",
+            "pages": [
+              "runbooks/debug-stuck-project",
+              "runbooks/add-new-kind",
+              "runbooks/ship-new-boilerplate"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
