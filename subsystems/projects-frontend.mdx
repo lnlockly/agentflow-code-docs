@@ -1,0 +1,115 @@
+---
+title: "Projects frontend"
+description: "How the user creates a project: CreateProjectModal kind picker + kind-aware ProjectCard accents on /projects."
+---
+
+# Projects frontend
+
+## TL;DR
+
+`/projects` dashboard is the owner's mission-control. The **New** button mounts `CreateProjectModal` — a 5-tile kind picker (AI-визитка / Telegram-бот / TG-ферма / Лендинг / Mini App) that pre-classifies the project kind on the client and POSTs `{ brief, kind, title }` to `/me/projects`. Picking the **TG-ферма** tile does NOT create a project — it navigates to the sales-funnel agent route, since `tg_farm` is not a backend `ProjectKind`. After projects exist, `ProjectCard` renders kind-aware accents so the owner spots визитка / бот rows at a glance.
+
+## Files
+
+| Repo / path | Что делает |
+|---|---|
+| `agentflow-landing/src/pages/ProjectsDashboard.tsx:43` | Mounts `<CreateProjectModal>`; the **New** button toggles `createOpen` state. |
+| `agentflow-landing/src/components/projects/CreateProjectModal.tsx:1` | The modal — `TILES` array, `KindGrid`, `KindIntake`, `IntakeForm`. |
+| `agentflow-landing/src/components/projects/CreateProjectModal.tsx:24` | `TileDef` discriminated union (`mode: 'project' | 'external'`) — TS-enforces that `external` tiles cannot reach `createProject`. |
+| `agentflow-landing/src/components/projects/CreateProjectModal.tsx:48` | `TILES` const — 5 tiles. TG-ферма is the only `mode: 'external'` entry. |
+| `agentflow-landing/src/components/projects/CreateProjectModal.tsx:213` | `IntakeForm` per-kind brief/title shaping (see "Brief shaping" below). |
+| `agentflow-landing/src/components/projects/CreateProjectModal.tsx:393` | `normalizeUsername` — strips `@`, strips `https://t.me/`, validates `^[A-Za-z0-9_]{3,32}$`. |
+| `agentflow-landing/src/components/projects/ProjectCard.tsx:38` | `KindAccent` helper — kind-specific icon + context line in the card meta row. |
+| `agentflow-landing/src/lib/agentsApi.ts:754` | `createProject(brief, title, preferredModel, teamId, kind, workflowOverride)` — REST call to `POST /me/projects`. |
+| `agentflow-agents/src/services/kind-classifier.ts:21` | Backend `ProjectKind` enum — single source of truth. Frontend `ProjectKind` type must stay in sync. |
+
+## Data flow
+
+```
+User on /projects clicks "New"
+   ↓
+CreateProjectModal opens (5 tiles, auto-fit grid)
+   ↓
+─── if tile.mode === 'project' ──────────────────────────
+   IntakeForm collects fields (per kind)
+   ↓
+   handleSubmit builds { brief, title } per kind
+   ↓
+   createProject(brief, title, null, null, kind, null)
+   ↓
+   POST /me/projects { brief, kind, title }
+       — backend skips classifyBriefKind because kind is set
+   ↓
+   navigate(/account/projects/:id)
+─── if tile.mode === 'external' (TG-ферма) ──────────────
+   onClose() + navigate('/agents/sales-funnel-tg-farm')
+   — NO project row created
+```
+
+## Per-kind brief shaping
+
+`IntakeForm.handleSubmit` (`CreateProjectModal.tsx:213`) maps controlled inputs to `(brief, title)` per kind:
+
+| `kind` | Inputs | Brief template | Title |
+|---|---|---|---|
+| `tg_profile_bundle` | `@username` | `AI-визитка для @<u>. Соскрейпь профиль, собери mini-site …` | `AI-визитка @<u>` |
+| `tg_bot` | name, purpose | `Telegram-бот "<name>". Цель: <purpose>. Платформа выдаст бот-токен из пула автоматически.` | `<name>` |
+| `landing` / `mini_app` | free text | raw textarea content | trimmed first line, capped at 60 chars |
+| `tg_farm` | — (escape-hatch tile) | — | — |
+
+The `tg_bot` intake has **no BOT_TOKEN field** — the platform drains a token from `BOT_TOKEN_POOL` on `workspace_ready` via `agentflow-agents/src/services/auto-bot.ts:142`. See [Auto-bot assign](/flows/auto-bot-assign).
+
+## ProjectCard kind-aware accent
+
+`ProjectCard.tsx:38` `KindAccent` reads `project.kind` and renders an icon + context line in `.pd-card__meta`:
+
+| `kind` | Icon | Subtitle | Source field |
+|---|---|---|---|
+| `tg_profile_bundle` | `IdCard` (lucide) | `AI-визитка @<tg_username>` or plain `AI-визитка` | `detail_meta.tg_username` ‖ `.username` ‖ `.source_username` |
+| `tg_bot` | `Bot` (lucide) | `@<bot_username>` or `Бот ещё не назначен` | `project.bot_username` |
+| `landing` / `mini_app` / `spa` / other | — | plain kind label | `project.kind` |
+
+`detail_meta` is the optional `Record<string, unknown>` on `ProjectSummary` (`agentsApi.ts:506`) populated by Виртуоз / scrape jobs. When the scraper has not run yet, the accent falls back to the bare kind label without throwing.
+
+## DB / Env / API
+
+**DB** (already used; nothing new):
+- `projects.kind` — `text`, set from POST body when the client pre-classifies.
+- `projects.bot_username` — populated by `auto-bot.ts` once a token is drained.
+- `projects.detail_meta` — `jsonb`, optional metadata bag.
+
+**Routes:**
+- `POST /me/projects` — accepts `{ brief, title?, kind?, team_id?, workflow_override? }`. Body shape lives in `agentsApi.ts:754`.
+- `GET /me/projects/:id` — payload shape: `ProjectSummary` in `agentsApi.ts:463`.
+
+**Env:** none added by the frontend modal. The Dockerfile bakes `VITE_ALLOW_NO_TONCENTER_KEY=1` so the prod build proceeds without a TONCENTER key.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Modal renders but submit does nothing | (no log — silent return when `username`/`name`/`purpose` empty) | `CreateProjectModal.tsx:222` (handleSubmit early returns) |
+| `kind` in POST body, backend still classifies | `classify_unknown_kind` despite client kind | `agentflow-agents/src/services/projects.ts:132` — verify it honours incoming `kind` |
+| TG-ферма tile lands on 404 | (route depends on `ferma-auditor` PR — TBD) | `CreateProjectModal.tsx:51` TODO comment |
+| `KindAccent` shows `Бот ещё не назначен` forever | `[auto-bot] pool empty` | `agentflow-agents/src/services/auto-bot.ts:151` |
+| AI-визитка card never gets `@handle` | `auto_scrape_post_ws_failed` | `agentflow-agents/src/services/projects.ts:1983` |
+| Modal tiles overflow on mobile | (visual only, no log) | `CreateProjectModal.tsx:142` — grid template uses `repeat(auto-fit, minmax(220px, 1fr))` |
+
+## Coupling to backend kind enum
+
+The frontend `ProjectKind` type (`CreateProjectModal.tsx:26`) MUST stay in sync with `agentflow-agents/src/services/kind-classifier.ts:21`. The current value is:
+
+```ts
+type ProjectKind = 'tg_profile_bundle' | 'tg_bot' | 'landing' | 'mini_app';
+// spa exists in backend enum but has no tile yet — owner has not asked for it.
+// tg_farm is NOT a kind — TG-ферма is an agent, not a project.
+```
+
+When the backend enum grows, this list must grow with it, or `createProject({kind})` accepts a string the backend silently drops. See [Add new kind](/runbooks/add-new-kind).
+
+## Related
+
+- [Create project flow](/flows/create-project) — backend chain after `POST /me/projects`.
+- [Auto-bot assign](/flows/auto-bot-assign) — how `tg_bot` cards eventually fill `bot_username`.
+- [Visitka tg-profile](/architecture/visitka-tg-profile) — what the `tg_profile_bundle` tile produces.
+- [Kinds](/architecture/kinds) — full kind enum + classifier behaviour.

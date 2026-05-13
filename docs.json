@@ -50,7 +50,8 @@
               "subsystems/runtime-supervisor",
               "subsystems/llm-router",
               "subsystems/tg-mcp",
-              "subsystems/auth-and-access"
+              "subsystems/auth-and-access",
+              "subsystems/projects-frontend"
             ]
           },
           {
