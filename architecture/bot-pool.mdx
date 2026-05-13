@@ -1,31 +1,125 @@
 ---
-title: "Бот pool + auto-assign"
-description: "BOT_TOKEN_POOL и auto-bot.ts: как раздаются токены."
+title: "Bot pool & auto-assign"
+description: "BOT_TOKEN_POOL model: lease, reclaim ladder (dead → done+idle), 409 conflict probe, BotFather fallback."
 ---
 
-# Бот pool + auto-assign
-
-> **TODO** — заполнить researcher-агентом. Стартовый skeleton.
+# Bot pool & auto-assign
 
 ## TL;DR
 
-(1-2 предложения)
+`BOT_TOKEN_POOL` — JSON-массив `{token, username}[]` в env платформы, ~5 entries в проде. Шарится между всеми пользователями. Раздаётся через `services/auto-bot.ts:autoCreateTelegramBot` после `workspace_ready` для проектов `kind ∈ {tg_bot, tg_profile_bundle}`.
+
+Lease НЕ perpetual: токен возвращается в пул, когда владелец-проект попадает в `failed`/`cancelled`/`draft`/`awaiting_approval` (DEAD — без probe) или в `done` + Telegram `getUpdates?timeout=0` отвечает 200 (idle — ни один pod не держит long-poll lock). `running`/`approved` владельцы — table stakes: НЕ yank'аем, даже если probe говорит idle (pod может быть в рестарте). Pool пуст / всё активно + `FF_AUTO_BOT_CREATE_BOTFATHER=1` → fallback на /newbot через Jarvis Telethon pod.
 
 ## Files
 
 | Repo / path | Что делает |
 |---|---|
-| `agentflow-agents/src/...` | (file ref) |
+| `agentflow-agents/src/services/auto-bot.ts:50` | `probeBotInConflict` — Telegram `getUpdates?timeout=0&offset=-1`, 4с timeout. 409 → токен реально занят. |
+| `agentflow-agents/src/services/auto-bot.ts:76` | `createBotViaBotFather` — Jarvis pod (`proj-71506e1l`, user_id 1) exec `python3 /workspace/bot_cli.py`. |
+| `agentflow-agents/src/services/auto-bot.ts:114` | `writeBotTokenFile` — `/workspace/bot_token.txt` (chmod 600) через code-exec MCP. |
+| `agentflow-agents/src/services/auto-bot.ts:142` | `autoCreateTelegramBot` — main entry; ladder pool → reclaim → BotFather. |
+| `agentflow-agents/src/services/auto-bot.ts:229` | Owner map: `SELECT id, status, bot_username FROM projects WHERE id != $self AND bot_username IS NOT NULL`. |
+| `agentflow-agents/src/services/auto-bot.ts:244` | `DEAD_STATUSES = {failed, cancelled, draft, awaiting_approval}`. |
+| `agentflow-agents/src/services/auto-bot.ts:261` | Reclaim loop — для каждого entry в pool order: probe → owner-status check → chosen/skip. |
+| `agentflow-agents/src/services/auto-bot.ts:296` | Atomic detach старого владельца + emit `bot_unassigned`. |
+| `agentflow-agents/src/services/auto-bot.ts:447` | `bot_assigned` event с payload `{username, project_name, via: 'pool'\|'botfather'}`. |
+| `agentflow-agents/src/services/projects.ts:1682` | `runProjectApprovalBackground` — caller, gate'нутый под `FF_AUTO_BOT_CREATE=1`. |
+| `agentflow-agents/src/services/seal.ts` | `sealString` — AES-256-GCM encryption для `projects.bot_token` + `project_secrets.value_encrypted`. |
+| `agentflow-agents/src/services/env-file-sync.ts` | `syncProjectEnvFile` — пушит decrypted secrets (включая `BOT_TOKEN`) в `/workspace/.env` для Procfile supervisor. |
+
+## Model
+
+**Pool entries** — статический список в env, читается каждый раз заново (нет кэша). Порядок entries = приоритет: первый кандидат, прошедший ladder, забирается. Никакой round-robin / random — для предсказуемости в проде.
+
+**Lease lifecycle:**
+
+```
+free (в pool, никем не used)
+  ↓ chosen by new project's autoCreateTelegramBot
+leased (projects.bot_username=@x, project_secrets.BOT_TOKEN sealed, is_set=true)
+  ↓ owner project status → failed/cancelled OR (done AND probe idle)
+reclaimable
+  ↓ next autoCreateTelegramBot call picks this entry
+re-leased (atomic detach старого + bind нового в одной function call)
+```
+
+**Что НЕ триггерит reclaim:**
+- Owner в `running` / `approved` — даже если probe idle (race с pod restart).
+- Owner в `done` но probe = 409 (live pod ещё poll'ит).
+- Project deletion НЕ предусмотрено в schema — нет cleanup hook'а.
+
+**Conflict probe (409):** Telegram держит long-poll lock ~10 минут после смерти процесса. Token может быть свободен в нашей БД (или owner=dead), но всё ещё 409 для нового pod'а. Probe — safety net: если pool entry "наш" по БД, но 409 — мы его всё равно пропускаем, не yank'аем.
 
 ## DB tables / env / API surface
 
-(таблицы Postgres, env vars, REST endpoints)
+**DB columns:**
+
+- `projects.bot_username` (text, nullable) — visible identifier, обнуляется при reclaim.
+- `projects.bot_token` (text, nullable) — sealed (AES-256-GCM).
+- `project_secrets` rows where `key='BOT_TOKEN'`:
+  - `value_encrypted` (bytea, nullable) — sealed; null при reclaim.
+  - `is_set` (bool) — gate для idempotency check в `auto-bot.ts:184`.
+  - `source` (text) — `'platform'` для auto-assigned, `'user'` для manually pasted.
+  - `masked` (text) — `AAAAA...XXXX`, для отображения в UI.
+  - `why` (text) — audit trail (`'Auto-assigned …'` / `'Reclaimed by auto-bot pool …'`).
+- `project_events`:
+  - `bot_assigned` — `{username, project_name, via: 'pool'|'botfather'}`.
+  - `bot_unassigned` — `{username, reason: 'pool_reclaim', previous_status, new_project_id}`.
+  - `log` (warn/info/error) — все greppable substrings из `auto-bot.ts`.
+
+**Env vars:**
+
+| Var | Default | Назначение |
+|---|---|---|
+| `FF_AUTO_BOT_CREATE` | (off) | Caller-level gate в `runProjectApprovalBackground`. `1` → auto-bot step активен. |
+| `FF_AUTO_BOT_CREATE_BOTFATHER` | (off) | Разрешает BotFather fallback при пустом / полностью активном пуле. |
+| `BOT_TOKEN_POOL` | — | JSON `[{token: "<bot_id>:<secret>", username: "<name>"}, ...]`. ~5 entries в проде. |
+| `JARVIS_OWNER_USER_ID` | `1` | User, от имени которого live Jarvis pod с Telethon-сессией. |
+| `JARVIS_WORKSPACE_PROJECT_NAME` | `proj-71506e1l` | Workspace name singleton pod'а (`auto-bot.ts:35`). |
+
+**Telegram Bot API contact:**
+- `GET /bot<token>/getUpdates?timeout=0&offset=-1` — probe, 4с AbortSignal.
+- `GET /bot<token>/getMe` — validation pool-токенов, 5с AbortSignal.
+
+**Internal MCP:**
+- code-exec `exec` в pod target проекта — `printf > /workspace/bot_token.txt`.
+- code-exec `exec` в Jarvis pod — `python3 /workspace/bot_cli.py <name> <username>` для BotFather mint.
+
+## Reclaim ladder (cheap → expensive)
+
+```
+for entry in pool:
+  owner          = ownerByUsername[entry.username]                # SELECT cached up-front
+  ownerIsDead    = owner ∧ owner.status ∈ DEAD_STATUSES
+  ownerIsActive  = owner ∧ ¬ownerIsDead ∧ owner.status ≠ 'done'
+  
+  conflict       = await probeBotInConflict(entry.token)         # 4s GET
+  if conflict:           skippedConflict ← entry; continue       # 10-min TG lock
+  if ownerIsActive:      skippedActive   ← entry; continue       # never yank running/approved
+  # owner dead OR (owner done ∧ probe idle) OR no owner at all
+  chosen = entry; reclaimedFromOwner = owner; break
+```
+
+Probe выполняется ВСЕГДА, даже если owner=dead (защита от orphan'а, который умер за минуту до status change в БД).
+
+Probe network error → `false` (conservative — лучше попробовать assign и потом get 409 в bot.py, чем skip каждый entry при downtime).
 
 ## Failure modes
 
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
+| Все pool токены active | `auto-bot: skipped N pool token(s) leased to a still-active project` | Расширить pool или подождать пока owner'ы перейдут в `done`/`failed`. |
+| Все pool токены 409 | `auto-bot: skipped N conflict-locked pool token(s)` | Wait 10 min for TG release или `kubectl delete pod` orphans. |
+| Pool пустой, BotFather off | `pool empty and FF_AUTO_BOT_CREATE_BOTFATHER off, skipping` | Расширить `BOT_TOKEN_POOL` или включить flag. |
+| Pool пустой, BotFather on, mint fail | `[auto-bot] botfather: no TOKEN= in output` / `botfather create exception` | `services/auto-bot.ts:76` — Jarvis Telethon session expired, перелогин в `proj-71506e1l`. |
+| Pool exhausted overall | `auto-bot: no available bot tokens (pool exhausted, BotFather unavailable)` | Combine fixes above + emit `project_events.log` с уровнем `warn`. |
+| Reclaim в БД случился, но новый pod 409 | `auto-bot: reclaimed @…` + downstream `getUpdates Conflict` в bot.py | Probe не сработал (race). Restart нового pod через ~10 мин, либо вручную остановить orphan. |
+| Placeholder secret блокирует assign | `[auto-bot] project N already has populated BOT_TOKEN, skipping` ХОТЯ `is_set=false` | Не воспроизводимо после фикса — UPDATE in-place через `placeholderSecretId` в `auto-bot.ts:184`. Если видишь — проверь, что `is_set` правильный bool. |
 
 ## Related
 
+- [Auto-bot assign flow](/flows/auto-bot-assign)
+- [Create project flow](/flows/create-project)
 - [Architecture overview](/architecture/overview)
+- [Debug stuck project](/runbooks/debug-stuck-project)
