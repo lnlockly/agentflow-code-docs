@@ -8,13 +8,18 @@ description: "Typed handler registry: every node id in agent_boilerplates.workfl
 ## TL;DR
 
 The walker resolves each `WorkflowNode.id` to a typed handler via
-`defaultRegistry.resolve(kind)`. 22 unique node ids ship across the 5
-seeded boilerplates; each has a handler under
+`defaultRegistry.resolve(kind)`. 50+ unique node ids ship across 16
+seeded boilerplates (5 originals + diploma composite + 6 TG-template
+extras from PR #196); each has a handler under
 `src/services/graph-executor/handlers/<group>.ts`. Deterministic work
-(deploy, scrape, smoke-test, request_token) wraps an existing service in
-≤20 LOC. Generative work (pick_theme, scaffold_*, *_flow) goes to a
-per-node coder-delegate with a tight `OUTPUT_EXPECTED` envelope so the
-walker can validate the result.
+(deploy, scrape, smoke-test, request_token, setup_bot, link_account)
+wraps an existing service in ≤20 LOC. Generative work (pick_theme,
+scaffold_*, *_flow) goes to a per-node coder-delegate with a tight
+`OUTPUT_EXPECTED` envelope so the walker can validate the result.
+
+The registry also resolves `kind:variant` suffixes (e.g.
+`tg.send_text:deliver`) to the base handler, so the diploma DAG can
+label per-edge variants without duplicate registrations.
 
 Contract: [`architecture/graph-executor.mdx`](/architecture/graph-executor).
 
@@ -34,10 +39,16 @@ Source: prod `agent_boilerplates.workflow_schema` (10 rows, 5 seeded).
 | 14 | spa | webapp-full | `scaffold_nest, scaffold_prisma, jwt_auth, billing_stripe, multi_tenant, admin_panel, deploy` |
 | 15 | landing | landing-full | `pick_theme, generate_sections, seo_optimize, deploy_caddy` |
 | 18 | tg_profile_bundle | tg-profile-bundle | `scrape_tg, render_landing, deploy_landing, scaffold_bot, wire_designapi, deploy_bot, booking_flow` |
+| 19 | tg_bot | tg-subscription-gate | `setup_bot, fetch_target_channel, register_callback, check_subscription, grant_or_deny` |
+| 20 | tg_bot | tg-voice-transcriber | `setup_bot, receive_voice, transcribe_whisper, format_text, reply_to_user` |
+| 21 | tg_bot | tg-join-request-handler | `setup_bot, register_join_listener, store_metadata, notify_owner, auto_approve_or_queue` |
+| 22 | tg_bot | tg-content-crossposter | `setup_bot, poll_source_channel, ai_summarize, format_for_platform, post_to_linkedin_or_x` |
+| 23 | tg_farm | tg-cold-mailer | `link_account, import_leads, personalize_template, throttled_send, log_replies` |
+| 24 | tg_farm | tg-ai-shiller | `link_account, set_keywords, poll_chats, ai_compose_reply, send_reply` |
+| diploma | tg_bot | composite DAG | `tg.get_user, tg.send_text, tg.wait_reply, llm.classify_intent, project.create_sub, project.wait_done, tg_lead_states.update` |
 
 Empty `workflow_schema` rows ship with a stub graph; the walker falls
-through to maestro for them until task #11 (TG-templates expansion)
-seeds the remaining 5.
+through to maestro for them.
 
 ## Handler registry
 
@@ -68,6 +79,21 @@ seeds the remaining 5.
 | `billing_stripe` | `handlers/spa.ts` | coder-backend delegate (Stripe Checkout + webhook) | 1 / 3s / false | 600s |
 | `multi_tenant` | `handlers/spa.ts` | coder-backend delegate (X-Org-Id + Membership guard) | 1 / 3s / false | 600s |
 | `admin_panel` | `handlers/spa.ts` | coder-spa delegate (React admin under admin-frontend/) | 1 / 3s / false | 600s |
+| `tg.get_user` | `handlers/tg.get_user.ts` | MCP `telegram/get_user` (peer lookup → username/user_id) | 2 / 3s / true | 60s |
+| `tg.send_text` | `handlers/tg-composite.ts` | MCP `telegram/send_message`, peer fallback to upstream `tg.get_user.username` | 1 / 0s / false | 60s |
+| `tg.wait_reply` | `handlers/tg-composite.ts` | MCP `telegram/get_history` cursor poll, emits `node_waiting` | 1 / 0s / true | 1800s |
+| `llm.classify_intent` | `handlers/tg-composite.ts` | `ctx.llm(ModelType.TEXT_LARGE)` → strict JSON intent | 1 / 0s / true | 60s |
+| `project.create_sub` | `handlers/project.ts` | `pipelines.startApproval` for child project | 1 / 3s / false | 60s |
+| `project.wait_done` | `handlers/project.wait_done.ts` | polls `projects.status` until terminal | 1 / 3s / true | 1800s |
+| `tg_lead_states.update` | `handlers/tg_lead_states.update.ts` | upserts row in `tg_lead_states` (idempotent) | 2 / 3s / true | 30s |
+| `setup_bot` | `handlers/tg-bot-extras.ts` | `auto-bot.autoCreateTelegramBot` (idempotent, shared by 4 tg_bot extras) | 2 / 5s / true | 180s |
+| `fetch_target_channel` / `register_callback` / `check_subscription` / `grant_or_deny` | `handlers/tg-bot-extras.ts` | coder-tg-bot delegate (subscription-gate flow) | 1 / 3s / false | 600s |
+| `receive_voice` / `transcribe_whisper` / `format_text` / `reply_to_user` | `handlers/tg-bot-extras.ts` | coder-tg-bot delegate (voice-transcriber flow) | 1 / 3s / false | 600s |
+| `register_join_listener` / `store_metadata` / `notify_owner` / `auto_approve_or_queue` | `handlers/tg-bot-extras.ts` | coder-tg-bot delegate (join-request flow) | 1 / 3s / false | 600s |
+| `poll_source_channel` / `ai_summarize` / `format_for_platform` / `post_to_linkedin_or_x` | `handlers/tg-bot-extras.ts` | coder-tg-bot delegate (content-crossposter flow) | 1 / 3s / false | 600s |
+| `link_account` | `handlers/tg-marketing.ts` | Telethon session bind (idempotent, branches on `ctx.kind` via `PROJECT_KIND` brief hint, shared by 2 tg_farm boilerplates) | 2 / 5s / true | 180s |
+| `import_leads` / `personalize_template` / `throttled_send` / `log_replies` | `handlers/tg-marketing.ts` | coder-tg-farm delegate (cold-mailer flow) | 1 / 3s / false | 600s |
+| `set_keywords` / `poll_chats` / `ai_compose_reply` / `send_reply` | `handlers/tg-marketing.ts` | coder-tg-farm delegate (ai-shiller flow) | 1 / 3s / false | 600s |
 
 Coder-fallback (`kind: '__coder__'`,
 [`graph-executor/coder-fallback.ts:39`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/graph-executor/coder-fallback.ts#L39))
@@ -86,6 +112,13 @@ without falling back. The coverage gate is enforced by
 | `agentflow-agents/src/services/graph-executor/handlers/tg-profile-bundle.ts` | `scrape_tg, deploy_landing, scaffold_bot, wire_designapi, deploy_bot, booking_flow` |
 | `agentflow-agents/src/services/graph-executor/handlers/mini-app.ts` | `scaffold_vite, tg_webapp_init, routes` |
 | `agentflow-agents/src/services/graph-executor/handlers/spa.ts` | `scaffold_nest, scaffold_prisma, jwt_auth, billing_stripe, multi_tenant, admin_panel` |
+| `agentflow-agents/src/services/graph-executor/handlers/tg-composite.ts` | `tg.send_text, tg.wait_reply, llm.classify_intent` (diploma composite primitives) |
+| `agentflow-agents/src/services/graph-executor/handlers/tg-bot-extras.ts` | `setup_bot` + 16 coder-delegates for the 4 new tg_bot boilerplates |
+| `agentflow-agents/src/services/graph-executor/handlers/tg-marketing.ts` | `link_account` + 8 coder-delegates for the 2 tg_farm boilerplates |
+| `agentflow-agents/src/services/graph-executor/handlers/tg.get_user.ts` | `tg.get_user` (MCP peer lookup) |
+| `agentflow-agents/src/services/graph-executor/handlers/project.ts` | `project.create_sub` (child pipeline launch) |
+| `agentflow-agents/src/services/graph-executor/handlers/project.wait_done.ts` | `project.wait_done` (terminal-status poll) |
+| `agentflow-agents/src/services/graph-executor/handlers/tg_lead_states.update.ts` | `tg_lead_states.update` (lead-state upsert) |
 | `agentflow-agents/tests/unit/graph-executor/handlers/registry-coverage.test.ts` | Asserts every seeded node id resolves without falling back |
 | `agentflow-agents/tests/unit/graph-executor/handlers/coder-delegate.test.ts` | Asserts brief envelope shape per coder-delegate handler |
 | `agentflow-agents/tests/unit/graph-executor/handlers/deterministic.test.ts` | Asserts retry policy + source-level delegation for deterministic handlers |
