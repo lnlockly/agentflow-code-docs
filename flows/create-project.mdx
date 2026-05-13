@@ -16,7 +16,7 @@ description: "POST /me/projects → kind classify → Maestro propose → user a
 | `agentflow-agents/src/routes/projects.ts:573` | `POST /me/projects` — создаёт row, спавнит Maestro propose. |
 | `agentflow-agents/src/services/projects.ts:132` | `createProjectForUser` — initial row insert (`status=draft`, `kind=null|classified`). |
 | `agentflow-agents/src/services/projects.ts:221` | `appendProjectEvent` — пишет в `project_events`. |
-| `agentflow-agents/src/services/kind-classifier.ts:21` | `ProjectKind` enum (`landing | tg_bot | spa | mini_app | tg_profile_bundle`). |
+| `agentflow-agents/src/services/kind-classifier.ts:21` | `ProjectKind` enum (`landing | tg_bot | spa | mini_app | tg_profile_bundle | tg_farm`). |
 | `agentflow-agents/src/services/kind-classifier.ts:47` | `REGEX_CONFIDENCE = 0.85` — порог для regex match. |
 | `agentflow-agents/src/services/kind-classifier.ts:49` | `MIN_LLM_CONFIDENCE = 0.5` — порог для LLM-классификатора. |
 | `agentflow-agents/src/services/kind-classifier.ts:90` | `classifyBriefKind` — regex first, fallback LLM. |
@@ -59,6 +59,7 @@ autoScrapeFromBrief                     — only if brief has @handles
 autoCreateTelegramBot                   — only kind ∈ {tg_bot, tg_profile_bundle}
    ↓ tries BOT_TOKEN_POOL → falls back to BotFather (if FF_AUTO_BOT_CREATE_BOTFATHER=1)
    ↓ project_events: 'bot_assigned'
+   ↓ NOTE: kind=tg_farm skips this step (MTProto user account, not Bot API)
    ↓
 scaffoldTgProfileBundle                 — only kind=tg_profile_bundle
    ↓ копирует template в /workspace
@@ -123,23 +124,41 @@ for the canonical enum):
 |---|---|---|---|
 | AI-визитка | `project` | `tg_profile_bundle` | `AI-визитка @<username>` |
 | Telegram-бот | `project` | `tg_bot` | `<bot name>` |
-| **TG-ферма** | `external` | — (NOT a backend kind) | — navigates to `/agents/sales-funnel-tg-farm` |
+| **TG-ферма** | `project` | `tg_farm` | `<campaign name>` (was `external` pre-task #11) |
 | Лендинг | `project` | `landing` | first line ≤ 60 chars |
 | Mini App | `project` | `mini_app` | first line ≤ 60 chars |
 
-The TG-ферма tile is the only `mode: 'external'` entry. Clicking it
-calls `onClose()` then `navigate('/agents/sales-funnel-tg-farm')` — no
-project row is created. The TS discriminated union prevents
-`createProject({ kind: 'tg_farm' })` from compiling, so the frontend
-cannot accidentally POST an unknown kind. The target route is currently
-a TBD landing tagged with a `TODO(team ship-base/ferma-auditor)` comment
-in the TILES array — it may 404 in production until the
-sales-funnel-tg-farm agent page ships.
+The TG-ферма tile flipped to `mode: 'project'` in task #11 — it now POSTs
+`{kind:'tg_farm', brief, title}` to `/me/projects` and provisions a
+project row backed by the cold-mailer or AI-shiller boilerplate
+(brief-analyzer picks the right one via the `ферма / cold-base /
+AI-shiller / воронка продаж` regex). See
+[TG templates matrix](/architecture/tg-templates) for the catalogue. The
+backend `autoCreateTelegramBot` step short-circuits for `kind=tg_farm`
+because MTProto creds live in project secrets, not the BOT_TOKEN_POOL.
 
 The `tg_bot` intake has **no BOT_TOKEN field** — the platform drains a
 token from `BOT_TOKEN_POOL` after `workspace_ready` via
 `agentflow-agents/src/services/auto-bot.ts:142`. See
 [Auto-bot assign](/flows/auto-bot-assign).
+
+### Boilerplates seeded from agent presets
+
+A handful of `agent_boilerplates` rows do **not** ship their own
+scaffolder repo — they reuse an existing agent preset from
+`agentflow-agents/presets/`. When the graph executor hits a node id
+covered by such a preset, the unregistered-id fallback delegates to
+`coder-agent-delegate` with the preset slug. Current mapping:
+
+| Boilerplate | Preset | Notes |
+|---|---|---|
+| `tg-cold-mailer` (`tg_farm`) | `sales-funnel-tg-farm.json` + `tg-account-operator.json` | MTProto outreach pipeline |
+| `tg-ai-shiller` (`tg_farm`) | `tg-ai-shiller.json` + `tg-account-operator.json` | keyword monitor + LLM reply |
+| `tg-subscription-gate` (`tg_bot`) | `tg-subscription-checker.json` | channel-membership gate |
+| `tg-voice-transcriber` (`tg_bot`) | `tg-voice-transcriber.json` | `useModel(TRANSCRIPTION)` |
+
+See [TG templates matrix](/architecture/tg-templates) for the full
+catalogue and per-node handler mapping.
 
 Mobile: tile grid uses `grid-template-columns: repeat(auto-fit, minmax(220px, 1fr))`
 so it collapses 3 → 2 → 1 column down to 360px viewport without a media
