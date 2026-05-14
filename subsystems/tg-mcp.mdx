@@ -16,7 +16,8 @@ description: "Python MCP сервер для MTProto-операций: 24 tools 
 | Repo / path | Что делает |
 |---|---|
 | `agentflow-tg-mcp/src/agentflow_tg_mcp/server.py:29` | `MCPAuthMiddleware` — raw-ASGI middleware, JWT-verify, exempt list. |
-| `agentflow-tg-mcp/src/agentflow_tg_mcp/server.py:105` | `_register_tools` — регистрирует 24 MCP tools (send_message, receive_message, scrape_chat, smoke_test_bot, click_button, forward_message, pin/unpin, react_to_message, search_messages, download_media, get_message_stats, join_channel, leave_channel, get_chat_members, view_channel, get_me, whoami, update_profile, get_full_user, download_profile_photo, …). |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/server.py:105` | `_register_tools` — регистрирует 25 MCP tools (send_message, **send_file**, receive_message, scrape_chat, smoke_test_bot, click_button, forward_message, pin/unpin, react_to_message, search_messages, download_media, get_message_stats, join_channel, leave_channel, get_chat_members, view_channel, get_me, whoami, update_profile, get_full_user, download_profile_photo, …). |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/tools/messages.py` `send_file` | Upload binary artefact to peer: base64-decode `file_bytes_b64`, wrap in `BytesIO(name=filename)`, call `client.send_file(target, buf, file_name, caption)`. Used by agentflow-agents `tg.send_file` graph handler for promo-video DAG terminal step. Errors: `file_bytes_b64_missing`, `filename_missing`, `invalid_base64`, `empty_payload`, `account_not_found`, `flood_wait` + Telethon structured. |
 | `agentflow-tg-mcp/src/agentflow_tg_mcp/server.py:597` | `build_app` — Starlette: mounts `/mcp` (streamable), `/sse` (SSE), `/health`, через `MCPAuthMiddleware`. |
 | `agentflow-tg-mcp/src/agentflow_tg_mcp/server.py:650` | `main` — uvicorn factory boot. |
 | `agentflow-tg-mcp/src/agentflow_tg_mcp/telethon_pool.py:20` | `TelethonPool` — LRU `max_size=32`, warm-set exempt. |
@@ -103,7 +104,7 @@ on real scrape request:
 - `GET /health` — exempt, returns `{ok: true}`.
 - `POST /mcp` — streamable HTTP transport (FastMCP streamable_app).
 - `GET /sse` / `POST /sse/messages` — SSE transport (FastMCP sse_app, messages path exempt).
-- 24 MCP tools — см. строки 105-469 server.py.
+- 25 MCP tools — см. строки 105-469 server.py.
 
 **Callbacks → agentflow-agents:**
 - `POST /internal/tg-callbacks` (`agentflow-agents/src/routes/internal.ts:49`) — после получения нового сообщения через Telethon.
@@ -122,6 +123,9 @@ on real scrape request:
 | Warm пропустил аккаунт (нет session_blob) | `warm_pool_skip` | `telethon_pool.py:131` (`warm_all`) |
 | Phone code expired | `phone_code_expired` | `_register_tools` (auth tools, server.py:105) |
 | Callback to agentflow-agents 500 | `tg_callback_send_failed` | `routes/internal.ts:49` |
+| `send_file` returns `error=invalid_base64` | `invalid_base64` (literal) | Caller passed non-b64 string. Fix the upstream — `tg.send_file` graph handler always reads via `code-exec.read_file_b64` which returns clean b64. |
+| `send_file` returns `error=empty_payload` | `empty_payload` (literal) | Decoded to zero bytes. Source file was empty / pod path mismatch. Check upstream producer node output. |
+| `send_file` returns `error=flood_wait, seconds=N` | `flood_wait` from `_structured_error` | Account-level rate limit. tg.send_file handler does NOT retry (idempotent=false) — operator must re-queue manually after the flood window. |
 
 ## Related
 
