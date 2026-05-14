@@ -13,13 +13,18 @@ description: "AI-визитка из TG-профиля: pipeline, файлы, fa
 
 Часть библиотеки canonical templates — см. [runbooks/canonical-templates](/runbooks/canonical-templates). У других kinds (landing/spa/tg_bot/mini_app) теперь есть свои scaffolds той же формы.
 
+**Style variants (2026-05-14):** scaffold теперь печёт стиль в `profile.json.style` ∈ { `cyber`, `minimal`, `luxury`, `playful`, `dark-techno` } на основе brief + scraped bio/posts. App.tsx применяет `data-style={style}` — все 5 тем лежат в одном `app.css` через CSS custom properties. Coder pass — только полировка, scaffold-direct fill убил необходимость в slot rewrites (issue #622: 17-минутные билды).
+
 ## Files
 
 | Path | Role |
 |---|---|
 | `agentflow-agents/src/services/tg-visitka-scaffold.ts` | Шаблон: пишет 13 файлов в /workspace через code-exec heredoc (идемпотентно) |
 | `agentflow-agents/src/services/graph-executor/handlers/tg-profile-bundle.ts` | Graph-node handlers: scrape_tg, deploy_landing, scaffold_bot, wire_designapi, deploy_bot |
-| `agentflow-agents/src/services/projects.ts:2037` | Вызывает `scaffoldTgProfileBundle()` в `runProjectApprovalBackground` |
+| `agentflow-agents/src/services/projects.ts:2058` | Вызывает `scaffoldTgProfileBundle({ ..., brief })` в `runProjectApprovalBackground`; читает `projects.brief` для style selector |
+| `agentflow-agents/src/services/tg-visitka-scaffold.ts:71` | `selectVisitkaStyle()` — keyword-based picker, 5 buckets (cyber/luxury/playful/dark-techno/minimal). Priority: first-match-wins. ASCII keywords с `\b`, Cyrillic — substring (JS `\b` не работает с кириллицей). |
+| `agentflow-agents/src/services/tg-visitka-scaffold.ts:780` | `injectVisitkaStyle()` — substitutes `__VISITKA_STYLE__` placeholder in profile_loader.py heredoc → `profile.json.style` ends up baked at build time. |
+| `agentflow-agents/src/services/tg-visitka-scaffold.ts:860` | `readScrapeSignals()` — best-effort `python3 -c …` через code-exec, читает `/workspace/scraped_*.json` чтобы добавить about+posts к style signal. Returns `{}` on any failure. |
 | `agentflow-agents/src/services/runtime-supervisor.ts:1484` | `deploy()` с `source:'flag_gated'` — запускает Vite build → preview |
 | `agentflow-agents/src/services/auto-scrape.ts` | MCP-first scrape path: `scrapeViaMcp()` calls `get_full_user` + `download_profile_photo` via `mcpDirect`; `scrapeOneTarget` tries MCP then falls back to kubectl exec |
 | `agentflow-agents/src/services/build-node-wrappers.ts:71` | `runBuildScrapeTgProfile` — single-target scrape entry from graph nodes |
@@ -29,18 +34,41 @@ description: "AI-визитка из TG-профиля: pipeline, файлы, fa
 
 ```
 approve
-  → scaffoldTgProfileBundle()       — пишет frontend/ backend/ Procfile scripts/
+  → scaffoldTgProfileBundle({brief})
+      → readScrapeSignals() — code-exec reads /workspace/scraped_*.json
+      → selectVisitkaStyle({brief, about, postsText}) → 1 of 5 styles
+      → injectVisitkaStyle(PROFILE_LOADER_PY, style) — bakes DEFAULT_STYLE
+      → code-exec heredoc → frontend/ backend/ Procfile scripts/
   → autoCreateTelegramBot()          — назначает бот-токен в bot_token.txt
   → plan_started → task_claimed
   → runtime-supervisor.deploy(flag_gated)
       → detectRuntime() → type=mixed (Procfile)
       → launch web: bash scripts/build-profile.sh
+                  → python3 backend/profile_loader.py
+                       → profile.json {…, "style": "cyber"}
                   && cd frontend && npm install && npm run build
                   && cd .. && cd dist && python3 -m http.server 8080
+      → App.tsx fetches profile.json → applies <main data-style={style}>
       → launch bot: python3 -u backend/bot.py
   → postDeployHealthCheck → repoint Caddy → preview_url live
   → audit_verdict → done
 ```
+
+## Style selector
+
+`selectVisitkaStyle({brief, about, postsText})` — pure, deterministic, side-effect-free.
+
+| Style | Keywords (ASCII / Cyrillic) | Visual |
+|---|---|---|
+| `cyber` | crypto, web3, defi, nft, btc, eth, developer, coder, fullstack, ai battle / разработ, разраб, кодер | neon green on black + monospace + grid overlay |
+| `luxury` | luxury, premium, jewel, gold, couture, concierge, atelier / элит, роскош, премиум, консьерж | burgundy + gold serif (Playfair) + italic |
+| `playful` | kids, child, girl, cartoon, playful, cute, kawaii, lifestyle, fashion blogger / дет, весел, пастель, игрушк, мам | pastel gradients + rounded blobs + Quicksand |
+| `dark-techno` | techno, rave, club, underground, industrial, drum & bass, edm, berghain, noir, brutalist | deep purple grid + electric pink gradient |
+| `minimal` (fallback) | minimal, clean, swiss, aesthetic, gallery, portfolio, architect, designer / типографик, архитект | white-on-light, Inter 400, lots of whitespace |
+
+Priority is **first-match-wins** in bucket order (cyber → luxury → playful → dark-techno → minimal). A brief saying "crypto trader" beats a scraped bio saying "luxury concierge".
+
+Override во время отладки: `VISITKA_STYLE=cyber python3 backend/profile_loader.py` — env var trumps the baked DEFAULT_STYLE in `profile_loader.load()`.
 
 ## DB / Env / API
 
@@ -61,6 +89,9 @@ approve
 | build-node-wrappers single-target scrape hits wrong Jarvis pod | `unknown_project` in scrape logs | **[FIXED PR #224]** `workspace` default was `'jarvis'`; now reads `JARVIS_WORKSPACE_PROJECT_NAME` env. |
 | Preview probe returns 200 on placeholder | `preview_pre_warm_probe: ready` but site = placeholder | Caddy gate (PR #217) — checks `/workspace/dist/index.html` before marking done |
 | audit_verdict=unknown still leads to done | `audit_verdict.*unknown` + `done` in same project | `project.wait_done` handler — auditor treats unknown as pass |
+| Все визитки одинаковые (generic dark Vite template) | `tg_visitka_scaffold: style=minimal` для всех проектов независимо от brief | **[FIXED feat/visitka-style-variants]** — `selectVisitkaStyle()` использует brief + scraped bio. Если brief всегда даёт `minimal`, добавь keyword в `tg-visitka-scaffold.ts:buckets`. |
+| profile.json содержит `"style":"__VISITKA_STYLE__"` raw placeholder | `__VISITKA_STYLE__` в `/workspace/frontend/public/profile.json` | `injectVisitkaStyle()` не запустился. Покрыто тестом `'scaffold: every style produces a profile_loader.py with NO __VISITKA_STYLE__ placeholder left'`. |
+| App.tsx not applying style — все рендерится как minimal-fallback | DOM: `<main data-style="minimal">` независимо от profile.json.style | `KNOWN_STYLES` whitelist в App.tsx режет неизвестный style; синхронизируй с TS-enum `VISITKA_STYLES`. |
 
 ## Root-cause deep-dive (PR #222)
 
