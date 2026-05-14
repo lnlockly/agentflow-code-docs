@@ -25,11 +25,14 @@ migration). See [Feature flags](/subsystems/feature-flags).
 | Event emit chain (DB + bus + pipeline_runs) | `agentflow-agents/src/services/graph-executor/events.ts` | shipped |
 | Production ExecCtx factory | `agentflow-agents/src/services/graph-executor/exec-ctx.ts` | shipped |
 | Public surface (`runGraphExecutor`) | `agentflow-agents/src/services/graph-executor/index.ts` | shipped |
-| Walker tests (6 cases) | `agentflow-agents/tests/unit/graph-executor/walker.test.ts` | green |
+| Walker tests (7 cases) | `agentflow-agents/tests/unit/graph-executor/walker.test.ts` | green |
 | Handler tests (23 cases) | `agentflow-agents/tests/unit/graph-executor/handlers/*.test.ts` | green |
 | `approveProject` fork on FF | `agentflow-agents/src/services/projects-pipeline.ts` | shipped |
-| `runGraphExecutorDispatch` | `agentflow-agents/src/services/projects.ts:2313` | shipped |
+| `runGraphExecutorDispatch` | `agentflow-agents/src/services/projects.ts:2373` | shipped |
 | FF parsing | `agentflow-agents/src/services/env.ts` (`ffGraphExecutor`, `ffGraphExecutorKinds`) | shipped |
+| Walker persistence (pod-restart resume) | `agentflow-agents/src/services/graph-executor/walker-persistence.ts` | shipped |
+| Stale-walker pinger | `agentflow-agents/src/services/pingers/walker-stale.ts` | shipped |
+| `graph_executor_walker_state` table | `agentflow-agents/migrations/2026-05-14g-walker-state.sql` | shipped |
 
 Implementation differences vs the original contract (below):
 
@@ -389,6 +392,102 @@ reads the latest event payload for `nodeId` — already shape-compatible.
 6. **Phase 6** — remove maestro freestyle for kinds with graphs. Maestro
    stays for `code_only` / `research` (no DAG).
 
+## Walker persistence (pod-restart resume)
+
+Since `2026-05-14` (PR `feat(graph-executor): persistent walker state survives pod restarts`)
+the walker survives pod restarts via a single-row-per-project state table
+plus a 30s pinger that reclaims stale walkers atomically.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ walker.ts (in-memory)             │ walker-persistence.ts (DB)     │
+├───────────────────────────────────┼────────────────────────────────┤
+│ executeNode(node) {                │                                │
+│   pushEvent('node_started');       │ ── upsertWalkerStep(           │
+│                                    │      project_id, current_step, │
+│                                    │      'running', payload)       │
+│   setInterval(10s) ──────────────► │ ── heartbeatWalker(project_id) │
+│                                    │      UPDATE last_heartbeat     │
+│   await handler.run(ctx);          │                                │
+│   stopHeartbeat();                 │                                │
+│   pushEvent('node_finished');      │   (next executeNode upserts    │
+│ }                                  │    the next current_step_id)   │
+│                                    │                                │
+│ // walk complete OR cycle          │                                │
+│ if (persistState)                  │ ── clearWalkerState(project_id)│
+│   await clearWalkerState();        │      DELETE FROM walker_state  │
+└───────────────────────────────────┴────────────────────────────────┘
+                                            │
+                                            ▼
+                            graph_executor_walker_state row
+                            persists across pod restart
+                                            │
+                                            ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ pingers/walker-stale.ts (30s tick, 60s threshold)                   │
+├─────────────────────────────────────────────────────────────────────┤
+│ rows = selectStaleWalkers(60s, 5)                                   │
+│ for row in rows:                                                    │
+│   claim = claimStaleWalker(project_id, row.last_heartbeat)          │
+│     // atomic: UPDATE … WHERE last_heartbeat = $seenAt RETURNING    │
+│     // (loses the race → another pod already grabbed it)            │
+│   resumeSteps = loadCompletedSteps(project_id)                      │
+│     // SELECT payload FROM project_events WHERE kind='node_finished'│
+│   runGraphExecutorDispatch(…, { resumeSteps, resumeAttempt }) ──────┤
+└─────────────────────────────────────────────────────────────────────┘
+                                            │
+                                            ▼
+                       walker resumes from current_step,
+                       skips completed nodes via in-degree decrement
+                       (`[graph-executor] idempotent_skip node_id=…`)
+```
+
+### Schema
+
+```sql
+CREATE TABLE graph_executor_walker_state (
+  project_id              integer PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  current_step_id         text NOT NULL,
+  step_status             text NOT NULL,          -- 'running' | 'waiting'
+  workspace_project_name  text NOT NULL,
+  started_at              timestamptz NOT NULL DEFAULT now(),
+  last_heartbeat          timestamptz NOT NULL DEFAULT now(),
+  attempt                 integer NOT NULL DEFAULT 1,
+  payload                 jsonb
+);
+CREATE INDEX idx_walker_state_heartbeat
+  ON graph_executor_walker_state (last_heartbeat);
+```
+
+One row per project. Only the *current* step is stored; completed steps are
+re-derived from `project_events.kind='node_finished'` so the table never grows.
+
+### Key knobs
+
+| Knob | Value | File |
+|---|---|---|
+| Heartbeat cadence | 10s | `walker.ts` (`HEARTBEAT_INTERVAL_MS`) |
+| Stale threshold | 60s | `walker-stale.ts` (`WALKER_STALE_THRESHOLD_SEC`) |
+| Pinger tick | 30s | `walker-stale.ts` (`WALKER_STALE_TICK_MS`) |
+| Resume cap per tick | 5 projects | `walker-stale.ts` (`WALKER_STALE_MAX_PER_TICK`) |
+| Persistence default | OFF in `runWalker`, ON in `runGraphExecutor` | `walker.ts` (`persistWalkerState`) |
+
+Tests stay DB-free because they call `runWalker` directly (default OFF);
+production callers go through `runGraphExecutor` which forces ON.
+
+### Resume semantics
+
+- `runGraphExecutorDispatch` emits `graph_executor_resumed` (with
+  `resume_attempt`, `resume_step_count`) when invoked with `resumeSteps`,
+  else `graph_executor_started` — greppable for ops.
+- `attempt` column increments each time the pinger reclaims the row, so
+  `walker_state.attempt > 1` is the canonical "this walk has restarted N times"
+  signal for ops dashboards.
+- All persistence calls are best-effort: `try/catch` with
+  `[walker-persist] …` warn logs. A DB blip never aborts the in-memory walk.
+- Atomic claim (`UPDATE … WHERE last_heartbeat = $seenAt RETURNING`) guards
+  against two pods double-resuming the same project.
+
 ## Risks & open questions
 
 | Risk | Mitigation / open |
@@ -412,6 +511,9 @@ reads the latest event payload for `nodeId` — already shape-compatible.
 | Coder partial reply | `[graph-executor] coder_partial node=<id>` | Brief was too broad; tighten `output_expected` |
 | Walker emits but CanvasLive doesn't render | `streamPipeline: unknown event kind` (landing console) | Verify event kind matches `node_started`/`node_finished`/`node_failed`/`edge_flowing` exactly |
 | Continue-on-error skipped a child that should have run | `[graph-executor] dependency closure marked <child> unreachable from failure of <parent>` | Per-kind policy table — change to `fail-fast` or remove the edge |
+| **RESOLVED 2026-05-14** Walker state lost on pod restart | `[walker-persist] upsert_failed` / `[walker-stale] resuming project_id=…` | Fixed by `graph_executor_walker_state` + `pingers/walker-stale.ts`. If you see resumes never firing → check pinger started in `auto-pinger.ts` and `last_heartbeat` is being written |
+| Pinger lost claim race (another pod won) | `[walker-stale] claim_lost project_id=…` | Expected on multi-pod — the winning pod logs `resuming project_id=…` |
+| Walker resume stuck at first step (no completed events) | `[walker-stale] resuming project_id=… resume_step_count=0` | Pre-restart walker died before any `node_finished` — walker re-runs from the entry node. Check handler idempotency. |
 
 ## Related
 
