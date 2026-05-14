@@ -134,6 +134,31 @@ Workspace pod не поднимается: vcluster syncer не может со�
      rollout restart sts/project-<name>
 ```
 
+### Case G — `status='approved'`, `approval_exhausted` event BUT `approval_in_flight` also present
+
+Cold-tenant warm-up race: the original `runProjectApprovalBackground` was still alive in
+`waitForTenantReady` when the pinger exhausted its 3-attempt cap and flipped to `failed`.
+
+```
+-- Was the procedure alive when the pinger fired?
+SELECT payload ->> 'event' AS event, created_at
+  FROM project_events
+ WHERE project_id = :id AND kind = 'log'
+   AND payload ->> 'event' IN ('approval_in_flight', 'approval_exhausted',
+                                'approval_retry_attempted', 'workspace_ready')
+ ORDER BY id DESC LIMIT 20;
+
+-- The in-flight guard (15 min window) should have prevented this from PR #XXX onwards.
+-- On older deploys: force-restart the approval manually:
+--   UPDATE projects SET status = 'approved', updated_at = now() WHERE id = :id;
+--   -- then let the pinger re-pick it, or hit:
+POST /internal/projects/:id/admin-approve
+```
+
+The fix (merged PR with `APPROVAL_IN_FLIGHT_GUARD_MS`) ensures the pinger skips any
+project whose `approval_in_flight` event is <15 min old, so legitimate cold-starts are
+not misclassified as failures.
+
 ### Case E — `paused_until > now()`
 
 ```
@@ -178,6 +203,7 @@ SELECT pt.id, pt.plan_id, pt.assignee_slug, pt.status, pt.retry_depth, pt.claime
 | Caddy всё ещё stub | `placeholder_repoint_skipped` | `services/pingers/placeholder-repoint.ts:94` |
 | `workspace_provision_retry` без `workspace_ready` | `exceeded quota: code-exec-quota` (vcluster syncer log) | `POST /internal/tenant/:userId/expand-quota` или ручной `kubectl patch` (см. Case F) |
 | expand-quota endpoint возвращает 500 | `Cannot read properties of undefined (reading 'url')` at `request.js#query` | агент-pod нужен передеплой с PR #208 (fix c.req.query binding). До деплоя — bypass через `kubectl exec user-<userId>-0 -c syncer` |
+| Pinger помечает `failed` пока cold-tenant ещё стартует (race) | `approval_in_flight` в `project_events` — проверить `created_at` и `payload.event`; если недавний — оригинальный approval всё ещё жив | `services/pingers/approval-retry.ts` — `APPROVAL_IN_FLIGHT_GUARD_MS` (15 min). `runProjectApprovalBackground` (projects.ts) эмитит `approval_in_flight` при старте; пингер пропускает проект пока событие свежее |
 
 ## Related
 
