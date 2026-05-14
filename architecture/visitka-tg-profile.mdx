@@ -19,6 +19,9 @@ description: "AI-визитка из TG-профиля: pipeline, файлы, fa
 | `agentflow-agents/src/services/graph-executor/handlers/tg-profile-bundle.ts` | Graph-node handlers: scrape_tg, deploy_landing, scaffold_bot, wire_designapi, deploy_bot |
 | `agentflow-agents/src/services/projects.ts:2037` | Вызывает `scaffoldTgProfileBundle()` в `runProjectApprovalBackground` |
 | `agentflow-agents/src/services/runtime-supervisor.ts:1484` | `deploy()` с `source:'flag_gated'` — запускает Vite build → preview |
+| `agentflow-agents/src/services/auto-scrape.ts` | MCP-first scrape path: `scrapeViaMcp()` calls `get_full_user` + `download_profile_photo` via `mcpDirect`; `scrapeOneTarget` tries MCP then falls back to kubectl exec |
+| `agentflow-agents/src/services/build-node-wrappers.ts:71` | `runBuildScrapeTgProfile` — single-target scrape entry from graph nodes |
+| `agentflow-agents/src/services/env.ts` | `jarvisTgAccountId` (`JARVIS_TG_ACCOUNT_ID`, default 4) |
 
 ## Data flow
 
@@ -51,7 +54,9 @@ approve
 | `dist/` absent, placeholder served, status=done | `runtime_runtime_failed` + `"service_crashed"` in project_events | `tg-visitka-scaffold.ts` INDEX_HTML entry point |
 | **[FIXED #222]** Vite build crashes: "Failed to resolve /assets/index.js" | `Error: Failed to resolve /assets/index.js from` (pod stderr) | `INDEX_HTML` in `tg-visitka-scaffold.ts` — was `/assets/index.js`, now `/src/main.tsx` |
 | Scaffold silently no-ops, `tg_visitka_scaffold_failed` in events | `tg_visitka_scaffold_failed: exit=1 stderr=` | `buildScaffoldScript()` heredoc bug — check `mkdir -p` guard for root-level files |
-| auto_scrape empty_response | `auto_scrape @X: empty_response:Defaulted container` | Workspace pod not ready yet; retry loop handles it |
+| auto_scrape empty_response — Jarvis session stale | `auto_scrape @X: empty_response` (no Python stdout) | **[FIXED PR #224]** `scrapeViaMcp()` in `auto-scrape.ts` — routes through `mcpDirect.callTool('telegram', 'get_full_user')` instead of kubectl exec. Falls back to kubectl if tg-mcp unreachable. |
+| auto_scrape MCP account wrong | `mcp_get_full_user_failed` or `mcp_profile_error` | Set `JARVIS_TG_ACCOUNT_ID` to the correct `tg_accounts.id`. Default is 4. |
+| build-node-wrappers single-target scrape hits wrong Jarvis pod | `unknown_project` in scrape logs | **[FIXED PR #224]** `workspace` default was `'jarvis'`; now reads `JARVIS_WORKSPACE_PROJECT_NAME` env. |
 | Preview probe returns 200 on placeholder | `preview_pre_warm_probe: ready` but site = placeholder | Caddy gate (PR #217) — checks `/workspace/dist/index.html` before marking done |
 | audit_verdict=unknown still leads to done | `audit_verdict.*unknown` + `done` in same project | `project.wait_done` handler — auditor treats unknown as pass |
 
