@@ -25,6 +25,8 @@ description: "AI-визитка из TG-профиля: pipeline, файлы, go
 
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
+| `scrape_tg` fails when brief has `@username` but no explicit `username` field | `scrape_tg_requires_username_or_brief` | **Fixed in PR fix/scrape-tg-username-fallback (2026-05-14).** Handler now extracts first `@handle` from brief via `/@([A-Za-z0-9_]{3,32})/`. Source: `agentflow-agents/src/services/graph-executor/handlers/tg-profile-bundle.ts:56-68` |
+| `tg_profile_bundle` project shows `status=done` while preview still serves Caddy placeholder | `preview_gate_blocked` | **Fixed in PR fix/preview-gate-tg-profile (2026-05-14).** `tg_profile_bundle` added to `STATIC_PREVIEW_KINDS` in `services/pingers/preview-placeholder.ts:34` and `mcp-servers/code-exec/helpers/workspace-resolve.ts:568`. Gate also runs in `services/projects.ts:2654` and `3006`. |
 
 ## Related
 
