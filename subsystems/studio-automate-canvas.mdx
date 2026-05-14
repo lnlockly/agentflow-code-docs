@@ -1,0 +1,96 @@
+---
+title: "Studio Automate canvas"
+description: "v0-tier visual layer for /studio?mode=automate — node cards, agent lanes, animated edges, glass-blur PromptBar."
+---
+
+# Studio Automate canvas
+
+## TL;DR
+
+`/studio?mode=automate` is the team-builder canvas. The user types a brief, the platform streams back a `BoilerplateWorkflow` (nodes + edges), and the canvas renders it as a graph with live status. Nodes self-group into **agent lanes** (Designer / Coder / QA …) when the workflow has ≥2 distinct agent prefixes covering ≥50% of nodes. Live SSE updates flip per-node status colors and fire flow particles along active edges. PromptBar at the bottom is glass-blur with a colored status pill.
+
+## Files
+
+| Repo / path | Что делает |
+|---|---|
+| `agentflow-landing/src/components/studio/Canvas.tsx:1` | SVG canvas — pan/zoom, lanes, edges, nodes, minimap, HUD chip, toolbar. |
+| `agentflow-landing/src/components/studio/Canvas.tsx:84` | `kindIcon(node)` — regex match on `id + label` → lucide icon. |
+| `agentflow-landing/src/components/studio/Canvas.tsx:140` | `inferAgentKey(node)` — agent prefix detection (see "Agent inference" below). |
+| `agentflow-landing/src/components/studio/Canvas.tsx:170` | `computeClusters(nodes)` — returns `Cluster[]` or `null` when signal too weak. |
+| `agentflow-landing/src/components/studio/Canvas.tsx:215` | `hashHue(key)` — deterministic HSL color per agent. |
+| `agentflow-landing/src/components/studio/PromptBar.tsx:1` | Glass-blur prompt bar with status pill, Mic/Send/Regen icon buttons. |
+| `agentflow-landing/src/pages/Studio.tsx:54` | `?_demo=1` URL hook — pre-populates 8 nodes / 4 agents for visual review without an API call. |
+| `agentflow-landing/src/store/studioStore.ts:1` | Zustand store — phase, nodes, edges, layout. Bumped `NODE_W=200`, `NODE_H=64`. |
+| `agentflow-landing/src/store/studioStore.ts` | Per-agent row layout: when ≥2 agent buckets + ≥50% signal, each agent gets its own row sorted alphabetically; cols by topological depth. |
+
+## Visual contract
+
+Numbers below are load-bearing — Canvas.tsx layout and the studioStore both use them. Change one, change both.
+
+| Token | Value | Where |
+|---|---|---|
+| Node width | `200` | `Canvas.tsx` `NODE_W`, `studioStore.ts` `NODE_W` |
+| Node height | `64` | `Canvas.tsx` `NODE_H`, `studioStore.ts` `NODE_H` |
+| Node header bar | `24` | `Canvas.tsx` `HEADER_H` |
+| Grid pitch | `24px` dotted | `Canvas.tsx` background grid |
+| Grid color | `var(--line) @ 8% alpha` | `Canvas.tsx` |
+| Lane padding | `28px` around cluster bbox | `Canvas.tsx` `LANE_PAD` |
+| Lane header bar | `28px` | `Canvas.tsx` `LANE_HEADER_H` |
+| Lane tint | `hsla(hue, 60%, 50%, 0.06)` body, `0.10` header | `Canvas.tsx` |
+| Fit padding | `56px` | `Canvas.tsx` `FIT_PADDING` |
+| Status dot pulse | `running` only | `Canvas.tsx` `STATUS_STYLES` |
+| Stagger | `i * 0.05s` framer-motion entry | `Canvas.tsx` motion.g |
+
+Node statuses: `queued | running | done | failed | skipped`. Edge state `edge_flowing` triggers the `<animateMotion>` particle + animated stroke-dashoffset.
+
+## Agent inference
+
+`BoilerplateWorkflowNode` has no `agent_id` field — the canvas infers an agent key from the node id and label. Both rules are pure-string, deterministic, and stable across SSE updates.
+
+1. **Id prefix** — token before the first `-` or `_` in `node.id`. Example: `coder-step-1` → `coder`, `qa_smoke_run` → `qa`.
+2. **Label prefix fallback** — if id has no separator, take the token before the first `:` or space in `node.label`. Example: `Designer: hero section` → `designer`, `QA smoke test` → `qa`.
+3. **No match** → returns `null` → the node falls back to "unclassified" bucket.
+
+Cluster mode activates only when:
+- `≥2` distinct non-null agent keys are present, AND
+- `≥50%` of nodes have a non-null key.
+
+If either threshold fails, the canvas falls back to plain topological layout (no lanes). This keeps solo workflows clean.
+
+## Data flow
+
+```
+User types brief in <PromptBar>
+   ↓
+Studio.tsx → buildWorkflow() POST /me/studio/workflow
+   ↓
+streamFlowRun SSE: node_started | node_finished | node_failed | edge_flowing
+   ↓
+useStudioStore — applies status to each node, layout recomputed if first frame
+   ↓
+Canvas.tsx
+   ├─ inferAgentKey(node) for every node
+   ├─ computeClusters → maybe Cluster[]
+   ├─ clusterBoxes → bbox rects with LANE_PAD + LANE_HEADER_H
+   ├─ render lanes (foreignObject header: 20px avatar circle, mono name, count chip)
+   ├─ render edges (animated dashoffset + animateMotion particle when active)
+   └─ render nodes (motion.g, header bar with icon + id pill + status dot)
+```
+
+## DB / Env / API
+
+Pure frontend feature. No new env, no new tables, no new routes. Hooks into the existing `streamFlowRun` SSE consumer.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Lanes never appear | `computeClusters returned null` (no log, inspect via React DevTools) | Lower the 50% signal threshold in `Canvas.tsx:170` or fix node ids upstream so they share prefixes. |
+| Node card overlapping a lane header | layout coords from store don't match `HEADER_H + LANE_HEADER_H` in Canvas | Keep `NODE_H`, `LANE_HEADER_H` in `Canvas.tsx` and `studioStore.ts` in sync. |
+| Flow particle stuck mid-edge | `edge_flowing` SSE event never replaced by `node_finished` | Backend graph executor isn't emitting the terminal event — see `agentflow-agents` graph-executor docs. |
+| `?_demo=1` showing in production | the URL hook left in `Studio.tsx:54` is harmless but visible to QA | Document or gate behind `import.meta.env.DEV` if it ever shows up in support tickets. |
+
+## Related
+
+- [Graph executor](/architecture/graph-executor) — backend SSE producer for node/edge events.
+- [Projects frontend](/subsystems/projects-frontend) — the `/projects` dashboard that comes after the Studio brief.
