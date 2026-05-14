@@ -29,10 +29,17 @@ description: "Три пути auth: x-api-key (af_live_, HMAC-SHA256), Bearer JW
 | `agentflow-agents/src/middleware/api-key-rate-limit.ts:114` | `defaultLimitFor` — читает `API_KEY_RPM_PRO=300`, `API_KEY_RPM_FREE=60`. Feature flag `FF_API_KEY_TIERS=1`. Возвращает 429 `rate_limited`. |
 | `agentflow-agents/src/routes/auth-magic-link.ts:206` | `POST /auth/magic-link/request` + alias `/auth/magic-link` — insert hashed nonce, send email via Resend, fall back to `dev_link` only when `ALLOW_DEV_MAGIC_LINK=1 && NODE_ENV!=production`. |
 | `agentflow-agents/src/routes/auth-magic-link.ts:316` | `GET\|POST /auth/magic-link/verify` + aliases `/auth/verify` — hash incoming token, look up unused unexpired row, find-or-create user by email, mint 7-day JWT, set `af_session` cookie. |
-| `agentflow-landing/src/pages/AuthEmailPage.tsx:65` | `/auth/email` page — **email+password form**. Posts to `/auth/login` via `agentsPost`, hard-navigates to `?next=` on success so AuthProvider re-bootstraps with the fresh `af_session` cookie. Was a magic-link inbox flow until 2026-05; replaced because the mailer (`RESEND_API_KEY`) never landed in prod. |
-| `agentflow-landing/src/pages/AuthVerifyPage.tsx:36` | `/auth/verify?token=…` page — posts to `/auth/magic-link/verify` via `agentsPost`, then invalidates `ME_QUERY_KEY` and redirects to `?next=`. Reachable only via inbox links (`/auth/email` no longer mints them). |
-| `agentflow-landing/src/main.tsx:322` | Router mount for `/auth/email` (`AuthEmailPage`) and `/auth/verify` (`AuthVerifyPage`). |
-| `agentflow-agents/src/routes/auth-password.ts` | `POST /auth/login`, `/auth/register` (gated by `PUBLIC_REGISTRATION_OPEN=1`), `/auth/logout`, `/auth/password-reset/{request,confirm}`. bcrypt cost 12, constant-time compare with dummy hash on miss, sets the same `af_session` JWT cookie as the magic-link path. |
+| `agentflow-landing/src/pages/AuthEmailPage.tsx:46` | `/auth/email` page — **dual-mode** (password tab default + magic-link tab fallback). Password tab posts to `/auth/login` via `agentsPost`, hard-navigates to `redirect_to` (or `?next=`) so AuthProvider re-bootstraps with the fresh `af_session` cookie. Magic-link tab kept as fallback so any working SMTP path still works. |
+| `agentflow-landing/src/pages/AuthForgotPassword.tsx` | `/auth/forgot-password` page — posts to `/auth/password-reset/request`. Always shows success state (privacy posture). |
+| `agentflow-landing/src/pages/AuthResetPassword.tsx` | `/auth/reset-password?token=…` page — posts to `/auth/password-reset/confirm`. |
+| `agentflow-landing/src/pages/AuthVerifyPage.tsx:36` | `/auth/verify?token=…` page — posts to `/auth/magic-link/verify` via `agentsPost`, then invalidates `ME_QUERY_KEY` and redirects to `?next=`. Reachable via inbox links (magic-link tab on `/auth/email`). |
+| `agentflow-landing/src/main.tsx:322` | Router mount for `/auth/email`, `/auth/verify`, `/auth/forgot-password`, `/auth/reset-password`. |
+| `agentflow-agents/src/routes/auth-password.ts:313` | `POST /auth/register` (gated by `PUBLIC_REGISTRATION_OPEN=1`). |
+| `agentflow-agents/src/routes/auth-password.ts:362` | `POST /auth/login` — bcrypt verify (cost 12), constant-time compare with dummy hash on miss, mints same `af_session` JWT cookie as magic-link path. Returns `{ok, user_id, redirect_to}`. |
+| `agentflow-agents/src/routes/auth-password.ts:368` | `POST /auth/logout` — clears the `af_session` cookie. |
+| `agentflow-agents/src/routes/auth-password.ts:476` | `POST /auth/password-reset/request` — HMAC-SHA256 hashes the reset token with `API_KEY_HMAC_SECRET`/`AUTH_JWT_SECRET`. |
+| `agentflow-agents/src/routes/auth-password.ts:566` | `POST /auth/password-reset/confirm` — verifies hashed token, bcrypts new password. |
+| `agentflow-agents/migrations/2026-05-11e-password-auth.sql` | Adds `users.password_hash` nullable + `auth_password_resets` table. |
 
 ## Data flow
 
@@ -101,9 +108,10 @@ Optional: FF_API_KEY_TIERS=1 →
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
 | /auth/email молча редиректит обратно на /login | (visual) `<Navigate to="/login" replace />` в `main.tsx` для `/auth/email` | `agentflow-landing/src/main.tsx:322` — mount `<AuthEmailPage />` напрямую. |
-| /auth/email POSTs to a magic-link endpoint and 404s | `agentsPost.*magic-link/request` в `AuthEmailPage.tsx` | Page was migrated to password login in 2026-05. Restore from main if regressed — should POST to `/auth/login`. |
-| Login form returns 401 with valid creds | `invalid_credentials` from `/auth/login` | `agentflow-agents/src/routes/auth-password.ts` — check `password_hash` actually populated on the user row (NULL for users created via Telegram OAuth → need password-reset to set one). |
-| Password-reset email never arrives | `[auth-password] reset_mail_failed: mailer_not_configured` | Wire `RESEND_API_KEY` в `agentflow-agents` Secret. Until then `/auth/forgot-password` silently no-ops and only Telegram login or pre-set passwords work. |
+| /auth/email shows only magic-link tab (no password input) | `mode === 'link'` stuck without segmented control | `AuthEmailPage.tsx:46` — default `mode` state should be `'password'`; tab toggle wired to `setMode`. |
+| Login returns 401 even with right creds | `invalid_credentials` from `POST /auth/login` | `agentflow-agents/src/routes/auth-password.ts:362` — `password_hash` is NULL for users created via Telegram OAuth or magic-link. Set one with `/auth/password-reset/confirm` or via admin bootstrap. |
+| Password-reset email never arrives | `[auth-password] reset_mail_failed: mailer_not_configured` | Wire `RESEND_API_KEY` в `agentflow-agents` Secret. Until then `/auth/forgot-password` silently no-ops; only Telegram login or pre-set passwords work. |
+| User has `password_hash IS NULL` and cannot log in (mailer dead) | `SELECT password_hash FROM users WHERE email=$1` → NULL | Bootstrap via SQL: `UPDATE users SET password_hash = '$2b$12$…' WHERE email=$1;` then notify user to reset on first login. Use `node -e "console.log(require('bcrypt').hashSync('temp_pw', 12))"`. |
 | Лавинообразные 401 от одного IP | `too_many_auth_failures` | `middleware/auth.ts:151` (brute-force gate) |
 | Все api-keys внезапно отвергаются | `jwt_not_configured` или `AGENTS_MASTER_KEY missing` | env config; `middleware/auth.ts:86` |
 | Platform admin не виден | `is_platform_admin_cache_stale` | `services/access.ts:26` — invalidate / restart pod |
