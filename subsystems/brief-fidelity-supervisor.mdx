@@ -1,0 +1,94 @@
+---
+title: "Brief-Fidelity Supervisor"
+description: "Post-smoke gate that rejects tg_bot and landing projects whose observable behavior diverges from the owner's brief."
+---
+
+# Brief-Fidelity Supervisor
+
+## TL;DR
+
+The supervisor runs **after** the bot smoke test returns `verdict=pass` (for tg_bot) or after the structural landing gate passes (for landing/spa/tg_profile_bundle). It extracts 3–5 keyword intents from the owner's brief via a cheap TEXT_SMALL call, then checks whether those keywords appear in the bot's reply transcript or the rendered HTML. If fewer than 40% match, a second LLM "judge" call makes the final call. A coder that ships a generic "/book" shell for an "AI Battle Royale" brief will now fail with `reason: brief_behavior_drift`.
+
+Feature-flag gated: `BRIEF_FIDELITY_SUPERVISOR` in `feature_flags` table (default `false`).
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/agents/brief-fidelity-supervisor.ts:59` | `BriefFidelityInput`, `BriefFidelityResult` types |
+| `agentflow-agents/src/services/agents/brief-fidelity-supervisor.ts:106` | `extractIntents()` — TEXT_SMALL → JSON `{intents:[...]}` |
+| `agentflow-agents/src/services/agents/brief-fidelity-supervisor.ts:182` | `llmJudge()` — TEXT_SMALL → `match \| drift \| empty` |
+| `agentflow-agents/src/services/agents/brief-fidelity-supervisor.ts:244` | `checkBriefFidelity()` — main export, feature-flag gated |
+| `agentflow-agents/src/services/projects.ts:1127` | Landing gate hook — runs after `validateLandingPreview` passes |
+| `agentflow-agents/src/services/projects.ts:2825` | Multi-agent tg_bot smoke hook — runs after `verdict=pass` |
+| `agentflow-agents/src/services/projects.ts:3192` | Single-coder tg_bot smoke hook — mirror of multi-agent path |
+| `agentflow-agents/migrations/2026-05-14f-brief-fidelity-supervisor.sql` | Feature flag seed row (value=`false`) |
+| `agentflow-agents/tests/unit/brief-fidelity-supervisor.test.ts` | 8 unit tests (all pass without DB/network) |
+
+## Data flow
+
+```
+Bot smoke test / landing gate
+        │
+        │  verdict=pass / validateLandingPreview ok
+        ▼
+checkBriefFidelity(brief, productKind, sampleBehaviorTranscript)
+        │
+        ├─ flag off (default) ──────────────────────▶ {ok:true}
+        ├─ brief or sample empty ──────────────────▶ {ok:true}
+        │
+        ▼
+extractIntents(brief)  [TEXT_SMALL, max_tokens=200]
+  └─ returns 3-5 lowercase keywords
+        │
+        ▼
+substring hit_rate = matches / total_intents
+        │
+        ├─ hit_rate >= 0.4 ────────────────────────▶ {ok:true}
+        │
+        ▼
+llmJudge(intents, sample)  [TEXT_SMALL, max_tokens=10]
+  └─ "match" | "drift" | "empty"
+        │
+        ├─ "match" ────────────────────────────────▶ {ok:true}
+        │
+        ▼
+{ok:false, reason:"brief_behavior_drift"}
+        │
+  (tg_bot)                      (landing)
+        │                             │
+UPDATE projects                 return {pass:false}
+  SET status='failed'             from gateLandingPreview
+appendProjectEvent               (prevents done flip)
+  kind='brief_fidelity_drift'
+createSmokeFixTask
+  (self-heal retry)
+```
+
+## DB / Env / API
+
+- Tables: `feature_flags` (key=`BRIEF_FIDELITY_SUPERVISOR`, value=`false` by default), `project_events` (kind=`brief_fidelity_drift`)
+- Env: none — DB-driven flag only
+- Feature flag enable SQL:
+  ```sql
+  UPDATE feature_flags SET value = 'true' WHERE key = 'BRIEF_FIDELITY_SUPERVISOR';
+  ```
+- MCP tools: none
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| LLM threw during intent extraction | `[brief-fidelity] llm_intent_extract_failed` | `brief-fidelity-supervisor.ts:118` — fail-open, returns `[]` |
+| Intent JSON unparseable | `[brief-fidelity] llm_intent_extract_unparseable` | `brief-fidelity-supervisor.ts:151` — fail-open |
+| No intents extracted | `[brief-fidelity] no_intents_extracted — fail_open` | `brief-fidelity-supervisor.ts:278` |
+| LLM judge threw | `[brief-fidelity] llm_judge_failed` | `brief-fidelity-supervisor.ts:220` — fail-open returns "match" |
+| Brief or sample empty, gate skipped | `[brief-fidelity] skip: brief or sample empty` | `brief-fidelity-supervisor.ts:265` — expected for empty projects |
+| Drift detected, project re-queued | `brief_fidelity_drift` event in project_events | `projects.ts:2841` and `projects.ts:3208` |
+| Landing gate rejected on drift | `brief_behavior_drift:` in `details` field of landing gate result | `projects.ts:1159` |
+| fetch of preview URL failed | `[gate] brief-fidelity check failed (fail-open)` | `projects.ts:1173` |
+
+## Related
+
+- [Feature flags](/subsystems/feature-flags)
+- [Graph handlers](/subsystems/graph-handlers)
