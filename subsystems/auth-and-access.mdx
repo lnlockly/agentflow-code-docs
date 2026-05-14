@@ -36,6 +36,8 @@ description: "Три пути auth: x-api-key (af_live_, HMAC-SHA256), Bearer JW
 | `agentflow-landing/src/main.tsx:322` | Router mount for `/auth/email`, `/auth/verify`, `/auth/forgot-password`, `/auth/reset-password`. |
 | `agentflow-agents/src/routes/auth-password.ts:313` | `POST /auth/register` (gated by `PUBLIC_REGISTRATION_OPEN=1`). |
 | `agentflow-agents/src/routes/auth-password.ts:362` | `POST /auth/login` — bcrypt verify (cost 12), constant-time compare with dummy hash on miss, mints same `af_session` JWT cookie as magic-link path. Returns `{ok, user_id, redirect_to}`. |
+| `agentflow-agents/src/routes/auth-password.ts:364` | `GET /auth/me` — primary AuthProvider bootstrap. Verifies `af_session` (via `requireSession`), returns `{ok, user: {id, email, ref_code, tg_id, tg_username, is_admin, access_granted_at, joined_at}, wallet:null, balance_micro:0, invited_by:null}`. Added 2026-05-14 because `agentflow-api /me` returning 5xx silently logged users out — bootstrapping from the cookie-issuing service decouples session validity from agentflow-api uptime. Landing enriches wallet/balance/invited_by via `apiGet('/me')` afterwards, treating its failure as non-fatal. |
+| `agentflow-landing/src/lib/auth.tsx:63` | `AuthProvider` queryFn — calls `agentsGet('/auth/me')` first; only treats `AgentsApiError` 401 as anonymous. Then enriches with `apiGet('/me')` for wallet/balance/invited_by; any failure there is non-fatal as long as agents authed us. |
 | `agentflow-agents/src/routes/auth-password.ts:368` | `POST /auth/logout` — clears the `af_session` cookie. |
 | `agentflow-agents/src/routes/auth-password.ts:476` | `POST /auth/password-reset/request` — HMAC-SHA256 hashes the reset token with `API_KEY_HMAC_SECRET`/`AUTH_JWT_SECRET`. |
 | `agentflow-agents/src/routes/auth-password.ts:566` | `POST /auth/password-reset/confirm` — verifies hashed token, bcrypts new password. |
@@ -118,6 +120,7 @@ Optional: FF_API_KEY_TIERS=1 →
 | Owner не может открыть свой project | `acl_owner_mismatch` | `services/access.ts:39` (userCanAccessProject) |
 | 429 rate_limited при низкой нагрузке | `api_key_rpm_exceeded` | `middleware/api-key-rate-limit.ts:114` — поднять `API_KEY_RPM_*` |
 | Internal endpoint не пускает (свой сервис) | `internal_secret_mismatch` | check `INTERNAL_API_SECRET` aligned между API-pod и runtime-supervisor / tg-mcp |
+| Successful login → /my/agents всё равно показывает «Нужен вход / Войти через Telegram» | curl `/_api/me` returns 503 while `/_agents/auth/me` returns 200 | `agentflow-api` service down. Now non-fatal: `AuthProvider` (`agentflow-landing/src/lib/auth.tsx:63`) bootstraps from `agentflow-agents` `/auth/me` first; agentflow-api `/me` is only an enrichment call. If both fail, user is anonymous. Fix root cause by reviving the `agentflow-api` deployment. |
 
 ## Related
 
