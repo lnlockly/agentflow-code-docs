@@ -27,6 +27,11 @@ description: "Три пути auth: x-api-key (af_live_, HMAC-SHA256), Bearer JW
 | `agentflow-agents/src/services/access.ts:39` | `userCanAccessProject` — owner OR platform_admin. |
 | `agentflow-agents/src/services/access.ts:56` | `userCanDispatchAgent` — analogous для agent-trigger / cron. |
 | `agentflow-agents/src/middleware/api-key-rate-limit.ts:114` | `defaultLimitFor` — читает `API_KEY_RPM_PRO=300`, `API_KEY_RPM_FREE=60`. Feature flag `FF_API_KEY_TIERS=1`. Возвращает 429 `rate_limited`. |
+| `agentflow-agents/src/routes/auth-magic-link.ts:206` | `POST /auth/magic-link/request` + alias `/auth/magic-link` — insert hashed nonce, send email via Resend, fall back to `dev_link` only when `ALLOW_DEV_MAGIC_LINK=1 && NODE_ENV!=production`. |
+| `agentflow-agents/src/routes/auth-magic-link.ts:316` | `GET\|POST /auth/magic-link/verify` + aliases `/auth/verify` — hash incoming token, look up unused unexpired row, find-or-create user by email, mint 7-day JWT, set `af_session` cookie. |
+| `agentflow-landing/src/pages/AuthEmailPage.tsx:53` | `/auth/email` page — posts to `/auth/magic-link/request` **via `agentsPost`** (agentflow-agents host, not agentflow-api). Wrong client was the 2026-05 outage. |
+| `agentflow-landing/src/pages/AuthVerifyPage.tsx:36` | `/auth/verify?token=…` page — posts to `/auth/magic-link/verify` via `agentsPost`, then invalidates `ME_QUERY_KEY` and redirects to `?next=`. |
+| `agentflow-landing/src/main.tsx:322` | Router mount for `/auth/email` (`AuthEmailPage`) and `/auth/verify` (`AuthVerifyPage`). |
 
 ## Data flow
 
@@ -94,6 +99,9 @@ Optional: FF_API_KEY_TIERS=1 →
 
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
+| /auth/email молча редиректит обратно на /login | (visual) `<Navigate to="/login" replace />` в `main.tsx` для `/auth/email` | `agentflow-landing/src/main.tsx:322` — mount `<AuthEmailPage />` напрямую. |
+| Magic-link 503 / endpoint missing на /_api | `apiPost.*magic-link` в page source | Switch page to `agentsPost` — routes live on agentflow-agents, not agentflow-api. |
+| Юзер кликнул link, но получает «expired/error» | `[auth-magic-link] mail_failed for ...: mailer_not_configured` | Wire `RESEND_API_KEY` в `agentflow-agents` Secret (или другой mailer). До этого e2e flow невозможен в prod без ручного INSERT. |
 | Лавинообразные 401 от одного IP | `too_many_auth_failures` | `middleware/auth.ts:151` (brute-force gate) |
 | Все api-keys внезапно отвергаются | `jwt_not_configured` или `AGENTS_MASTER_KEY missing` | env config; `middleware/auth.ts:86` |
 | Platform admin не виден | `is_platform_admin_cache_stale` | `services/access.ts:26` — invalidate / restart pod |
