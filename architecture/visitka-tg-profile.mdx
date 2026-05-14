@@ -5,28 +5,31 @@ description: "AI-визитка из TG-профиля: pipeline, файлы, go
 
 # Визитка (tg_profile_bundle)
 
-> **TODO** — заполнить researcher-агентом. Стартовый skeleton.
-
 ## TL;DR
 
-(1-2 предложения)
+`tg_profile_bundle` boilerplate (id=18) builds an AI-powered Telegram profile page: scrapes the target's TG profile, scaffolds a landing, wires the design API, deploys landing + bot, and wires a booking flow. Triggered as a sub-project from diploma DAG (`tg_farm` kind, boilerplate id=31).
 
 ## Files
 
 | Repo / path | Что делает |
 |---|---|
-| `agentflow-agents/src/...` | (file ref) |
+| `agentflow-agents/src/services/graph-executor/handlers/tg-profile-bundle.ts` | All node handlers: `scrape_tg`, `deploy_landing`, `scaffold_bot`, `wire_designapi`, `deploy_bot`, `booking_flow` |
+| `agentflow-agents/src/services/build-node-wrappers.ts` | `runBuildScrapeTgProfile`, `runBuildWireDesignapi` — delegates to coder agents |
+| `agentflow-agents/src/services/runtime-supervisor.ts` | `deploy()` — called by `deploy_landing` and `deploy_bot` |
 
 ## DB tables / env / API surface
 
-(таблицы Postgres, env vars, REST endpoints)
+- Tables: `agent_boilerplates` (id=18 for tg_profile_bundle, id=31 for diploma/tg_farm)
+- Nodes in boilerplate 18: `scrape_tg` → `deploy_landing` → `scaffold_bot` → `wire_designapi` → `deploy_bot` → `booking_flow`
 
 ## Failure modes
 
-| Симптом | Лог-строка для grep | Где починить |
+| Symptom | Log signature for grep | Where to fix |
 |---|---|---|
-| `scrape_tg` fails on diploma sub-projects whose brief contains a TG @username but no explicit `username` field | `scrape_tg_requires_username_or_brief` (literal in handler) | Hit on diploma run #591 (`tg_profile_bundle` sub of #590) — brief was `"AI-визитка для @avsee4. Соскрейпь профиль..."` but the handler never extracted the @-mention. Suggested fix: regex `/@([A-Za-z0-9_]{3,32})/` over the `brief` string when `username` is not supplied; pass the first match as `username`. Handler source: `agentflow-agents/src/services/graph-executor/handlers/scrape-tg.ts` (grep for the literal error). **Backlog — not blocking diploma preemptive parallel feature.** |
+| `scrape_tg` fails when brief has `@username` but no explicit `username` field | `scrape_tg_requires_username_or_brief` | **Fixed in PR fix/scrape-tg-username-fallback (2026-05-14).** Handler now extracts first `@handle` from brief via `/@([A-Za-z0-9_]{3,32})/`. Source: `agentflow-agents/src/services/graph-executor/handlers/tg-profile-bundle.ts:56-68` |
 
 ## Related
 
 - [Architecture overview](/architecture/overview)
+- [Graph executor](/architecture/graph-executor)
+- [Graph handlers](/subsystems/graph-handlers)
