@@ -178,6 +178,7 @@ SELECT pt.id, pt.plan_id, pt.assignee_slug, pt.status, pt.retry_depth, pt.claime
 | Caddy всё ещё stub | `placeholder_repoint_skipped` | `services/pingers/placeholder-repoint.ts:94` |
 | `workspace_provision_retry` без `workspace_ready` | `exceeded quota: code-exec-quota` (vcluster syncer log) | `POST /internal/tenant/:userId/expand-quota` или ручной `kubectl patch` (см. Case F) |
 | expand-quota endpoint возвращает 500 | `Cannot read properties of undefined (reading 'url')` at `request.js#query` | агент-pod нужен передеплой с PR #208 (fix c.req.query binding). До деплоя — bypass через `kubectl exec user-<userId>-0 -c syncer` |
+| Cold-tenant approval race: project flipped to `failed`, потом снова `running` | `approval_in_flight` event без matching `approval_provisioned`/`approval_failed`, и `approval_exhausted` через 5-15 мин | `services/pingers/approval-retry.ts` пропускает retry пока есть незакрытый `approval_in_flight` < 15 мин ИЛИ `users.tenant_status IN ('provisioning','pending')`. Если пинговать всё равно фейлит — проверь, что `runProjectApprovalBackground` дошёл до своего try/catch и записал `approval_failed` (`services/projects.ts:1742`). |
 
 ## Related
 
