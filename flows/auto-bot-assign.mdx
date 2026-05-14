@@ -70,6 +70,22 @@ autoCreateTelegramBot (auto-bot.ts:142)
   ↓   project_events: kind='bot_unassigned', target=$old, payload={username, reason:'pool_reclaim', previous_status, new_project_id}
   ↓   log "reclaimed @... from project N (status=..., no active poller)"
   ↓
+[5b] Divergent-brief check (когда reclaimedFromOwner != null, см. auto-bot.ts):
+  ↓   prevBrief = reclaimedFromOwner.prevBrief; newBrief = SELECT brief FROM projects WHERE id=$projectId
+  ↓   sim = briefJaccard(prevBrief, newBrief)                  // cheap lexical
+  ↓   if sim >= 0.5: judgeSource='lexical_match'; divergent=false  // same product, owner iterates
+  ↓   else: divergent = await llmJudgeDivergent(prevBrief, newBrief)   // Haiku-class tool_use
+  ↓        judgeSource='llm' (флейк → false, conservative)
+  ↓   if divergent:
+  ↓     await clearTelegramWebhook(chosen.token)                // POST setWebhook?url=&drop_pending_updates=true
+  ↓     UPDATE projects SET requires_fresh_coder_pass=true WHERE id=$projectId
+  ↓     project_events: kind='pool_token_reset_divergent_brief',
+  ↓       payload={token_username, prev_project_id, similarity_score, judge_source, webhook_reset_ok, webhook_reset_detail}
+  ↓   else: project_events.log info "reclaim brief similarity=X.XXX (judge=...), webhook left intact"
+  ↓
+  ↓   (Read by graph-executor/handlers/tg-bot.ts:scaffoldAiogramHandler.run при follow-up
+  ↓   coder pass — prepend reset directive в brief'е и clear flag после coder return.)
+  ↓
 [6] Pool exhausted (chosen==null):
   ↓   if allowBotFather:
   ↓     slug = projectName.alnum.lower.slice(0,18); rand4; username = `${slug}_${rand4}_bot`
@@ -103,7 +119,9 @@ autoCreateTelegramBot (auto-bot.ts:142)
 - `project_events`:
   - `bot_assigned` — payload `{username, project_name, via: 'pool' | 'botfather'}`.
   - `bot_unassigned` — payload `{username, reason: 'pool_reclaim', previous_status, new_project_id}`.
-  - `log` (level=warn/info/error) — `auto-bot: skipped N conflict-locked …`, `auto-bot: skipped N pool token(s) leased to a still-active project …`, `auto-bot: reclaimed @… from project N …`, `auto-bot: minting via BotFather …`, `auto-bot: no available bot tokens …`, `auto-bot: getMe failed/network error …`.
+  - `pool_token_reset_divergent_brief` (migration `2026-05-14j`) — payload `{token_username, prev_project_id, similarity_score, judge_source: 'lexical_match'|'llm'|'missing_brief', webhook_reset_ok, webhook_reset_detail}`.
+  - `log` (level=warn/info/error) — `auto-bot: skipped N conflict-locked …`, `auto-bot: skipped N pool token(s) leased to a still-active project …`, `auto-bot: reclaimed @… from project N …`, `auto-bot: minting via BotFather …`, `auto-bot: no available bot tokens …`, `auto-bot: getMe failed/network error …`, `auto-bot: reclaim brief similarity=X.XXX (judge=…), webhook left intact`.
+- `projects.requires_fresh_coder_pass` (bool) — set true в divergent-brief path, cleared after `scaffold_aiogram` coder pass.
 
 **Env:**
 - `FF_AUTO_BOT_CREATE=1` — глобальный gate в `runProjectApprovalBackground` (если 0, шаг пропускается; `autoCreateTelegramBot` сама не читает этот флаг — gate на уровне caller'а).
@@ -116,6 +134,8 @@ autoCreateTelegramBot (auto-bot.ts:142)
 - code-exec MCP `exec` → `python3 /workspace/bot_cli.py "<name>" "<username>"` в Jarvis pod (BotFather путь).
 - Telegram Bot API `GET /bot<token>/getUpdates?timeout=0&offset=-1` (probe, 4с timeout).
 - Telegram Bot API `GET /bot<token>/getMe` (validation, 5с timeout, только pool токены).
+- Telegram Bot API `POST /bot<token>/setWebhook?url=&drop_pending_updates=true` (divergent-brief reclaim path, 5с timeout).
+- AI router `useModel(ModelType.TEXT_SMALL)` через `invokeAI` → tool `judge_brief_divergence` (Haiku-class) — only когда Jaccard < 0.5.
 
 ## Failure modes
 
@@ -131,6 +151,7 @@ autoCreateTelegramBot (auto-bot.ts:142)
 | `getMe` not ok (revoked token / wrong format) | `auto-bot: getMe failed for @<username>` | `services/auto-bot.ts:377` — токен инвалид, перевыпустить через @BotFather и заменить в `BOT_TOKEN_POOL`. |
 | Reclaim случился ошибочно (старый pod ещё жив) | `auto-bot: reclaimed @<username> from project N` + новый pod получает 409 | Probe не среагировал (race window). Перенастроить старый pod вручную, добавить токен обратно в pool. |
 | `bot_assigned` есть, но bot.py не видит токен | — | Coder читает не `/workspace/bot_token.txt` — поправить boilerplate (`agent_boilerplates/`), либо подождать ~5с пока `syncProjectEnvFile` (`auto-bot.ts:459`) докатит `/workspace/.env`. |
+| Zombie-code carryover: pool reclaim → /start новой проекты возвращает старую копию | `auto-bot: reclaimed @…` без последующего `pool_token_reset_divergent_brief` event'а ХОТЯ briefs различны | RESOLVED (PR #228, 2026-05-14): divergent-brief detection (Jaccard short-circuit + Haiku-class LLM judge) → `setWebhook('')` + `requires_fresh_coder_pass=true`. Если flag не выставился: grep `auto-bot.ts:llmJudgeDivergent` exception в логах. Если webhook не очистился: `webhook_reset_ok=false` в payload, поднимай probe выше + ручной `setWebhook?url=` curl. |
 
 ## Related
 
