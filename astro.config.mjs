@@ -83,6 +83,7 @@ export default defineConfig({
             { label: 'Add a New Kind', slug: 'runbooks/add-new-kind' },
             { label: 'Ship a New Boilerplate', slug: 'runbooks/ship-new-boilerplate' },
             { label: 'Update the RAG', slug: 'runbooks/update-rag-docs' },
+            { label: 'Revolution Doctrine', slug: 'runbooks/revolution-doctrine' },
           ],
         },
       ],
