@@ -29,9 +29,10 @@ description: "Три пути auth: x-api-key (af_live_, HMAC-SHA256), Bearer JW
 | `agentflow-agents/src/middleware/api-key-rate-limit.ts:114` | `defaultLimitFor` — читает `API_KEY_RPM_PRO=300`, `API_KEY_RPM_FREE=60`. Feature flag `FF_API_KEY_TIERS=1`. Возвращает 429 `rate_limited`. |
 | `agentflow-agents/src/routes/auth-magic-link.ts:206` | `POST /auth/magic-link/request` + alias `/auth/magic-link` — insert hashed nonce, send email via Resend, fall back to `dev_link` only when `ALLOW_DEV_MAGIC_LINK=1 && NODE_ENV!=production`. |
 | `agentflow-agents/src/routes/auth-magic-link.ts:316` | `GET\|POST /auth/magic-link/verify` + aliases `/auth/verify` — hash incoming token, look up unused unexpired row, find-or-create user by email, mint 7-day JWT, set `af_session` cookie. |
-| `agentflow-landing/src/pages/AuthEmailPage.tsx:53` | `/auth/email` page — posts to `/auth/magic-link/request` **via `agentsPost`** (agentflow-agents host, not agentflow-api). Wrong client was the 2026-05 outage. |
-| `agentflow-landing/src/pages/AuthVerifyPage.tsx:36` | `/auth/verify?token=…` page — posts to `/auth/magic-link/verify` via `agentsPost`, then invalidates `ME_QUERY_KEY` and redirects to `?next=`. |
+| `agentflow-landing/src/pages/AuthEmailPage.tsx:65` | `/auth/email` page — **email+password form**. Posts to `/auth/login` via `agentsPost`, hard-navigates to `?next=` on success so AuthProvider re-bootstraps with the fresh `af_session` cookie. Was a magic-link inbox flow until 2026-05; replaced because the mailer (`RESEND_API_KEY`) never landed in prod. |
+| `agentflow-landing/src/pages/AuthVerifyPage.tsx:36` | `/auth/verify?token=…` page — posts to `/auth/magic-link/verify` via `agentsPost`, then invalidates `ME_QUERY_KEY` and redirects to `?next=`. Reachable only via inbox links (`/auth/email` no longer mints them). |
 | `agentflow-landing/src/main.tsx:322` | Router mount for `/auth/email` (`AuthEmailPage`) and `/auth/verify` (`AuthVerifyPage`). |
+| `agentflow-agents/src/routes/auth-password.ts` | `POST /auth/login`, `/auth/register` (gated by `PUBLIC_REGISTRATION_OPEN=1`), `/auth/logout`, `/auth/password-reset/{request,confirm}`. bcrypt cost 12, constant-time compare with dummy hash on miss, sets the same `af_session` JWT cookie as the magic-link path. |
 
 ## Data flow
 
@@ -100,8 +101,9 @@ Optional: FF_API_KEY_TIERS=1 →
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
 | /auth/email молча редиректит обратно на /login | (visual) `<Navigate to="/login" replace />` в `main.tsx` для `/auth/email` | `agentflow-landing/src/main.tsx:322` — mount `<AuthEmailPage />` напрямую. |
-| Magic-link 503 / endpoint missing на /_api | `apiPost.*magic-link` в page source | Switch page to `agentsPost` — routes live on agentflow-agents, not agentflow-api. |
-| Юзер кликнул link, но получает «expired/error» | `[auth-magic-link] mail_failed for ...: mailer_not_configured` | Wire `RESEND_API_KEY` в `agentflow-agents` Secret (или другой mailer). До этого e2e flow невозможен в prod без ручного INSERT. |
+| /auth/email POSTs to a magic-link endpoint and 404s | `agentsPost.*magic-link/request` в `AuthEmailPage.tsx` | Page was migrated to password login in 2026-05. Restore from main if regressed — should POST to `/auth/login`. |
+| Login form returns 401 with valid creds | `invalid_credentials` from `/auth/login` | `agentflow-agents/src/routes/auth-password.ts` — check `password_hash` actually populated on the user row (NULL for users created via Telegram OAuth → need password-reset to set one). |
+| Password-reset email never arrives | `[auth-password] reset_mail_failed: mailer_not_configured` | Wire `RESEND_API_KEY` в `agentflow-agents` Secret. Until then `/auth/forgot-password` silently no-ops and only Telegram login or pre-set passwords work. |
 | Лавинообразные 401 от одного IP | `too_many_auth_failures` | `middleware/auth.ts:151` (brute-force gate) |
 | Все api-keys внезапно отвергаются | `jwt_not_configured` или `AGENTS_MASTER_KEY missing` | env config; `middleware/auth.ts:86` |
 | Platform admin не виден | `is_platform_admin_cache_stale` | `services/access.ts:26` — invalidate / restart pod |
