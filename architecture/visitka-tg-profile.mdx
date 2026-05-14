@@ -5,27 +5,69 @@ description: "AI-визитка из TG-профиля: pipeline, файлы, go
 
 # Визитка (tg_profile_bundle)
 
-> **TODO** — заполнить researcher-агентом. Стартовый skeleton.
-
 ## TL;DR
 
-(1-2 предложения)
+`kind=tg_profile_bundle` projects build a single-page personal site from a Telegram @username. The pipeline scrapes the profile via tg-mcp (`get_full_user` + `download_profile_photo`) into the project pod's `/workspace/public/`, then a coder agent renders a Vite landing using the JSON + avatar. Avatar bytes never round-trip through the LLM context — tg-mcp writes straight to the target pod via the `/internal/code-exec/write_file_b64` side-channel.
 
 ## Files
 
-| Repo / path | Что делает |
+| Path | Role |
 |---|---|
-| `agentflow-agents/src/...` | (file ref) |
+| `agentflow-agents/src/services/auto-scrape.ts:208` | `scrapeViaMcp` — MCP-first path via `mcpDirect.callTool('telegram', 'get_full_user'\|'download_profile_photo')` |
+| `agentflow-agents/src/services/auto-scrape.ts:306` | `scrapeOneTarget` — tries MCP first, falls back to kubectl-exec Telethon script when `TG_MCP_URL` is unset or MCP errors |
+| `agentflow-agents/src/services/auto-scrape.ts:415` | `autoScrapeFromBrief` — extracts @-mentions from brief, fans out, writes JSON+photo to project pod |
+| `agentflow-agents/src/services/scrape-script.ts` | Legacy Python Telethon helper (kept as fallback, no longer the primary path) |
+| `agentflow-agents/src/services/build-node-wrappers.ts:59` | `runBuildScrapeTgProfile` — flow-executor node entrypoint |
+| `agentflow-agents/src/routes/scraper.ts` | `POST /me/scrape-target` — ad-hoc UX endpoint (gated by `FF_TG_SCRAPE=1`) |
+| `agentflow-agents/src/services/tg-visitka-scaffold.ts` | Vite SPA skeleton emitted before coder runs |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/tools/profile.py` | `get_full_user`, `download_profile_photo` (with `project`+`save_path` direct sink) |
 
-## DB tables / env / API surface
+## Data flow
 
-(таблицы Postgres, env vars, REST endpoints)
+```
+brief @username
+   │
+   ▼
+projects.ts ── autoScrapeFromBrief()
+   │
+   ▼
+auto-scrape.scrapeOneTarget()
+   │
+   ├─ if env.tgMcpUrl ──► scrapeViaMcp ──► mcpDirect.callTool('telegram', 'get_full_user', { account_id, peer })
+   │                                  └─► mcpDirect.callTool('telegram', 'download_profile_photo',
+   │                                       { account_id, peer, project: <proj>, save_path: /workspace/public/<u>_avatar.jpg })
+   │                                       (tg-mcp POSTs bytes to /internal/code-exec/write_file_b64)
+   │
+   └─ fallback ──► kubectl exec Jarvis pod ──► python scrape_target.py @user
+                                                          │
+                                                          ▼
+                                              stdout JSON parsed last-line
+```
+
+## DB / Env / API
+
+- **Tables**: `projects` (kind=`tg_profile_bundle`), `project_artifacts` (key=`scrape_target_<username>`)
+- **Env**:
+  - `FF_AUTO_SCRAPE_ON_CREATE=1` — auto-fan-out on project create
+  - `FF_TG_SCRAPE=1` — gate `/me/scrape-target` route
+  - `TG_MCP_URL` — when set, MCP path is preferred (defaults to `http://agentflow-tg-mcp:4500/sse/`)
+  - `JARVIS_TG_ACCOUNT_ID` — which `tg_accounts.id` to authenticate the MCP scrape with (default `4`)
+  - `JARVIS_OWNER_USER_ID`, `JARVIS_WORKSPACE_PROJECT_NAME` — fallback Jarvis pod target
+- **Routes**: `POST /me/scrape-target { username, download_photo?, posts_limit?, include_channel? }`
+- **MCP tools**: `telegram.get_full_user`, `telegram.download_profile_photo` (with `project`+`save_path`), `telegram.get_messages`, `telegram.list_accounts`
 
 ## Failure modes
 
-| Симптом | Лог-строка для grep | Где починить |
+| Symptom | Log signature for grep | Where to fix |
 |---|---|---|
+| Empty scrape, project stays placeholder | `[auto-scrape] empty_response` | tg-mcp session pool — verify `JARVIS_TG_ACCOUNT_ID` is `active` in `tg_accounts` |
+| MCP unreachable, kubectl fallback engaged | `[auto-scrape] mcp scrape failed for ... — falling back to kubectl exec` | `agentflow-tg-mcp` pod down OR `TG_MCP_URL` misconfigured |
+| Defaulted-container kubectl warning | `Defaulted container "project" out of: project, preview` | RESOLVED PR #224 — MCP path bypasses kubectl entirely |
+| Photo missing in landing | `mcp_profile_error:` or photo block silently skipped | check `has_photo` on user; some users have no avatar set |
+| Telethon AuthKeyUnregistered (fallback path) | `AuthKeyUnregistered` in fallback stderr | Jarvis pod session file stale — re-import owner string into `/workspace/sessions/owner.session_string` |
 
 ## Related
 
 - [Architecture overview](/architecture/overview)
+- [Flow executor](/subsystems/flow-executor)
+- [tg-mcp tools reference](/subsystems/tg-mcp)
