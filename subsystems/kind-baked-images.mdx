@@ -1,0 +1,166 @@
+---
+title: "Kind-Baked Workspace Images"
+description: "Per-kind layered Docker images so warm pods boot with the right deps + scaffold pre-installed — no claim-time provisioning."
+---
+
+# Kind-Baked Workspace Images
+
+## TL;DR
+
+Warm pod pool used to spawn a single kind-agnostic image. Approving a
+`tg_profile_bundle` project still meant the claim path had to `pip install
+aiogram` + `cp -a` the visitka scaffold into `/workspace`. We now layer
+**per-kind images** (`agentflow-project-<kind>`) on top of the baked
+multi-kind base. Pool refill is multi-kind via
+`POD_POOL_TARGETS={"generic":2,"tg_profile_bundle":1}`; claim filters by
+the project's `kind` first and falls back to `generic`. MVP shipped with
+`tg_profile_bundle` only — adding a new kind is one Dockerfile + one
+`KIND_IMAGES` row + one matrix-line edit.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/runtime-image/Dockerfile` | Base image (`agentflow-project:latest`) — node22 + python3.12 + s6 + multi-kind boilerplate cache. Built nightly by `build-runtime.yml` (unchanged). |
+| `agentflow-agents/runtime-image/kinds/tg_profile_bundle.Dockerfile:1` | Thin layer FROM the baked base — adds `aiogram>=3.4,<4.0` + `requests>=2.32,<3.0` + bakes the visitka scaffold reference under `/opt/agentflow/baked/tg_profile_bundle/`. |
+| `agentflow-agents/runtime-image/baked/tg_profile_bundle/frontend/package.json` | Reference Vite + React 19 declaration so post-claim `npm install --prefer-offline` hits the npm cache the base image already laid down. |
+| `agentflow-agents/runtime-image/baked/tg_profile_bundle/backend/requirements.txt` | Mirror of `tg-visitka-scaffold.ts::REQUIREMENTS_TXT`. Keep in sync when bumping aiogram. |
+| `agentflow-agents/.github/workflows/build-workspace-images.yml:1` | CI matrix that builds `agentflow-project-<kind>:{sha,latest}` for each entry. Daily 04:00 UTC + manual + push on `runtime-image/kinds/**` change. |
+| `agentflow-agents/src/mcp-servers/code-exec/constants.ts:KIND_IMAGES` | Map `kind → ghcr image`. Per-kind env override hook (`AGENTFLOW_KIND_IMAGE_<KIND_UPPER>`). |
+| `agentflow-agents/src/mcp-servers/code-exec/constants.ts:imageForKind` | Resolver — unknown kind degrades to `generic`. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/pod-pool.ts:getPodPoolTargets` | Parse `POD_POOL_TARGETS` JSON env, default `{generic: TARGET_WARM_COUNT}`. Drops invalid entries silently. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/pod-pool.ts:warmPodManifest` | Adds `agentflow-kind=<kind>` label and uses `imageForKind(kind)`. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/pod-pool.ts:claimWarmPod` | Tier 1: `preferredKind` selector. Tier 2: `generic` selector. Tier 3 (no preference): any unclaimed pod. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/pod-pool.ts:countWarmPods` | Optional `kind` arg narrows the label selector. Used by per-kind refill. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/pod-pool.ts:spawnWarmPod` | Optional `kind` arg, defaults to `generic`. |
+| `agentflow-agents/src/services/pingers/pod-pool-refill.ts:refillTenant` | Iterates `(kind, target)` pairs from `getPodPoolTargets()`, counts + spawns per kind. |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts:create_project` | Looks up `projects.kind` by `workspace_project_name`, passes as `preferredKind` to `claimWarmPod`. |
+| `agentflow-agents/tests/unit/pod-pool-kind.test.ts` | Source-contract tests for the resolver, manifest, target parser, and Dockerfile shape. |
+
+## Data flow
+
+```
+Build flow (CI)
+  build-runtime.yml         (03:00 UTC)
+    └─ build agentflow-project:latest  (multi-kind base, ~700MB)
+                  ↓
+  build-workspace-images.yml (04:00 UTC, matrix)
+    └─ for each kind in matrix:
+         FROM ghcr.io/lnlockly/agentflow-project:latest
+         + pip install <kind deps>
+         + COPY runtime-image/baked/<kind>/ → /opt/agentflow/baked/<kind>/
+         tag  ghcr.io/lnlockly/agentflow-project-<kind>:{sha,latest}
+
+Pool refill (every 60s, per tenant)
+  pod-pool-refill.ts::refillTenant
+    sweepStalePods(kc)
+    for each (kind, target) in POD_POOL_TARGETS env:
+      countWarmPods(kc, kind)
+        ↓ if count < target
+      spawnWarmPod(kc, ns, kind) × (target - count)
+        └─ warmPodManifest(name, ns, kind)  → image=imageForKind(kind)
+                                              label agentflow-kind=<kind>
+
+Project approve / create_project
+  code-exec/index.ts:create_project
+    SELECT kind FROM projects WHERE workspace_project_name=:name  (best-effort)
+      ↓
+    claimWarmPod(kc, ns, name, { preferredKind: kind })
+      Tier 1:  agentflow-pool=warm,agentflow-claimed=false,agentflow-kind=<kind>
+      Tier 2:  agentflow-pool=warm,agentflow-claimed=false,agentflow-kind=generic
+      Tier 3:  agentflow-pool=warm,agentflow-claimed=false   (legacy, only when no kind)
+      ↓ pick first Running candidate
+      kubectl label --overwrite agentflow-claimed=true agentflow-project=<id>
+      ↓ on success
+    spawnWarmPodAsync(uid, ns, claim.kind)  — refills the SAME kind that was drained
+```
+
+## DB / Env / API
+
+- **Tables:** none new — pool state stays in pod labels.
+- **Env:**
+  - `POD_POOL_ENABLED` — must equal `"1"` (unchanged; from #234).
+  - `POD_POOL_TARGETS` — JSON map `{kind: target}`. Default
+    `{"generic": 3}` matches pre-PR behaviour. Example multi-kind:
+    `{"generic":2,"tg_profile_bundle":1}`.
+  - `AGENTFLOW_PROJECT_IMAGE` — override the generic / base image.
+  - `AGENTFLOW_KIND_IMAGE_<KIND_UPPER>` — override per kind, e.g.
+    `AGENTFLOW_KIND_IMAGE_TG_PROFILE_BUNDLE=ghcr.io/lnlockly/agentflow-project-tg-profile-bundle:abc1234`.
+- **K8s labels (per warm pod):**
+  - `agentflow-pool=warm`
+  - `agentflow-claimed=false|true`
+  - `agentflow-kind=<kind>` ← **NEW**
+  - `agentflow-tenant=af-tenant-<userId>`
+  - `agentflow-project=<projectId>` (only when claimed)
+- **Routes / MCP tools:** none — internal to `code-exec` create_project.
+
+## Per-kind image table
+
+| Kind | Image | Bake content | Status |
+|---|---|---|---|
+| `generic` | `${PROJECT_IMAGE}` (default `nikolaik/python-nodejs:python3.12-nodejs22`, override via `AGENTFLOW_PROJECT_IMAGE`) | none / inherits from base | shipped #234 |
+| `tg_profile_bundle` | `ghcr.io/lnlockly/agentflow-project-tg-profile-bundle:latest` | `aiogram>=3.4,<4.0` + `requests>=2.32,<3.0` + `frontend/package.json` + `backend/requirements.txt` reference copies | shipped this PR |
+| `tg_bot` | (planned) `ghcr.io/lnlockly/agentflow-project-tg-bot:latest` | `aiogram` + bot scaffold reference | backlog — extend matrix |
+| `landing` | (planned) | TailwindCSS preset + favicon | backlog |
+| `spa` | (planned) | `react-router-dom@^7` | backlog |
+| `mini_app` | (planned) | TG WebApp SDK type stubs | backlog |
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Approve still cold-starts even though kind matches | `pod-pool: pool empty for kind` (kind=`tg_profile_bundle`) | `pod-pool-refill.ts` — bump `POD_POOL_TARGETS` for that kind, or check kind image actually built (`kubectl describe pod warm-pod-<x>` → ImagePullBackOff). |
+| Kind warm pod stuck in ImagePullBackOff | `pod-pool: spawn wait failed` + describe shows `Failed to pull image` | `runtime-image/kinds/<kind>.Dockerfile` build failed in CI, OR `KIND_IMAGES[<kind>]` points at a SHA not in ghcr. Fall back: set `AGENTFLOW_KIND_IMAGE_<KIND_UPPER>=<known-good-sha>`. |
+| Refill spawns wrong kind | `pod-pool-refill: spawning warm pods` with unexpected `kind` field | `POD_POOL_TARGETS` env malformed — `getPodPoolTargets()` silently drops invalid entries (negative, >20, non-numeric). Verify with `kubectl exec deploy/agentflow-agents -- env \| grep POD_POOL_TARGETS`. |
+| Claim picks generic pod when matching kind exists | `pod-pool: claimed warm pod` with `kind=generic` for a `tg_profile_bundle` project | `projects.kind` lookup in `create_project` returned null (raw create_project from coder, not the platform). Expected behaviour — fall back is intentional. |
+| Kind pod boots but `import aiogram` fails inside coder turn | `ModuleNotFoundError: No module named 'aiogram'` | Image FROM the wrong base or build skipped pip step. Rebuild: `gh workflow run build-workspace-images.yml -f kind=tg_profile_bundle`. |
+| `tests/unit/pod-pool-kind.test.ts` fails on CI after bumping the scaffold | `aiogram>=3\.4,<4\.0` regex mismatch | Dockerfile + `baked/<kind>/backend/requirements.txt` + `tg-visitka-scaffold.ts::REQUIREMENTS_TXT` drifted apart. Sync all three. |
+
+## Operational commands
+
+```bash
+# Confirm POD_POOL_TARGETS is parsed as expected on a running deployment
+kubectl -n franchise-factory exec deploy/agentflow-agents -- node -e \
+  "console.log(require('./dist/mcp-servers/code-exec/helpers/pod-pool.js').getPodPoolTargets())"
+
+# Inspect kind labels on warm pods in a tenant vcluster (replace 5 with the user id)
+kubectl --kubeconfig <(./scripts/dump-tenant-kubeconfig.sh 5) -n default \
+  get pods -l agentflow-pool=warm \
+  -o jsonpath='{range .items[*]}{.metadata.labels.agentflow-kind}{" "}{.metadata.name}{"\n"}{end}'
+
+# Force a rebuild of a single kind image without touching the others
+gh workflow run build-workspace-images.yml -f kind=tg_profile_bundle
+
+# Pin a specific SHA for tg_profile_bundle without redeploy
+kubectl -n franchise-factory set env deploy/agentflow-agents \
+  AGENTFLOW_KIND_IMAGE_TG_PROFILE_BUNDLE=ghcr.io/lnlockly/agentflow-project-tg-profile-bundle:abc1234
+
+# Roll back to single-kind pool
+kubectl -n franchise-factory set env deploy/agentflow-agents POD_POOL_TARGETS='{"generic":3}'
+```
+
+## Adding a new kind
+
+1. Drop `runtime-image/kinds/<kind>.Dockerfile` — `FROM ${BASE_IMAGE}`,
+   `pip install` whatever, `COPY baked/<kind>/`.
+2. Drop `runtime-image/baked/<kind>/...` reference scaffold (mirror the
+   bodies of the matching scaffold constants in `src/services/<kind>-scaffold.ts`).
+3. Append `<kind>` to the matrix in
+   `.github/workflows/build-workspace-images.yml`.
+4. Append a row to `KIND_IMAGES` in
+   `src/mcp-servers/code-exec/constants.ts`.
+5. Bump `POD_POOL_TARGETS` env on the deployment.
+6. Add a contract assertion in `tests/unit/pod-pool-kind.test.ts` that
+   `imageForKind('<kind>')` returns the new ghcr URL.
+7. Update the table in this page + the [Pod Pre-Warm Pool](/subsystems/pod-prewarm-pool) failure-mode column.
+
+## Related
+
+- [Pod Pre-Warm Pool](/subsystems/pod-prewarm-pool) — the consumer of
+  these images. The pool's claim flow now tier-filters by kind.
+- [Canonical Templates](/runbooks/canonical-templates) — per-kind scaffold
+  contents that the baked reference copies mirror.
+- [Runtime Supervisor](/subsystems/runtime-supervisor) — s6 + Procfile
+  flow that runs inside the kind image.
+- [Caddy Preview](/subsystems/caddy-preview) — sidecar served from the
+  same pod after a kind-typed warm pod is claimed.
