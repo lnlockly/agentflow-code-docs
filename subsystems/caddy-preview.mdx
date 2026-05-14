@@ -7,7 +7,7 @@ description: "Per-pod Caddy sidecar для preview URL: static / proxy / stub mo
 
 ## TL;DR
 
-Каждый project-pod несёт Caddy sidecar на порту 8080. Читает `/workspace/.runtime/plan.json` и сам выбирает режим: **static** (раздаёт `dist/` или `pick_root` подкаталог), **proxy** (forward в backend на `127.0.0.1:PORT`), **stub** (HTML «Workspace ready — deploying...»). Stub-страница умышленно sha256-hashed в `placeholder-hashes.json`, чтобы preview-gate не финализировал проект, пока coder реально не запустил приложение. Гейт покрывает kinds: `landing`, `spa`, `mini_app`, `tg_profile_bundle` (визитка).
+Каждый project-pod несёт Caddy sidecar на порту 8080. Читает `/workspace/.runtime/plan.json` и сам выбирает режим: **static** (раздаёт `dist/` или `pick_root` подкаталог), **proxy** (forward в backend на `127.0.0.1:PORT`), **stub** (HTML «Workspace ready — deploying...»). Stub-страница умышленно sha256-hashed в `placeholder-hashes.json`, чтобы preview-gate не финализировал проект, пока coder реально не запустил приложение.
 
 ## Files
 
@@ -19,7 +19,7 @@ description: "Per-pod Caddy sidecar для preview URL: static / proxy / stub mo
 | `agentflow-agents/src/mcp-servers/code-exec/helpers/caddy.ts:129` | `auto_install_deps` — детектит lockfiles → запускает `npm ci`/`pnpm i`/`pip install -r requirements.txt`. |
 | `agentflow-agents/src/mcp-servers/code-exec/helpers/caddy.ts:257` | `projectManifest` — собирает StatefulSet+Service yaml: PVC `/workspace`, Caddy sidecar, readiness/liveness probes. |
 | `agentflow-agents/src/mcp-servers/code-exec/helpers/caddy.ts:544` | Workspace-ready HTML stub (lines 544-555) — отдаётся когда `plan.json` отсутствует. |
-| `agentflow-agents/src/services/pingers/preview-placeholder.ts:34` | `STATIC_PREVIEW_KINDS = ['landing','spa','mini_app','tg_profile_bundle']` — какие kinds детектят placeholder. |
+| `agentflow-agents/src/services/pingers/preview-placeholder.ts:33` | `STATIC_PREVIEW_KINDS = ['spa','landing','mini_app']` — какие kinds детектят placeholder. |
 | `agentflow-agents/src/services/pingers/preview-placeholder.ts:41` | `TINY_BODY_BYTES = 800` — threshold под которым тело считается «placeholder-sized». |
 | `agentflow-agents/src/services/pingers/preview-placeholder.ts:69` | `loadPlaceholderHashes` — читает `src/config/placeholder-hashes.json` (sha256 deny-list). |
 | `agentflow-agents/src/services/pingers/preview-placeholder.ts:101` | `classifyPreviewProbe` — title regex `/Workspace ready/i` + hash + size. |
@@ -67,7 +67,6 @@ preview-gate.checkPreviewGate (per-kind dimensions) → finalize or hold
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
 | Preview зависает на «Workspace ready...» | `caddy_workspace_ready_title` | `services/pingers/preview-placeholder.ts:125` |
-| `tg_profile_bundle` застрял в `done` пока preview — placeholder | `preview_gate_blocked` | `services/pingers/preview-placeholder.ts:34` (добавлен в `STATIC_PREVIEW_KINDS`) |
 | Static SPA отдаёт 404 на subroutes | `pick_root_no_index_html` | `helpers/caddy.ts:29` (PICK_ROOT_SUBDIR_BLOCK) |
 | `dist/` собран но Caddy всё ещё stub | `placeholder_repoint_skipped` | `services/pingers/placeholder-repoint.ts:94` |
 | Sha256 совпал с известным boilerplate | `placeholder_hash_match` | `src/config/placeholder-hashes.json` |

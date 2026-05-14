@@ -131,7 +131,6 @@ Probe network error → `false` (conservative — лучше попробова�
 | Pool exhausted overall | `auto-bot: no available bot tokens (pool exhausted, BotFather unavailable)` | Combine fixes above + emit `project_events.log` с уровнем `warn`. |
 | Reclaim в БД случился, но новый pod 409 | `auto-bot: reclaimed @…` + downstream `getUpdates Conflict` в bot.py | Probe не сработал (race). Restart нового pod через ~10 мин, либо вручную остановить orphan. |
 | Placeholder secret блокирует assign | `[auto-bot] project N already has populated BOT_TOKEN, skipping` ХОТЯ `is_set=false` | Не воспроизводимо после фикса — UPDATE in-place через `placeholderSecretId` в `auto-bot.ts:184`. Если видишь — проверь, что `is_set` правильный bool. |
-| Owner's personal TG account assigned as project bot (#592 — @avsee4 misfire): `bot_username` set to owner's own handle, not a real bot account | `[auto-bot] pool empty after owner-exclusion filter (excluded owner_user_id=X)` и/или `auto-bot: skipped N pool token(s) belonging to the project owner` | Owner-exclusion filter уже включён (`auto-bot.ts` — query `tg_links` WHERE `user_id = proj.ownerUserId`, skip matching pool entries). Если видишь этот лог — pool не содержит ни одного реального бот-аккаунта для этого пользователя; расширь `BOT_TOKEN_POOL` настоящими bot-токенами или включи BotFather fallback. |
 
 ## Related
 
