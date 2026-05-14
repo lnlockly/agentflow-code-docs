@@ -88,6 +88,7 @@ export default defineConfig({
             { label: 'Canonical Templates', slug: 'runbooks/canonical-templates' },
             { label: 'Scaffold Hardening', slug: 'runbooks/scaffold-hardening' },
             { label: 'Update the RAG', slug: 'runbooks/update-rag-docs' },
+            { label: 'Revolution Doctrine', slug: 'runbooks/revolution-doctrine' },
           ],
         },
       ],
