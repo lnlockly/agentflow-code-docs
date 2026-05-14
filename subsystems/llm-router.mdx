@@ -7,7 +7,13 @@ description: "Mini-registry с приоритетом, owner-scoped провай
 
 ## TL;DR
 
-Все LLM-вызовы внутри agentflow-agents идут через `invokeAI()` → mini-registry, которая выбирает провайдера по `ModelType` (`TEXT_SMALL`/`TEXT_BIG`/`EMBEDDING_*` и т.п.), приоритету (desc) и owner_user_id-скоупу. Перед вызовом — budget gate (`assertUserBudget`), после — запись в `agent_usage`. DB-таблица `llm_provider_configs` позволяет добавлять providers (anthropic-compat или openai-compat) без деплоя — `refreshDbProviders` тикает каждые N секунд и подкидывает новые handlers в registry.
+Все LLM-вызовы внутри agentflow-agents идут через `invokeAI()` → mini-registry, которая выбирает провайдера по `ModelType` (`TEXT_SMALL`/`TEXT_BIG`/`EMBEDDING_*` и т.п.), приоритету (desc) и owner_user_id-скоупу. Перед вызовом — budget gate (`assertUserBudget`), затем exact-match response cache (опц. `LLM_CACHE_ENABLED=1`), после — запись в `agent_usage`. DB-таблица `llm_provider_configs` позволяет добавлять providers (anthropic-compat или openai-compat) без деплоя — `refreshDbProviders` тикает каждые N секунд и подкидывает новые handlers в registry.
+
+## Response cache (exact-match)
+
+`response-cache.ts` хеширует канонический payload `{modelType, model, temperature, system, messages, tools, tool_choice, max_tokens}` через SHA-256 и пишет/читает строку из `llm_response_cache`. Кешируются только детерминированные пути: TEXT_* при явном `temperature===0` и OBJECT_* (любые). IMAGE/VIDEO/TTS/embedding/streaming — пропускаются на гейте `isCacheable`. TTL — 7 дней (read-time фильтр + cleanup sweep). На `hit` пропускается upstream + `agent_usage` (чтобы не дублировать billing); на `miss` — обычный fallback chain через `useModel`, ответ кладётся в кеш. Опт-ин через env флаг — выключенный cache no-op'ит и оба пути работают как раньше.
+
+Backlog: semantic / pgvector lookup для случаев когда exact-match промахивается на пунктуации/пробелах.
 
 ## Files
 
@@ -18,7 +24,12 @@ description: "Mini-registry с приоритетом, owner-scoped провай
 | `agentflow-agents/src/ai-router/registry.ts:118` | `getProviderHandler` — lookup по slug. |
 | `agentflow-agents/src/ai-router/registry.ts:158` | `useModel` — main entry: probe-then-route, preferred provider, candidate fallback chain. |
 | `agentflow-agents/src/ai-router/registry.ts:243` | `listProviders` — debug endpoint backing. |
-| `agentflow-agents/src/ai-router/instrumented.ts:112` | `invokeAI` — wraps useModel с budget gate + usage record + Sentry span. |
+| `agentflow-agents/src/ai-router/instrumented.ts:112` | `invokeAI` — wraps useModel: budget gate + exact-match cache + usage record. |
+| `agentflow-agents/src/ai-router/response-cache.ts:64` | `computeCacheKey` — SHA-256 over canonical params (deterministic property order). |
+| `agentflow-agents/src/ai-router/response-cache.ts:108` | `isCacheable` — gate: TEXT_*/OBJECT_* only, TEXT_* requires `temperature===0`. |
+| `agentflow-agents/src/ai-router/response-cache.ts:154` | `lookupCached` — DB read, 7-day TTL filter, bump hit_count + last_hit_at. |
+| `agentflow-agents/src/ai-router/response-cache.ts:189` | `storeCached` — insert/upsert response payload on miss. |
+| `agentflow-agents/migrations/2026-05-14n-llm-response-cache.sql` | `llm_response_cache` table + indexes. |
 | `agentflow-agents/src/ai-router/types.ts:25` | `ModelType` enum — `TEXT_SMALL`, `TEXT_BIG`, `EMBEDDING_BASE`, и т.д. |
 | `agentflow-agents/src/ai-router/types.ts:52` | `AiCallContext` — `{ user_id, project_id?, agent_slug?, model_type }`. |
 | `agentflow-agents/src/ai-router/types.ts:181` | `TextGenerationResult` — `{ text, usage, model, provider }`. |
@@ -38,6 +49,7 @@ Agent / service вызывает invokeAI({ ctx, model_type, messages, max_token
    ↓
 instrumented.invokeAI (line 112)
    ↓ assertUserBudget(ctx.user_id, estimated_cost) → BudgetExceededError → emit budget_cap_hit
+   ↓ isCacheable + computeCacheKey → lookupCached → HIT? return cached response (skip usage record)
    ↓
 registry.useModel (registry.ts:158)
    ↓ select providers WHERE supports(model_type) AND (owner=null OR owner=ctx.user_id)
@@ -48,6 +60,7 @@ provider handler (anthropic-compat | openai-compat | custom)
    ↓
 instrumented.invokeAI logs to agent_usage:
    { user_id, project_id, model, provider, prompt_tokens, completion_tokens, cost_usd }
+   ↓ storeCached(hash, response) — fire-and-forget on miss
    ↓
 return result
 ```
@@ -57,12 +70,14 @@ return result
 **DB:**
 - `llm_provider_configs` — `{ slug, kind: anthropic_compat|openai_compat, base_url, api_key_sealed, model_id, priority, owner_user_id?, supports_model_types[], max_tokens, enabled }`.
 - `agent_usage` — append-only usage log: `{ user_id, project_id, agent_slug, model, provider, prompt_tokens, completion_tokens, cost_usd, created_at }`.
+- `llm_response_cache` — `{ hash (sha256), model_type, provider, model, prompt_preview, response (jsonb), created_at, last_hit_at, hit_count }`. 7-day TTL at read time.
 - `users.budget_cents_remaining` — counter, decremented в budget gate.
 
 **Env:**
 - `XAI_API_KEY` — opt-in registration for xAI provider в bootstrap.
 - `OPENROUTER_API_KEY` — legacy fallback (ai-router/bootstrap.ts:21).
 - `LLM_DB_REFRESH_MS` — cadence для refreshDbProviders.
+- `LLM_CACHE_ENABLED` — `1`/`true` to enable exact-match response cache (default off).
 
 **API surface:**
 - `invokeAI(ctx, opts)` — единственная точка входа из application кода.
@@ -79,6 +94,9 @@ return result
 | DB provider не подтянулся | `refresh_db_providers_failed` | `llm-providers/db-driven.ts:454` |
 | Owner-scoped provider не виден | `provider_owner_mismatch` | `ai-router/registry.ts:158` (filter clause) |
 | Stream aggregate упал в середине | `aggregate_openai_stream_failed` | `llm-providers/db-driven.ts:80` |
+| Stale cache return для подобных но разных промптов | `[llm-cache] hit` без ожидаемого upstream call | `ai-router/response-cache.ts:64` (computeCacheKey — добавь missing field в payload). |
+| Cache lookup/store падает — но запросы проходят | `[llm-cache] lookup_failed` / `store_failed` | `ai-router/response-cache.ts:154` (Postgres reachable? миграция применена?). |
+| Cache double-bills юзера | `[llm-cache] hit` + agent_usage row с теми же tokens | `ai-router/instrumented.ts` (cacheHit guard на usage insert). |
 
 ## Related
 
