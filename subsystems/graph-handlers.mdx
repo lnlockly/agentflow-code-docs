@@ -178,6 +178,7 @@ ctx.emit({ kind: 'node_finished', payload: { output } })
 | Coder reply missing `files_written` array | handler returns `files_written: []` and walker per-kind policy decides | If kind is `fail-fast` on this node, brief was too broad — tighten `output_expected` in the registration |
 | Duplicate handler registration on boot | `duplicate_handler:<kind>` thrown at module load | Two registrations for one `kind` — remove the second one |
 | `project.wait_done` zod fails with `project_id: required` (was production bug on diploma run #581) | `project.wait_done_no_project_id_resolved` (literal in handler) | Boilerplate must set either `project_id` (templated `{{steps["..."].output.sub_project_id}}`) or `from_step: "<create_sub node id>"`. Static `project_id` cannot be hardcoded for parallel sub-project DAGs. See `handlers/project.wait_done.ts:20-45` |
+| ~~Boilerplate-instantiated project falls out of graph_executor.kinds allowlist after Maestro proposes~~ **RESOLVED PR #218** | ~~`[propose-project-plan] kind-lock active, keeping projects.kind=`~~ (warn now fires; previously no log — bug was silent kind overwrite) | Fixed by kind-lock guard in `agentflow-agents/src/mcp-servers/team-manager/tools/propose-project-plan.ts:985-999`. When `workflow_override IS NOT NULL`, `propose_project_plan` skips writing `projects.kind`. SQL workaround no longer needed. |
 
 ## Related
 
