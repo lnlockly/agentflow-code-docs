@@ -1,0 +1,75 @@
+---
+title: "Deploy shield"
+description: "Drain-aware rolling restart. preStop hook polls /internal/drain until walker work finishes, so GitHub Actions deploys don't kill 30-min sub-project builds."
+---
+
+# Deploy shield
+
+## TL;DR
+
+GitHub Actions deploys agentflow-agents via `kubectl set image` ≈ several times a day. Before the shield, every rollout killed whatever the walker was doing — sub-project builds run 5–30 min, so 2–3 deploys in that window stranded the walker mid-step. The shield adds a `preStop` lifecycle hook that polls `/internal/drain` until the in-flight count reaches 0 or the 300s grace period elapses, so rolling restarts wait for active work instead of decapitating it. Fail-open at every layer: a stuck endpoint cannot wedge a deploy.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/internal-drain.ts:1` | `/internal/drain` endpoint. 200 = drainable, 503 = walker work in-flight. |
+| `agentflow-agents/src/routes/internal-drain.ts:38` | `getInFlightCounts()` — one round-trip count of `plan_tasks (in_progress)` + `agent_runs (queued/running)`. |
+| `agentflow-agents/src/server.ts:19` | `internalDrainApp` import. |
+| `agentflow-agents/src/server.ts:354` | `app.route('/', internalDrainApp)` mount. |
+| `agentflow-agents/k8s/agentflow-agents.yaml:92` | `terminationGracePeriodSeconds: 300`. |
+| `agentflow-agents/k8s/agentflow-agents.yaml:223` | `lifecycle.preStop.exec` — node one-liner polls `/internal/drain` every 5s for up to 280s. |
+| `agentflow-agents/.github/workflows/deploy.yml:235` | `kubectl rollout status` waits for the new pod (and the old pod's preStop) to finish. |
+
+## Data flow
+
+```
+GitHub Actions push to main
+   ↓
+.github/workflows/deploy.yml
+   ↓ kubectl set image deploy/agentflow-agents …
+kubelet decides to terminate the old pod
+   ↓ runs lifecycle.preStop FIRST (before SIGTERM)
+node -e poll loop (in-pod)
+   ↓ GET http://127.0.0.1:4100/internal/drain   ← every 5s, up to 56 times
+internal-drain.ts /internal/drain
+   ↓ SELECT count(*) FROM plan_tasks WHERE status='in_progress'
+   ↓ SELECT count(*) FROM agent_runs WHERE status IN ('queued','running')
+   → drainable=true  → preStop exits 0 → kubelet sends SIGTERM → pod exits clean
+   → drainable=false → loop sleeps 5s and re-polls
+   → DB error        → drainable=true (fail-open, log line)
+   → timeout (280s)  → preStop exits 0 → kubelet SIGTERM/SIGKILL → walker dies (rare)
+```
+
+## DB / Env / API
+
+- Tables read: `plan_tasks`, `agent_runs` (both indexed on status for in-flight subsets — see `idx_plan_tasks_status`, `idx_agent_runs_status`).
+- Env: none new. Hits the existing `DATABASE_URL` via `db/client.ts`.
+- Routes: `GET /internal/drain` (no auth — read-only counts, in-cluster only). No Ingress rule maps `/internal/*` to the public host.
+- k8s: `terminationGracePeriodSeconds: 300`, `lifecycle.preStop.exec` with inline `node -e` loop. The `capabilities: drop ["ALL"]` profile allows `node` to fork-exec but not spawn a shell — that's why we use `node -e` not `sh -c`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Pod terminates mid-walker anyway (grace exhausted) | `[preStop] grace exhausted, allowing SIGTERM` | Bump `terminationGracePeriodSeconds` in `k8s/agentflow-agents.yaml:92` AND `max` in preStop loop (currently 56 × 5s = 280s). |
+| Drain endpoint returns 200 forever despite running build | check `walker_state.last_heartbeat` (sibling branch) OR `plan_tasks status='in_progress'` count | `plan_tasks` row stuck at `in_progress` — fix pool-worker reset, not the drain endpoint. |
+| Drain endpoint never returns 200 | `[drain] DB check failed, failing open` repeating | DB unreachable from pod — drain falls open and deploy proceeds, but the deploy log line is the trail. |
+| Deploy hangs at `kubectl rollout status` for >5 min | rollout timeout in CI | Old pod still in preStop. Check `kubectl logs <old-pod> -c agentflow-agents --previous` for `[preStop]` lines. |
+| `node -e` syntax error after edit | `SyntaxError` in pod logs at termination | Lint the inline script before merging k8s manifest edits. |
+
+## Override (emergency)
+
+If the shield wedges a deploy, strip the hook live:
+
+```bash
+kubectl -n franchise-factory patch deploy agentflow-agents --type=json \
+  -p='[{"op":"remove","path":"/spec/template/spec/containers/0/lifecycle"}]'
+```
+
+Re-apply the manifest after the next deploy to restore.
+
+## Related
+
+- [/subsystems/runtime-supervisor](/subsystems/runtime-supervisor) — per-project pod lifecycle (separate from agents pod lifecycle).
+- E2E nightly self-test: `.github/workflows/e2e-nightly.yml` — independent cron that dispatches canonical briefs daily; orthogonal to the shield, but they share the goal of catching deploy regressions early.
