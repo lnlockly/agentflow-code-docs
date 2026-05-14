@@ -131,6 +131,7 @@ Probe network error → `false` (conservative — лучше попробова�
 | Pool exhausted overall | `auto-bot: no available bot tokens (pool exhausted, BotFather unavailable)` | Combine fixes above + emit `project_events.log` с уровнем `warn`. |
 | Reclaim в БД случился, но новый pod 409 | `auto-bot: reclaimed @…` + downstream `getUpdates Conflict` в bot.py | Probe не сработал (race). Restart нового pod через ~10 мин, либо вручную остановить orphan. |
 | Placeholder secret блокирует assign | `[auto-bot] project N already has populated BOT_TOKEN, skipping` ХОТЯ `is_set=false` | Не воспроизводимо после фикса — UPDATE in-place через `placeholderSecretId` в `auto-bot.ts:184`. Если видишь — проверь, что `is_set` правильный bool. |
+| Reused pool-bot shows previous owner's `/book` shell to new owner — coder-tg-bot defaults to tg-visitka template even when brief требует другой продукт (AI Battle Royale, MLM funnel). Pool contamination accelerates the drift. | `brief_fidelity_drift` event in `project_events` для проекта со свежеассайненным pool-токеном | (1) `red-bot-pool-reset` workflow чистит код бота между ownerами. (2) `presets/coder-tg-bot.json` системный prompt теперь содержит brief-imperative guard (`Your ONLY product spec is the brief below…`) + 5-шаговый skill chain `read-brief-3x → extract-intent-keywords → verify-keywords-present-in-code → code → self-review-vs-brief`. См. [Brief-Fidelity Supervisor](/subsystems/brief-fidelity-supervisor). |
 
 ## Related
 
