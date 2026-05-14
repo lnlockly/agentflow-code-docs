@@ -1,0 +1,99 @@
+---
+title: "Scaffold hardening"
+description: "Static scaffolds in agentflow-agents — what they are, where their build-smoke tests live, and how to add one when you ship a new kind."
+---
+
+# Scaffold hardening
+
+## TL;DR
+
+A *scaffold* is a TypeScript module that emits literal source files into the project pod's `/workspace` (Vite app, aiogram bot, Procfile, etc.) BEFORE the coder agent's first turn. They are static — the file bodies are string constants in TS, not coder-generated — so a single character regression silently ships to every new user until someone notices. PR #222 was exactly that: one corrupt `<script>` tag in `tg-visitka-scaffold.ts` left seven визитки serving a 491-byte placeholder. The fix class: every scaffold gets an integration test that materializes it into a tmpdir, runs `npm install + npm run build`, and asserts the produced `dist/` ships hashed Vite assets. The test runs in CI on every PR that touches `src/services/*scaffold*.ts`.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/tg-visitka-scaffold.ts:577` | `scaffoldTgProfileBundle` — emits Vite + aiogram + Procfile into `/workspace` for `kind=tg_profile_bundle`. |
+| `agentflow-agents/src/services/tg-visitka-scaffold.ts:521` | `buildScaffoldScript` — assembles the shell heredoc that lays down each file with `[ ! -f path ]` guards. |
+| `agentflow-agents/src/services/tg-visitka-scaffold.ts:612` | `TG_VISITKA_REQUIRED_PATHS` — canonical file list (used by both unit and integration tests). |
+| `agentflow-agents/src/services/tg-visitka-scaffold.ts:633` | `__test_buildScaffoldScript` — test-only export, returns the exact shell script the runtime emits. |
+| `agentflow-agents/tests/unit/tg-visitka-scaffold.test.ts:1` | Static-shape assertions (template references, no hardcoded models, root-level mkdir guard). Fast (~50 ms), no npm. |
+| `agentflow-agents/tests/integration/tg-visitka-scaffold-build.test.ts:1` | Real build smoke. Materializes scaffold → `npm install` → `npm run build` → asserts hashed `/assets/*.js` references. ~15 s warm, ~60 s cold. |
+| `agentflow-agents/.github/workflows/scaffold-smoke.yml:1` | CI workflow. Runs all `tests/integration/*scaffold*.test.ts` on PRs touching scaffolds. |
+
+## Inventory
+
+One static scaffold lives in the repo today:
+
+| Slug | File | Kind | What it scaffolds |
+|---|---|---|---|
+| `tg-visitka-scaffold` | `src/services/tg-visitka-scaffold.ts` | `tg_profile_bundle` | Vite + React визитка (`frontend/`) + aiogram 3 bot (`backend/`) + `Procfile` |
+
+Other `kind`s (`tg_bot`, `spa`, `mini_app`, `landing`) are scaffolded by **graph-executor handlers** (`src/services/graph-executor/handlers/{tg-bot,spa,mini-app}.ts`) which delegate to the coder agent rather than writing static files. They are NOT covered by this hardening pass — they need a different test contract (coder behavior + preview-gate output) which lives under `tests/integration/preview-gate*.test.ts` and the E2E nightly harness.
+
+When a new kind moves from "coder writes everything from scratch" to "platform scaffolds a 90 %-complete starter" — at that point it becomes a static scaffold and MUST get an integration test under `tests/integration/<kind>-scaffold-build.test.ts`.
+
+## Data flow
+
+```
+PR touches src/services/*scaffold*.ts
+    │
+    ├─► GitHub Actions: scaffold-smoke.yml (paths filter)
+    │     │
+    │     ├─► node --import tsx --test tests/integration/*scaffold*.test.ts
+    │     │     │
+    │     │     ├─► import __test_buildScaffoldScript()  ← test-only export
+    │     │     ├─► strip `cd /workspace` line          ← runtime hardcoded
+    │     │     ├─► bash <script> in tmpdir            ← writes frontend/* backend/* Procfile
+    │     │     ├─► cd frontend && npm install        ← real Vite resolve
+    │     │     ├─► npm run build                       ← FAILS on bad <script src>
+    │     │     ├─► assert dist/index.html exists, size > 200
+    │     │     ├─► assert every /assets/<base>.{js,css} has Vite hash
+    │     │     └─► assert each referenced bundle exists in dist/assets/
+    │     │
+    │     └─► non-zero exit → PR red → no merge
+    │
+    └─► (regular `npm test` also picks this up — same glob)
+```
+
+## DB / Env / API
+
+- Tables: none touched.
+- Env: `SKIP_SCAFFOLD_SMOKE=1` — opt-out for local fast loops; CI never sets it.
+- Routes: none.
+- MCP tools: none.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Vite build dies with "Failed to resolve /assets/index.js from index.html" | `Failed to resolve.*from index.html` in scaffold-smoke job | The scaffold's `INDEX_HTML` const referenced a pre-built path instead of `/src/main.tsx`. Fix in `src/services/<kind>-scaffold.ts`. |
+| `dist/index.html` < 200 bytes | `dist/index.html too small` | `INDEX_HTML` const lost its `<div id="root">` or React mount markup. |
+| Bundle ref in HTML has no Vite hash | `missing Vite content hash — this is the #222 regression class` | A hand-authored `<script src="/assets/index.js">` snuck in. Use `/src/main.tsx` so Vite hashes the build output. |
+| Bundle referenced but file missing from `dist/assets/` | `referenced bundle .* missing from dist/assets/` | Vite's `manifest` and the HTML diverged — usually a stale `INDEX_HTML` const that hardcodes a filename Vite no longer emits. |
+| Scaffold script exits non-zero on apply | `scaffold script failed:` in test output | A heredoc collision, missing mkdir, or root-level `mkdir -p Procfile` regression. See `tests/unit/tg-visitka-scaffold.test.ts:142` for the project #551 precedent. |
+
+## How to add a new scaffold
+
+1. **Build the scaffold module** at `src/services/<kind>-scaffold.ts`.
+   - Export the scaffold entrypoint (`scaffold<Kind>` async fn taking `{ projectId, ownerUserId, workspaceProjectName }`).
+   - Export `<KIND>_REQUIRED_PATHS` — frozen array of relative paths.
+   - Export `__test_buildScaffoldScript` — pure fn returning the shell script (the integration test imports this to bypass the code-exec MCP call).
+   - Wrap every `cat > path <<EOF` in `[ ! -f path ]` so coder edits survive re-runs.
+
+2. **Add the integration test** at `tests/integration/<kind>-scaffold-build.test.ts`.
+   - Pattern: copy `tg-visitka-scaffold-build.test.ts` and swap the import + required-file list.
+   - Build assertion must include: `dist/index.html` exists, body > 200 bytes, every `/assets/<base>.{js,css}` has a 6+ char hash suffix, each referenced bundle exists on disk with size > 100 bytes.
+   - If the scaffold ships a backend (Python aiogram, NestJS, etc.) add a second test that runs the backend's syntax check (`python3 -m py_compile`, `tsc --noEmit`) — that's a separate test, not a build test.
+
+3. **Verify the CI workflow picks it up** — the existing `paths:` glob `tests/integration/*scaffold*.test.ts` already matches; no workflow edit needed.
+
+4. **Update this runbook's inventory table** with the new slug + file + kind.
+
+5. **Cross-link from the kind's subsystem doc** so anyone debugging `kind=<new>` lands here.
+
+## Related
+
+- [Ship a new boilerplate](/runbooks/ship-new-boilerplate) — different from a scaffold: boilerplates are git repos cloned at workspace_ready, scaffolds are TS-resident file bodies emitted via heredoc.
+- [Add a new kind](/runbooks/add-new-kind) — kind registration prerequisites before a scaffold can be wired up.
+- `agentflow-agents/tests/unit/tg-visitka-scaffold.test.ts` — static-shape sibling test that runs in every unit-test pass.
