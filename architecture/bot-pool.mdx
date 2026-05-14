@@ -9,6 +9,8 @@ description: "BOT_TOKEN_POOL model: lease, reclaim ladder (dead → done+idle), 
 
 `BOT_TOKEN_POOL` — JSON-массив `{token, username}[]` в env платформы, ~5 entries в проде. Шарится между всеми пользователями. Раздаётся через `services/auto-bot.ts:autoCreateTelegramBot` после `workspace_ready` для проектов `kind ∈ {tg_bot, tg_profile_bundle}`.
 
+После выдачи токена платформа кладёт canonical scaffold (`backend/bot.py` + `commands.py` + `bot_handler.py`) в `/workspace` — см. [runbooks/canonical-templates](/runbooks/canonical-templates). Старый `FF_AUTO_BOT_CREATE` echo-stub удалён.
+
 Lease НЕ perpetual: токен возвращается в пул, когда владелец-проект попадает в `failed`/`cancelled`/`draft`/`awaiting_approval` (DEAD — без probe) или в `done` + Telegram `getUpdates?timeout=0` отвечает 200 (idle — ни один pod не держит long-poll lock). `running`/`approved` владельцы — table stakes: НЕ yank'аем, даже если probe говорит idle (pod может быть в рестарте). Pool пуст / всё активно + `FF_AUTO_BOT_CREATE_BOTFATHER=1` → fallback на /newbot через Jarvis Telethon pod.
 
 ## Files

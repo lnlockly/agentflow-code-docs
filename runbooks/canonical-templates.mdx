@@ -1,0 +1,95 @@
+---
+title: "Canonical Templates (slot-fill scaffolds per kind)"
+description: "How each top kind ships a 90%-complete scaffold + slot pattern the coder agent fills."
+---
+
+# Canonical Templates
+
+## TL;DR
+
+Each top kind (`landing`, `spa`, `tg_bot`, `mini_app`, `tg_profile_bundle`) has a canonical scaffold that drops 6-13 files into `/workspace` on `approve`, before the coder agent's first turn. Coder agents fill `<!-- SLOT:brief.* -->` markers — they do NOT rewrite structure. Every file write is guarded by `[ ! -f path ]` so re-runs after coder edits never clobber work.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/scaffold-utils.ts` | Shared shell-script builder + slot regex + `applyScaffoldInPod()` |
+| `agentflow-agents/src/services/landing-scaffold.ts` | `kind=landing` — Vite + React landing (hero / 3 features / CTA, dark default) |
+| `agentflow-agents/src/services/spa-scaffold.ts` | `kind=spa` — react-router-dom@^7 with `Home` + `About` routes and a shared `Layout` outlet |
+| `agentflow-agents/src/services/tg-bot-scaffold.ts` | `kind=tg_bot` — aiogram 3 + `COMMAND_REGISTRY` + DesignAPI helper for free-text |
+| `agentflow-agents/src/services/mini-app-scaffold.ts` | `kind=mini_app` — Vite + React + Telegram WebApp SDK + MainButton |
+| `agentflow-agents/src/services/tg-visitka-scaffold.ts` | `kind=tg_profile_bundle` — landing-визитка + assistant-bot (existing, PR #222) |
+| `agentflow-agents/src/services/projects.ts:2057` | `runProjectApprovalBackground` dispatches by `proj.kind` after pod provision |
+
+## Data flow
+
+```
+approve
+  ├─ provisionWorkspaceWithRetry()   — vCluster + code-exec MCP warm
+  ├─ installDesignapiHelper()        — /workspace/.tools/designapi.py
+  ├─ autoScrapeFromBrief()           — only if @-handle in brief
+  ├─ if kind in {tg_bot, tg_profile_bundle}: autoCreateTelegramBot()
+  └─ kind dispatch (projects.ts:~2080):
+      tg_profile_bundle → scaffoldTgProfileBundle()
+      tg_bot            → scaffoldTgBot()
+      landing           → scaffoldLanding()
+      spa               → scaffoldSpa()
+      mini_app          → scaffoldMiniApp()
+        ↓
+      applyScaffoldInPod(FILES, …)   — buildScaffoldShellScript + code-exec
+        ↓
+      coder agent fills <!-- SLOT:brief.* --> markers
+        ↓
+      audit: listUnresolvedSlots(text) === [] gates 'done'
+```
+
+## Slot conventions
+
+Two slot syntaxes — coder MUST replace both before audit passes:
+
+| Syntax | Used in | Example |
+|---|---|---|
+| `<!-- SLOT:brief.<field> -->` | HTML, JSX, MD, Procfile, requirements.txt | `<h1><!-- SLOT:brief.title --></h1>` |
+| `"__SLOT_BRIEF_<FIELD>__"` | JSON, TS string literals | `{ "title": "__SLOT_BRIEF_TITLE__" }` |
+
+`scaffold-utils.ts::SLOT_REGEX` matches both. `listUnresolvedSlots(text)` returns the markers still present in a file — audit gates `done` on an empty result across the whole tree.
+
+## Per-kind slots
+
+### landing
+`brief.title`, `brief.subtitle`, `brief.description`, `brief.feature_1_title`/`_body` × 3, `brief.cta_section_title`, `brief.cta_text`, `brief.cta_href`.
+
+### spa
+`brief.title`, `brief.nav_home`, `brief.nav_about`, `brief.home_title`/`_body`, `brief.about_title`/`_body`. Procfile uses `npx serve -s dist` so subpaths 200 instead of 404 (python3 `http.server` breaks SPA history-mode routing).
+
+### tg_bot
+`brief.start_greeting`, `brief.help_reply`, `brief.about_reply`, `brief.system_prompt`, `brief.fallback_reply`. Commands beyond `/help` and `/about` are added by appending to `backend/commands.py::COMMAND_REGISTRY` — `bot.py` auto-registers them at startup.
+
+### mini_app
+`brief.title`, `brief.greeting`, `brief.body`, `brief.main_button_text`, `brief.main_button_reply`. `index.html` loads `telegram.org/js/telegram-web-app.js`; `App.tsx` calls `WebApp.ready()` + `.expand()` and binds `MainButton` to the CTA. CSS pulls `--tg-theme-*` vars so the app matches the host TG client.
+
+### tg_profile_bundle
+See `architecture/visitka-tg-profile.mdx`. Existing scaffold (PR #222), unchanged.
+
+## DB / Env / API
+
+- Env: `FF_AUTO_BOT_CREATE` — no longer gates `tg_bot` scaffold (was guarding the legacy echo-bot stub; the new scaffold runs unconditionally).
+- Routes: none — scaffolds run inside `runProjectApprovalBackground` only.
+- MCP tools: `code-exec.exec` (writes files) + `code-exec.platformFallback` (env injection for DesignAPI key).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Scaffold timeout / pod down | `landing_scaffold_failed: exit=` | `agentflow-agents/src/services/scaffold-utils.ts:applyScaffoldInPod` |
+| File written as directory (root-level Procfile) | `sh: cannot create Procfile: Is a directory` | regression — `buildScaffoldShellScript` dirname fallback to `.` |
+| Coder shipped unresolved slots | `<!-- SLOT:brief.` in `/workspace/frontend` | audit must call `listUnresolvedSlots` per file before marking `done` |
+| SPA subpath returns 404 | `python3 -m http.server` in `Procfile` of spa kind | spa Procfile must use `npx serve -s dist -l 8080` |
+| Mini App white-screen | `window.Telegram.WebApp is undefined` in browser console | `index.html` must load `telegram-web-app.js` synchronously |
+
+## Related
+
+- [Kinds catalog](/architecture/kinds)
+- [Визитка (tg_profile_bundle)](/architecture/visitka-tg-profile)
+- [Bot pool & token assignment](/architecture/bot-pool)
+- [Add a new kind](/runbooks/add-new-kind)
