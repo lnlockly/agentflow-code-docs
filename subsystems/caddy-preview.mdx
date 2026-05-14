@@ -40,7 +40,7 @@ mode=static  → file_server { root /workspace/<root> } (PICK_ROOT_SUBDIR_BLOCK 
 mode=proxy   → reverse_proxy 127.0.0.1:<PORT>
 plan.json missing → serve HTML stub (caddy.ts:544) "Workspace ready — deploying..."
    ↓
-External client GET https://<slug>.preview.agentflow.dev/
+External client GET https://<slug>.proj.agentflow.website/
    ↓
 preview-placeholder.probePreviewUrl
    ↓ title=/Workspace ready/  OR  sha256 ∈ deny-list  OR  body<800b  → placeholder=true
@@ -72,6 +72,44 @@ preview-gate.checkPreviewGate (per-kind dimensions) → finalize or hold
 | Sha256 совпал с известным boilerplate | `placeholder_hash_match` | `src/config/placeholder-hashes.json` |
 | `auto_install_deps` падает (peer deps) | `auto_install_deps_failed` | `helpers/caddy.ts:129` |
 | Body < TINY_BODY_BYTES | `tiny_body_placeholder` | `preview-placeholder.ts:41` |
+
+## Domain provisioning latency — already instant
+
+Asked 2026-05-14: do we need a pre-allocated slug pool (table `domain_pool`,
+pinger reserving N hosts in advance) so approve→preview has zero wait?
+**Answer: no — the wait is already gone.** Three layers each take ~0 ms of
+synchronous path on approve:
+
+| Layer | Mechanism | Latency on approve |
+|---|---|---|
+| DNS | Wildcard `*.proj.agentflow.website → 144.217.65.94` A-record in Cloudflare (DNS-only, grey-cloud). One record covers every slug forever. | 0 ms — no per-slug record to publish, resolvers return on first query. |
+| TLS | Single ZeroSSL wildcard cert in Secret `franchise-factory/wildcard-proj-agentflow-tls` (issued via DNS-01 through ClusterIssuer `zerossl-dns`, renewBefore 30d). `env.previewWildcardTlsSecret` defaults to that name. | 0 ms — cert is pre-issued, every new Ingress just references the existing secret. nginx serves it on the first request. |
+| Ingress | `ensurePreviewIngressPlaceholder` (`agentflow-agents/src/services/pool-worker/post-build.ts:50`) runs **fire-and-forget at project create** (`services/projects.ts:117`). `kubectl apply` of ConfigMap+Deployment+Service+Ingress takes ~1 s; nginx-ingress reload < 1 s. Runs in parallel with pod spawn and the agent's first turn (which take 10–60 s). | < 2 s, but off the critical path — by the time the user can click the preview URL the Ingress is live. |
+
+**Measured 2026-05-14** (from a laptop, ~150 ms RTT to ff-france):
+
+```
+real-proj  : connect=0.007s  tls=0.32s  total=0.53s  http=200  (wildcard cert)
+fresh-slug : connect=0.02s   tls=0.39s  total=0.60s  http=404  (k8s default cert, no Ingress)
+```
+
+The "fresh slug" 404 comes from nginx-ingress's default-backend with the
+fake k8s cert — that's expected because no Ingress matches the host yet.
+The moment `ensurePreviewIngressPlaceholder` lands, the same host serves the
+ZeroSSL wildcard cert and the placeholder HTML. No DNS propagation, no
+ACME challenge, no LE rate limit.
+
+**Implication for design:** any "domain pool" / pre-allocator that reserves
+slugs `p-<rand8>` in advance buys nothing on top of the current pipeline.
+The bottleneck on approve→preview is the agent producing real output, not
+the network glue. Skip the pool unless a future change reintroduces
+per-host cert issuance.
+
+Related history: 2026-05-02 wildcard rollout (memory
+`project_agentflow_wildcard_tls.md`) replaced per-host LE HTTP-01 (30–60 s
+per cert, 50 certs/week LE rate limit) with a single ZeroSSL DNS-01 cert.
+Stale page `agentflow-agents/docs/expose-public-contract.md` still
+describes the old per-host model — patch it if you touch that doc next.
 
 ## Related
 
