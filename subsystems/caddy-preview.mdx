@@ -19,12 +19,13 @@ description: "Per-pod Caddy sidecar для preview URL: static / proxy / stub mo
 | `agentflow-agents/src/mcp-servers/code-exec/helpers/caddy.ts:129` | `auto_install_deps` — детектит lockfiles → запускает `npm ci`/`pnpm i`/`pip install -r requirements.txt`. |
 | `agentflow-agents/src/mcp-servers/code-exec/helpers/caddy.ts:257` | `projectManifest` — собирает StatefulSet+Service yaml: PVC `/workspace`, Caddy sidecar, readiness/liveness probes. |
 | `agentflow-agents/src/mcp-servers/code-exec/helpers/caddy.ts:544` | Workspace-ready HTML stub (lines 544-555) — отдаётся когда `plan.json` отсутствует. |
-| `agentflow-agents/src/services/pingers/preview-placeholder.ts:33` | `STATIC_PREVIEW_KINDS = ['spa','landing','mini_app']` — какие kinds детектят placeholder. |
-| `agentflow-agents/src/services/pingers/preview-placeholder.ts:41` | `TINY_BODY_BYTES = 800` — threshold под которым тело считается «placeholder-sized». |
-| `agentflow-agents/src/services/pingers/preview-placeholder.ts:69` | `loadPlaceholderHashes` — читает `src/config/placeholder-hashes.json` (sha256 deny-list). |
-| `agentflow-agents/src/services/pingers/preview-placeholder.ts:101` | `classifyPreviewProbe` — title regex `/Workspace ready/i` + hash + size. |
-| `agentflow-agents/src/services/pingers/preview-placeholder.ts:168` | `shouldHoldFinalizeForPlaceholder` — used by healer/finalize gate. |
-| `agentflow-agents/src/services/pingers/preview-placeholder.ts:199` | `probePreviewUrl` — GET + HEAD probe для placeholder/ready detection. |
+| `agentflow-agents/src/services/pingers/preview-placeholder.ts:34` | `STATIC_PREVIEW_KINDS = ['spa','landing','mini_app','tg_profile_bundle']` — какие kinds детектят placeholder. |
+| `agentflow-agents/src/services/pingers/preview-placeholder.ts:42` | `TINY_BODY_BYTES = 800` — threshold под которым тело считается «placeholder-sized». |
+| `agentflow-agents/src/services/pingers/preview-placeholder.ts:70` | `loadPlaceholderHashes` — читает `src/config/placeholder-hashes.json` (sha256 deny-list). |
+| `agentflow-agents/src/services/pingers/preview-placeholder.ts:99` | `hasSpaShellMarkers` — returns true for Vite SPA shells (`<div id="root"`, `<div id="app"`, `<script type="module"`). Bypasses `tiny_body` check. |
+| `agentflow-agents/src/services/pingers/preview-placeholder.ts:116` | `classifyPreviewProbe` — title regex `/Workspace ready/i` → size (SPA-exempt) → sha256 hash. |
+| `agentflow-agents/src/services/pingers/preview-placeholder.ts:184` | `shouldHoldFinalizeForPlaceholder` — used by healer/finalize gate. |
+| `agentflow-agents/src/services/pingers/preview-placeholder.ts:213` | `probePreviewUrl` — GET + HEAD probe для placeholder/ready detection. |
 | `agentflow-agents/src/services/pingers/placeholder-repoint.ts:23` | `PLACEHOLDER_REPOINT_TICK_MS = 60_000` — sweep cadence. |
 | `agentflow-agents/src/services/pingers/placeholder-repoint.ts:94` | `runPlaceholderRepointSweep` — если static kind отдаёт stub а в `/workspace` уже есть `dist/` → reload Caddy. |
 
@@ -43,8 +44,10 @@ plan.json missing → serve HTML stub (caddy.ts:544) "Workspace ready — deploy
 External client GET https://<slug>.preview.agentflow.dev/
    ↓
 preview-placeholder.probePreviewUrl
-   ↓ title=/Workspace ready/  OR  sha256 ∈ deny-list  OR  body<800b  → placeholder=true
-   ↓ status=200 + body≥2048b + no markers           → ready=true
+   ↓ title=/Workspace ready/  OR  sha256 ∈ deny-list  → placeholder=true
+   ↓ body<800b AND no SPA-shell markers             → placeholder=true  (tiny_body)
+   ↓ body<800b WITH <div id="root"> or <script type="module"> → SPA shell, not placeholder
+   ↓ status=200 + no markers                        → ready=true
 preview-gate.checkPreviewGate (per-kind dimensions) → finalize or hold
 ```
 
@@ -71,7 +74,8 @@ preview-gate.checkPreviewGate (per-kind dimensions) → finalize or hold
 | `dist/` собран но Caddy всё ещё stub | `placeholder_repoint_skipped` | `services/pingers/placeholder-repoint.ts:94` |
 | Sha256 совпал с известным boilerplate | `placeholder_hash_match` | `src/config/placeholder-hashes.json` |
 | `auto_install_deps` падает (peer deps) | `auto_install_deps_failed` | `helpers/caddy.ts:129` |
-| Body < TINY_BODY_BYTES | `tiny_body_placeholder` | `preview-placeholder.ts:41` |
+| Body < TINY_BODY_BYTES (non-SPA) | `tiny_body_placeholder` | `preview-placeholder.ts:42` |
+| SPA shell (412B) misread as placeholder | `preview_gate_blocked.*tiny_body` (project stays running forever) | **[FIXED PR #226]** `hasSpaShellMarkers` check in `preview-placeholder.ts:105` — `<div id="root"`, `<div id="app"`, `<script type="module"` bypass `tiny_body` |
 
 ## Related
 
