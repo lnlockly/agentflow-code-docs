@@ -23,6 +23,7 @@ Pool пустой / все заняты live-поллером + `FF_AUTO_BOT_CRE
 | `agentflow-agents/src/services/auto-bot.ts:76` | `createBotViaBotFather` — Jarvis pod (`JARVIS_OWNER_USER_ID=1`, `JARVIS_WORKSPACE_PROJECT_NAME=proj-71506e1l`) exec `python3 /workspace/bot_cli.py` → парсит `TOKEN=` / `USERNAME=`. |
 | `agentflow-agents/src/services/auto-bot.ts:114` | `writeBotTokenFile` — `umask 077 && printf > /workspace/bot_token.txt && chmod 600` через code-exec MCP. **НЕ `.env.bot`.** |
 | `agentflow-agents/src/services/auto-bot.ts:142` | `autoCreateTelegramBot(projectId, projectName)` — main entry. |
+| `agentflow-agents/src/services/auto-bot.ts` (after proj fetch) | Owner-exclusion: SELECT `tg_links` WHERE `user_id = proj.ownerUserId` → build `ownerTgUsernames` Set. Any pool entry whose username (normalised, @-stripped, lowercased) is in this set is skipped before the conflict probe. |
 | `agentflow-agents/src/services/auto-bot.ts:161` | Log `pool empty and FF_AUTO_BOT_CREATE_BOTFATHER off, skipping`. |
 | `agentflow-agents/src/services/auto-bot.ts:184` | Idempotency guard — skip если `BOT_TOKEN` уже с `is_set=true` (placeholder-секрет от coder'а с `is_set=false` НЕ блокирует — overwrite через `placeholderSecretId`). |
 | `agentflow-agents/src/services/auto-bot.ts:229` | `ownerRows` SELECT — все проекты с `botUsername IS NOT NULL` кроме самого себя. |
@@ -52,9 +53,14 @@ autoCreateTelegramBot (auto-bot.ts:142)
   ↓
 [2] Load proj (owner_user_id, workspace_project_name) — нужен для writeBotTokenFile
   ↓
+[2b] Owner-exclusion: SELECT tg_username FROM tg_links WHERE user_id = proj.ownerUserId
+  ↓   Build ownerTgUsernames Set (normalised: @-stripped, lowercase)
+  ↓
 [3] Build ownerByUsername map: SELECT id,status,botUsername FROM projects WHERE id != $self AND botUsername IS NOT NULL
   ↓
 [4] Reclaim ladder loop — for each entry in pool order:
+  ↓   poolUsername = entry.username.replace(/^@/,'').toLowerCase()
+  ↓   ↳ ownerTgUsernames.has(poolUsername) → push skippedOwner; continue  ← NEW (#592 fix)
   ↓   owner = ownerByUsername.get(entry.username)
   ↓   ownerIsDead   = owner && DEAD_STATUSES.has(owner.status)
   ↓   ownerIsActive = owner && !ownerIsDead && owner.status !== 'done'
@@ -130,6 +136,7 @@ autoCreateTelegramBot (auto-bot.ts:142)
 | `getMe` validation 5с timeout | `[auto-bot] getMe network error` / `auto-bot: getMe network error` | `services/auto-bot.ts:388` — api.telegram.org или egress proxy down. Approval продолжается без bot. |
 | `getMe` not ok (revoked token / wrong format) | `auto-bot: getMe failed for @<username>` | `services/auto-bot.ts:377` — токен инвалид, перевыпустить через @BotFather и заменить в `BOT_TOKEN_POOL`. |
 | Reclaim случился ошибочно (старый pod ещё жив) | `auto-bot: reclaimed @<username> from project N` + новый pod получает 409 | Probe не среагировал (race window). Перенастроить старый pod вручную, добавить токен обратно в pool. |
+| Owner's personal TG account assigned as bot — incident #592 (@avsee4 misfire) | `[auto-bot] pool empty after owner-exclusion filter (excluded owner_user_id=X)` / `auto-bot: skipped N pool token(s) belonging to the project owner` | Fixed: owner-exclusion filter queries `tg_links` by `owner_user_id` and skips matching pool entries. If you still see: `BOT_TOKEN_POOL` contains no real bot accounts for this user — add proper bot tokens or enable BotFather fallback. |
 | `bot_assigned` есть, но bot.py не видит токен | — | Coder читает не `/workspace/bot_token.txt` — поправить boilerplate (`agent_boilerplates/`), либо подождать ~5с пока `syncProjectEnvFile` (`auto-bot.ts:459`) докатит `/workspace/.env`. |
 
 ## Related
