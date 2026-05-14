@@ -46,6 +46,7 @@ export default defineConfig({
             { label: 'Kinds', slug: 'architecture/kinds' },
             { label: 'TG Templates', slug: 'architecture/tg-templates' },
             { label: 'Graph Executor', slug: 'architecture/graph-executor' },
+            { label: 'Channel Variants', slug: 'architecture/channel-variants' },
           ],
         },
         {
@@ -61,6 +62,8 @@ export default defineConfig({
             { label: 'Projects Frontend', slug: 'subsystems/projects-frontend' },
             { label: 'Graph Handlers', slug: 'subsystems/graph-handlers' },
             { label: 'Feature Flags', slug: 'subsystems/feature-flags' },
+            { label: 'Brief-Fidelity Supervisor', slug: 'subsystems/brief-fidelity-supervisor' },
+            { label: 'Deploy Shield', slug: 'subsystems/deploy-shield' },
           ],
         },
         {
@@ -82,6 +85,8 @@ export default defineConfig({
             { label: 'Debug Stuck Project', slug: 'runbooks/debug-stuck-project' },
             { label: 'Add a New Kind', slug: 'runbooks/add-new-kind' },
             { label: 'Ship a New Boilerplate', slug: 'runbooks/ship-new-boilerplate' },
+            { label: 'Canonical Templates', slug: 'runbooks/canonical-templates' },
+            { label: 'Scaffold Hardening', slug: 'runbooks/scaffold-hardening' },
             { label: 'Update the RAG', slug: 'runbooks/update-rag-docs' },
           ],
         },

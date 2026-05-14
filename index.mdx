@@ -10,10 +10,27 @@ This is the internal code-level documentation. **Not for end users** — public 
 ## What lives here
 
 - **Architecture overview** — 5 minute tour of the whole platform
-- **Products** — visitka, bot, ferma — what files build each
-- **Subsystems** — code-exec MCP, Caddy preview, LLM router, TG MCP
+- **Products** — visitka, bot pool, ferma, channel variants, tg templates, graph executor
+- **Subsystems** — 12 pages covering code-exec MCP, pod pre-warm pool, Caddy preview, runtime supervisor, LLM router, TG MCP, auth, projects frontend, graph handlers, feature flags, brief-fidelity supervisor, deploy shield
 - **Flows** — step-by-step paths through the system (with file refs)
-- **Runbooks** — how to diagnose and fix common issues
+- **Runbooks** — debug stuck projects, add a kind, ship a boilerplate, canonical templates, scaffold hardening, update the RAG
+
+## Subsystems index
+
+| Page | One-line role |
+|------|----------------|
+| [Code Exec MCP](/subsystems/code-exec-mcp) | shell-in-pod tool used by every coder agent and scaffold |
+| [Pod Pre-Warm Pool](/subsystems/pod-prewarm-pool) | hot workspace pods so approve→ready is sub-second |
+| [Caddy Preview](/subsystems/caddy-preview) | wildcard TLS + per-project routing for `*.proj.agentflow.website` |
+| [Runtime Supervisor](/subsystems/runtime-supervisor) | universal build+deploy state machine (Procfile / s6) |
+| [LLM Router](/subsystems/llm-router) | `useModel(ModelType.*)` — no hardcoded model names |
+| [Telegram MCP](/subsystems/tg-mcp) | Python Telethon — 24 tools, MTProto |
+| [Auth and Access](/subsystems/auth-and-access) | JWT, AF API keys, owner vs admin |
+| [Projects Frontend](/subsystems/projects-frontend) | React 19 workspace UI |
+| [Graph Handlers](/subsystems/graph-handlers) | DAG node registry per kind |
+| [Feature Flags](/subsystems/feature-flags) | `feature_flags` table + lookup helpers |
+| [Brief-Fidelity Supervisor](/subsystems/brief-fidelity-supervisor) | post-smoke gate rejecting coder drift from owner brief |
+| [Deploy Shield](/subsystems/deploy-shield) | drain-aware preStop hook so rolling restarts don't kill walker work |
 
 ## For LLM agents
 
