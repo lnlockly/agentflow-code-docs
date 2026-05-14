@@ -121,3 +121,4 @@ kubectl -n franchise-factory set env deploy/agentflow-agents POD_POOL_ENABLED=0
 - [Code Exec MCP](/subsystems/code-exec-mcp) — the consumer of `claimWarmPod` / `returnPodToPool`.
 - [Create Project Flow](/flows/create-project) — end-to-end approve → provision path that the pool short-circuits.
 - [Caddy Preview](/subsystems/caddy-preview) — preview URL reconcile runs after the StatefulSet pod is up, regardless of whether the image came from a warm-pool claim.
+- [Pod-GC Pinger](/subsystems/pod-gc-pinger) — kills *project* workspace pods (label `project-*`, not `agentflow-pool=warm`). The two pingers coexist: pod-gc reclaims slots from done/failed projects so refill has node Pod-limit headroom to spawn new warm pods.
