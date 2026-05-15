@@ -1,0 +1,98 @@
+---
+title: "Agents — provision + taxonomy"
+description: "How agent rows land in Postgres, and the invariant that DB column `category` mirrors `character.category` so frontend taxonomy gates fire."
+---
+
+# Agents — provision + taxonomy
+
+## TL;DR
+
+An agent is one row in the `agents` table. Most agents are spawned through `provisionAgent` (`src/services/agent-provision.ts:63`) which takes a `CharacterInput`, normalises plugins/system/secrets via `buildCharacter`, inserts the row, then creates + starts the agent in the remote Eliza runtime. Frontend gates key off the top-level columns (`category`, `keywords`, …) — not off the JSONB `character` blob — so those columns **must** mirror the corresponding fields from the preset / input character at insert time.
+
+## The invariant
+
+> **`agents.category` (column) === `character.category` (JSONB field)** for every fresh insert.
+
+The same rule applies to `agents.keywords`. If the input has no `category`, the column is explicitly `NULL` (not `undefined`, which drizzle would drop). If the input carries garbage (non-string, non-array), the row falls back to `NULL` / `[]` — defence-in-depth so a bogus preset cannot corrupt the column.
+
+`CharacterInput` (`src/services/character.ts:35`) does **not** list `category` or `keywords` as known fields — those are preset-level taxonomy, mirrored onto the DB row by the insert path. `buildCharacter` does not propagate them into its return value either; only `provisionAgent` and the per-insert path in `routes/agents.ts:1657` (hire-from-preset) handle the mirror.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/agent-provision.ts:63` | `provisionAgent` — shared insert path for `POST /agents`, MCP `architect.create_agent`, `me-presets`, `projects.ts`, seed scripts. |
+| `agentflow-agents/src/services/agent-provision.ts:81` | `rawInput.category` typeof-guarded read → `presetCategory: string \| null` → set on the row. |
+| `agentflow-agents/src/services/agent-provision.ts:96` | `rawInput.keywords` array filter → strings only → set on the row. |
+| `agentflow-agents/src/db/schema.ts:79` | `category text` column (no enum; validation in `services/agent-taxonomy.ts`). |
+| `agentflow-agents/src/db/schema.ts:80` | `keywords text[] NOT NULL DEFAULT '{}'`. |
+| `agentflow-agents/src/db/schema.ts:183` | `agents_category_idx` partial index (WHERE category IS NOT NULL) for taxonomy queries. |
+| `agentflow-agents/src/routes/agents.ts:1670` | Hire-from-preset path — independent insert (does NOT call `provisionAgent`); also mirrors `category` + `keywords`. |
+| `agentflow-agents/src/routes/marketplace.ts:1009` | Fork path — mirrors `base.category`. |
+| `agentflow-agents/src/scripts/bootstrap-marketplace.ts:318` | Platform-owned bootstrap insert. (Does NOT set category — bootstrap rows are admin-curated post-hoc.) |
+| `agentflow-agents/src/services/template-showcase-seed.ts:75` | Showcase platform-owned seed insert. (Same as bootstrap — admin curates taxonomy after.) |
+| `agentflow-agents/src/routes/me.ts:94` | Maestro singleton — internal; no category. |
+| `agentflow-landing/src/components/agents/AgentWorkspace.tsx:151` | Frontend gate: `agent?.category === 'researcher'` → renders knowledge sidebar. **This is the gate the invariant unblocks.** |
+| `agentflow-agents/tests/unit/agent-provision-category.test.ts` | Source-contract regression suite for the mirror. |
+
+## Data flow — preset hire
+
+```
+me-presets POST /me/from-preset/:slug
+       │
+       ▼
+load preset JSON (presets/<slug>.json)
+       │  preset.category === 'researcher'
+       ▼
+provisionAgent({ character: preset as never, … })
+       │
+       ▼ src/services/agent-provision.ts:63
+buildCharacter(input, secrets, …)
+       │   ⮕ drops category / keywords from JSON payload
+       │   ⮕ returns { name, bio, system, settings, plugins, … }
+       ▼
+db.insert(agents).values({
+  …,
+  character,                       // JSONB — has system, plugins, settings
+  category: presetCategory,        // ← mirror from input.character.category
+  keywords: presetKeywords,        // ← mirror from input.character.keywords
+})
+       │
+       ▼
+GET /me/agents/:slug → row.category === 'researcher'
+       │
+       ▼
+AgentWorkspace.tsx:151 → KnowledgeSidebar renders
+```
+
+## DB / Env / API
+- Tables: `agents` (columns of interest: `category text`, `keywords text[]`)
+- Indices: `agents_category_idx`, `agents_owner_category_rating_idx`
+- Env: none (taxonomy is JSON-driven)
+- Routes touching the mirror: `POST /me/from-preset/:slug`, `POST /me/marketplace/:slug/hire`, `POST /me/marketplace/:slug/fork`, `POST /agents` (architect MCP)
+- MCP tools: `architect.create_agent` (via `mcp-servers/architect.ts`)
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Researcher agent has no knowledge sidebar | (frontend) `agent.category === 'researcher'` returns `false` for a row where `character.category === 'researcher'` | Check the insert path that created it — mirror missing. |
+| New row lands with `category=NULL` despite preset taxonomy | `psql -c "SELECT id, slug, category, character->>'category' FROM agents WHERE category IS NULL AND character ? 'category'"` returns rows | `services/agent-provision.ts:81` — verify the typeof guard and the values({…}) call still pass `category:`. |
+| TS error after touching `provisionAgent` insert payload | `tsc` complains about `presetCategory: string \| null` | The type pin in the helper variable is intentional — keep it. |
+
+## Backfill
+
+When the mirror was first added, existing rows in prod needed a one-off backfill:
+
+```sql
+UPDATE agents
+SET category = character->>'category'
+WHERE (character ? 'category') AND (category IS NULL OR category = '');
+```
+
+Run **after** the code fix is deployed (otherwise the next preset hire re-introduces a `NULL` for any row created in the gap).
+
+## Related
+- [Souls Collective](/subsystems/souls) — souls have their own taxonomy in `data.soul` graph nodes, separate from `agents.category`.
+- [Auth and Access](/subsystems/auth-and-access)
+- [Architecture overview](/architecture/overview)
