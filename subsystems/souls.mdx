@@ -169,6 +169,51 @@ Souls running inside agentflow-agents need to call the platform's `/me/*` API ba
 
 Screen-record path (`video.record_graph_demo`) avoids the auth dance entirely by pointing at the public read-only `/flows/<slug>` route (`PublicFlowView` in agentflow-landing) — backed by `GET /public/flows/:slug` in `agentflow-agents/src/routes/public-flows.ts:26`. Marks the flow `is_public=true` before the soul tries to record. Selector default is `[data-nodeid]` to match the SVG canvas in `components/studio/Canvas.tsx:531`.
 
+## Team roster (ops souls, KB-only, no LLM)
+
+Eight role-based souls seeded by `scripts/seed-team-roster.sql` (generated from
+`scripts/build-team-roster-{presets,sql}.mjs`) form the platform-ops layer that
+runs alongside sales souls. Every message they emit comes from
+`agent_knowledge_base` rows fetched by `knowledge.fetch` — there are zero
+`llm.call` nodes anywhere in this roster, so they keep working when LLM
+providers degrade. All inter-soul DMs go through `agent.message_peer` →
+`agent_messages` → `trigger.agent_message`, never through TG.
+
+| Slug | Cron | Peer-target | TG-out | Mission |
+|---|---|---|---|---|
+| `soul-ceo_agentflow` | `*/30 * * * *` | `qa_smoke_tester` (topic `review`) | `@avsee4` (acct 6) | Ship/iterate/halt decisions per soul; daily summary DM to owner |
+| `soul-qa_smoke_tester` | `*/15 * * * *` | `ceo_agentflow` (topic `qa_report`) | `@avsee4` (acct 6) | Smoke-test sales/dedup paths; critical fails escalate to owner |
+| `soul-qa_data_integrity` | `*/20 * * * *` | `ceo_agentflow` (topic `qa_data`) | — | Audit `tg_lead_states`/`agent_messages` for stale/orphan/dedup-breach |
+| `soul-ux_reviewer` | `0 * * * *` | `ceo_agentflow` (topic `ux_review`) | — | Hourly graph audit; KB-critique for dense graphs / missing branches |
+| `soul-copywriter` | `0 */2 * * *` | `ceo_agentflow` (topic `copy_proposal`) | — | Propose rewrites of low-confidence KB entries; CEO applies |
+| `soul-growth_strategist` | `0 */3 * * *` | `ceo_agentflow` (topic `growth_signal`) | — | Funnel-rate signal per stage; new opener proposals |
+| `soul-funnel_orchestrator` | `*/5 * * * *` | `ceo_agentflow` (topic `funnel_route`) | `@avsee4` (acct 6) | Ack new inbounds + route to sales/ceo/spam |
+| `soul-revenue_watcher` | `0 12 * * *` | `ceo_agentflow` (topic `revenue_daily`) | `@avsee4` (acct 6) | Daily qualified/closed count; spike/no-revenue flags |
+
+Shape: every preset is 9-10 nodes following the same skeleton —
+`trigger.cron` (+ optional `trigger.agent_message` when a peer can wake it),
+`data.soul`, `knowledge.fetch` over role-specific topics,
+`dialog.dedup_guard` (jaccard 0.92), `logic.branch` on
+`steps.dedup.output.skip`, and either `agent.message_peer` (mandatory)
+followed by `tg.send_text` (only for souls that DM the owner) → `output.store`.
+The `skip=true` path terminates in a separate `output.store` so the run is
+auditable from `flow_runs.output_json`.
+
+KB seed: 64 rows total (8 per soul), all `source = 'team-roster-seed'`,
+`confidence` 0.5–0.9. Topics per soul:
+
+- ceo: `decision_ship`, `decision_iterate`, `decision_halt`, `weekly_summary`
+- qa_smoke: `test_pass`, `test_fail`, `dedup_caught_dupe`, `peer_throttle_caught`
+- qa_data: `stale_lead_found`, `orphan_record`, `dedup_breach`, `data_clean`
+- ux: `graph_too_dense`, `graph_missing_branch`, `graph_well_structured`, `graph_cycle_detected`
+- copy: `rewrite_proposal`, `tone_fix`, `slang_purge`, `length_trim`
+- growth: `funnel_leak`, `stage_optimisation`, `new_opener_proposal`, `cohort_drop`
+- funnel: `ack_new_lead`, `route_to_sales`, `route_to_ceo`, `route_to_spam`
+- revenue: `daily_summary`, `no_revenue_today`, `revenue_spike`, `cohort_report`
+
+All eight flows seed with `enabled=false`. Enable per soul after smoke-testing
+via `PATCH /me/souls/<handle>` with `{enabled: true}`.
+
 ## Related
 
 - [Graph executor (contract & spec)](/architecture/graph-executor) — same registry + walker that runs every soul tick
