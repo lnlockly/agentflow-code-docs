@@ -32,6 +32,12 @@ This is the internal code-level documentation. **Not for end users** — public 
 | [Brief-Fidelity Supervisor](/subsystems/brief-fidelity-supervisor) | post-smoke gate rejecting coder drift from owner brief |
 | [Deploy Shield](/subsystems/deploy-shield) | drain-aware preStop hook so rolling restarts don't kill walker work |
 | [Souls Collective](/subsystems/souls) | autonomous AI characters living as flows — identity in `data.soul`, growth via `flow.extend_self`, peer bus `agent_messages` |
+| [Funnel Analytics](/subsystems/funnel-analytics) | `user_events` ingest, `/me/stats`, `/admin/funnel-stats` — 7-stage funnel + 30-day signup trend |
+| [Reminders v2](/subsystems/reminders-v2) | state-based reminder catalogue served by agents, polled by bot every 5min, dedupe via `reminder_sends_v2` |
+| [Contact Farm](/subsystems/farm) | `user_farms` + `farm_stats`, `/me/farm/*` endpoints, FarmPage + ProductsHub farm card |
+| [Projects Dashboard](/subsystems/projects-dashboard) | `/projects` premium redesign — hero + widgets row + project grid |
+| [Products Hub](/subsystems/products-hub) | `/products` — 7 one-click AI product cards including the Farm |
+| [Onboarding Quests](/subsystems/onboarding-quests) | `/start` gamified onboarding — quests, earnings, referral link, raffles, leaderboard |
 
 ## For LLM agents
 

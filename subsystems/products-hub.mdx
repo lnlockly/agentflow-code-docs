@@ -1,0 +1,81 @@
+---
+title: "Products Hub"
+description: "/products — premium hub with 7 ready-made AI product cards including the Farm. Tag-pill filters, live Farm metric, mobile-responsive grid."
+---
+
+# Products Hub
+
+## TL;DR
+
+`/products` (auth-gated app shell) lists ready-made AI products as
+"one-click" cards. Shipped 2026-05-15 redesign with gradient hero,
+mono-count badge, pill filters, glow icons, and a `/me/farm/stats`
+live metric on the Farm card. 7 products total — six template-driven
+agents plus the Farm.
+
+The Farm card promotes the corresponding sidebar nav entry — the nav
+link was removed in this redesign so the only entrypoint is here.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/pages/ProductsHub.tsx:43` | `PRODUCTS` array — 7 cards |
+| `agentflow-landing/src/pages/ProductsHub.tsx:107` | Farm card definition (`id: 'farm'`, `href: '/farm'`) |
+| `agentflow-landing/src/pages/ProductsHub.tsx:119` | `FILTERS` array — `['All', 'Контент', 'CRM', 'SEO', 'Поддержка', 'Ферма']` |
+| `agentflow-landing/src/pages/ProductsHub.tsx:126` | `ProductsHub` page component |
+| `agentflow-landing/src/pages/ProductsHub.tsx:133` | `useEffect` — `apiGet<FarmStatsLite>('/me/farm/stats')` for live count |
+| `agentflow-landing/src/pages/ProductsHub.tsx:154` | Responsive grid logic (1/2/auto-fill cols) |
+
+## The 7 products
+
+| id | name | tag | href | popular |
+|---|---|---|---|---|
+| `seo-writer` | SEO Blog Writer | SEO | `/studio?template=seo-writer` | yes |
+| `email-campaign` | Email Campaign | Контент | `/studio?template=email-campaign` | no |
+| `lead-qualifier` | Lead Qualifier | CRM | `/studio?template=lead-qualifier` | yes |
+| `content-calendar` | Content Calendar | Контент | `/studio?template=content-calendar` | no |
+| `support-bot` | Support Bot | Поддержка | `/studio?template=support-bot` | no |
+| `social-reposter` | Social Reposter | Контент | `/studio?template=social-reposter` | no |
+| `farm` | Ферма контактов | Ферма | `/farm` | yes |
+
+## Data flow
+
+```
+ProductsHub mount
+  ├─► apiGet('/me/farm/stats')     ─► sets farmContacts (number | null)
+  │   on failure: silently keep null, card still renders without live count
+  │
+  ├─► useMediaQuery('(max-width: 1023px)')  ─► tablet layout
+  └─► useMediaQuery('(max-width: 767px)')   ─► mobile layout
+
+User clicks filter pill
+  └─► setActiveFilter(option)
+      └─► visible = PRODUCTS.filter(p => p.tag === option)
+
+User clicks card
+  └─► <Link to={product.href}>
+      • 6 product templates  ─► /studio?template=…
+      • Farm                  ─► /farm
+```
+
+## DB / Env / API
+
+- Routes consumed: `GET /me/farm/stats` (agentflow-agents) — best-effort, hides metric on failure
+- Tags available: `Контент | CRM | SEO | Поддержка | Ферма`
+- No new tables, env vars, or backend endpoints
+- Filter pills hide products by tag string match; `'All'` shows everything
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Farm card has no live contacts count | `apiGet<FarmStatsLite>('/me/farm/stats')` catch handler swallows | Expected — confirm `/me/farm/stats` returns `{ contacts: number }` for the session. Check user has a `user_farms` row |
+| Filter pill clears all cards | `visible` array empty after filter | Tag string mismatch — check `PRODUCTS[*].tag` matches one of `FILTERS` exactly (case-sensitive Russian strings) |
+| Grid collapses to single column on desktop | `isTablet`/`isMobile` triggered unexpectedly | Window < 1024px or < 768px — confirm with `window.innerWidth` in DevTools |
+| Click on card stays on `/products` | n/a | Check `href` field in `PRODUCTS` — `/studio?template=…` requires Studio to be mounted in `main.tsx` |
+
+## Related
+
+- [Farm](/subsystems/farm) — the Farm product card deep-links here and reads its stats
+- [Projects Dashboard](/subsystems/projects-dashboard) — `ProductsBanner` CTAs into this page

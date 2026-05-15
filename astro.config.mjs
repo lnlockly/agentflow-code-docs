@@ -64,6 +64,12 @@ export default defineConfig({
             { label: 'Feature Flags', slug: 'subsystems/feature-flags' },
             { label: 'Brief-Fidelity Supervisor', slug: 'subsystems/brief-fidelity-supervisor' },
             { label: 'Deploy Shield', slug: 'subsystems/deploy-shield' },
+            { label: 'Funnel Analytics', slug: 'subsystems/funnel-analytics' },
+            { label: 'Reminders v2', slug: 'subsystems/reminders-v2' },
+            { label: 'Contact Farm', slug: 'subsystems/farm' },
+            { label: 'Projects Dashboard', slug: 'subsystems/projects-dashboard' },
+            { label: 'Products Hub', slug: 'subsystems/products-hub' },
+            { label: 'Onboarding Quests', slug: 'subsystems/onboarding-quests' },
           ],
         },
         {
