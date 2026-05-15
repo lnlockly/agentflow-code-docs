@@ -15,6 +15,16 @@ Eliza's `@elizaos/plugin-knowledge` route surface
 (`/api/agents/<elizaAgentId>/plugins/documents`), but no production agent
 loads that plugin, so every call returned 404 `"API endpoint not found"`.
 
+### Async ack (2026-05-15)
+
+`POST /me/agents/:slug/memories/ingest` now returns **202 + `job_id` in <2s**
+and runs fetch/chunk/embed in the background via `setImmediate`. Clients poll
+`GET /me/agents/:slug/memories/ingest/:job_id` until `status` is `done` or
+`failed`. Before this change a Wikipedia-sized URL ingest blocked the request
+for 60-120s and tripped Cloudflare's 100s edge timeout (524) even though the
+work succeeded server-side. Job rows live in `knowledge_ingest_jobs`
+(migration `2026-05-15g-knowledge-ingest-jobs.sql`).
+
 ## Files
 
 | Path | Role |
@@ -31,7 +41,12 @@ loads that plugin, so every call returned 404 `"API endpoint not found"`.
 | `agentflow-agents/src/services/research-ingest.ts:194` | `formatCaptionsAsMarkdown` — `[hh:mm:ss]` per segment. |
 | `agentflow-agents/src/services/memory-ingest.ts:259` | `ingestForAgent` — inserts one `agent_memories` row per chunk + embedding. |
 | `agentflow-agents/src/services/agent-memory.ts:282` | `insertKnowledgeChunk` — pgvector INSERT (writes NULL embedding when embed service is down). |
+| `agentflow-agents/src/routes/me-agents-memories.ts:82` | `POST /me/agents/:slug/memories/ingest` — async ack, returns 202 + `job_id`. |
+| `agentflow-agents/src/routes/me-agents-memories.ts:170` | `GET /me/agents/:slug/memories/ingest/:job_id` — poll job status. |
+| `agentflow-agents/src/services/ingest-jobs.ts:1` | Job lifecycle: createIngestJob / spawnIngestJob / runIngestJob (in-process bg worker). |
+| `agentflow-agents/migrations/2026-05-15g-knowledge-ingest-jobs.sql:1` | `knowledge_ingest_jobs` table definition. |
 | `agentflow-agents/tests/research-ingest.test.ts:1` | Pure helpers — 21 tests, no DB / MCP / Eliza dependency. |
+| `agentflow-agents/tests/me-agents-memories-ingest.test.ts:1` | Async-ack + polling integration tests (skipped without DB). |
 
 ## Data flow
 
@@ -70,7 +85,9 @@ Frontend (KnowledgeSidebar)
 
 ## DB / Env / API
 
-- **Table:** `agent_memories` (columns `agent_id`, `content`, `meta jsonb`, `embedding vector(1024)`). Migration `0057_agent_knowledge_index.sql`.
+- **Tables:**
+  - `agent_memories` (columns `agent_id`, `content`, `meta jsonb`, `embedding vector(1024)`). Migration `0057_agent_knowledge_index.sql`.
+  - `knowledge_ingest_jobs` (columns `id`, `agent_id uuid`, `owner_user_id`, `status`, `payload jsonb`, `result jsonb`, `error text`, `chunks_created`, `created_at`, `started_at`, `finished_at`). Migration `2026-05-15g-knowledge-ingest-jobs.sql`.
 - **Env:**
   - `RESEARCH_DEFAULT_WORKSPACE` (optional) — if set, Whisper fallback uses this project pod instead of looking up the caller's most-recent project.
   - `FF_AGENT_MEMORY_RETRIEVAL=1` — gates retrieval into the chat system prompt.
@@ -80,13 +97,20 @@ Frontend (KnowledgeSidebar)
   - `DELETE /agents/:slug/knowledge/:docId`
   - `POST /agents/:slug/knowledge/url` (`{url, title?}`)
   - `POST /agents/:slug/knowledge/youtube` (`{url, fallback?, lang?}`)
+  - `POST /me/agents/:slug/memories/ingest` — **async**, returns 202 `{ok, job_id, status:'pending', poll_url}`.
+  - `GET /me/agents/:slug/memories/ingest/:job_id` — `{ok, status, chunks_created, error?, result?, created_at, started_at, finished_at}`.
 - **Pricing:** URL = 5¢, captions = 5¢, Whisper = 15¢ base + 2¢/min over 10 min (`whisperCostCents`).
 
 ## Failure modes
 
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
+| 524 / Cloudflare 100s timeout on `/me/agents/:slug/memories/ingest` | (gateway timeout, no app log) | Pre-2026-05-15 sync handler. Async ack is now default; if you still see it, frontend is hitting an old build of agentflow-agents — roll forward. |
 | 404 `API endpoint not found` on URL/YouTube ingest | `API endpoint not found` (upstream Eliza) | Was: proxy hit plugin-knowledge that no agent loads. Fixed in `routes/knowledge.ts` — now writes to `agent_memories` directly. |
+| Job row stuck in `running` forever | `[ingest-jobs] runIngestJob escaped` (rare) or no log at all | Pod restarted mid-job. In-process worker has no resume — the row is orphaned. UI should timeout after ~5 min and surface failure. Long-term fix: swap `spawnIngestJob` for bullmq / agentflow-workers. |
+| Job `status=failed`, `error="too_many_redirects"` | `too_many_redirects` | Source URL bounces > 5 hops. Inspect with `curl -ILv`. |
+| Job `status=failed`, `error="redirect_blocked:private_host_blocked"` | `redirect_blocked:` | Source URL redirected to a private/loopback host. SSRF guard correct — don't bypass. |
+| Job `status=failed`, `error="empty_content"` | `empty_content` | Source page had no extractable text (login wall / JS-only shell). |
 | 409 `no_workspace` on captions ingest | `no_workspace` | Should NOT happen on captions — captions run in-process. If you see this, the YouTube handler skipped `fetchYouTubeCaptions`. Check `routes/knowledge.ts:355`. |
 | 409 `no_workspace` on Whisper fallback | `Whisper fallback needs a project pod` | Set `RESEARCH_DEFAULT_WORKSPACE` or create a project via `/research`. |
 | 422 `no_captions` | `pass fallback=whisper to use audio model` | Video has no public captions. Retry with `{fallback:"whisper"}` — needs workspace. |
