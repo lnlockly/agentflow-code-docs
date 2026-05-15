@@ -1,0 +1,118 @@
+---
+title: "Research ingest — URL + YouTube knowledge endpoints"
+description: "Server-side article fetch + readability and YouTube captions/Whisper ingest into Eliza plugin-knowledge."
+---
+
+# Research ingest
+
+## TL;DR
+
+Two HTTP endpoints on `agentflow-agents` let a research agent ingest external
+sources into its Eliza `plugin-knowledge` store without the user copy-pasting
+text. `POST /agents/:slug/knowledge/url` does server-side fetch + Mozilla
+Readability → forwards extracted markdown via the existing knowledge data:
+URL upload. `POST /agents/:slug/knowledge/youtube` runs the existing
+`transcribe.py captions` asset in the user's project pod; Whisper is
+opt-in (`fallback=whisper`) and runs async with a job id.
+
+Both endpoints charge via `debitCredits()` from `services/stars-billing.ts`
+and refund on any downstream failure.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/knowledge.ts:226` | `POST /agents/:slug/knowledge/url` handler — fetch + readability + forward. |
+| `agentflow-agents/src/routes/knowledge.ts:328` | `POST /agents/:slug/knowledge/youtube` handler — captions-first + Whisper opt-in. |
+| `agentflow-agents/src/services/research-ingest.ts:24` | `validatePublicHttpUrl` — blocks loopback / RFC1918 / link-local / IPv6 ULA. |
+| `agentflow-agents/src/services/research-ingest.ts:91` | `extractArticle` — `@mozilla/readability` over a `jsdom` window. |
+| `agentflow-agents/src/services/research-ingest.ts:127` | `parseYouTubeUrl` — accepts `/watch?v=`, `youtu.be/`, `/shorts/`, `/embed/`, `/live/`. |
+| `agentflow-agents/src/services/research-ingest.ts:175` | `formatCaptionsAsMarkdown` — emits `[hh:mm:ss] line` per segment. |
+| `agentflow-agents/src/services/research-ingest.ts:208` | `whisperCostCents` — flat 15¢ ≤10min, then 2¢/min over. |
+| `agentflow-agents/src/services/stars-billing.ts:399` | `refundCredits(userId, cents, reason)` — inverse of `debitCredits`. |
+| `agentflow-agents/assets/youtube-transcriber/transcribe.py:49` | `captions` subcommand — `youtube-transcript-api` fast path. |
+| `agentflow-agents/assets/youtube-transcriber/transcribe.py:101` | `full_pipeline` — captions → fallback yt-dlp + faster-whisper. |
+| `agentflow-agents/src/types/jsdom.d.ts:1` | Local jsdom type shim — avoids `@types/jsdom` undici-types conflict. |
+| `agentflow-agents/tests/research-ingest.test.ts:1` | 18 unit tests covering URL validation, article extraction, YT parsing, caption formatting, Whisper pricing. |
+
+## Data flow
+
+```
+[User] paste URL or YT link in /research sidebar
+        │
+        ▼
+POST /agents/:slug/knowledge/{url|youtube}
+        │
+        ├─ validate input (private-IP / YT host filter)
+        ├─ debitCredits(5¢)
+        │
+URL ────┼─ fetch (15s timeout, 5MB cap, redirect:follow)
+        │     │
+        │     ▼
+        │  readability(jsdom) → title + markdown
+        │     │
+        │     ▼
+        │  proxy POST to Eliza /api/agents/<id>/plugins/documents
+        │  (data:text/plain;base64 fileUrl)
+        │
+YT  ────┼─ callCodeExecTool('exec', { project, command:
+        │     'python3 /workspace/assets/youtube-transcriber/transcribe.py captions --url X' })
+        │     │
+        │     ├─ ok → format with [hh:mm:ss] → forward as data: URL
+        │     │
+        │     └─ no captions
+        │            ├─ fallback=captions_only (DEFAULT) → 422 with hint
+        │            └─ fallback=whisper → debit 15¢, spawn `transcribe.py full`
+        │                                  via nohup, return { job_id, status:processing }
+        │
+        ▼
+On any downstream non-2xx → refundCredits(userId, cents, 'refund_knowledge_ingest')
+```
+
+## DB / Env / API
+
+- **Tables:** none new; piggybacks on Eliza `plugin-knowledge` documents/fragments
+  and `user_credits` for billing. Refund reason recorded via `console.info`
+  log line (audit log table can land later if compliance asks).
+- **Env:**
+  - `RESEARCH_DEFAULT_WORKSPACE` — optional project pod name used for the
+    YouTube transcribe runner. When unset, falls back to the user's most
+    recent `projects.workspace_project_name`.
+  - `ELIZA_URL`, `ELIZA_API_KEY` (existing) — knowledge proxy target.
+- **Routes:**
+  - `POST /agents/:slug/knowledge/url` — body `{ url, title? }`.
+  - `POST /agents/:slug/knowledge/youtube` — body `{ url, fallback?: 'captions_only' | 'whisper' }`.
+- **MCP tools:** `code-exec.exec` (transcribe.py runner inside the project pod).
+- **Pricing constants:** `URL_INGEST_COST_CENTS = 5`, `CAPTIONS_INGEST_COST_CENTS = 5`,
+  `WHISPER_BASE_COST_CENTS = 15`, `WHISPER_PER_MIN_OVER_10_CENTS = 2`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| URL ingest 400 with `invalid_url` | client-side validation error | `services/research-ingest.ts:24` (`validatePublicHttpUrl`) |
+| URL ingest 400 with `private_host_blocked` | user paste an RFC1918 / loopback URL | expected — block intended |
+| URL ingest 502 `fetch_failed` | external host returned non-2xx | `routes/knowledge.ts:284` — refund posted, surface upstream status |
+| URL ingest 413 `response_too_large` | body exceeded `URL_FETCH_MAX_BYTES` (5MB) | `routes/knowledge.ts:307` — bump cap if a legitimate site needs more |
+| URL ingest 422 `no_article_content` | readability returned nothing | `services/research-ingest.ts:91` — page is a SPA shell, manual paste needed |
+| YouTube 400 `not_a_youtube_url` | URL host not in `YT_HOSTS` | `services/research-ingest.ts:115` |
+| YouTube 409 `no_workspace` | user has no project with `workspace_project_name` | create a project or set `RESEARCH_DEFAULT_WORKSPACE` env |
+| YouTube 422 `no_captions` | video lacks captions and fallback not requested | client opts in via `fallback: 'whisper'` |
+| Refund log line on 4xx/5xx | `[stars-billing] refundCredits user=… reason=refund_knowledge_ingest` | `services/stars-billing.ts:418` |
+| jsdom build error about undici-types | post-`npm i @types/jsdom` | local shim at `src/types/jsdom.d.ts` — do NOT install `@types/jsdom` |
+
+## Pricing finalisation TODO
+
+Whisper opt-in path debits a flat 15¢ at spawn time. The 2¢/min over-10
+overage is computed in `whisperCostCents` but not yet billed on completion.
+A follow-up should either:
+- have `transcribe.py full` POST back to an internal webhook with the
+  measured duration, then `debitCredits(userId, whisperCostCents(dur) - 15)`, or
+- poll the `transcripts/<job_id>.log` from a sweeper.
+
+## Related
+
+- [knowledge-proxy](/subsystems/knowledge-proxy) — base `POST /agents/:slug/knowledge`
+- [stars-billing](/subsystems/stars-billing) — `debitCredits` / `refundCredits`
+- [code-exec](/subsystems/code-exec) — `callCodeExecTool` MCP runner
+- [tavily-mcp](/subsystems/tavily-mcp) — sibling research path (web search, not ingest)
