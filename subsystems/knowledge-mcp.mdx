@@ -1,0 +1,143 @@
+---
+title: "Knowledge MCP"
+description: "Internal MCP server that exposes the agent's ingested knowledge (pgvector over agent_memories) as a native tool the chat-tooluse loop can call."
+---
+
+# Knowledge MCP
+
+## TL;DR
+
+Native-tool path to the ingested knowledge an agent already has. Wraps `retrieveKnowledge` (pgvector cosine search over `agent_memories` rows tagged `meta.kind='knowledge'`) and surfaces it as one MCP tool — `search`. Without this server, researcher-category agents (`lenin`, `marcus-aurelius`, `tolstoy`, `sapolsky`, `trotsky`) reply "Я не вижу прикреплённого документа" even when uploads landed cleanly, because `chat-tooluse.ts` bypasses the Eliza runtime and only the runtime can reach `@elizaos/plugin-knowledge`. The auto-inject in `agent-provision.ts` adds the server block to every researcher preset on provision.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/mcp-servers/knowledge.ts:43` | `KnowledgeCtx` shape — only `agentSlug` flows in from the route. |
+| `agentflow-agents/src/mcp-servers/knowledge.ts:67-83` | `defaultLoadAgentBySlug` — agents-row lookup by slug, returns `{ id, elizaAgentId, state }`. |
+| `agentflow-agents/src/mcp-servers/knowledge.ts:85-99` | `__setKnowledgeDeps` DI seam used by the unit test to swap DB + retrieve without a live Postgres. |
+| `agentflow-agents/src/mcp-servers/knowledge.ts:103-152` | `search` tool handler — resolves agent UUID via `resolveAgentUuid`, calls `retrieveKnowledge(agentUuid, query, topK)`, trims chunk previews to 1500 chars + ellipsis, returns `{ id, chunk, score, title, source, source_type, source_url, chunk_index, chunk_count }` per hit. |
+| `agentflow-agents/src/mcp-servers/knowledge.ts:155-165` | `handleKnowledgeMcp` — Hono entrypoint via `handleJsonRpcMcp`, server name `agentflow-knowledge`. |
+| `agentflow-agents/src/mcp-servers/knowledge.ts:168-175` | `callKnowledgeTool` — direct-invocation helper for tests and mcp-direct paths. |
+| `agentflow-agents/src/routes/internal-mcp.ts:34` | `import { handleKnowledgeMcp } from '../mcp-servers/knowledge.js';` |
+| `agentflow-agents/src/routes/internal-mcp.ts:66` | `KNOWLEDGE_PATHS = ['/internal/mcp/knowledge', '/internal/mcp/knowledge/']` mount declaration. |
+| `agentflow-agents/src/routes/internal-mcp.ts:300-310` | `?agent=<slug>` query-pin mount loop — rejects requests without the slug query so an LLM cannot escape the bucket. |
+| `agentflow-agents/src/services/internal-mcp-resolver.ts:50` | `'knowledge'` added to the `INTERNAL_MCPS` whitelist so the resolver substitutes `${AGENTFLOW_INTERNAL}/knowledge` placeholders. |
+| `agentflow-agents/src/services/internal-mcp-resolver.ts:60-66` | `AGENT_SCOPED_KEYS = new Set(['self', 'knowledge'])` — branch that pins `?agent=<slug>` instead of `?owner=<uid>`. |
+| `agentflow-agents/src/services/agent-provision.ts:55-104` | `injectKnowledgeMcpForResearcher` — auto-inject `knowledge` server block when `character.category === 'researcher'`. Idempotent — skips if the preset already declares it. |
+| `agentflow-agents/src/services/agent-provision.ts:117-124` | `provisionAgent` calls the injector before `buildCharacter` so the resolver mints the live URL with `?agent=<slug>`. |
+| `agentflow-agents/src/services/chat-tooluse.ts:191-211` | `hasKnowledgeTool(connected)` + `KNOWLEDGE_RETRIEVAL_RULE` — appended to the system prompt when the agent has the knowledge MCP attached. Tells the model to call `knowledge__search` before claiming it can't see docs. |
+| `agentflow-agents/src/services/chat-tooluse.ts:362-370` | `deriveSystemPrompt` consumes `hasKnowledge` and bolts the retrieval rule onto the prompt body. |
+| `agentflow-agents/src/services/agent-memory.ts:353-392` | `retrieveKnowledge` — pgvector cosine search over `agent_memories WHERE meta->>'kind'='knowledge'`, hard cap 20 hits. |
+| `agentflow-agents/src/services/agent-memory.ts:282-334` | `insertKnowledgeChunk` — the ingest side. `meta.kind='knowledge'`, embedding via `embedTexts` (bge-m3 1024-dim through the AI router). |
+| `agentflow-agents/src/routes/knowledge.ts:147-163` | `POST /agents/:slug/knowledge` — multipart/text ingest path that lands rows the `search` tool then retrieves. |
+| `agentflow-agents/src/routes/knowledge.ts:224-329` | `POST /agents/:slug/knowledge/url` — server-fetch + readability + ingest. |
+| `agentflow-agents/tests/mcp-servers/knowledge.test.ts:1-198` | `node --test` coverage: registry sanity, happy path with score + metadata, empty knowledge, unknown agent, tombstoned agent, empty-query short-circuit. |
+
+## Data flow
+
+```
+Agent (chat-tooluse loop, native tool_use)
+   │
+   │ JSON-RPC tools/call → POST /internal/mcp/knowledge/?agent=<slug>
+   ▼
+handleKnowledgeMcp (knowledge.ts)
+   │
+   ├── handleJsonRpcMcp dispatch → search handler ({ query, top_k })
+   │
+   ├── loadAgentBySlug(agentSlug)
+   │     └── SELECT id, eliza_agent_id, state FROM agents WHERE slug = ?
+   │     ├── null    → { ok: false, error: 'agent_not_found', items: [] }
+   │     └── state='tombstoned' → { ok: false, error: 'agent_tombstoned' }
+   │
+   ├── resolveAgentUuid(elizaAgentId, id) → canonical UUID
+   │
+   └── retrieveKnowledge(agentUuid, query, topK)
+          │ embed query via invokeAI(TEXT_EMBEDDING) → 1024-dim
+          ▼
+       pgvector hnsw: ORDER BY embedding <=> query LIMIT topK
+       WHERE meta->>'kind' = 'knowledge' AND agent_id = agentUuid
+          │
+          ▼
+       trim chunk to 1500 chars + ellipsis → return items[]
+```
+
+## DB / Env / API
+
+**DB:**
+- `agent_memories` rows where `meta->>'kind' = 'knowledge'`. Columns used: `id`, `content`, `meta` (jsonb: `title`, `source`, `source_type`, `source_url`, `chunk_index`, `chunk_count`), `embedding` (vector(1024)), `agent_id` (uuid).
+- pgvector hnsw index over `embedding` keeps the cosine search sub-millisecond on tens of thousands of chunks.
+
+**Env:**
+- `AGENTFLOW_INTERNAL` (resolver) — base URL the placeholder is rewritten against (`env.agentflowAgentsUrl`).
+- `INTERNAL_API_SECRET` — shared secret the mount validates via constant-time compare.
+
+**Routes:**
+- `POST /internal/mcp/knowledge/?agent=<slug>&token=<secret>` — JSON-RPC MCP transport. `agent` is required, missing → 400 `missing_agent_query`. Token mismatch → 401 `unauthorized`.
+
+**MCP tools:**
+- `search({ query: string (2-1000 chars), top_k?: integer (1-20, default 5) })` →
+  ```json
+  {
+    "ok": true,
+    "query": "...",
+    "top_k": 5,
+    "items": [
+      {
+        "id": 7,
+        "chunk": "first 1500 chars + …",
+        "score": 0.8765,
+        "title": "Империализм как высшая стадия капитализма",
+        "source": "https://...",
+        "source_type": "url",
+        "source_url": "https://...",
+        "chunk_index": 2,
+        "chunk_count": 12
+      }
+    ]
+  }
+  ```
+
+Empty knowledge → `{ ok: true, items: [] }`. Embed service down → `retrieveKnowledge` returns `[]`; the tool surfaces the same empty list so chat degrades gracefully (the LLM simply has no retrieval signal that turn).
+
+## Auto-inject + system prompt
+
+Two production paths make the server actually reach researcher agents:
+
+1. **Provision-time** (`agent-provision.ts:55-104`): `injectKnowledgeMcpForResearcher` adds the server block to `character.settings.mcp.servers.knowledge` before `buildCharacter` runs. The resolver then mints a live `?agent=<slug>` URL inside `buildCharacter`. Idempotent — if the preset JSON already declared `knowledge`, the inject is a no-op.
+
+2. **Chat-time** (`chat-tooluse.ts:191-211, 362-370`): when the agent's connected MCP list contains `knowledge`, the system prompt gets a Russian-language retrieval-first rule appended. The rule forbids "Я не вижу документа" / "нет файла" answers without an actual empty `knowledge__search` result, and tells the model to cite by `title` / `source_url`.
+
+Existing rows (pre-2026-05-15 researchers) need a one-shot backfill:
+
+```sql
+UPDATE agents
+   SET character = jsonb_set(
+         character,
+         '{settings,mcp,servers,knowledge}',
+         '{"type":"streamable-http","name":"AgentFlow Knowledge","url":"${AGENTFLOW_INTERNAL}/knowledge","timeout":60}'::jsonb,
+         true
+       )
+ WHERE category = 'researcher'
+   AND (character->'settings'->'mcp'->'servers'->'knowledge') IS NULL;
+```
+
+The resolver inside `buildCharacter` rewrites the placeholder to a fresh `?agent=<slug>` URL the next time the agent is chatted.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Agent replies "Я не вижу прикреплённого документа" despite ingest | (no log — model hallucinated) | The agent's `character.settings.mcp.servers` lacks `knowledge`. Run the backfill UPDATE above. Source: `agent-provision.ts:55-104`. |
+| Mount returns `missing_agent_query` | `"missing_agent_query"` | URL lacks `?agent=<slug>`. Resolver should mint that — check `internal-mcp-resolver.ts:73-82` and `AGENT_SCOPED_KEYS`. |
+| Mount returns `unauthorized` | `unauthorized` | `?token=` doesn't match `INTERNAL_API_SECRET`. Token rotated since the URL was baked into `character.settings.mcp.servers`. The resolver rebuilds stale-token URLs on the next provision (`internal-mcp-resolver.ts:115`). Force a redeploy of the agent. |
+| Search returns `agent_not_found` | `"error":"agent_not_found"` | Slug in URL has no row in `agents`. Agent was deleted but its baked URL is being hit by a stale chat session. |
+| Search returns `agent_tombstoned` | `"error":"agent_tombstoned"` | Agent was soft-deleted (`state='tombstoned'`); no further retrieval. |
+| Search returns empty items but ingest succeeded | (no error — empty array) | Either embed service is down (`[agent-memory] embed_error:` upstream) or the row has `embedding IS NULL`. Check `agent_memories` directly: `SELECT count(*) FROM agent_memories WHERE agent_id=? AND embedding IS NULL`. |
+| Search returns `empty_query` | `"error":"empty_query"` | Caller passed empty / whitespace-only query. Validate the agent's prompt. Source: `knowledge.ts:115`. |
+
+## Related
+
+- [Tavily MCP](/subsystems/tavily-mcp)
+- [Research ingest](/subsystems/research-ingest)
+- [Research knowledge sidebar](/subsystems/research-knowledge-sidebar)
