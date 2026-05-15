@@ -1,0 +1,80 @@
+---
+title: "Projects Dashboard"
+description: "/projects — marketplace-tier dashboard with hero strip, user-stats widget, farm banner, products CTA, and the project grid."
+---
+
+# Projects Dashboard
+
+## TL;DR
+
+`/projects` got a 2026-05-15 premium redesign aimed at marketplace
+visual parity. Three widgets sit between the hero and the project grid:
+`UserStatsStrip` (live `/me/stats`), `FarmBanner` (CTA into `/farm`),
+and `ProductsBanner` (CTA into `/products`). Behind a 15s `refetchInterval`
+the grid stays warm with active project status.
+
+The Balance / Marketing / Referrals "control-center" widgets in the
+original spec did not ship here — they live in `Account.tsx` and the
+referrals stack instead. This page kept the lighter widget set.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/pages/ProjectsDashboard.tsx:1` | Page entry (`/projects` route) |
+| `agentflow-landing/src/pages/ProjectsDashboard.tsx:189` | `useQuery` with `refetchInterval: 15_000` |
+| `agentflow-landing/src/pages/ProjectsDashboard.tsx:313` | `pdp-widgets` row (`UserStatsStrip` + `FarmBanner` + `ProductsBanner`) |
+| `agentflow-landing/src/pages/ProjectsDashboard.tsx:629` | `FarmBanner` inline component |
+| `agentflow-landing/src/pages/ProjectsDashboard.tsx:664` | `ProductsBanner` inline component |
+| `agentflow-landing/src/components/dashboard/UserStatsStrip.tsx:29` | `UserStatsStrip` component (fetches `/me/stats`) |
+| `agentflow-landing/src/styles/projects-premium.css` | All `.pdp-*` styles |
+
+## Data flow
+
+```
+GET /me/projects (agentflow-agents)                 ─► project grid
+  └─ react-query refetchInterval=15_000
+
+UserStatsStrip
+  └─► GET /me/stats (agentflow-agents)              ─► contacts/refs/FLOW strip
+                                                     or "launch the farm" CTA
+
+FarmBanner
+  └─ reads localStorage('af_farm_visited')           ─► copy + link to /farm
+     (no network call — copy is static-with-i18n)
+
+ProductsBanner
+  └─ static CTA → /products
+```
+
+`FarmBanner` does not call `/me/farm/stats` itself; the visited flag
+only flips after the user has hit `/farm` once. The live count of
+contacts/refs in the active-state copy is currently hardcoded (`340` /
+`12`) and pending wire-up to `/me/farm/stats`.
+
+## DB / Env / API
+
+- Routes consumed (all under `agentsBaseUrl`):
+  - `GET /me/projects` — main grid source (paged, no params)
+  - `GET /me/stats` — UserStatsStrip
+  - `GET /me/create-status` — locked-state banner (paid-tier gate)
+- LocalStorage keys: `af_farm_visited` — first visit to `/farm` flips the FarmBanner copy
+- No new env vars
+- Tailwind/CSS file: `projects-premium.css` (`.pdp-*` class prefix)
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Widgets row empty | `UserStatsStrip` returns null when fetch fails | By design — silent hide so the dashboard does not show a broken widget |
+| FarmBanner shows "active" copy with no real farm | `localStorage.getItem('af_farm_visited')` returns truthy | User visited `/farm` but did not start. Visit flag does not reflect actual status — bug-prone; backlog: read `/me/farm/stats` here |
+| Project grid stale | n/a — `refetchInterval: 15_000` | Already polls every 15s; force-refresh via React Query DevTools |
+| Locked banner showing for admin | `createStatus?.locked && !admin_bypass` | Admin bypass uses `users.is_admin=true`; check `/me/create-status` response |
+| `pdp-widgets` overflows on mobile | n/a (CSS) | Edit `projects-premium.css` — widget row collapses to single column < 720px |
+
+## Related
+
+- [Funnel analytics](/subsystems/funnel-analytics) — `/me/stats` shape comes from there
+- [Farm](/subsystems/farm) — `FarmBanner` deep-links to it
+- [Products Hub](/subsystems/products-hub) — `ProductsBanner` deep-links to it
+- [Projects Frontend](/subsystems/projects-frontend) — pre-redesign architecture
