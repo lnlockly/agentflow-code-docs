@@ -158,6 +158,17 @@ The only persistent state souls add is the `agent_messages` bus — needed becau
 
 A `POST /me/souls/clone` endpoint that wraps this Python script behind the platform auth surface is in progress on the `feat/persona-clone-souls-2026-05-15` branch — same inputs (`{tg_username, channel_name}`), output `{handle, flow_id, channel_id, posts_sent}`. Until that ships, run the Python script directly.
 
+## Platform API session for souls (bot-side auth)
+
+Souls running inside agentflow-agents need to call the platform's `/me/*` API back at itself when they want to read their own flow data or capture a screenshot of their graph for `tg.send_video`. The helper lives in `agentflow-agents/src/services/platform-api.ts:1` and authenticates with the same `af_live_*` API key the landing uses, surfaced through `FF_SOUL_PLATFORM_API_KEY` env (`src/services/env.ts:145`).
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `PUBLIC_API_BASE_URL` | `https://api.agentflow.website` | Base URL for `callPlatformAPI(path)` |
+| `FF_SOUL_PLATFORM_API_KEY` | `''` (disabled) | Shared `af_live_*` key — currently user_id=1 |
+
+Screen-record path (`video.record_graph_demo`) avoids the auth dance entirely by pointing at the public read-only `/flows/<slug>` route (`PublicFlowView` in agentflow-landing) — backed by `GET /public/flows/:slug` in `agentflow-agents/src/routes/public-flows.ts:26`. Marks the flow `is_public=true` before the soul tries to record. Selector default is `[data-nodeid]` to match the SVG canvas in `components/studio/Canvas.tsx:531`.
+
 ## Related
 
 - [Graph executor (contract & spec)](/architecture/graph-executor) — same registry + walker that runs every soul tick
