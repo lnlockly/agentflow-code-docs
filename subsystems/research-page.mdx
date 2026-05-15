@@ -1,0 +1,93 @@
+---
+title: "Research entry page"
+description: "/research landing surface inside agentflow-landing — researcher-template gallery, the user's research agents, and a create-blank entry."
+---
+
+# Research entry page
+
+## TL;DR
+
+`/research` is a workspace surface in `agentflow-landing` that pulls
+researcher-category presets from `GET /me/presets` and the user's own
+provisioned research agents from `GET /agents`, filters both client-side
+against a canonical slug whitelist (`lenin`, `trotsky`, `tolstoy`,
+`sapolsky`, `marcus-aurelius`, `researcher`), and renders three blocks —
+Templates, My research agents, Create blank. Wrapped in `AppShellV2`
+with a sidebar entry (Telescope icon) between Agents and Souls.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/pages/Research.tsx:1-44` | Module-level docstring + types. |
+| `agentflow-landing/src/pages/Research.tsx:63-70` | `RESEARCHER_SLUGS` whitelist — keep in sync with `presets/<slug>.json` where `category=researcher`. |
+| `agentflow-landing/src/pages/Research.tsx:74-77` | `isResearcherPreset` — accepts `category==='researcher'` OR slug-whitelist match. Whitelist fallback exists because `/me/presets` currently only forwards `marketplace_meta.category`, which is null for these presets. |
+| `agentflow-landing/src/pages/Research.tsx:81-86` | `isResearchAgent` — slug-prefix match (provisioned agents append per-user suffixes; mirrors `aliasPrefixesFor` in `agentflow-agents/src/routes/me-presets.ts`). |
+| `agentflow-landing/src/pages/Research.tsx:99-115` | React Query fetches for `/me/presets` and `/agents`, both gated on `isAuthenticated`. |
+| `agentflow-landing/src/pages/Research.tsx:124-200` | Page layout — header, Templates section, My research agents section. |
+| `agentflow-landing/src/pages/Research.tsx:267-364` | `TemplateCard` — links to `/agents/new?preset=<slug>&category=researcher`. |
+| `agentflow-landing/src/pages/Research.tsx:366-432` | `BlankCard` — `/agents/new?category=researcher`. |
+| `agentflow-landing/src/pages/Research.tsx:434-565` | `AgentCard` — open chat (`/my/agents/:slug`) and manage (`/account/agents/:slug`). |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:46` | `Telescope` icon import. |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:82` | `WORKSPACE_NAV` entry — `{ to: '/research', icon: Telescope, key: 'research' }` between Agents and Souls. |
+| `agentflow-landing/src/main.tsx:279` | Lazy import. |
+| `agentflow-landing/src/main.tsx:484` | Route registration under `RequireAuth`. |
+| `agentflow-landing/src/i18n/{en,ru,zh}.json` | `research.*` and `app.shell.nav.research` keys. |
+
+## Data flow
+
+```
+User navigates to /research
+   │
+   ▼
+RequireAuth (agentflow-landing/src/components/auth/RequireAuth.tsx)
+   │
+   ▼
+Research.tsx
+   │
+   ├── useQuery('research-presets')
+   │     └── agentsGet('/me/presets')
+   │           → GET https://agentflow-agents/me/presets   (Hono, requireSession)
+   │             agentflow-agents/src/routes/me-presets.ts:36
+   │
+   ├── useQuery('research-agents')
+   │     └── agentsGet('/agents')
+   │           → GET https://agentflow-agents/agents       (Hono, requireSession)
+   │             agentflow-agents/src/routes/agents.ts:236
+   │
+   └── client-side filter via RESEARCHER_SLUGS
+         ├── Templates grid → TemplateCard → /agents/new?preset=<slug>&category=researcher
+         ├── My research agents → AgentCard → /my/agents/<slug> (chat) or /account/agents/<slug> (manage)
+         └── BlankCard → /agents/new?category=researcher
+```
+
+## DB / Env / API
+
+- Tables: none of its own. Reads via existing endpoints.
+- Env: none — uses platform session cookie.
+- Routes:
+  - Read: `GET /me/presets` (returns `{ ok, items: ServerPreset[] }`)
+  - Read: `GET /agents` (returns `{ ok, items: AgentRow[] }`)
+  - Outbound link: `GET /agents/new?category=researcher[&preset=<slug>]` → `CreateAgentPage`
+  - Outbound link: `GET /my/agents/<slug>` → `AgentWorkspacePage`
+  - Outbound link: `GET /account/agents/<slug>` → `Agents` (legacy chat shell, behind `VITE_FF_AGENT_3TAB_UI` toggle)
+- MCP tools: none directly, but Tavily MCP is what powers the researcher
+  personas at runtime — see [Tavily MCP](/subsystems/tavily-mcp).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `Templates will appear here` rendered even though `presets/lenin.json` exists | `[me-presets] empty` (none today — fail silently) | `agentflow-agents/src/services/preset-store.ts` — preset row missing `status='active'` or `source='platform'`. |
+| Card disappears after seeding a new researcher preset | (none — silent UI miss) | Add the new slug to `RESEARCHER_SLUGS` in `Research.tsx:63`. Long-term: surface `character.category` at `/me/presets` so the whitelist becomes redundant. |
+| `No research agents yet` rendered after provisioning from `/agents/new?preset=lenin` | (none — silent UI miss) | Provisioned slug must start with the preset slug. Check `provisionAgent` in `agentflow-agents/src/services/agent-provision.ts` — if a custom slug strategy lands, update `isResearchAgent` in `Research.tsx:81`. |
+| Sidebar entry missing on mobile | n/a — `BOTTOM_NAV` constant in `AppShellV2.tsx:120-126` only pins 5 items. | Research deliberately lives in the drawer, not the mobile bottom bar. |
+
+## Related
+
+- [Tavily MCP](/subsystems/tavily-mcp) — the web-research toolset every
+  researcher preset declares in its `mcp_servers` block.
+- Presets seeded by lane C — `presets/lenin.json`, `presets/trotsky.json`,
+  `presets/tolstoy.json`, `presets/sapolsky.json`,
+  `presets/marcus-aurelius.json`, `presets/researcher.json`. All carry
+  `category=researcher`.
