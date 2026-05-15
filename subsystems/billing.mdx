@@ -1,0 +1,73 @@
+---
+title: "Billing balance (FLOW)"
+description: "How user balance is computed: flow_ledger is the source of truth, flow_balances is a cached aggregate."
+---
+
+# Billing balance (FLOW)
+
+## TL;DR
+
+User balance lives in two Postgres tables. `flow_ledger` is the append-only journal — every credit/debit writes a row, and the user's balance equals `SUM(amount)` over their rows. `flow_balances` is a writer-maintained aggregate (one row per user, kept in sync by `creditUser()` / `debitUser()` inside the same TX as the ledger insert) used by the charge hot path under `SELECT ... FOR UPDATE` so concurrent turns don't race. Read-side helpers (`getBalance`, `isPaidUser`) sum the ledger directly so a stale or missing `flow_balances` row never lies to the user.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/flow-meter.ts:229` | `getBalance(userId)` — sums `flow_ledger.amount`, returns USDF string |
+| `agentflow-agents/src/middleware/auth.ts:241` | `isPaidUser(userId)` — sums `flow_ledger.amount WHERE kind IN ('deposit','academy_purchase','plan_purchase','tier_purchase')` |
+| `agentflow-agents/src/routes/billing.ts:95` | `GET /me/balance` — calls `getBalance(session.sub)` + adds `user_credits.balance_cents` |
+| `agentflow-agents/src/routes/billing.ts:260` | charge admin path — re-reads via `getBalance(userId)` |
+| `agentflow-agents/src/routes/billing-usage.ts:111` | usage panel — reads balance via `getBalance(userId)` |
+| `agentflow-agents/src/routes/internal.ts:382` | internal-secret balance endpoint, calls `getBalance(userId)` |
+| `agentflow-agents/src/services/flow-meter.ts:618` | `creditUser(args)` — INSERT `flow_ledger` + UPSERT `flow_balances` in one TX |
+| `agentflow-agents/src/services/flow-meter.ts:551` | settle-debit upsert on `flow_balances` (hot path) |
+| `agentflow-agents/src/services/promo-codes.ts:236` | promo `balance_topup` redeem — UPSERT `flow_balances` (writes ledger row separately, see file) |
+
+## Data flow
+
+```
+                 deposit / promo / settle
+                          │
+                          ▼
+                ┌──────────────────────┐
+                │  creditUser/debitUser│  (single TX)
+                └──────────┬───────────┘
+                           │
+        ┌──────────────────┴──────────────────┐
+        ▼                                     ▼
+  INSERT flow_ledger                  UPSERT flow_balances
+  (append-only journal,               (cached aggregate, one
+  every row has kind+amount)          row per user, used by
+                                      settle() with FOR UPDATE)
+
+read path
+─────────
+  GET /me/balance ─► getBalance(userId) ─► SUM(flow_ledger.amount)
+  isPaidUser(userId)                   ─► SUM(flow_ledger.amount WHERE kind IN paid_kinds)
+```
+
+## DB / Env / API
+
+- Tables: `flow_ledger(user_id, amount, kind, ref_id, created_at, …)`, `flow_balances(user_id PK, balance NUMERIC(18,6))`
+- Env: none specific to balance read; schema detection via `flowSchemaReady()` (`flow-meter.ts:155`)
+- Routes: `GET /me/balance`, `POST /internal/users/:id/balance` (internal-secret guarded)
+- MCP tools: none direct; balance is exposed via `agentflow-mcp-server` `/me/balance` proxy
+
+## Invariants
+
+- Every balance mutation goes through `creditUser()` / `debitUser()` (or `settle()` / `applyInvoicePaid()` / promo redeem, all of which update both tables in one TX). Raw `INSERT INTO flow_ledger` bypasses the `flow_balances` UPSERT and breaks any code path still reading the aggregate.
+- `getBalance()` and `isPaidUser()` use the same predicate family (sum of `flow_ledger.amount`). When they disagree, the ledger is right.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `/me/balance` returns 0 but user has a `flow_ledger` deposit row | `flow_balances WHERE user_id` in raw SQL outside `creditUser` | Audit callsite; reroute through `creditUser()` in `services/flow-meter.ts:618` |
+| Balance widget desyncs after manual SQL insert | `INSERT INTO flow_ledger` outside `flow-meter.ts` / `cryptobot-billing.ts` / `promo-codes.ts` | Remove the raw insert; use `creditUser()` |
+| `getBalance` returns `'Infinity'` on fresh DB | `flowSchemaReady` false | Run migrations; `flow_balances` table must exist (`flow-meter.ts:155`) |
+| Settle reports wrong balance after race | concurrent turns missing `FOR UPDATE` lock | Hot path stays on `flow_balances` row lock inside `settle()` TX (`flow-meter.ts:551`) |
+
+## Related
+
+- [CryptoBot billing](/subsystems/cryptobot-billing) — deposit source that feeds `flow_ledger` via `applyInvoicePaid` → `creditUser`
+- [LLM router](/subsystems/llm-router) — debit source via `settle()` after every model call
