@@ -9,8 +9,10 @@ description: "Owner-scoped contact-messaging farm — user_farms + farm_stats, /
 
 Per-user "contact farm" feature: a connected Telegram account auto-sends
 one referral-link message per day to its contacts. Backend tables and
-endpoints shipped 2026-05-15; the daily worker that actually sends the
-messages is not yet built — see Backlog.
+endpoints shipped 2026-05-15. The daily send worker shipped same day in
+**stub mode** — it ticks hourly, writes audit rows to `farm_send_log`,
+and bumps `farm_stats.sent_today` / `sent_total`. Real MTProto sending
+is still backlog (needs per-user Telethon transport — see Backlog).
 
 The farm's `status` column is the canonical source for the
 `farm_activated` funnel stage in [Funnel analytics](/subsystems/funnel-analytics)
@@ -22,14 +24,19 @@ and the `farm_activated` state in [Reminders v2](/subsystems/reminders-v2).
 |---|---|
 | `agentflow-agents/src/db/schema.ts:2479` | `userFarms` Drizzle table — status / message_template / send_hour |
 | `agentflow-agents/src/db/schema.ts:2506` | `farmStats` Drizzle table — counters per user |
-| `agentflow-agents/src/db/migrations/0064_farm_tables.sql` | Migration creating both tables |
+| `agentflow-agents/src/db/schema.ts:2532` | `farmSendLog` Drizzle table — per-send audit trail |
+| `agentflow-agents/src/db/migrations/0064_farm_tables.sql` | Migration creating user_farms + farm_stats |
+| `agentflow-agents/migrations/2026-05-15d-farm-send-log.sql` | Migration creating farm_send_log |
 | `agentflow-agents/src/routes/farm.ts:19` | Hono `app` for `/me/farm/*` |
 | `agentflow-agents/src/routes/farm.ts:40` | `GET /me/farm/stats` — never 404s; returns `EMPTY_STATS` for unknown users |
-| `agentflow-agents/src/routes/farm.ts:73` | `POST /me/farm/start` — upsert with status='active' |
-| `agentflow-agents/src/routes/farm.ts:98` | `POST /me/farm/pause` — set status='paused' |
-| `agentflow-agents/src/routes/farm.ts:122` | `POST /me/farm/toggle` — flip active↔paused |
+| `agentflow-agents/src/routes/farm.ts` | `POST /me/farm/start` — upsert with status='active', seeds contacts_count |
+| `agentflow-agents/src/routes/farm.ts` | `POST /me/farm/pause` — set status='paused' |
+| `agentflow-agents/src/routes/farm.ts` | `POST /me/farm/toggle` — flip active↔paused |
+| `agentflow-agents/src/routes/farm.ts` | `GET /me/farm/contacts` — contacts preview + recent farm_send_log entries |
+| `agentflow-agents/src/services/farm-send-worker.ts` | Hourly worker — picks due active farms, writes audit rows + bumps counters |
 | `agentflow-agents/src/server.ts:85` | Imports `farmApp` |
-| `agentflow-agents/src/server.ts:515` | Mounts `farmApp` at `/` |
+| `agentflow-agents/src/server.ts:106` | Imports `startFarmSendWorker` |
+| `agentflow-agents/src/server.ts:290` | Boots the worker (gated by `FF_FARM_WORKER`) |
 | `agentflow-landing/src/pages/FarmPage.tsx:170` | `/farm` route — dashboard + connect-TG block |
 | `agentflow-landing/src/pages/ProductsHub.tsx:107` | Farm product card on `/products` (live `contacts` metric) |
 | `agentflow-landing/src/pages/ProjectsDashboard.tsx:629` | `FarmBanner` widget on `/projects` |
@@ -51,12 +58,18 @@ and the `farm_activated` state in [Reminders v2](/subsystems/reminders-v2).
                                           farm card, UserStatsStrip,
                                           ProjectsDashboard FarmBanner)
 
-  [BACKLOG]  daily worker (cron, NOT YET BUILT):
-    SELECT users WHERE user_farms.status='active' AND
-           (send_hour reached today AND last_run_at < today)
-    → for each user: pick contacts → send 1 TG msg with ref link
-    → UPDATE farm_stats SET sent_today, sent_total, last_run_at
-    → INSERT user_events (kind='farm_activated') on first send
+  hourly farm-send-worker tick (FF_FARM_WORKER, default ON):
+    SELECT user_farms.user_id WHERE status='active'
+      AND (farm_stats.last_run_at IS NULL OR < NOW() - 23h)
+      LIMIT 10
+    → for each: buildStubContacts(user_id) → 3..15 ids
+    → INSERT farm_send_log (user_id, contact_id, status='stub')
+    → UPDATE farm_stats SET sent_today += n, sent_total += n,
+                            contacts_count = n, last_run_at = NOW()
+  midnight UTC: UPDATE farm_stats SET sent_today = 0
+
+  [BACKLOG]  real Telethon sending (per-user MTProto session)
+    Today's worker is stub-only — every audit row has status='stub'.
 ```
 
 The funnel's `farm_activated` stage in `/admin/funnel-stats` is sourced
@@ -69,11 +82,14 @@ the moment the user clicks start, before any send has fired.
 - Tables:
   - `user_farms (id, user_id UNIQUE, status, message_template, send_hour, created_at, updated_at)`
   - `farm_stats (id, user_id UNIQUE, contacts_count, sent_total, sent_today, registrations, flow_earned, last_run_at, updated_at)`
+  - `farm_send_log (id, user_id FK→users ON DELETE CASCADE, contact_id, status, sent_at, error)` — audit trail; index `idx_farm_send_log_user_time(user_id, sent_at DESC)`
 - Indexes: `user_farms_user_id_idx` UNIQUE, `farm_stats_user_id_idx` UNIQUE
-- Status enum (string-typed): `'inactive' | 'active' | 'paused'`
-- `send_hour`: UTC hour 0-23 at which the daily worker should fire (default 10)
+- Status enum (string-typed): `'inactive' | 'active' | 'paused'` for farms; `'sent' | 'failed' | 'stub'` for `farm_send_log.status`
+- `send_hour`: UTC hour 0-23 — currently informational; worker ticks hourly and uses 23h cooldown rather than gating on send_hour
+- Env: `FF_FARM_WORKER` (set to `0` to disable, default ON), `FF_FARM_TICK_MS` (override interval for tests; default `3_600_000`)
 - Routes (all `requireSession`, user_id = session.sub):
   - `GET /me/farm/stats` — returns `{ ok, farm: { status, message_template, send_hour, contacts_count, sent_total, sent_today, registrations, flow_earned, last_run_at } }`
+  - `GET /me/farm/contacts` — returns `{ ok, mode: 'stub' | 'real', total, contacts: [{contact_id}], recent: [{id, contact_id, status, sent_at}] }`
   - `POST /me/farm/start`
   - `POST /me/farm/pause`
   - `POST /me/farm/toggle`
@@ -87,11 +103,15 @@ the moment the user clicks start, before any send has fired.
 | `FarmPage` shows mock data | `MOCK_STATS` constant in `FarmPage.tsx:37` | Frontend still uses mock-on-fetch-failure — verify `/me/farm/stats` reachable from browser |
 | `ProductsHub` farm card has no live count | `apiGet<FarmStatsLite>('/me/farm/stats')` in `ProductsHub.tsx:135` returned error | Card hides the metric silently — check auth state, agentsBaseUrl in DevTools |
 | User exists but `toggle` does nothing | Toggle path explicitly only flips active↔paused | If status='inactive' (never started), call `/me/farm/start` first |
+| Counters not moving despite active status | `farm-send: due farms` log absent | Verify `FF_FARM_WORKER!=0`; check the row has last_run_at older than 23h (or NULL) |
+| Audit log full of `status='stub'` | `farm-send tick complete` log has `mode: 'stub'` | By design until real MTProto transport ships — see Backlog |
+| `sent_today` doesn't reset at midnight | `farm-send: midnight reset failed` | Inspect DB connectivity; reset retries every tick once the new UTC day arrives |
 
 ## Backlog
 
-- **Daily send worker** — the cron that reads `user_farms.status='active'` and actually sends one TG message per user per day. Until it lands, `sent_today` / `sent_total` / `last_run_at` stay at zero and `registrations` is only credited when an outside referral signup fires.
-- **Contact pool ingestion** — UI for the user to import their contacts list. Currently `contacts_count` is admin-writable only.
+- **Real MTProto send** — wire `farm-send-worker.processFarm()` to a per-user Telethon transport (today's `tg-scraper` hard-pins user 1's Jarvis pod, so reuse needs generalisation). Once live, swap `status='stub'` → `'sent'` / `'failed'` and drop the `mode: 'stub'` log tag.
+- **Contact pool ingestion** — UI for the user to import their contacts list. Today the worker uses a deterministic `buildStubContacts(userId)` generator (3..15 ids per day).
+- **Registration credit** — wire `farm_activated` referral signups into `farm_stats.registrations` + `flow_earned`. The funnel already observes the activation event; the credit side is still open.
 
 ## Related
 
