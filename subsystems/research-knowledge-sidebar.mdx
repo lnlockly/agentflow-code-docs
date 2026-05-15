@@ -1,0 +1,72 @@
+---
+title: "Research knowledge sidebar (frontend)"
+description: "Right-rail Knowledge panel inside AgentWorkspace chat for researcher agents — URL/PDF/YouTube ingest UI."
+---
+
+# Research knowledge sidebar
+
+## TL;DR
+
+The Knowledge sidebar is a right-rail accordion inside the `AgentWorkspace`
+chat tab. It surfaces three ingest controls (URL / PDF / YouTube) against the
+research-ingest endpoints landed in PR #320, plus a polled document list for
+status visibility. Visible only when `agent.category === 'researcher'` AND the
+URL carries `?sidebar=knowledge`, so it stays out of the way for non-research
+agents.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/components/agents/KnowledgeSidebar.tsx:1` | The sidebar component — three accordion blocks + polled doc list. |
+| `agentflow-landing/src/components/agents/AgentWorkspace.tsx:28` | Imports KnowledgeSidebar. |
+| `agentflow-landing/src/components/agents/AgentWorkspace.tsx:156` | Conditional mount — `category === 'researcher'` + `?sidebar=knowledge`. |
+| `agentflow-landing/src/styles/agent-workspace.css:897` | `.af-ks*` scoped styles (`.af-aws-with-sidebar` grid wraps chat + rail). |
+| `agentflow-landing/src/lib/agentsApi.ts:54` | `agentsGet`/`agentsPost` — every ingest call uses these helpers (no raw fetch beyond the multipart upload). |
+
+## Data flow
+
+```
+User opens /my/agents/<slug>?sidebar=knowledge
+        │
+        ▼
+AgentWorkspace fetches /agents/:slug → agent.category check
+        │
+        ▼ (researcher only)
+KnowledgeSidebar mounts
+        │
+        ├─ URL block      → POST /agents/:slug/knowledge/url       (5¢)
+        ├─ PDF block      → POST /agents/:slug/knowledge           (multipart)
+        └─ YouTube block  → POST /agents/:slug/knowledge/youtube   (5¢ captions
+                            / 15¢+ whisper if checkbox toggled, fallback=whisper)
+        │
+        ▼
+GET /agents/:slug/knowledge → list rows
+        │
+        ▼
+useEffect polls every 4000ms while any row has status='processing'
+```
+
+## DB / Env / API
+
+- Backend endpoints (live since PR #320): see `subsystems/research-ingest.mdx`
+  for the server side. The frontend only consumes them.
+- No new env vars. The sidebar reads `VITE_AGENTS_URL` indirectly via
+  `agentsBaseUrl` for the multipart fetch fallback (existing constant).
+- URL params: `?sidebar=knowledge` toggles visibility. Other tabs (knowledge,
+  settings) are unaffected — sidebar mounts only inside `tab === 'chat'`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Sidebar invisible for researcher agent | n/a (UI-only — verify URL has `?sidebar=knowledge`) | `components/agents/AgentWorkspace.tsx:160` |
+| Sidebar visible for non-researcher | `agent.category === 'researcher'` check skipped | `components/agents/AgentWorkspace.tsx:160` |
+| Doc list never refreshes after ingest | `setInterval(...4000)` cleared too early | `components/agents/KnowledgeSidebar.tsx:108` (poll effect) |
+| 409 `agent_not_live` on list | `Агент ещё не запущен.` | start the agent first; UI shows this string |
+| 5¢/15¢ debit shown wrong | `'Загрузить (5¢)'` / `'Загрузить (15¢+)'` | `components/agents/KnowledgeSidebar.tsx:230` |
+
+## Related
+
+- [Research ingest (backend)](/subsystems/research-ingest) — endpoints + billing
+- [Agent workspace](/subsystems/projects-frontend) — surrounding chat shell
