@@ -127,6 +127,8 @@ All require `requireSession`. Ownership check is the `flows.owner_user_id = sess
 | `flow.extend_self` silently no-ops | `flow.extend_self appended … added_nodes=0` | LLM returned proposal whose node ids already exist; check `existingIds.has` filter at `:1411` |
 | Peer message inserted but never delivered | `agent_message flow execute failed` | `services/agent-trigger-worker.ts:551` — the receiving soul's flow threw on execute; check its `flow_runs` row |
 | Peer message lost (insert returned 0) | `delivered:false, reason:'missing_to_handle'` in `agent.message_peer` output | sender preset — `to_handle` is required (see `services/flow-executor.ts:1471`) |
+| `video.record_graph_demo` returns a `.png` fallback URL | `ffmpeg_unavailable: spawn ffmpeg ENOENT` | install ffmpeg in the runtime image (`Dockerfile:28` — `apk add ... ffmpeg`); fixed in `fix/video-pipeline-ffmpeg-and-send-video` |
+| `tg.send_video` returns `Unknown tool: send_video` from tg-mcp | `Unknown tool: send_video` in `step_logs.error` | tg-mcp has no `send_video` tool — `runTgSendVideo` (`services/flow-executor.ts:1486`) must call generic `send_file` (Telethon auto-detects MIME from filename extension). Same for `runTgSendVideoNote`. |
 | `/me/souls` returns empty for a user who has soul flows | (no log — silent filter) | client-side: confirm flow has a node where `kind === 'data.soul'` AND `config.handle` is a non-empty string (`routes/souls.ts:84`) |
 | Wake fails with 409 | response body `{"error":"soul_disabled"}` | `PATCH /me/souls/:handle` with `{enabled:true}` first, then wake |
 | Migration partially applied | `pg_advisory_xact_lock(2026051502)` blocks indefinitely | another migrator holds the lock; check `pg_stat_activity` |
