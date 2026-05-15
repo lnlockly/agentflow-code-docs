@@ -1,0 +1,159 @@
+---
+title: "Dialog state machine (Kostya v6)"
+description: "Stateful dialog engine for souls — reads history + tg_lead_states, classifies stage via rule engine, jaccard-dedups, writes state back."
+---
+
+# Dialog state machine (Kostya v6)
+
+## TL;DR
+
+Kostya v5 fired random `response_template` rows from KB every cron tick
+and shipped duplicates to @MLM808. v6 turns the soul into a real dialog
+operator: two triggers (`trigger.cron` proactive + `trigger.tg.new_message`
+reactive) feed a shared pipeline that reads peer history, reads
+`tg_lead_states.meta`, runs a pure rule-engine classifier to pick a stage
+(`cold` / `warmed` / `question_asked` / `call_done` / `stale` / `lost`),
+fetches a stage-scoped KB entry, jaccard-dedups against the last 3
+outbound + a 48 h template cooldown, sends, then writes the new state
+back. Four new graph-executor node kinds + a v6 preset on
+`presets/souls/kostya.json`. Gated by `FF_DIALOG_V6` (umbrella) on top of
+`FF_FLOWS` and `FF_TG_SALES_FUNNEL`.
+
+Spec: `agentflow-agents/docs/specs/2026-05-15-kostya-v6-dialog-state-machine.md`.
+Plan: `agentflow-agents/docs/plans/2026-05-15-kostya-v6-dialog-state-machine.md`.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/dialog-state.ts:96` | `classifyStage(input)` — pure rule engine, first-match wins, falls back to explicit `default` rule then `'noop'` |
+| `agentflow-agents/src/services/dialog-state.ts:160` | `tokenize(s)` — lowercased split on `[\s,!?.\-—:;()"'«»\n]+`, drops tokens of length ≤ 1 |
+| `agentflow-agents/src/services/dialog-state.ts:169` | `jaccard(a, b)` — set-based similarity `|A∩B|/|A∪B|` |
+| `agentflow-agents/src/services/dialog-state.ts:177` | `dedupGuard(input)` — jaccard vs last 3 outbound + template-cooldown check, short-text bypass under 10 chars |
+| `agentflow-agents/src/services/flow-executor.ts:2648` | `runLeadStateRead(node, ctx)` — SELECT from `tg_lead_states`, missing row → `{state:'cold', meta:{}}`, no write |
+| `agentflow-agents/src/services/flow-executor.ts:2697` | `runLeadStateWrite(node, ctx)` — INSERT … ON CONFLICT update, `meta_patch` shallow-merges, `append_template_id` pushes into `meta.recent_template_ids[]` capped at 10 |
+| `agentflow-agents/src/services/flow-executor.ts:2808` | `runLogicClassifyStage(node, ctx)` — renders templated `rules`, `history`, `lead_state` config, forwards to pure `classifyStage` helper |
+| `agentflow-agents/src/services/flow-executor.ts:2828` | `runDialogDedupGuard(node, ctx)` — renders templated config (candidate text + history + recent ids + cooldown) and forwards to pure `dedupGuard` helper |
+| `agentflow-agents/src/services/flow-executor.ts:3065` | Dispatcher wire for `logic.classify_stage` |
+| `agentflow-agents/src/services/flow-executor.ts:3066` | Dispatcher wire for `lead_state.read` |
+| `agentflow-agents/src/services/flow-executor.ts:3067` | Dispatcher wire for `lead_state.write` |
+| `agentflow-agents/src/services/flow-executor.ts:3068` | Dispatcher wire for `dialog.dedup_guard` |
+| `agentflow-agents/src/services/agent-trigger-worker.ts:338` | `processFlowTgNewMessageTriggers` — poller for the reactive trigger; both `FF_FLOWS` and `FF_TG_SALES_FUNNEL` required |
+| `agentflow-agents/src/db/schema.ts:2326` | `tgLeadStates` Drizzle table — `(owner_user_id, tg_account_id, tg_chat_peer)` unique, `meta` jsonb |
+| `agentflow-agents/presets/souls/kostya.json` | v6 preset graph — two triggers, classify + branch fan-out, dedup-guarded send, state writeback |
+
+The shape adapter that turns `tg.get_history` output into the
+`{ direction, text, occurred_at }` rows expected by `classifyStage` and
+`dedupGuard` is inlined in the two handlers (`runLogicClassifyStage`
+2808-2822 and `runDialogDedupGuard` 2828+) via type assertions on the
+templated config — there is no standalone `adaptHistory` function.
+Authoring the preset, you template the history straight from the
+upstream `tg.get_history` step output.
+
+## Data flow
+
+```
+[trigger.tg.new_message]──┐         (reactive — inbound from any peer)
+[trigger.cron 15 min   ]──┤         (proactive — follow-up + stale sweeps)
+                          ▼
+                   [data.soul]      (identity, handle, account_id, style)
+                          ▼
+                [tg.get_history N=20]  (last 20 peer turns)
+                          ▼
+                 [lead_state.read]     (state + meta from tg_lead_states)
+                          ▼
+              [logic.classify_stage]   (pure rule engine over history+meta)
+                          ▼
+                 [logic.branch stage]
+   ┌──────────┬─────────┬─────────────┬───────────┬─────────┬──────────┐
+  cold      warmed  question_asked  call_done   stale    lost / noop
+   │          │           │             │          │          │
+   ▼          ▼           ▼             ▼          ▼          ▼
+kb:opener  kb:warmup  kb:objection  kb:post_call kb:nudge   END
+   └──────────┴─────┬─────┴─────────────┴──────────┘
+                    ▼
+            [dialog.dedup_guard]       jaccard(candidate, last_3_out) ≥ 0.7
+                    │                  OR template_id in recent + cooldown
+         ┌─ skip=true ──► END (logged, no DB write)
+         │
+         └─ skip=false
+                    ▼
+              [tg.send_typing 2-4s]
+                    ▼
+              [tg.send_text]           (CoT-leak guard server-side)
+                    ▼
+             [lead_state.write]        new state, push template_id,
+                    │                  update last_outbound_at, cap 10
+                    ▼
+                  END
+```
+
+## DB / Env / API
+
+- Tables: `tg_lead_states` — one row per `(owner_user_id, tg_account_id, tg_chat_peer)`. `state` is free-form text (`cold` / `warmed` / `question_asked` / `call_done` / `stale` / `lost` / soul-author's choice). `meta` is jsonb with the shape:
+  ```jsonc
+  {
+    "last_template_id": "kb:42",
+    "last_outbound_at": "2026-05-15T16:14:00Z",
+    "last_inbound_at":  "2026-05-15T15:47:00Z",
+    "recent_template_ids": ["kb:42", "kb:7"],   // capped at 10
+    "template_last_used": { "kb:42": "2026-05-15T16:14:00Z" },
+    "last_event_type": "call",
+    "last_event_at": "2026-05-15T15:53:00Z"
+  }
+  ```
+- Migration: `2026-05-14b-tg-lead-states.sql` — table exists pre-v6; v6 adds no DDL.
+- Env:
+  - `FF_FLOWS=1` — umbrella for graph-executor flows.
+  - `FF_TG_SALES_FUNNEL=1` — required for `trigger.tg.new_message` poller (`agent-trigger-worker.ts:340`).
+  - `FF_DIALOG_V6=1` — planned gate for the four new node kinds (per spec). Lets us flip back if rollout breaks.
+- Routes: re-uses `POST /me/flows/:slug/run` for manual fires; otherwise the worker drives via cron + new-message polling.
+- MCP tools called from the graph: TG-MCP `get_history`, `send_message`, `send_chat_action`.
+- New node kinds (registered in `flow-executor.ts:3065-3068`):
+  - `lead_state.read` — SELECT-only, idempotent.
+  - `lead_state.write` — INSERT … ON CONFLICT (owner_user_id, tg_account_id, tg_chat_peer) DO UPDATE; `meta` shallow-merged; `recent_template_ids` capped at 10.
+  - `logic.classify_stage` — pure, rules in node config, output `{stage, reason, matched_rule_index}`.
+  - `dialog.dedup_guard` — pure, output `{skip, reason, max_similarity}`. Downstream `logic.branch` wires `skip=true` to end-noop and `skip=false` to send.
+
+## Rule shape — `logic.classify_stage`
+
+```jsonc
+{
+  "rules": [
+    { "when": { "last_event_type": "call" },                                  "then": "call_done" },
+    { "when": { "peer_silence_min": 1440, "current_stage": ["warmed","question_asked"] },
+                                                                              "then": "stale" },
+    { "when": { "peer_text_matches": ["бот\\??|ai\\??|нейросеть"] },          "then": "question_asked" },
+    { "when": { "peer_text_matches": ["дорого|не потяну|сколько"] },          "then": "question_asked" },
+    { "when": { "current_stage": "cold", "has_inbound": true },               "then": "warmed" },
+    { "when": { "current_stage": "cold", "has_inbound": false },              "then": "cold" },
+    { "default": "noop" }
+  ]
+}
+```
+
+First matching rule wins. Regex matches are case-insensitive; an invalid
+regex silently skips (`dialog-state.ts:79-83`). If no `when` matches and
+no `default` rule exists, the engine returns `{ stage: 'noop', reason: 'fallback', matched_rule_index: -1 }`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Empty outbound | CoT-leak guard inside `tg.send_text` returns `{blocked:true}` (existing handler); `lead_state.write` then no-ops | Review template content, regenerate KB entry for that stage |
+| Duplicate outbound | `dedup_guard` returns `skip:true, reason:"jaccard_X.XX_ge_0.7"` (literal in `dialog-state.ts:198`) | Tune `jaccard_threshold` per node config, or rotate KB to introduce token diversity |
+| Same template fired twice within cooldown | `dedup_guard` returns `skip:true, reason:"template_cooldown_<N>h_lt_48h"` (`dialog-state.ts:211`) | Expected — soul re-tried during cooldown. Lower `template_cooldown_hours` per-node if needed |
+| Recent-template guard fires without timestamp | `reason:"template_recent_no_ts"` (`dialog-state.ts:217`) | `meta.template_last_used` map missing for this id. Older row from pre-v6. Will self-heal on next successful send |
+| Lead stuck in `cold` despite inbound traffic | `runLogicClassifyStage` output `reason:"fallback"` or unexpected `rule_N` | Rules in preset don't match the current text — inspect history shape passed in (`steps['tg.get_history'].output`) and adjust regex / `has_inbound` rule |
+| Missing lead-state row on first send | `runLeadStateRead` output `{state:'cold', meta:{}}` (no row read); `runLeadStateWrite` then INSERTs lazily | Expected — row created on first successful write |
+| `runLeadStateWrite` throws `lead_state.write_no_row_returned` | Literal in `flow-executor.ts:2734` | DB returned zero rows from RETURNING — concurrent DELETE or schema drift. Check `tg_lead_states` row exists post-write |
+| `runLeadStateRead` / `.write` throws `lead_state.<read|write>_missing_account_or_peer` | Literals in `flow-executor.ts:2659` / `2711` | Preset templated `account_id` or `peer` config resolved to empty — check upstream `data.soul` and `trigger.tg.new_message` output |
+| Reactive trigger never fires | `processFlowTgNewMessageTriggers` early-returns on `FF_FLOWS !== '1'` or `FF_TG_SALES_FUNNEL !== '1'` (`agent-trigger-worker.ts:339-340`) | Set both env vars on the worker deployment |
+| Short reply ("ок") passes dedup but feels duplicative | `reason:"too_short_to_dedup"` (`dialog-state.ts:182`) | By design — candidates shorter than 10 chars bypass jaccard. Add a length floor in the preset upstream if undesirable |
+| Cron tick races with reactive trigger on same peer | Two independent `flow_runs` rows — each goes through `dedup_guard`, second one usually returns `skip:true` | Expected — concurrency is safe because dedup is the gate, not a lock |
+
+## Related
+
+- [Graph executor — node handlers](/subsystems/graph-handlers) — registry pattern the v6 nodes follow
+- [LLM router](/subsystems/llm-router) — `useModel(ModelType.TEXT_LARGE)` pattern (v6 is rule-based; v7 will swap `knowledge.fetch` for `llm.call` per branch)
+- [Feature flags](/subsystems/feature-flags) — `FF_FLOWS`, `FF_TG_SALES_FUNNEL`, `FF_DIALOG_V6`
