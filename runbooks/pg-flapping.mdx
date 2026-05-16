@@ -1,0 +1,90 @@
+---
+title: "PG flapping + agents rollout-loop"
+description: "Postgres OOMKilled → recovery mode → agents readiness fails → approved projects regress to failed. Root cause, recovery, prevention."
+---
+
+# PG flapping + agents rollout-loop
+
+## TL;DR
+
+`agentflow-postgres` pod is provisioned with `memory: 512Mi` limit, which is too small for `pg17 + pgvector` under real load. PG hits OOM (Exit 137), restarts into **recovery mode**, then for ~30-60s rejects all queries with `the database system is in recovery mode`. Background workers in `agentflow-agents` (`runProjectApprovalBackground`, `rate-limit-status`, `agent-memory`) wrap their DB writes in `.catch(...)` that only **logs** — they never **retry**. So an approved project mid-pipeline loses its `status: 'running'` update; later the healer marks it `failed`. Combined with node `ubuntu` running at load-avg 80+ (tenant `npm install` floods), kubelet on `ubuntu` cannot start a replacement PG pod for 3-4 min, and during that window the agents readiness probe (which hits `/health/ready` → DB ping) fails → agents pod scaled down → rollout-loop because CI keeps pushing on every merge to main.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/projects-pipeline.ts:521` | `runProjectApprovalBackground(...).catch(...)` — fire-and-forget, no retry on `57P03`. |
+| `agentflow-agents/src/services/projects-pipeline.ts:486` | The `update(projects).set({ status: 'approved' })` that hits PG. |
+| `agentflow-agents/src/services/projects-pipeline.ts:523` | `appendProjectEvent` event-write that fails when PG is in recovery — this is the `[pipeline] approval background failed: insert into project_events` log signature. |
+| `agentflow-agents/src/db/client.ts` (drizzle pool) | No retry-on-recovery middleware. Adding one here closes the failure mode. |
+| `k8s/` (cluster-only — NOT in repo) | `kubectl -n franchise-factory get deploy agentflow-postgres -o yaml`. PG manifest lives only in-cluster; bumping limits = `kubectl set resources`. |
+
+## Data flow (failure path)
+
+```
+tenant project pod → npm install storms node `ubuntu`
+       ↓
+node load → 80, CPU 99%, kubelet sluggish
+       ↓
+PG memory > 512Mi → OOMKilled (exit 137)
+       ↓
+PG restart → ~30-60s in recovery mode
+       ↓
+agents pod queries → 'terminating connection because of crash'
+                     → 'the database system is in recovery mode'
+       ↓
+[pipeline] approval background failed: insert into project_events
+       ↓ (NO RETRY)
+projects.status stuck at 'approved' (the `running` update lost)
+       ↓
+healer.ts re-classifies → status='failed'
+       ↓
+agents /health/ready hits dead DB → readiness fails
+       ↓
+deployment-controller rolls a new RS (CI auto-deploy on every push to main makes this look like a loop)
+```
+
+## DB / Env / API / Infra
+
+- Tables touched on the failure path: `projects`, `project_events`, `plan_tasks`.
+- Critical error SQLSTATE: `57P03` (cannot_connect_now) + `57P02` (crash_shutdown).
+- Log signatures for grep:
+  - `terminating connection because of crash of another server process`
+  - `the database system is in recovery mode`
+  - `[pipeline] approval background failed`
+  - `[rate-limit-status] the database system is in recovery mode`
+  - `[agent-memory] record_failed: the database system is in recovery mode`
+- PV is local-path pinned to node `ubuntu` (`kubernetes.io/hostname=ubuntu`). PG **cannot** be moved to `cloud-exclusive-intel-pl-1` without data migration.
+- Node ceilings (verified 2026-05-16):
+  - `ubuntu`: 8 CPU / 64Gi RAM, **load-avg 80**, 185 pods, CPU 99% — overloaded.
+  - `cloud-exclusive-intel-pl-1...`: 8 CPU / 64Gi RAM, load fine, labeled `role=tenant-worker`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Approved project regresses to `failed` | `[pipeline] approval background failed` + `database system is in recovery mode` | `agentflow-agents/src/services/projects-pipeline.ts:521` — wrap in retry-on-57P03 helper. |
+| Agents pod rollout-loops (generation jumps 10+ in 30 min) | Multiple `ScalingReplicaSet` events on `kubectl describe deploy agentflow-agents` | Combination of CI auto-deploy + readiness flap. Add `min-ready-seconds: 60` on the deployment + back off CI deploys. |
+| PG pod stuck `Pending` on `ubuntu` 2+ min with no events past `Scheduled` | `kubectl describe pod agentflow-postgres-... \| grep Events -A 5` shows only `Scheduled` | Node `ubuntu` overloaded (`ssh ff-france 'uptime'` → load 80). Don't restart PG until load < 20. See "Recovery procedure" below. |
+| PG OOMKilled (`Exit Code: 137`, `Reason: OOMKilled`) | `kubectl describe pod agentflow-postgres-... \| grep -E 'OOMKilled\|Exit Code'` | Bump `memory: 512Mi` → `2Gi`. **Must do during low-load window** — see recovery procedure. |
+
+## Recovery procedure (when PG is flapping)
+
+1. **Check node load first** — `ssh ff-france 'uptime'`. If load-avg > 20, **do not** trigger a PG redeploy. Kubelet will not start the new pod.
+2. Identify the CPU hog: `ssh ff-france 'ps -eo pid,pcpu,comm --sort=-pcpu | head -10'`. Usually a tenant `npm install` — find the offending project via `kubectl -n franchise-factory get pods -o wide --field-selector spec.nodeName=ubuntu | grep proj-` and check its log.
+3. Once node load < 20, bump PG resources: `kubectl -n franchise-factory set resources deploy/agentflow-postgres --limits=cpu=2,memory=2Gi --requests=cpu=100m,memory=512Mi`.
+4. If the new PG pod gets stuck Pending > 3 min: `kubectl -n franchise-factory delete pod -l app=agentflow-postgres --force --grace-period=0` and retry.
+5. After PG is `1/1 Running`, force-delete any stuck terminating agents pods: `kubectl -n franchise-factory delete pod -l app=agentflow-agents --field-selector status.phase=Pending --force --grace-period=0`.
+
+## Followups (not yet shipped)
+
+- **Retry middleware on drizzle client** — wrap pool with `pg-retry` or hand-rolled `retry-on-57P03` for the approval/event write path. Without this, even with PG at 2Gi, a future OOM still loses approvals.
+- **Bump PG memory limit to 2Gi** — pending a low-load window on the `ubuntu` node. Tracking: when `uptime` shows load-avg < 20.
+- **Per-tenant `npm install` quota** — tenant pods should have `cpu: 500m` limit (not just request) to prevent one project from drowning the host. See `k8s/code-exec-tenant-bootstrap.yaml`.
+- **`minReadySeconds: 60` on agentflow-agents deploy** — soaks transient DB blips before declaring the pod ready, preventing CI-driven rollout-loop during PG recovery.
+- **PG manifest into repo** — currently in-cluster only, `kubectl set resources` is the only path. Move to `agentflow-agents/k8s/postgres.yaml` so resource limits are reviewable.
+
+## Related
+
+- [Debug stuck project](/runbooks/debug-stuck-project) — covers the downstream symptom (`status='failed'` after approve).
+- [Capacity failure modes](/subsystems/capacity-failure-modes) — workspace_provision_failed kin: node CPU full, vCluster ResourceQuota, host inotify.
