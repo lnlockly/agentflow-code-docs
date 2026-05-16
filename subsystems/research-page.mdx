@@ -83,8 +83,28 @@ Research.tsx
 | `No research agents yet` rendered after provisioning from `/agents/new?preset=lenin` | (none — silent UI miss) | Provisioned slug must start with the preset slug. Check `provisionAgent` in `agentflow-agents/src/services/agent-provision.ts` — if a custom slug strategy lands, update `isResearchAgent` in `Research.tsx:81`. |
 | Sidebar entry missing on mobile | n/a — `BOTTOM_NAV` constant in `AppShellV2.tsx:120-126` only pins 5 items. | Research deliberately lives in the drawer, not the mobile bottom bar. |
 
+## Polish (2026-05-16)
+
+- `FIGURE_TOPICS` map at `Research.tsx:88-95` adds a per-slug topical
+  descriptor under each TemplateCard (e.g. lenin → "марксистская теория,
+  революция 1917, империализм, диктатура пролетариата"). When you add a
+  new researcher preset, drop one entry into this map.
+- Each card surfaces a quiet "Хочешь свою фигуру? Создай blank-агента →"
+  link below the primary CTA, mirroring the standalone BlankCard so the
+  blank path stays discoverable.
+- `AgentWorkspace.tsx` now passes `agent.category` + `agent.topics` into
+  `AgentChatPanel`. Researcher agents get an in-persona greeter on empty
+  chat ("Привет, я Ленин.") with three "Спроси меня про <topic>" buttons
+  sourced from `character.topics`. The chat also renders a seed-loading
+  banner while `GET /agents/:slug/knowledge` count is still climbing.
+- Backend: `publicAgent` (`agentflow-agents/src/routes/agents.ts`) now
+  serializes `category`, `bio`, and the first 12 `character.topics` so
+  the workspace can branch on researcher-shape without a separate fetch.
+
 ## Related
 
+- [Knowledge MCP](/subsystems/knowledge-mcp) — citation pills, source
+  rendering, and the UUID backfill script.
 - [Tavily MCP](/subsystems/tavily-mcp) — the web-research toolset every
   researcher preset declares in its `mcp_servers` block.
 - Presets seeded by lane C — `presets/lenin.json`, `presets/trotsky.json`,
