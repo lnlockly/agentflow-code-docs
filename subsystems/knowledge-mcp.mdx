@@ -124,6 +124,38 @@ UPDATE agents
 
 The resolver inside `buildCharacter` rewrites the placeholder to a fresh `?agent=<slug>` URL the next time the agent is chatted.
 
+## Citation pills (2026-05-16)
+
+The chat route harvests `knowledge.search` results during the chat-tooluse
+loop and surfaces them as citation pills under the assistant bubble in the
+landing chat. Plumbing:
+
+- `agentflow-agents/src/routes/agents.ts` collects `{source_url, title, score}`
+  from each `knowledge.search` `tool_result` (dedup by `source_url`, highest
+  score wins), caps at the top 8, and emits them on the SSE `done` event as
+  `{ text, sources: [...] }`.
+- The agent message row is persisted with `meta: { sources: [...] }` so
+  reloading history keeps the pills visible across sessions.
+- `agentflow-landing/src/components/agents/AgentChatPanel.tsx` renders the
+  pills under each agent bubble — small rounded chip with `📖 host · title`,
+  links to `source_url` in a new tab.
+
+### Backfill researcher UUIDs (pre-#339 agents)
+
+Pre-PR #339 the seed-knowledge ingest fired before `agents.eliza_agent_id`
+was written back, so seed chunks landed under the deterministic UUID
+(`uuidFromAgentId(agentId)`) while later ingests landed under the canonical
+Eliza UUID. `knowledge.search` calls `resolveAgentUuid(elizaAgentId, id)`
+which prefers the Eliza UUID, so seed chunks were unreachable from chat
+retrieval. Run the one-shot script on existing rows:
+
+```bash
+tsx scripts/backfill-researcher-knowledge-uuid.ts        # apply
+tsx scripts/backfill-researcher-knowledge-uuid.ts --dry  # print only
+```
+
+Source: `agentflow-agents/scripts/backfill-researcher-knowledge-uuid.ts`.
+
 ## Failure modes
 
 | Symptom | Log signature for grep | Where to fix |
