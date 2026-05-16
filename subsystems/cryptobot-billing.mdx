@@ -168,6 +168,7 @@ Token used for HMAC must match `CRYPTO_BOT_TOKEN` in pod env.
 | Invoice paid but status still pending | `applyInvoicePaid: invoice not paid` | CryptoBot sent update with status≠paid; check `update.payload.status` (`services/cryptobot-billing.ts:378`) |
 | Subscription expires_at drift | (silent — verify against `cryptobot_subscriptions.expires_at`) | `GREATEST(existing, now())` clause at `services/cryptobot-billing.ts:495` — stacks on top of remaining time |
 | Pending row missing on webhook | (defensive INSERT — no error) | Covered by `INSERT INTO cryptobot_payments` at `services/cryptobot-billing.ts:458` when SELECT returns 0 rows |
+| Customer paid but TG bot says "🔒 Доступ к AgentFlow закрытый бета. Запроси приглашение @avsee4" | (visual; `/internal/tg/whoami` returns `in_beta:false` for paid user) | `agentflow-agents/src/routes/internal-tg.ts` whoami handler now ORs `tg_beta_allowlist` with `cryptobot_subscriptions.status='active' AND expires_at > now()` via `isPayingSubscriber()`. CryptoBot webhook intentionally does NOT write `tg_beta_allowlist`; the gate must read the subscription row instead. See `subsystems/beta-gate.mdx`. |
 
 ## Pricing matrix (single source of truth)
 
