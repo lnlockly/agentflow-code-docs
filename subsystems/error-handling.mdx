@@ -1,0 +1,100 @@
+---
+title: "Error handling — envelope, ErrorBoundary, toasts, 429"
+description: "Standard {ok:false, error, message, detail} envelope, frontend ErrorBoundary v2 with /me/client-errors reporting, notify toast helper, 429 surfacing."
+---
+
+# Error handling
+
+## TL;DR
+
+Every backend route returns the same JSON envelope on error: `{ ok: false, error: '<code>', message: '<RU>', detail?: '<safe>', ...extras }`. The frontend `ErrorBoundary` catches render crashes, ships a fire-and-forget report to `POST /me/client-errors`, and shows a friendly retry card. A `notify` helper wraps the global toast store so call-sites stay short. 429 responses include `retry_after_sec` so the fetch wrapper can surface a countdown toast automatically.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/lib/error-envelope.ts:30` | `errJson(c, code, status, opts)` — write the standard envelope |
+| `agentflow-agents/src/lib/error-envelope.ts:51` | `rateLimited(c, retryAfterSec, opts)` — 429 with header + RU message |
+| `agentflow-agents/src/lib/error-envelope.ts:79` | `unauthorized(c, detail?)` — 401 shortcut |
+| `agentflow-agents/src/lib/error-envelope.ts:87` | `forbidden(c, detail?)` — 403 shortcut |
+| `agentflow-agents/src/lib/error-envelope.ts:95` | `notFound(c, detail?)` — 404 shortcut |
+| `agentflow-agents/src/lib/error-envelope.ts:103` | `badRequest(c, detail?, extras?)` — 400 shortcut |
+| `agentflow-agents/src/lib/error-envelope.ts:112` | `internalError(c, cause?)` — 500 shortcut, logs cause |
+| `agentflow-agents/src/middleware/rate-limit.ts:42` | `rateLimitPerUser` — adds `retry_after_sec` + `message` to 429 body |
+| `agentflow-agents/src/routes/me-client-errors.ts:62` | `POST /me/client-errors` — anon-friendly crash report receiver |
+| `agentflow-agents/src/server.ts:350` | Global `app.onError` — falls back to envelope on any uncaught throw |
+| `agentflow-agents/migrations/2026-05-15h-client-errors.sql:14` | `client_errors` table schema |
+| `agentflow-landing/src/components/ErrorBoundary.tsx:30` | `buildClientErrorPayload` (pure) — testable payload shaper |
+| `agentflow-landing/src/components/ErrorBoundary.tsx:73` | `reportClientError` — sendBeacon → fetch fallback |
+| `agentflow-landing/src/components/ErrorBoundary.tsx:107` | Class component — render error trap with retry / reload / copy / email / home buttons |
+| `agentflow-landing/src/lib/notify.ts:22` | `notifyOk / notifyError / notifyWarn / notifyInfo / notifyRateLimited` |
+| `agentflow-landing/src/lib/agentsApi.ts:36` | `request()` — detects 429 and fires `notifyRateLimited(retry_after_sec)` |
+| `agentflow-landing/src/pages/NotFound.tsx:1` | Styled `/`-catchall 404 page (search + quick links + SVG) |
+| `agentflow-landing/src/main.tsx:649` | `<Route path="*" element={<ErrorBoundary><NotFound /></ErrorBoundary>}>` |
+| `agentflow-landing/src/store/globalStore.ts:28` | Existing zustand store with `addToast / dismissToast` |
+| `agentflow-landing/src/components/ui/ToastStack.tsx:16` | Framer-Motion stack mounted in `main.tsx` |
+
+## Data flow
+
+```
+[render crash]
+  └─→ ErrorBoundary.componentDidCatch
+        ├─→ console.error (DEV) | console.warn (PROD)
+        ├─→ reportClientError → sendBeacon → POST /me/client-errors
+        │                                       └─→ pino warn + soft-insert client_errors
+        └─→ setState{error} → render fallback card
+
+[fetch 429]
+  └─→ agentsApi.request()
+        ├─→ parseRetryAfter (body retry_after_sec → Retry-After header → date)
+        ├─→ import('./notify') → notifyRateLimited(secs)
+        │                          └─→ globalStore.addToast({warning, ...})
+        └─→ throw AgentsApiError (caller still gets the rejection)
+
+[route throws]
+  └─→ Hono app.onError
+        ├─→ pino log + Sentry captureException
+        └─→ c.json({ ok:false, error:'internal_error', message, detail }, 500)
+```
+
+## DB / Env / API
+
+- Tables: `client_errors` (id, ip, name, message, stack, component_stack, href, user_agent, occurred_at, created_at)
+- Env: `RATE_LIMIT_CHAT_PER_MIN` (default 30), `RATE_LIMIT_CHAT_PER_HOUR` (default 600)
+- Routes:
+  - `POST /me/client-errors` — anon, 20 hits / 60 s per IP, returns 204
+  - `app.onError` — fallback for every other route
+- Frontend env: `VITE_AGENTS_URL` — base URL the ErrorBoundary posts to
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Frontend crash silently disappears | `[ErrorBoundary]` (console) | `agentflow-landing/src/components/ErrorBoundary.tsx:96` |
+| `client_errors` POSTs return 429 | `Слишком много отчётов об ошибках` | `agentflow-agents/src/routes/me-client-errors.ts:58` |
+| `client_errors` insert silently skipped | `client_errors insert skipped` | `agentflow-agents/src/routes/me-client-errors.ts:113` |
+| Rate-limit toast doesn't show countdown | (no log; check `retry_after_sec` in payload) | `agentflow-landing/src/lib/agentsApi.ts:50` |
+| 404 page shows homepage | `<Route path="*">` regression | `agentflow-landing/src/main.tsx:649` |
+| Uncaught throw leaks stack to client | `unhandled_route_error` | `agentflow-agents/src/server.ts:350` |
+
+## Wire shape (canonical)
+
+```jsonc
+// success
+{ "ok": true, ...data }
+
+// generic error
+{ "ok": false, "error": "internal_error", "message": "Что-то сломалось у нас. Попробуй ещё раз.", "detail": "TypeError: ..." }
+
+// 429
+{ "ok": false, "error": "rate_limited", "retry_after_sec": 30, "window": "minute", "limit": 30, "message": "Слишком много запросов. Попробуй через минуту." }
+// + Retry-After: 30 header
+
+// 404 / 403 / 401 / 400 — same shape, different error code
+{ "ok": false, "error": "not_found", "message": "Не найдено.", "detail": "project missing" }
+```
+
+## Related
+
+- [Landing app shell](/subsystems/landing-shell)
+- [LLM router](/subsystems/llm-router)
