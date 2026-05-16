@@ -9,16 +9,34 @@ description: "How user balance is computed: flow_ledger is the source of truth, 
 
 User balance lives in two Postgres tables. `flow_ledger` is the append-only journal — every credit/debit writes a row, and the user's balance equals `SUM(amount)` over their rows. `flow_balances` is a writer-maintained aggregate (one row per user, kept in sync by `creditUser()` / `debitUser()` inside the same TX as the ledger insert) used by the charge hot path under `SELECT ... FOR UPDATE` so concurrent turns don't race. Read-side helpers (`getBalance`, `isPaidUser`) sum the ledger directly so a stale or missing `flow_balances` row never lies to the user.
 
+## 3-API balance parity (May 2026 fix)
+
+After PR #310 switched `getBalance()` to `SUM(flow_ledger)`, three balance endpoints returned three different numbers for the same user:
+
+| Endpoint | Repo / file | Pre-fix source | Symptom |
+|---|---|---|---|
+| `GET /auth/me` | `agentflow-agents/src/routes/auth-password.ts:386` | hard-coded `balance_micro: 0` | AuthProvider bootstrap stuck at 0 |
+| `GET /_api/me` | `agentflow-api/src/routes/me.ts:39` | `SELECT balance FROM flow_balances` | shows writer-aggregate, misses ledger-only entries |
+| `GET /_agents/me/balance` | `agentflow-agents/src/routes/billing.ts:95` | `getBalance()` + user_credits | correct |
+
+Owner saw `-2458 USDF` on one rail, `+99.77` on another. Root cause: pre-#310 top-ups bumped `flow_balances` but never inserted a `flow_ledger` row, so the SUM-based read returned the wrong number for legacy users.
+
+Reconcile: a one-shot SQL inserts a `reconcile_legacy_balance` ledger row equal to `flow_balances.balance - SUM(flow_ledger.amount)` for every user where the diff exceeds 0.001 USDF and no prior `reconcile_legacy_balance` row exists. After reconcile, both `flow_balances.balance` and `SUM(flow_ledger.amount)` converge for legacy users.
+
+Fix (PRs `lnlockly/agentflow-agents#352` + `lnlockly/agentflow-api#2`): both `/auth/me` and `/_api/me` now compute `balance_micro` from `SUM(flow_ledger.amount)` (the same path `getBalance()` uses). `/_agents/me/balance` also exposes `balance_micro` so all three endpoints publish the same integer field for the same authenticated session.
+
 ## Files (with line refs)
 
 | Path | Role |
 |---|---|
 | `agentflow-agents/src/services/flow-meter.ts:229` | `getBalance(userId)` — sums `flow_ledger.amount`, returns USDF string |
 | `agentflow-agents/src/middleware/auth.ts:241` | `isPaidUser(userId)` — sums `flow_ledger.amount WHERE kind IN ('deposit','academy_purchase','plan_purchase','tier_purchase')` |
-| `agentflow-agents/src/routes/billing.ts:95` | `GET /me/balance` — calls `getBalance(session.sub)` + adds `user_credits.balance_cents` |
+| `agentflow-agents/src/routes/auth-password.ts:386` | `GET /auth/me` — calls `getBalance(row.id)` → `flowToMicro()` for `balance_micro` |
+| `agentflow-agents/src/routes/billing.ts:95` | `GET /me/balance` — calls `getBalance(session.sub)` + adds `user_credits.balance_cents`; exposes `balance_micro` |
 | `agentflow-agents/src/routes/billing.ts:260` | charge admin path — re-reads via `getBalance(userId)` |
 | `agentflow-agents/src/routes/billing-usage.ts:111` | usage panel — reads balance via `getBalance(userId)` |
 | `agentflow-agents/src/routes/internal.ts:382` | internal-secret balance endpoint, calls `getBalance(userId)` |
+| `agentflow-api/src/routes/me.ts:52` | `GET /me` — sums `flow_ledger.amount` (was: read `flow_balances.balance` directly) |
 | `agentflow-agents/src/services/flow-meter.ts:618` | `creditUser(args)` — INSERT `flow_ledger` + UPSERT `flow_balances` in one TX |
 | `agentflow-agents/src/services/flow-meter.ts:399` | `settle()` insufficient-funds gate (`SELECT … FOR UPDATE` + `have >= need`) before the debit upsert |
 | `agentflow-agents/src/services/flow-meter.ts:436` | settle-debit upsert on `flow_balances` (hot path, guarded by gate above) |
@@ -45,6 +63,8 @@ User balance lives in two Postgres tables. `flow_ledger` is the append-only jour
 read path
 ─────────
   GET /me/balance ─► getBalance(userId) ─► SUM(flow_ledger.amount)
+  GET /auth/me    ─► getBalance(userId) ─► SUM(flow_ledger.amount)
+  GET /_api/me    ─► SUM(flow_ledger.amount) (post-PR #352)
   isPaidUser(userId)                   ─► SUM(flow_ledger.amount WHERE kind IN paid_kinds)
 ```
 
@@ -52,13 +72,14 @@ read path
 
 - Tables: `flow_ledger(user_id, amount, kind, ref_id, created_at, …)`, `flow_balances(user_id PK, balance NUMERIC(18,6))`
 - Env: none specific to balance read; schema detection via `flowSchemaReady()` (`flow-meter.ts:155`)
-- Routes: `GET /me/balance`, `POST /internal/users/:id/balance` (internal-secret guarded)
+- Routes: `GET /me/balance`, `GET /auth/me`, `GET /_api/me`, `POST /internal/users/:id/balance` (internal-secret guarded)
 - MCP tools: none direct; balance is exposed via `agentflow-mcp-server` `/me/balance` proxy
 
 ## Invariants
 
 - Every balance mutation goes through `creditUser()` / `debitUser()` (or `settle()` / `applyInvoicePaid()` / promo redeem, all of which update both tables in one TX). Raw `INSERT INTO flow_ledger` bypasses the `flow_balances` UPSERT and breaks any code path still reading the aggregate.
 - `getBalance()` and `isPaidUser()` use the same predicate family (sum of `flow_ledger.amount`). When they disagree, the ledger is right.
+- The three public balance endpoints (`/auth/me`, `/_api/me`, `/_agents/me/balance`) must all expose `balance_micro` derived from `SUM(flow_ledger.amount)`. A divergence is a bug.
 
 ## Failure modes
 
@@ -69,6 +90,7 @@ read path
 | `getBalance` returns `'Infinity'` on fresh DB | `flowSchemaReady` false | Run migrations; `flow_balances` table must exist (`flow-meter.ts:155`) |
 | Settle reports wrong balance after race | concurrent turns missing `FOR UPDATE` lock | Hot path stays on `flow_balances` row lock inside `settle()` TX (`flow-meter.ts:551`) |
 | User balance shows negative after LLM usage | `[internal/usage] settle insufficient` | `services/flow-meter.ts:399` (`settle()` gate). Run `npm run reconcile:negative-balances` once after fix deploys to zero existing negatives. |
+| 3 balance APIs disagree (`/auth/me=0`, `/_api/me=X`, `/_agents/me/balance=Y`) | `balance_micro: 0` hard-coded in `routes/auth-password.ts` + `SELECT balance FROM flow_balances` in `agentflow-api/src/routes/me.ts` | Reconcile legacy users via `reconcile_legacy_balance` ledger row, then point both endpoints at `SUM(flow_ledger.amount)` (see "3-API balance parity" section above). |
 
 ## Related
 
