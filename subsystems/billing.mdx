@@ -91,6 +91,8 @@ read path
 | Settle reports wrong balance after race | concurrent turns missing `FOR UPDATE` lock | Hot path stays on `flow_balances` row lock inside `settle()` TX (`flow-meter.ts:551`) |
 | User balance shows negative after LLM usage | `[internal/usage] settle insufficient` | `services/flow-meter.ts:399` (`settle()` gate). Run `npm run reconcile:negative-balances` once after fix deploys to zero existing negatives. |
 | 3 balance APIs disagree (`/auth/me=0`, `/_api/me=X`, `/_agents/me/balance=Y`) | `balance_micro: 0` hard-coded in `routes/auth-password.ts` + `SELECT balance FROM flow_balances` in `agentflow-api/src/routes/me.ts` | Reconcile legacy users via `reconcile_legacy_balance` ledger row, then point both endpoints at `SUM(flow_ledger.amount)` (see "3-API balance parity" section above). |
+| Phantom $900+ "LLM burn" TG alert with no matching debit rows | `llm-burn-alert: hourly warn threshold exceeded` followed by `lastWarnHourBucket` skipping subsequent ticks; ledger shows large `credit_reconcile` rows with negative `amount` | `services/pingers/llm-burn-alert.ts` must filter `kind = ANY(LLM_DEBIT_KINDS)` (PR #358). `credit_reconcile` writes are accounting clawbacks (see `scripts/reconcile-tier-overcredit.mjs:202`) — not LLM spend. |
+| Hot-loop burn outpaces the daily cap before `agent_runs.cost_cents` updates | `BudgetExceededError period=daily` or `period=monthly` from `services/llm-circuit-breaker.ts` | Short-window kill switch reads `flow_ledger` for the last hour. Env: `LLM_USER_HOURLY_CAP_USD` (default $5), `LLM_PLATFORM_HOURLY_CAP_USD` (default $20). `0` disables. |
 
 ## Related
 

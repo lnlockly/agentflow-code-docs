@@ -100,6 +100,13 @@ pool-worker startPoolWorker drains plan_tasks  — pool-worker/index.ts:38
 | Auto-scrape silently skipped | `auto_scrape_post_ws_failed` | `services/projects.ts:1983` |
 | Kind classify даёт `null` | `classify_unknown_kind` | `services/kind-classifier.ts:90` |
 | Pool worker не подхватывает | `pool_tick_failed` или paused | `services/pool-worker/claim.ts:33` (paused gate) |
+| Unsupported `kind` payload | HTTP 400 `unsupported_kind` | `routes/projects.ts:740` (EXPLICIT_KINDS + KIND_ALIASES) |
+| Duplicate project on double-POST | response `idempotent_replay: true` | `routes/projects.ts:651` (60s sha256 window) |
+| `agent-skills cross_category_search_failed: operator does not exist: uuid = text` | grep `cross_category_search_failed` | `services/agent-skills.ts:207` (uuid::text cast on JOIN) |
+
+**Kind aliases (frontend → canonical):** `ai_card`, `ai-card`, `visitka` → `tg_profile_bundle`; `tg-farm`, `farm` → `tg_farm`. Unknown explicit kinds → 400, never silent fallback.
+
+**Idempotency key:** `sha256(owner_user_id | kind | team_id | brief)` or `Idempotency-Key` header. Hits within 60s replay the existing row.
 
 ## Frontend entry: CreateProjectModal
 
