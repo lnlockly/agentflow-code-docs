@@ -9,6 +9,16 @@ description: "How user balance is computed: flow_ledger is the source of truth, 
 
 User balance lives in two Postgres tables. `flow_ledger` is the append-only journal — every credit/debit writes a row, and the user's balance equals `SUM(amount)` over their rows. `flow_balances` is a writer-maintained aggregate (one row per user, kept in sync by `creditUser()` / `debitUser()` inside the same TX as the ledger insert) used by the charge hot path under `SELECT ... FOR UPDATE` so concurrent turns don't race. Read-side helpers (`getBalance`, `isPaidUser`) sum the ledger directly so a stale or missing `flow_balances` row never lies to the user.
 
+There is also a **legacy `user_credits.credits_cents`** table that tracks historical CryptoBot / Telegram-Stars subscription tier purchases. Both payment rails (CryptoBot, Stars) mirror every successful webhook into `flow_ledger` (`kind='credit_topup'`) inside the same TX as the `user_credits` write so the charge path always sees the payment.
+
+## Two-pool unification (May 2026 fix)
+
+Before May 2026, CryptoBot and Stars webhooks only credited `user_credits`. The live charging logic (`settle()`, `chargeLlmUsage()`, `getBalance()`) reads `flow_ledger` only — a paid customer therefore saw `balance=0` and every LLM call was rejected with `[internal/usage] settle insufficient`. Symptom: customer paid $30 via CryptoBot, agent failed every turn.
+
+Fix: `applyInvoicePaid` (`services/cryptobot-billing.ts:500`) and `handleSuccessfulPayment` (`services/stars-billing.ts:314`) now write BOTH `user_credits` (legacy tier ledger, untouched) AND `flow_ledger` + `flow_balances` (unified balance) inside the same TX. Idempotency lives in `meta->>'invoice_id'` (CryptoBot) / `meta->>'telegram_charge_id'` (Stars) — `flow_ledger` has no `ref_external` column, so we use a JSON key + `WHERE NOT EXISTS` guard. A redelivered webhook replays neither rail.
+
+Backfill: `npm run backfill:cryptobot-to-flow-ledger` (script `scripts/backfill-cryptobot-to-flow-ledger.mjs`) catches up paid customers whose CryptoBot payments landed before the fix.
+
 ## Files (with line refs)
 
 | Path | Role |
@@ -23,6 +33,9 @@ User balance lives in two Postgres tables. `flow_ledger` is the append-only jour
 | `agentflow-agents/src/services/flow-meter.ts:399` | `settle()` insufficient-funds gate (`SELECT … FOR UPDATE` + `have >= need`) before the debit upsert |
 | `agentflow-agents/src/services/flow-meter.ts:436` | settle-debit upsert on `flow_balances` (hot path, guarded by gate above) |
 | `agentflow-agents/scripts/reconcile-negative-balances.ts` | one-shot ops script: zero out negative balances + write `credit_reconcile` ledger rows |
+| `agentflow-agents/src/services/cryptobot-billing.ts:500` | applyInvoicePaid — writes user_credits + flow_ledger (credit_topup) in same TX |
+| `agentflow-agents/src/services/stars-billing.ts:314` | handleSuccessfulPayment — writes user_credits + flow_ledger (credit_topup) in same TX |
+| `agentflow-agents/scripts/backfill-cryptobot-to-flow-ledger.mjs` | one-shot ops script: backfill flow_ledger for paid CryptoBot subscribers from before the May 2026 fix |
 | `agentflow-agents/src/services/promo-codes.ts:236` | promo `balance_topup` redeem — UPSERT `flow_balances` (writes ledger row separately, see file) |
 
 ## Data flow
@@ -69,6 +82,7 @@ read path
 | `getBalance` returns `'Infinity'` on fresh DB | `flowSchemaReady` false | Run migrations; `flow_balances` table must exist (`flow-meter.ts:155`) |
 | Settle reports wrong balance after race | concurrent turns missing `FOR UPDATE` lock | Hot path stays on `flow_balances` row lock inside `settle()` TX (`flow-meter.ts:551`) |
 | User balance shows negative after LLM usage | `[internal/usage] settle insufficient` | `services/flow-meter.ts:399` (`settle()` gate). Run `npm run reconcile:negative-balances` once after fix deploys to zero existing negatives. |
+| Paid CryptoBot/Stars customer rejected by charge gate | `[internal/usage] settle insufficient` + `cryptobot_subscriptions.status='active'` but `flow_ledger` has no `credit_topup` row | Pre-May-2026 webhooks. Run `npm run backfill:cryptobot-to-flow-ledger` once. Live fix: `services/cryptobot-billing.ts:500` + `services/stars-billing.ts:314` already mirror credit into `flow_ledger`. |
 
 ## Related
 
