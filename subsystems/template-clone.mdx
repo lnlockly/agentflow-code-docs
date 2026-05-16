@@ -1,0 +1,106 @@
+---
+title: "Template clone (generic inputs → project)"
+description: "How a preset JSON's inputs[] schema becomes an auto-rendered form, a validated REST clone, sealed project_secrets, and an MCP-callable tool — with zero per-template platform code."
+---
+
+# Template clone
+
+> **Status: SHIPPED post-merge of agentflow-agents PR #NNN + agentflow-landing PR #MMM.** Line refs in the Files table are approximate against the planned design; refresh after lanes A/B/C/D land.
+
+## TL;DR
+
+Every AgentFlow template (Kwork operator, TG poster, sales funnel, future verticals) ships as one `presets/<slug>.json` file with a top-level `inputs[]` schema. The landing renders a generic `<GraphInputForm>` from that schema. `POST /me/templates/:slug/clone` validates the submission against the schema, seals secret-typed values into `project_secrets`, creates the project row, and kicks the graph. The same path is exposed via MCP `clone_template`. Adding a new vertical means shipping one JSON — no new routes, no new pages, no new components.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/presets/*.json` | Preset definitions. New optional top-level `inputs: GraphInput[]`. |
+| `agentflow-agents/src/services/preset-store.ts:56` | `readPresetFromDisk` — reads preset JSON (passes `inputs` through unchanged). |
+| `agentflow-agents/src/services/preset-store.ts:124` | `getPreset(slug)` — DB-cached read used by the clone endpoint and MCP tools. |
+| `agentflow-agents/src/routes/templates.ts:1` | New router. `POST /me/templates/:slug/clone` + `GET /me/templates` listing. |
+| `agentflow-agents/src/routes/projects.ts` | `createProjectFromPreset` helper reused by the clone endpoint (same insert path as `POST /me/projects`). |
+| `agentflow-agents/src/services/seal.ts:67` | `sealString` / `sealProjectSecretValue` — AES-256-GCM envelope for all input values at rest. |
+| `agentflow-agents/src/db/schema.ts:1226` | `projectSecrets` table — one row per input, `value_encrypted` always populated. |
+| `agentflow-mcp-server/src/tools/clone-template.ts` | `clone_template` MCP tool. Thin wrapper around the REST endpoint. |
+| `agentflow-mcp-server/src/tools/list-templates.ts` | `list_templates` MCP tool — returns `{ slug, name, category, inputs }[]` so the LLM sees the schema before cloning. |
+| `agentflow-landing/src/components/templates/GraphInputForm.tsx:1` | Generic form. `switch (input.type)` per-field renderer; no template-specific code. |
+| `agentflow-landing/src/pages/Templates.tsx:1` | Listing grid. Cards expose `requires_inputs` filter pill. |
+| `agentflow-landing/src/pages/TemplateDetail.tsx:1` | Detail page. Right-rail hosts `<GraphInputForm schema={template.inputs}>`. Submit → `cloneTemplate(slug, values)`. |
+| `agentflow-landing/src/lib/agentsApi.ts` | `cloneTemplate(slug, inputs)` helper paired with existing `cloneFromPreset`. |
+
+## Data flow
+
+```
+/templates  →  /templates/:slug  →  <GraphInputForm schema={preset.inputs}>
+                                          │
+                                          │ submit values
+                                          ▼
+                        POST /me/templates/:slug/clone
+                                          │
+                       ┌──────────────────┼──────────────────┐
+                       ▼                  ▼                  ▼
+                getPreset(slug)   validate(values, inputs)   requireSession
+                       │                  │
+                       │       ┌──────────┴──────────┐
+                       │       │ type-switch:        │
+                       │       │ text/url/number/    │
+                       │       │ bool/secret/        │
+                       │       │ secret_json/select  │
+                       │       └──────────┬──────────┘
+                       │                  │
+                       ▼                  ▼
+              createProjectFromPreset(userId, slug, title)
+                       │
+                       ▼
+              for each input:
+                INSERT project_secrets {
+                  key=name,
+                  source='owner',
+                  is_set=true,
+                  value_encrypted = sealProjectSecretValue(stringified),
+                  masked = mask(value)
+                }
+                       │
+                       ▼
+              INSERT project_events kind='cloned_from_template'
+                       │
+                       ▼
+              project-lifecycle worker picks up the row,
+              reads project_secrets, starts the graph
+
+  MCP path: clone_template(slug, title?, inputs)
+        └→ client.fetch('POST /me/templates/:slug/clone')  (same handler)
+```
+
+## DB / Env / API
+
+- Tables:
+  - `project_secrets` (`agentflow-agents/src/db/schema.ts:1226`) — one row per declared input. `value_encrypted` always populated (we seal at rest even for non-secret types, no per-key scope leakage).
+  - `projects`, `project_events` (`kind='cloned_from_template'`, payload `{ template_slug, input_names_set }`).
+- Routes:
+  - `GET /me/templates` — list with full `inputs` schema per preset.
+  - `POST /me/templates/:slug/clone` — body `{ title?, inputs: Record<string, unknown> }`, response `{ ok, project: { id, slug, status } }`.
+- MCP tools (via `agentflow-mcp-server`):
+  - `list_templates` — `{ slug, name, description, category, inputs }[]`.
+  - `clone_template` — `{ slug, title?, inputs }` → `{ project_id, slug, status, preview_url }`.
+- Env: none new. `SECRET_SEAL_KEY` (already required by `services/seal.ts`) covers `value_encrypted`.
+- Limits: `secret_json` and `secret` ≤ 8 KB; `text` ≤ 1 KB; `file` (base64 fallback) ≤ 5 MB raw.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Submit fails with 400, error tag `bad_input` | `[templates] bad_input` | Type mismatch (e.g. `number` got a string, `url` failed `validatePublicHttpUrl`). Check the offending `name` in the response body and fix the value. |
+| Submit fails with 400, error tag `missing_required` | `[templates] missing_required` | Required input absent. Form should block this client-side — if the LLM/MCP path triggers, fill the input and retry. |
+| `secret_json` rejected with 400 `invalid_secret_json` | `[templates] invalid_secret_json` | Server `JSON.parse` failed. Strip stray quotes / trailing commas from the pasted blob. |
+| 404 on `POST /me/templates/:slug/clone` | `[templates] unknown_template` | Preset slug not seeded. Run preset re-seed or check `presets/<slug>.json` exists and `agent_presets` row was inserted. |
+| Two clones, same template, same title race | `[templates] duplicate_clone idempotent_return` | Working as intended — idempotent on `(user_id, template_slug, title)`, returns the existing row (same pattern as `me-presets.ts:117`). |
+| Plaintext value visible in logs | `inputs` field present in request-log dump | Logger middleware must strip `inputs` from request bodies on `/clone` routes. Patch the redactor allowlist. |
+| Owner submitted form but graph never starts | `[project-lifecycle] no project_secrets row` | Clone wrote `projects` but seal failed for one secret. Check `[seal] encrypt_failed`. Re-submit. |
+
+## Related
+
+- [Marketplace](/subsystems/marketplace) — public listing surface that hosts the template cards.
+- [Agents](/subsystems/agents) — `agents` table + per-user provision lifecycle reused by clone.
+- [Presets](/subsystems/presets) — preset JSON catalog, seeding, and `seed_knowledge_urls` companion hook.
