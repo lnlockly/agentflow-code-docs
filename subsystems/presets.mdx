@@ -26,10 +26,11 @@ to admit ignorance.
 | `agentflow-agents/src/routes/me-presets.ts:117` | `POST /me/agents/from-preset` — clone preset for current user, idempotent resync by slug-prefix. |
 | `agentflow-agents/src/services/agent-provision.ts:112` | `provisionAgent` — single insert path used by `/agents` (human flow) and `from-preset` (clone flow). |
 | `agentflow-agents/src/services/agent-provision.ts:230` | Seed-knowledge fire-and-forget block. |
-| `agentflow-agents/src/services/seed-knowledge.ts` | `extractSeedKnowledgeUrls` + `seedKnowledgeFromUrls` + inline `runWithConcurrency(limit=3)`. |
+| `agentflow-agents/src/services/seed-knowledge.ts` | `extractSeedKnowledgeUrls` + `seedKnowledgeFromUrls` + `findAlreadyIngestedSources` + inline `runWithConcurrency(limit=3)`. |
 | `agentflow-agents/src/services/ingest-jobs.ts:248` | `spawnIngestJob` — `setImmediate(runIngestJob)` background runner reused for seed URLs. |
+| `agentflow-agents/src/routes/me-presets.ts` | `from-preset` resync path ALSO calls `seedKnowledgeFromUrls` (idempotent — skips URLs already in `agent_memories` or `knowledge_ingest_jobs`). |
 | `agentflow-agents/scripts/lint-preset-knowledge.mjs` | Pre-build lint: every `knowledge[]` path must resolve AND every `seed_knowledge_urls` entry must be a valid public http(s) URL. |
-| `agentflow-agents/tests/seed-knowledge.test.ts` | Unit tests (8 cases) for the seed-ingest helper. |
+| `agentflow-agents/tests/seed-knowledge.test.ts` | Unit tests (10 cases) for the seed-ingest helper. |
 
 ## `seed_knowledge_urls` schema
 
@@ -66,7 +67,8 @@ provisionAgent(input)
   ├── INSERT agent_secrets
   ├── INSERT agent_events kind='created'
   ├── void embedding fire-and-forget
-  ├── void seedKnowledgeFromUrls fire-and-forget   ← NEW
+  ├── void seedKnowledgeFromUrls fire-and-forget
+  │     ├── findAlreadyIngestedSources(agentUuid, urls)  ← skips covered URLs
   │     ├── runWithConcurrency(urls, limit=3)
   │     ├── debitCredits(owner, 5¢) per URL
   │     ├── INSERT knowledge_ingest_jobs (status='pending')
@@ -79,6 +81,13 @@ provisionAgent(input)
   └── eliza create + start
        ↓
        return { row, live: true }   ← responds in ~1-2s; seed URLs keep loading
+
+# Resync path (existing agent for this owner+preset):
+POST /me/agents/from-preset (existing clone found)
+  ├── UPDATE agents.character (system + mcp from preset)
+  ├── elizaUpdate + cycle stop/start
+  └── void seedKnowledgeFromUrls fire-and-forget
+        └── findAlreadyIngestedSources → skips covered URLs (no double-charge)
 ```
 
 ## DB / Env / API
@@ -96,7 +105,9 @@ provisionAgent(input)
 |---|---|---|
 | Fresh cloned researcher answers "нужна догрузка" on first turn | (no log; missing seed_knowledge_urls in preset) | Add the array to `presets/<slug>.json`, redeploy. |
 | Some seed URLs never appear in `agent_memories` | `[seed-knowledge] invalid_url` | URL fails `validatePublicHttpUrl` — check protocol / private host. |
-| All seed URLs skipped on user | `[seed-knowledge] debit_failed` | Owner ran out of credits at provision time. Top up + re-clone (idempotent resync uses existing row, so seed runs again only on a brand new clone). |
+| All seed URLs skipped on user | `[seed-knowledge] debit_failed` | Owner ran out of credits at provision time. Top up + POST `/me/agents/from-preset` again — resync hook re-runs the seed and skips URLs already ingested. |
+| Resync clone never gets the new corpus | `[me-presets] resync seed_knowledge` not in logs | Agent has no `eliza_agent_id` (provisioning failed earlier). Re-trigger provision; resync only fires when an Eliza agent id exists. |
+| All URLs report `skip_already_ingested` on every resync | `[seed-knowledge] <slug> skip_already_ingested` | Working as intended — corpus is complete. No action. |
 | Job rows stuck in `running` | `[ingest-jobs] runIngestJob escaped` | Pod restart mid-job — see `ingest-jobs.ts`. |
 | Preset PR adds a typo'd seed URL | `[lint-presets] FAIL` (CI) | Fix the URL in the preset JSON. |
 
