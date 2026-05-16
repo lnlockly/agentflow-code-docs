@@ -5,7 +5,7 @@ description: "How a preset JSON's inputs[] schema becomes an auto-rendered form,
 
 # Template clone
 
-> **Status: SHIPPED post-merge of agentflow-agents PR #NNN + agentflow-landing PR #MMM.** Line refs in the Files table are approximate against the planned design; refresh after lanes A/B/C/D land.
+> **Status: Backend SHIPPED in agentflow-agents PR #387 (Lanes A + B + D). MCP source staged in `mcp-tools-staging/` awaiting sibling PR in `agentflow-mcp-server`. Frontend (Lane C) and the per-route logger redaction (Lane A6) follow-up.**
 
 ## TL;DR
 
@@ -18,12 +18,14 @@ Every AgentFlow template (Kwork operator, TG poster, sales funnel, future vertic
 | `agentflow-agents/presets/*.json` | Preset definitions. New optional top-level `inputs: GraphInput[]`. |
 | `agentflow-agents/src/services/preset-store.ts:56` | `readPresetFromDisk` — reads preset JSON (passes `inputs` through unchanged). |
 | `agentflow-agents/src/services/preset-store.ts:124` | `getPreset(slug)` — DB-cached read used by the clone endpoint and MCP tools. |
-| `agentflow-agents/src/routes/templates.ts:1` | New router. `POST /me/templates/:slug/clone` + `GET /me/templates` listing. |
-| `agentflow-agents/src/routes/projects.ts` | `createProjectFromPreset` helper reused by the clone endpoint (same insert path as `POST /me/projects`). |
+| `agentflow-agents/src/routes/me-templates.ts:1` | Router. `POST /me/templates/:slug/clone` + `GET /me/templates` listing. |
+| `agentflow-agents/src/types/template-input.ts:1` | `GraphInput` Zod schema + `parseGraphInputs` + `isSecretType`. Shared by REST + MCP + (Lane C) frontend type mirror. |
+| `agentflow-agents/src/services/template-input-validator.ts:1` | Pure `validateInputs(schema, raw)` helper — per-type validators, SSRF guard on `url`, JSON.parse for `secret_json`. |
+| `agentflow-agents/src/routes/projects.ts` | Insert path that `me-templates.ts` mirrors (no shared helper yet — both routes call `db.insert(projects)` directly). |
 | `agentflow-agents/src/services/seal.ts:67` | `sealString` / `sealProjectSecretValue` — AES-256-GCM envelope for all input values at rest. |
 | `agentflow-agents/src/db/schema.ts:1226` | `projectSecrets` table — one row per input, `value_encrypted` always populated. |
-| `agentflow-mcp-server/src/tools/clone-template.ts` | `clone_template` MCP tool. Thin wrapper around the REST endpoint. |
-| `agentflow-mcp-server/src/tools/list-templates.ts` | `list_templates` MCP tool — returns `{ slug, name, category, inputs }[]` so the LLM sees the schema before cloning. |
+| `agentflow-mcp-server/src/tools/clone-template.ts` | `clone_template` MCP tool. Thin wrapper around the REST endpoint. Source currently staged in `agentflow-agents/mcp-tools-staging/`. |
+| `agentflow-mcp-server/src/tools/list-templates.ts` | `list_templates` MCP tool — returns `{ slug, name, category, inputs }[]` so the LLM sees the schema before cloning. Source currently staged in `agentflow-agents/mcp-tools-staging/`. |
 | `agentflow-landing/src/components/templates/GraphInputForm.tsx:1` | Generic form. `switch (input.type)` per-field renderer; no template-specific code. |
 | `agentflow-landing/src/pages/Templates.tsx:1` | Listing grid. Cards expose `requires_inputs` filter pill. |
 | `agentflow-landing/src/pages/TemplateDetail.tsx:1` | Detail page. Right-rail hosts `<GraphInputForm schema={template.inputs}>`. Submit → `cloneTemplate(slug, values)`. |
@@ -89,15 +91,16 @@ Every AgentFlow template (Kwork operator, TG poster, sales funnel, future vertic
 
 ## Failure modes
 
-| Symptom | Log signature for grep | Where to fix |
+| Symptom | Log / response signature for grep | Where to fix |
 |---|---|---|
-| Submit fails with 400, error tag `bad_input` | `[templates] bad_input` | Type mismatch (e.g. `number` got a string, `url` failed `validatePublicHttpUrl`). Check the offending `name` in the response body and fix the value. |
-| Submit fails with 400, error tag `missing_required` | `[templates] missing_required` | Required input absent. Form should block this client-side — if the LLM/MCP path triggers, fill the input and retry. |
-| `secret_json` rejected with 400 `invalid_secret_json` | `[templates] invalid_secret_json` | Server `JSON.parse` failed. Strip stray quotes / trailing commas from the pasted blob. |
-| 404 on `POST /me/templates/:slug/clone` | `[templates] unknown_template` | Preset slug not seeded. Run preset re-seed or check `presets/<slug>.json` exists and `agent_presets` row was inserted. |
-| Two clones, same template, same title race | `[templates] duplicate_clone idempotent_return` | Working as intended — idempotent on `(user_id, template_slug, title)`, returns the existing row (same pattern as `me-presets.ts:117`). |
-| Plaintext value visible in logs | `inputs` field present in request-log dump | Logger middleware must strip `inputs` from request bodies on `/clone` routes. Patch the redactor allowlist. |
-| Owner submitted form but graph never starts | `[project-lifecycle] no project_secrets row` | Clone wrote `projects` but seal failed for one secret. Check `[seal] encrypt_failed`. Re-submit. |
+| Submit fails with 400, response `{ error: 'bad_input', name, detail }` | response body contains `"error":"bad_input"` | Type mismatch (e.g. `number` got a string, `url` failed `validatePublicHttpUrl`, regex unmatched). Inspect `name` + `detail` and fix the value. Code: `services/template-input-validator.ts:validateOne`. |
+| Submit fails with 400, `error: 'missing_required'` | response body contains `"error":"missing_required"` | Required input absent and no `default`. Form should block this client-side — if the LLM/MCP path triggers, fill the input and retry. Code: `services/template-input-validator.ts:validateInputs` step 2a. |
+| `secret_json` rejected with 400 `invalid_secret_json` | response body contains `"error":"invalid_secret_json"` | Server `JSON.parse` failed. Strip stray quotes / trailing commas from the pasted blob. Code: `services/template-input-validator.ts` `secret_json` branch. |
+| 400 `error: 'unknown_input'` | response body contains `"error":"unknown_input"` | Caller sent a key not declared in `preset.inputs[]`. Common when an old form still posts a removed input. Reload `list_templates` / `/me/templates`. |
+| 404 on `POST /me/templates/:slug/clone` | response body `{ error: 'unknown_template', detail: slug }` | Preset slug not seeded. Run preset re-seed or check `presets/<slug>.json` exists and `agent_presets` row was inserted. Code: `routes/me-templates.ts` `getPreset` null branch. |
+| Two clones, same template, same title race | response body `{ idempotent: true, project }` | Working as intended — idempotent on `(owner, template_slug, title)` within 60 s. Code: `routes/me-templates.ts` `INTERVAL '60 seconds'` block. |
+| Plaintext value visible in logs | `inputs` field present in request-log dump | Logger middleware must strip `inputs` from request bodies on `/clone` routes. **Lane A6 follow-up — not in PR #387.** |
+| Owner submitted form but graph never starts | `project_secrets` row missing for declared input | Clone wrote `projects` but seal failed for one secret. Response would be `{ error: 'seal_failed', name }` — check `AGENTS_MASTER_KEY` env. Code: `routes/me-templates.ts` `sealString` try/catch. |
 
 ## Related
 
