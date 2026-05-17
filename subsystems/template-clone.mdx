@@ -80,7 +80,7 @@ Every AgentFlow template (Kwork operator, TG poster, sales funnel, future vertic
   - `projects`, `project_events` (`kind='cloned_from_template'`, payload `{ template_slug, input_names_set }`).
 - Routes:
   - `GET /me/templates` — list with full `inputs` schema per preset.
-  - `POST /me/templates/:slug/clone` — body `{ title?, inputs: Record<string, unknown> }`, response `{ ok, project: { id, slug, status } }`.
+  - `POST /me/templates/:slug/clone` — body `{ title?, inputs: Record<string, unknown>, autorun?: boolean }`, response `{ ok, project: { id, slug, status }, secrets_set, autostarted, autostart_error? }`. `autorun` defaults to `true` — `agentflow-agents/src/routes/me-templates.ts:344` classifies the brief, flips status to `awaiting_approval`, and calls `approveProject({trigger:'template_clone_autostart'})`. Pass `autorun:false` to keep the project in `draft` for previews / audits. Best-effort: any failure leaves the project in `draft` and surfaces `autostart_error` in the response.
 - MCP tools (via `agentflow-mcp-server`):
   - `list_templates` — `{ slug, name, description, category, inputs }[]`.
   - `clone_template` — `{ slug, title?, inputs }` → `{ project_id, slug, status, preview_url }`.
@@ -98,6 +98,8 @@ Every AgentFlow template (Kwork operator, TG poster, sales funnel, future vertic
 | Two clones, same template, same title race | `[templates] duplicate_clone idempotent_return` | Working as intended — idempotent on `(user_id, template_slug, title)`, returns the existing row (same pattern as `me-presets.ts:117`). |
 | Plaintext value visible in logs | `inputs` field present in request-log dump | Logger middleware must strip `inputs` from request bodies on `/clone` routes. Patch the redactor allowlist. |
 | Owner submitted form but graph never starts | `[project-lifecycle] no project_secrets row` | Clone wrote `projects` but seal failed for one secret. Check `[seal] encrypt_failed`. Re-submit. |
+| Clone returns `autostarted:false` + `autostart_error:"kind_classification_failed"` | response body field `autostart_error` | Brief was too generic for `classifyBriefKind`. User can hit Approve in the workspace, or caller can pass `kind` via a `POST /me/projects` follow-up. |
+| Clone returns `autostarted:false` + `autostart_error:"invalid_proposal"` | response body field `autostart_error` | Classified kind has no `agent_boilerplates.workflow_schema` and the preset didn't ship a `proposed_plan`. Surface the project in `awaiting_approval`; owner triggers Maestro from UI. |
 
 ## Related
 
