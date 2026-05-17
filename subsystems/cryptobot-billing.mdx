@@ -31,9 +31,13 @@ There is an older parallel CryptoBot integration in `agentflow-api/src/routes/su
 | `agentflow-agents/src/services/cryptobot-billing.ts:533` | `recordPendingInvoice` — INSERT `cryptobot_payments` row pre-pay |
 | `agentflow-agents/src/services/cryptobot-billing.ts:563` | `getActiveSubscription(userId)` — returns `{tier, expires_at, started_at}` or null |
 | `agentflow-agents/src/routes/billing-cryptobot.ts:56` | `GET /me/billing/cryptobot/pricing` — public matrix the landing reads on mount |
-| `agentflow-agents/src/routes/billing-cryptobot.ts:84` | `POST /me/billing/cryptobot/create-invoice` — auth'd, zod-validated, mints payload + creates invoice + records pending row |
+| `agentflow-agents/src/routes/billing-cryptobot.ts:84` | `POST /me/billing/cryptobot/create-invoice` — auth'd, zod-validated, mints subscription payload + creates invoice + records pending row |
+| `agentflow-agents/src/routes/billing-cryptobot.ts` | `POST /me/billing/cryptobot/create-topup-invoice` — auth'd, zod-validated `{amount_usd 1..10000, asset?}`, mints **free-form top-up** payload `topup:u<id>:c<cents>:v1` + creates invoice + records pending row. Owner-shipped 2026-05-17 (PR #418) for `/account/billing` free-form input flow. |
 | `agentflow-agents/src/routes/billing-cryptobot.ts:187` | `GET /me/subscription` — auth'd, returns active subscription or `{active:false, tier:null}` |
-| `agentflow-agents/src/routes/billing-cryptobot.ts:206` | `POST /webhooks/cryptobot` — public, raw-body signature verify before parse, calls `applyInvoicePaid` |
+| `agentflow-agents/src/routes/billing-cryptobot.ts:206` | `POST /webhooks/cryptobot` — public, raw-body signature verify before parse, calls `applyInvoicePaid` which now dispatches on payload prefix: `sub:` → subscription credit, `topup:` → flow_balances USDT credit |
+| `agentflow-agents/src/services/cryptobot-billing.ts` | `encodeTopupPayload({userId, amountCents})` / `parseTopupPayload` — free-form top-up payload format. Strict regex on parse; rejects negative / non-integer. |
+| `agentflow-agents/src/services/cryptobot-billing.ts` | `applyTopupInvoicePaid` — webhook handler for top-up payloads. Idempotent (advisory lock + cryptobot_payments status flip). Credits `flow_balances.balance` (USDT pool) via `flow_ledger kind='topup_cryptobot'`. No subscription side-effect. |
+| `agentflow-agents/src/services/cryptobot-billing.ts` | `recordPendingTopup({userId, invoiceId, asset, amountString, usdCents})` — INSERT cryptobot_payments with `kind='topup'`, tier+period NULL. |
 | `agentflow-agents/src/server.ts:438` | Router mount: `app.route('/', billingCryptoBotApp)` |
 | `agentflow-agents/migrations/2026-05-14p-cryptobot-payments.sql` | DDL for `cryptobot_payments` + `cryptobot_subscriptions` (manual psql apply, see Runbook below) |
 | `agentflow-agents/tests/unit/cryptobot-billing.test.ts` | 18 unit tests — pricing matrix, payload round-trip + 9 rejection cases, HMAC happy/sad paths, `createInvoice` fetch stub |
@@ -141,9 +145,10 @@ There is an older parallel CryptoBot integration in `agentflow-api/src/routes/su
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/me/billing/cryptobot/pricing` | public | Tier + period matrix the landing reads on mount |
-| POST | `/me/billing/cryptobot/create-invoice` | session cookie | Mints invoice, returns `{pay_url, invoice_id, amount_usd, credits_usdf}` |
+| POST | `/me/billing/cryptobot/create-invoice` | session cookie | Subscription path. Mints `sub:` payload, returns `{pay_url, invoice_id, amount_usd, credits_usdf}` |
+| POST | `/me/billing/cryptobot/create-topup-invoice` | session cookie | Free-form top-up. Body `{amount_usd 1..10000, asset?}`, mints `topup:` payload, returns `{pay_url, invoice_id, amount_usd}`. Backs the new `/account/billing` page (owner directive 2026-05-17). |
 | GET | `/me/subscription` | session cookie | Active subscription or `{active:false, tier:null}` |
-| POST | `/webhooks/cryptobot` | HMAC-SHA256 (header `crypto-pay-api-signature`) | Idempotent invoice_paid handler |
+| POST | `/webhooks/cryptobot` | HMAC-SHA256 (header `crypto-pay-api-signature`) | Idempotent invoice_paid handler. Dispatches on payload prefix (`sub:` / `topup:`). |
 
 ### Webhook registration
 
@@ -169,6 +174,8 @@ Token used for HMAC must match `CRYPTO_BOT_TOKEN` in pod env.
 | Subscription expires_at drift | (silent — verify against `cryptobot_subscriptions.expires_at`) | `GREATEST(existing, now())` clause at `services/cryptobot-billing.ts:495` — stacks on top of remaining time |
 | Pending row missing on webhook | (defensive INSERT — no error) | Covered by `INSERT INTO cryptobot_payments` at `services/cryptobot-billing.ts:458` when SELECT returns 0 rows |
 | Customer paid but TG bot says "🔒 Доступ к AgentFlow закрытый бета. Запроси приглашение @avsee4" | (visual; `/internal/tg/whoami` returns `in_beta:false` for paid user) | `agentflow-agents/src/routes/internal-tg.ts` whoami handler now ORs `tg_beta_allowlist` with `cryptobot_subscriptions.status='active' AND expires_at > now()` via `isPayingSubscriber()`. CryptoBot webhook intentionally does NOT write `tg_beta_allowlist`; the gate must read the subscription row instead. See `subsystems/beta-gate.mdx`. |
+| Top-up `amount_usd` outside 1..10000 | `invalid_body` with detail `amount_usd must be between 1 and 10000` | Zod range guard on `POST /me/billing/cryptobot/create-topup-invoice`. Client must clamp before submit. |
+| User paid free-form top-up but balance unchanged | Look for `flow_ledger` row `kind='topup_cryptobot' meta->>'invoice_id'=<id>` — missing ⇒ webhook never landed; present + correct amount ⇒ `flow_balances.balance` upsert race | `applyTopupInvoicePaid` re-uses subscription path's advisory lock + cryptobot_payments status flip. Ledger NOT EXISTS guard greps `meta->>'invoice_id'` to dedupe redeliveries. |
 
 ## Pricing matrix (single source of truth)
 
