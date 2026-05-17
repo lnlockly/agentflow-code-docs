@@ -139,6 +139,7 @@ Side-effect: each entry in `missing` whose `key` did not already exist in
 | 404 `not_listed` for a private agent | Agent's `is_public_listing=false`. Use `/fork` instead (base templates) | check `agents.is_public_listing` for the slug |
 | 403 `forbidden` | Caller is not the project owner (collaborators can't hire) | by design — hire is a financial commitment, owner-only |
 | Unique-violation in logs on /hire retries | Two parallel hires racing on stub insert | benign — caught by `try/catch` at marketplace.ts:743 |
+| Detail-page pricing renders "—" for every platform-funded agent | Backend returns `price_per_message_micro_usd:0` for agents that use the shared DesignAPI key; landing helper collapses 0 and null/undefined to em-dash | `agentflow-landing/src/pages/MarketplaceDetail.tsx:53` — helper must split null→"—", 0→`marketplace.detail.price_platform` ("Platform-covered"), >0→USD (fixed in landing PR #282) |
 
 ## Related
 
