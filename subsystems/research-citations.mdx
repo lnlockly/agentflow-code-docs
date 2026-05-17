@@ -1,0 +1,124 @@
+---
+title: "Research citation pills"
+description: "How citation URLs from knowledge / tavily tool calls get harvested, streamed over SSE, persisted onto chat_messages.meta.sources, and rendered as pills under each agent reply on reload."
+---
+
+# Research citation pills
+
+## TL;DR
+
+The chat-tooluse loop now harvests citation URLs (`source_url` / `url`) from every tool result in a turn, dedupes them per user message, streams them on a new `sources` SSE event, and persists the final list onto `chat_messages.meta.sources`. The frontend already reads `meta.sources` on history load (`AgentChatPanel.tsx`), so pills survive a page reload — the bug fixed here was the backend never writing them.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/chat-tooluse.ts:200-330` | `extractSourcesFromToolResult` + `mergeSources` helpers (pure, exported, unit-tested) |
+| `agentflow-agents/src/services/chat-tooluse.ts:559` | Per-turn accumulator inside `runChatTurnNative` |
+| `agentflow-agents/src/services/chat-tooluse.ts:700-720` | Per-tool-result harvest + `onSourcesUpdate` handler fire |
+| `agentflow-agents/src/services/chat-tooluse.ts:104-117` | `ChatTurnSource` interface (matches frontend `KnowledgeSource`) |
+| `agentflow-agents/src/services/chat-tooluse.ts:158-167` | `ChatTurnHandlers.onSourcesUpdate` declaration |
+| `agentflow-agents/src/services/chat-tooluse.ts:174` | `ChatTurnResult.sources` field |
+| `agentflow-agents/src/routes/agents.ts:14-18` | `ChatTurnSource` import |
+| `agentflow-agents/src/routes/agents.ts:694-704` | Capture `collectedSources` from `onSourcesUpdate` + emit `sources` SSE event |
+| `agentflow-agents/src/routes/agents.ts:797-815` | Persist `meta: { sources }` onto the assistant `chat_messages` row + include on `done` event |
+| `agentflow-landing/src/components/agents/AgentChatPanel.tsx:60-85` | Reader: pulls `m.meta.sources` and renders citation chips |
+| `agentflow-landing/src/lib/agentsApi.ts:132-136` | `KnowledgeSource` shape (matches `ChatTurnSource`) |
+| `agentflow-agents/tests/services/chat-tooluse-sources.test.ts` | 13 unit tests covering extract + dedupe + the QA repro scenario |
+
+## Data flow
+
+```
+user message
+   │
+   ▼
+runChatTurnNative (chat-tooluse.ts)
+   │
+   ├── tool dispatch loop ──┐
+   │                        │
+   │   for each tool_use:   │
+   │     mcpRes = callTool  │
+   │     ┌──────────────────▼──────────────────┐
+   │     │ extractSourcesFromToolResult        │
+   │     │   knowledge.search → items[].source_url │
+   │     │   tavily.{search,extract,news}      │
+   │     │     → results[].url                 │
+   │     │   generic → {items|results}[].url   │
+   │     └──────────────────┬──────────────────┘
+   │                        │
+   │     mergeSources(acc, new) ── dedupe by URL
+   │                        │
+   │     if grew → onSourcesUpdate(snapshot)
+   │                        │
+   ▼                        ▼
+ChatTurnResult.sources    SSE: event:sources
+   │                        │
+   ▼                        ▼
+routes/agents.ts          (frontend live update)
+   │
+   ├── enqueueEvent('done', { text, sources })
+   └── db.insert(chatMessages).values({
+         role: 'agent',
+         content: replyText,
+         meta: { sources }   ← persisted here
+       })
+                         │
+                         ▼
+              page reload → GET /agents/:slug/messages
+                         │
+                         ▼
+        storedToTurn() reads m.meta.sources
+                         │
+                         ▼
+            AgentChatPanel renders citation pills
+```
+
+## DB / Env / API
+
+- Tables: `chat_messages.meta` (JSONB, nullable — no migration needed).
+- Persisted shape: `meta = { sources: [{ source_url, title, score }, ...] }` only when at least one URL was harvested. Otherwise `meta = null`.
+- SSE events emitted by `POST /agents/:slug/chat`:
+  - `event: sources` — `{ sources: [{ source_url, title, score }, ...] }` — fires whenever the accumulator grows. Optional for the UI; live pills render from `ui_blocks` today, persistence is the actual fix.
+  - `event: done` — now `{ text, sources? }` (sources omitted when empty).
+- No env vars added.
+- API routes: no shape change to existing `GET /agents/:slug/messages` — `meta.sources` flows through the existing `StoredMessage.meta: Record<string, unknown> | null` field.
+
+## What counts as a source
+
+`extractSourcesFromToolResult(server, tool, mcpResult)` is generic and accepts ANY tool whose payload has:
+- `items[]` (knowledge.search shape) or `results[]` (tavily.* shape), with each entry exposing one of `source_url` / `url` / `source`, OR
+- A flat top-level object with one of those URL fields (single-result tools).
+
+Hard filter: only `http(s)://` URLs are kept. `file://`, `javascript:`, and bare strings are rejected so the pill list can't be poisoned by tool authors.
+
+First-write-wins on dedupe: identical `source_url` from two tools keeps the title/score from the first occurrence. Deterministic, predictable for the UI.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Pills appear during stream then vanish on reload | `db.insert(chatMessages).values(` agent row without `meta` field | `agentflow-agents/src/routes/agents.ts:805` |
+| Pills never appear at all (knowledge tool returns empty) | `[chat-tooluse] start agent=` followed by `tool=knowledge.search` and zero items | Owner has no docs ingested — see `knowledge-mcp.mdx` |
+| Wrong title on shared URL | first-write-wins by design — change order of tool calls in prompt | `chat-tooluse.ts:mergeSources` (intentional) |
+| `meta=null` on persisted row despite tool returning URLs | tool result envelope `isError:true` → harvester skips | check MCP server logs for the offending tool |
+
+## QA repro (the bug this fixed)
+
+From `qa-issues/2026-05-16-researcher-no-knowledge-hallucinated-citations.md` (retest log):
+
+> PR #344 "feat(research): plumb knowledge citations through chat done event" added ONLY `scripts/backfill-researcher-knowledge-uuid.ts` (130 lines) — no code changes to the chat route or chat-tooluse service. The PR description claims `done` event carries `sources[]` and `agent_message.meta.sources` is persisted, but neither is true in the merged code.
+
+Verification command after this fix lands:
+
+```bash
+curl https://agentflow.website/_agents/agents/lenin-7fdbd1/messages?limit=5 \
+  | jq '.items[] | select(.role=="agent") | {id, has_sources: (.meta.sources | length > 0)}'
+```
+
+Expected: agent rows produced AFTER deploy show `has_sources: true` whenever the model called `knowledge.search` or `tavily.search` with at least one HTTP URL in the result.
+
+## Related
+
+- [Knowledge MCP](/subsystems/knowledge-mcp) — the tool that produces `items[].source_url`.
+- [Research page](/subsystems/research-page) — the owner-facing UI where pills render.
+- [Research ingest](/subsystems/research-ingest) — how documents get into `agent_memories` so the knowledge tool has something to return.
