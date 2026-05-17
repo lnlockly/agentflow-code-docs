@@ -1,0 +1,95 @@
+---
+title: "Workspace provisioning"
+description: "Approve-time vcluster pod provision with auto-retry + structured events"
+---
+
+# Workspace provisioning
+
+## TL;DR
+
+When a user approves a project, the platform calls
+`provisionWorkspaceWithRetry` which `kubectl apply`s the StatefulSet
+manifest into the user's vcluster, then `kubectl wait`s for the pod to be
+Ready. The call retries up to 8 times with backoff
+(5/15/30/60/120/180/240 s, total ~10.7 min) because k3s+calico+vcluster
+return transient `apply_failed` and `pod_not_ready` errors under churn
+and these always recover within ~30-60 s.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/projects.ts:1538` | `provisionWorkspaceWithRetry` — the retry helper |
+| `agentflow-agents/src/services/projects.ts:1491` | `WORKSPACE_PROVISION_BACKOFF_SCHEDULE_SEC` constant |
+| `agentflow-agents/src/services/projects.ts:1509` | `WORKSPACE_PROVISION_TERMINAL_ERRORS` set — short-circuits the loop |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts:200` | `create_project` MCP tool — does the actual `kubectl apply` + `wait` |
+| `agentflow-agents/src/services/pingers/approval-retry.ts:1` | 60s pinger that re-fires `runProjectApprovalBackground` for stuck `status='approved'` rows |
+| `agentflow-agents/src/scripts/retry-failed-projects.ts:1` | Bulk script that re-approves projects stuck at `status='failed'` (legacy escape hatch) |
+| `agentflow-agents/tests/unit/workspace-provision-retry.test.ts` | Source-contract tests for the helper |
+
+## Data flow
+
+```
+user clicks Approve
+  → POST /me/projects/:id/approve
+    → runProjectApprovalBackground (services/approval.ts)
+      → provisionWorkspaceWithRetry (loop up to 8 attempts)
+          attempt N:
+            ├── pingTenantApi  (warm the vcluster apiserver)
+            ├── warmupVcluster (if ping failed)
+            └── callCodeExecTool('create_project', …)
+                  → kubectl apply manifest    (returns apply_failed on calico flap)
+                  → kubectl wait --for=ready  (returns pod_not_ready on slow image pull)
+          on failure:
+            ├── append project_event kind=workspace_provision_retry
+            │     payload={attempt, max_attempts, last_error, next_delay_sec}
+            └── sleep(next_delay_sec) and loop
+          on permanent error (invalid_project_name / kubeconfig_unavailable / quota_exceeded):
+            └── break out of loop
+      → on exhaustion:
+          ├── append project_event kind=workspace_provision_failed_terminal
+          └── throw Error('workspace_provision_failed: <code>: <detail>')
+              → caller marks projects.status='failed'
+```
+
+## DB / Env / API
+
+- Tables: `project_events` (rows with `kind` in `workspace_provision_retry`,
+  `workspace_provision_failed_terminal`, `log`)
+- Env knobs:
+  - `WORKSPACE_PROVISION_MAX_ATTEMPTS` — override default 8 attempts
+  - `WORKSPACE_PROVISION_BASE_DELAY_SEC` — scale the whole backoff ramp
+    (default 5)
+- Routes:
+  - `POST /me/projects/:id/approve` — owner-facing entry point
+  - `POST /internal/projects/:id/reapprove` — ops escape hatch
+- MCP tools:
+  - `code-exec.create_project` — the underlying kubectl call
+
+## Event contract
+
+The FE workspace status pill subscribes to per-project events and
+distinguishes:
+
+| Event kind | Spinner | Status flip | Meaning |
+|---|---|---|---|
+| `workspace_provision_retry` | keep spinning | no | informational; payload shows `next_delay_sec` for "Попытка 3/8, ещё 60с" |
+| `workspace_provision_failed_terminal` | stop spinner | yes (`failed`) | retry budget exhausted; surface "Не получилось поднять окружение" copy |
+| `log` `msg=workspace_provision_retry attempt=…` | n/a | no | legacy event for grep-based log scrapers; kept for backward compat |
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Project stuck at `status='approved'` for >5 min | `workspace_provision_retry attempt=` in project_events | nothing — pinger `approval-retry.ts:1` re-fires after 5 min grace |
+| Project flipped to `failed` after one apply timeout | `workspace_provision_failed: apply_failed` in stderr/log AND only attempt=1 event present | regression in `WORKSPACE_PROVISION_TERMINAL_ERRORS` (must NOT contain `apply_failed`) — see PR for `feat/auto-retry-workspace-provision` |
+| All new projects fail with `quota_exceeded` | `workspace_provision_failed: quota_exceeded` | `services/tenant-quota-verifier.ts` should auto-expand; manual fix via `POST /internal/tenant/:userId/expand-quota` header `x-agentflow-secret` |
+| All new projects fail with `kubeconfig_unavailable` | `workspace_provision_failed: kubeconfig_unavailable` | tenant vcluster missing kubeconfig secret — investigate vcluster syncer pod |
+| FE spinner never ends on failed project | no `workspace_provision_failed_terminal` event | regression — helper must emit terminal kind BEFORE throwing |
+
+## Related
+
+- [code-exec MCP](/subsystems/code-exec-mcp) — the actual `kubectl apply` + `wait` caller
+- [project-lifecycle flow](/flows/project-lifecycle)
+- [create-project flow](/flows/create-project)
+- [pod-gc-pinger](/subsystems/pod-gc-pinger) — cleans up orphan Terminating pods that saturate calico
