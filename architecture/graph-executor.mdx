@@ -514,6 +514,9 @@ production callers go through `runGraphExecutor` which forces ON.
 | **RESOLVED 2026-05-14** Walker state lost on pod restart | `[walker-persist] upsert_failed` / `[walker-stale] resuming project_id=…` | Fixed by `graph_executor_walker_state` + `pingers/walker-stale.ts`. If you see resumes never firing → check pinger started in `auto-pinger.ts` and `last_heartbeat` is being written |
 | Pinger lost claim race (another pod won) | `[walker-stale] claim_lost project_id=…` | Expected on multi-pod — the winning pod logs `resuming project_id=…` |
 | Walker resume stuck at first step (no completed events) | `[walker-stale] resuming project_id=… resume_step_count=0` | Pre-restart walker died before any `node_finished` — walker re-runs from the entry node. Check handler idempotency. |
+| **RESOLVED 2026-05-17** Walker-stale tick crashes on Date binding | `walker-stale tick failed` + `Received an instance of Date` | Fixed in `walker-persistence.ts:claimStaleWalker` — `seenAt.toISOString()` before SQL bind. postgres-js v3.4.5 throws `Buffer.from(date)` on raw Date for timestamptz equality in `prepare: false`. Symptom: queue head jammed by 5 chronically-stale walkers, projects 942/943 stuck `running` despite live preview URLs. |
+| Walker chronically broken — same row stuck at queue head | `[walker-stale] max_attempts_reached project_id=…` + `walker_max_attempts_reached` event | After `WALKER_STALE_MAX_ATTEMPTS=10` resumes, pinger flips project to `failed` and DELETEs walker_state row. Check handler that keeps throwing on resume. |
+| One bad walker row used to kill the whole tick | `[walker-stale] row_failed project_id=…` | Fixed 2026-05-17 — per-row `try/catch` in `runWalkerStaleTick`. Old behaviour: throw inside loop → loop exited → no other walker resumed. |
 
 ## Related
 
