@@ -103,7 +103,7 @@ Platega, all unchanged) then spend balance on a tier:
 
 | Route | Repo / file | Purpose |
 |---|---|---|
-| `POST /subscriptions/buy-from-balance` | `agentflow-api/src/routes/subscriptions.ts:239` | Debit balance + activate sub + credit monthly grant, all in one `db.transaction` |
+| `POST /subscriptions/buy-from-balance` | `agentflow-api/src/routes/subscriptions.ts:239` | Debit balance + activate sub atomically in `db.transaction`. Single `flow_ledger` row `kind='debit_subscription_buy'`. No grant credit — `flow_balances.balance` is the FLOW-credits column and the tier value is captured in `meta.grant_flow` for audit. |
 | `GET /me/flow-balance` | `agentflow-api/src/routes/subscriptions.ts:601` | Read balance + last 20 ledger rows |
 | `GET /me/subscription` | `agentflow-api/src/routes/subscriptions.ts:560` | Latest sub row (status-priority ordered) |
 | `agentflow-landing/src/pages/AccountSubscription.tsx` | landing | UI for the two-step flow at `/account/subscription` |
@@ -125,6 +125,8 @@ top-up flow).
 |---|---|---|
 | `/subscriptions/buy-from-balance` returns 402 but balance card shows enough | `insufficient_balance` in `agentflow-api/src/routes/subscriptions.ts:262` while `getBalance` reports balance >= price | Cabinet badge reads `/me/balance` (agentflow-agents), this route reads `getBalance` from `agentflow-api/src/services/flow-credits.ts:117` which hits its own connection. Confirm both pools point at the same `flow_balances` row. |
 | Buy succeeds but UI keeps showing old balance | no `invalidateQueries(['api-flow-balance'])` after POST | `AccountSubscription.tsx:buyFromBalance` must invalidate `api-flow-balance` AND `api-me-subscription` AND the agents-side `me-balance` query key |
+| Second buy → 500 with raw `duplicate key value violates unique constraint "uniq_active_sub_per_user"` | Postgres error leaks through default catch | **FIXED PR #9** (2026-05-17): handler now catches the constraint name + returns 409 `{ ok:false, error:'already_subscribed' }`. |
+| Buy returns 200 but balance unchanged | Both a `debit_subscription_buy` (`-20`) and a `subscription_grant` (`+20`) hit the same `flow_balances.balance` column | **FIXED PR #9** (2026-05-17): grant credit removed from this path. The grant pathway only applies to off-platform USDT payments via the legacy `/subscriptions/checkout` route (cryptobot/platega/bep20 webhook), where there's a separate USDT-in event. |
 
 ## Related
 
