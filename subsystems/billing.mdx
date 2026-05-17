@@ -94,6 +94,38 @@ read path
 | Phantom $900+ "LLM burn" TG alert with no matching debit rows | `llm-burn-alert: hourly warn threshold exceeded` followed by `lastWarnHourBucket` skipping subsequent ticks; ledger shows large `credit_reconcile` rows with negative `amount` | `services/pingers/llm-burn-alert.ts` must filter `kind = ANY(LLM_DEBIT_KINDS)` (PR #358). `credit_reconcile` writes are accounting clawbacks (see `scripts/reconcile-tier-overcredit.mjs:202`) — not LLM spend. |
 | Hot-loop burn outpaces the daily cap before `agent_runs.cost_cents` updates | `BudgetExceededError period=daily` or `period=monthly` from `services/llm-circuit-breaker.ts` | Short-window kill switch reads `flow_ledger` for the last hour. Env: `LLM_USER_HOURLY_CAP_USD` (default $5), `LLM_PLATFORM_HOURLY_CAP_USD` (default $20). `0` disables. |
 
+## Buy subscription from balance (May 2026)
+
+Owner directive 2026-05-17: payments must go through balance first. The old
+direct `/subscriptions/checkout` path is still available but no longer
+surfaced in the frontend. Users top up USDT first (CryptoBot / BEP-20 /
+Platega, all unchanged) then spend balance on a tier:
+
+| Route | Repo / file | Purpose |
+|---|---|---|
+| `POST /subscriptions/buy-from-balance` | `agentflow-api/src/routes/subscriptions.ts:239` | Debit balance + activate sub + credit monthly grant, all in one `db.transaction` |
+| `GET /me/flow-balance` | `agentflow-api/src/routes/subscriptions.ts:601` | Read balance + last 20 ledger rows |
+| `GET /me/subscription` | `agentflow-api/src/routes/subscriptions.ts:560` | Latest sub row (status-priority ordered) |
+| `agentflow-landing/src/pages/AccountSubscription.tsx` | landing | UI for the two-step flow at `/account/subscription` |
+| `agentflow-landing/src/main.tsx:521` | route registration | `<Route path="/account/subscription" …>` |
+
+Tier matrix (`flow-credits.ts:125-138`): `plus=$20→20 USDF`, `pro=$100→100`,
+`max=$200→200`. The route inserts the subscription row with
+`payment_method='balance'` for audit.
+
+Insufficient-balance path returns HTTP **402** with
+`{ balance, required, topup_url:'/me/topup' }`. The frontend renders an
+inline "Не хватает X USDT" hint per tier card and offers a
+"Пополнить баланс" button that links to `/account/billing` (the existing
+top-up flow).
+
+### Failure modes (buy-from-balance)
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `/subscriptions/buy-from-balance` returns 402 but balance card shows enough | `insufficient_balance` in `agentflow-api/src/routes/subscriptions.ts:262` while `getBalance` reports balance >= price | Cabinet badge reads `/me/balance` (agentflow-agents), this route reads `getBalance` from `agentflow-api/src/services/flow-credits.ts:117` which hits its own connection. Confirm both pools point at the same `flow_balances` row. |
+| Buy succeeds but UI keeps showing old balance | no `invalidateQueries(['api-flow-balance'])` after POST | `AccountSubscription.tsx:buyFromBalance` must invalidate `api-flow-balance` AND `api-me-subscription` AND the agents-side `me-balance` query key |
+
 ## Related
 
 - [CryptoBot billing](/subsystems/cryptobot-billing) — deposit source that feeds `flow_ledger` via `applyInvoicePaid` → `creditUser`
