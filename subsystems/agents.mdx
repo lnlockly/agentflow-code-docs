@@ -142,6 +142,44 @@ Files:
 | Save returns 500 `existing_secrets_unreadable` | `existing_secrets_unreadable` in response body | Master key rotated since the row was sealed. Either restore the old `AGENTS_MASTER_KEY` for a one-off re-seal script, or delete + re-create the agent. |
 | Panel shows zero rows after hire | (frontend) `required_secrets` is `[]` in `/agents/:slug/settings` response | Preset's `requiredSecrets` field is missing — fix in `presets/<slug>.json` then re-run `bootstrap-marketplace`. |
 
+## Chat attachments — owner directive 2026-05-17
+
+`POST /agents/:slug/chat` accepts an optional `attachments[]` array alongside `text`. Each entry is `{ filename, mime, data_base64 }`. Images render as Anthropic vision content blocks on the first user message of the turn; text files are inlined inside `<attachment filename="…">` envelopes. Vision needs the big model — turns route through `useModel(ModelType.TEXT_LARGE)` which is already vision-capable (no hardcoded model).
+
+### Policy
+
+| Class | MIME allow-list | Per-file cap |
+|---|---|---|
+| Image | `image/png`, `image/jpeg`, `image/webp` | 5 MB decoded |
+| Text | `text/plain`, `text/markdown`, `application/json` | 200 KB decoded |
+
+Per-turn cap: 6 attachments. Raw POST body cap: 8 MB (returns `413 payload_too_large` above that — covers a 5 MB image plus base64 inflation plus headers).
+
+### Persistence — placeholder, not bytes
+
+`chat_messages.content` stores only `[file: shot.png 320 KB]` lines next to the user's text. The actual base64 bytes only live in the LLM context for that turn, so DB rows stay small and history reload doesn't re-ship megabytes to the browser. A `meta.attachments[]` summary (filename / mime / kind / bytes) is persisted alongside so admin tooling can audit what was attached.
+
+### Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/chat-attachments.ts` | Pure module: `parseAttachments`, `buildPersistedUserContent`, `buildUserMessageContent`. No I/O. |
+| `agentflow-agents/src/routes/agents.ts` (around the `POST /agents/:slug/chat` handler) | Zod `chatAttachmentSchema`, payload-size guard, route wiring into `runChatTurnNative`. |
+| `agentflow-agents/src/services/chat-tooluse.ts` | `ChatTurnParams.attachments` surface; first-user-message projection via `buildUserMessageContent`. |
+| `agentflow-agents/tests/unit/chat-attachments.test.ts` | 28 source-contract tests (parser, projections, route + tooluse wiring greps). |
+| `agentflow-landing/src/lib/chatAttachments.ts` | Frontend mirror: client-side staging + `FileReader` → base64. |
+| `agentflow-landing/src/components/agents/AgentChatPanel.tsx` (composer) | 📎 attach button, chip strip, picker. |
+| `agentflow-landing/src/lib/agentsApi.ts::openChat` | Optional `attachments?: ChatAttachmentPayload[]` parameter on the SSE call. |
+
+### Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Owner reports 413 from `/agents/:slug/chat` after attaching a screenshot | `payload_too_large` in JSON body, or content-length ≥ 8 MB | `MAX_REQUEST_BYTES` in `src/services/chat-attachments.ts` — raise if the owner spec changes. |
+| `attachment_unsupported_mime` returned for a `.md` file | `attachment_unsupported_mime` in chat response body | Browser tagged the file as `application/octet-stream`. Frontend accepts `.md` via the `accept` attribute but the backend needs the real MIME — surface a hint to rename the file or fix the upload pipeline. |
+| Agent ignores an attached image | `[chat-tooluse] start agent=… tools=…` line WITHOUT a follow-up vision-block response | Confirm `useModel(ModelType.TEXT_LARGE)` resolves to a vision-capable provider; some BYOK Anthropic keys default to older models. |
+| Chat history loads slowly after attach turns | `chat_messages.content` row contains raw base64 instead of a placeholder | Regression in `buildPersistedUserContent`. The route MUST persist the placeholder, never the raw body. |
+
 ## Related
 - [Souls Collective](/subsystems/souls) — souls have their own taxonomy in `data.soul` graph nodes, separate from `agents.category`.
 - [Auth and Access](/subsystems/auth-and-access)
