@@ -1,0 +1,57 @@
+---
+title: "Concierge UIBlocks (FloatingGuide + /assistant)"
+description: "How the chat-assistant preset's `@ui-blocks:` marker turns into clickable actions across the two cabinet chat surfaces."
+---
+
+# Concierge UIBlocks
+
+## TL;DR
+The `chat-assistant` preset appends a single `@ui-blocks: [...]` JSON line at the end of its replies. Two surfaces consume it: the FloatingGuide bar/panel (`/account/*`) dispatches the action inline; the `/assistant` page renders pill-buttons under the message so the user clicks to confirm. Both share one parser/dispatcher at `agentflow-landing/src/lib/uiBlocks.ts`.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/lib/uiBlocks.ts:1` | Shared `parseUiBlocksLine` + `executeUiBlock` dispatcher. |
+| `agentflow-landing/src/components/agents/AgentChatPanel.tsx:38` | Imports parser; renders pill-buttons when `renderUiBlocks={true}`. |
+| `agentflow-landing/src/components/account/FloatingGuide.tsx:55` | Imports `parseUiBlocksLine` for `extractUiBlockNav` — inline dispatch on stream completion. |
+| `agentflow-landing/src/pages/Assistant.tsx:121` | Opts into pill rendering via `renderUiBlocks` prop. |
+| `agentflow-landing/tests/ui-blocks-parser.test.mjs:1` | 14 parser + dispatcher regression assertions. |
+
+## Data flow
+
+```
+chat-assistant SSE done → text ending in "@ui-blocks: [...]"
+         │
+         ▼
+  parseUiBlocksLine(text) → { strippedText, blocks }
+         │
+   ┌─────┴─────┐
+   ▼           ▼
+FloatingGuide  AgentChatPanel (renderUiBlocks=true)
+ dispatches    renders pills
+ immediately   user clicks → executeUiBlock(block, opts)
+```
+
+## DB / Env / API
+
+- Tables: none — pure UI marker on top of the existing chat-message persistence.
+- Env: none.
+- Routes consumed (via `executeUiBlock` → `agentsApi`):
+  - `GET /me/personal-team` — to scope new projects to the user's hub.
+  - `POST /me/projects` — for `create_project` intent.
+- Intent kinds: `navigate` (SPA push), `logout` (auth tear-down + redirect to `/`), `create_project` ({brief, projectKind?, title?} → `createProject()` + push to `/account/projects/:id`). Unknown kinds log to console and no-op.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Pill button does nothing on click | `[uiBlocks] unknown intent kind` | Add the intent to `executeUiBlock` in `src/lib/uiBlocks.ts`. |
+| Raw `@ui-blocks: [...]` line shown to the user | (silent — visual regression) | Confirm host passes `renderUiBlocks` to `AgentChatPanel` OR (for FloatingGuide) confirm `extractUiBlockNav` strips before render. |
+| `create_project` intent navigates back to dashboard with error toast | `Не удалось создать проект` | Likely `POST /me/projects` 4xx — inspect `agentflow-agents` server logs. |
+| `/assistant` page-level scroll appears, latest message hidden | n/a | The chat host must use `height: calc(100vh - 96px)` + `min-height: 0` on the flex chain — see `src/pages/Assistant.tsx:159`. |
+
+## Related
+
+- [Agents subsystem](/subsystems/agents) — chat-assistant preset definition lives there.
+- [Brief fidelity supervisor](/subsystems/brief-fidelity-supervisor) — `create_project` intent eventually feeds the same brief pipeline.
