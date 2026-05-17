@@ -159,6 +159,18 @@ Per-turn cap: 6 attachments. Raw POST body cap: 8 MB (returns `413 payload_too_l
 
 `chat_messages.content` stores only `[file: shot.png 320 KB]` lines next to the user's text. The actual base64 bytes only live in the LLM context for that turn, so DB rows stay small and history reload doesn't re-ship megabytes to the browser. A `meta.attachments[]` summary (filename / mime / kind / bytes) is persisted alongside so admin tooling can audit what was attached.
 
+### UI rendering — inline images, no raw `[file: …]` text
+
+`AgentChatPanel` reads `meta.attachments[]` off the stored row and renders each entry inline on the user bubble:
+
+- `kind: 'image'` with a `data_url` → `<img>` thumbnail at max 240×240 (`object-fit: contain`), wrapped in an anchor that opens the full image in a new tab.
+- `kind: 'image'` without `data_url` (history reload — backend doesn't round-trip the bytes) → filename chip with size.
+- `kind: 'text'` (md / json / txt) → filename chip with size.
+
+The `data_url` is only populated on the optimistic just-sent bubble: the composer builds `data:${mime};base64,${data_base64}` from the staged payload before sending, so the user sees their image instantly without waiting for the server echo. On reload the chip path takes over.
+
+`storedToTurn` strips the trailing `[file: name 320 KB]` placeholder lines from the bubble text when real attachments rehydrate — otherwise the bubble would show both the chip AND the raw text (owner flagged this 2026-05-17 as «глупо»). The persistence layer keeps the placeholder so plain-text history exports stay self-describing.
+
 ### Files
 
 | Path | Role |
@@ -168,7 +180,8 @@ Per-turn cap: 6 attachments. Raw POST body cap: 8 MB (returns `413 payload_too_l
 | `agentflow-agents/src/services/chat-tooluse.ts` | `ChatTurnParams.attachments` surface; first-user-message projection via `buildUserMessageContent`. |
 | `agentflow-agents/tests/unit/chat-attachments.test.ts` | 28 source-contract tests (parser, projections, route + tooluse wiring greps). |
 | `agentflow-landing/src/lib/chatAttachments.ts` | Frontend mirror: client-side staging + `FileReader` → base64. |
-| `agentflow-landing/src/components/agents/AgentChatPanel.tsx` (composer) | 📎 attach button, chip strip, picker. |
+| `agentflow-landing/src/components/agents/AgentChatPanel.tsx` (composer + bubble) | 📎 attach button, chip strip, picker, inline `<img>` rendering, `[file: …]` placeholder strip. |
+| `agentflow-landing/tests/chat-attachments-render.test.mjs` | Static-source contract: bubble must read `meta.attachments[]`, build a `data:` URL out of staged base64, render `<img>` at 240px, fall back to chip on history reload. |
 | `agentflow-landing/src/lib/agentsApi.ts::openChat` | Optional `attachments?: ChatAttachmentPayload[]` parameter on the SSE call. |
 
 ### Failure modes
@@ -179,6 +192,7 @@ Per-turn cap: 6 attachments. Raw POST body cap: 8 MB (returns `413 payload_too_l
 | `attachment_unsupported_mime` returned for a `.md` file | `attachment_unsupported_mime` in chat response body | Browser tagged the file as `application/octet-stream`. Frontend accepts `.md` via the `accept` attribute but the backend needs the real MIME — surface a hint to rename the file or fix the upload pipeline. |
 | Agent ignores an attached image | `[chat-tooluse] start agent=… tools=…` line WITHOUT a follow-up vision-block response | Confirm `useModel(ModelType.TEXT_LARGE)` resolves to a vision-capable provider; some BYOK Anthropic keys default to older models. |
 | Chat history loads slowly after attach turns | `chat_messages.content` row contains raw base64 instead of a placeholder | Regression in `buildPersistedUserContent`. The route MUST persist the placeholder, never the raw body. |
+| Bubble shows raw `[file: red.png 70 B]` text instead of an image | grep `[file:` against the rendered DOM of a user bubble | `AgentChatPanel.tsx::storedToTurn` is not calling `stripAttachmentPlaceholders` when `meta.attachments[]` rehydrates, or the bubble isn't reading `t.attachments`. Owner originally flagged 2026-05-17. |
 
 ## Related
 - [Souls Collective](/subsystems/souls) — souls have their own taxonomy in `data.soul` graph nodes, separate from `agents.category`.
