@@ -42,6 +42,14 @@ description: "Три пути auth: x-api-key (af_live_, HMAC-SHA256), Bearer JW
 | `agentflow-agents/src/routes/auth-password.ts:476` | `POST /auth/password-reset/request` — HMAC-SHA256 hashes the reset token with `API_KEY_HMAC_SECRET`/`AUTH_JWT_SECRET`. |
 | `agentflow-agents/src/routes/auth-password.ts:566` | `POST /auth/password-reset/confirm` — verifies hashed token, bcrypts new password. |
 | `agentflow-agents/migrations/2026-05-11e-password-auth.sql` | Adds `users.password_hash` nullable + `auth_password_resets` table. |
+| `agentflow-agents/migrations/2026-05-16d-users-deleted-at-and-slug-backfill.sql` | Adds `users.deleted_at` + backfills `users.slug = 'user_' \|\| id` for legacy NULL rows. **Side-effect:** `users.slug` is now `text NOT NULL UNIQUE` with no DEFAULT — every INSERT must supply a slug or the row rejects with `23505`/`23502`. |
+| `agentflow-api/src/db/schema.ts:32` | `slug: text('slug').notNull().unique()` — drizzle column added 2026-05-17 to match the prod DDL after fresh signups began 500ing. |
+| `agentflow-api/src/repos/slugs.ts` | Slug derivation per identity (`slugForTgId`, `slugForWallet`, `slugForRefCode`, `slugFromEmail`) + `withSlugRetry` wrapper that catches `23505` on `users.slug` and retries with a fresh hex suffix. |
+| `agentflow-api/src/repos/users.ts:99` | Bot/internal-users insert — uses `slugForTgId(input.tg_id)`. |
+| `agentflow-api/src/services/users.ts:53` | SIWE wallet signup — uses `slugForWallet(addr)`. |
+| `agentflow-api/src/services/users.ts:106` | TG-link signup — uses `slugForTgId(tgId)`. |
+| `agentflow-api/src/services/users.ts:149` | email/password signup — uses `slugFromEmail(email)` (deterministic local-part + random suffix). |
+| `agentflow-api/src/services/users.ts:189` | `ensureAdminUser` — uses `slugForRefCode(ADMIN_REF_CODE)`. |
 
 ## Data flow
 
@@ -121,6 +129,7 @@ Optional: FF_API_KEY_TIERS=1 →
 | 429 rate_limited при низкой нагрузке | `api_key_rpm_exceeded` | `middleware/api-key-rate-limit.ts:114` — поднять `API_KEY_RPM_*` |
 | Internal endpoint не пускает (свой сервис) | `internal_secret_mismatch` | check `INTERNAL_API_SECRET` aligned между API-pod и runtime-supervisor / tg-mcp |
 | Successful login → /my/agents всё равно показывает «Нужен вход / Войти через Telegram» | curl `/_api/me` returns 503 while `/_agents/auth/me` returns 200 | `agentflow-api` service down. Now non-fatal: `AuthProvider` (`agentflow-landing/src/lib/auth.tsx:63`) bootstraps from `agentflow-agents` `/auth/me` first; agentflow-api `/me` is only an enrichment call. If both fail, user is anonymous. Fix root cause by reviving the `agentflow-api` deployment. |
+| `POST /internal/users` 500 for every new TG `/start`; all SIWE/email/TG-link signups also broken | `null value in column "slug" of relation "users" violates not-null constraint` | Drizzle schema in `agentflow-api/src/db/schema.ts` was missing the `slug` column after migration `2026-05-16d-users-deleted-at-and-slug-backfill.sql` added `users.slug text NOT NULL UNIQUE` to prod. Fixed 2026-05-17 by adding the column to the schema and routing every `db.insert(users)` through `src/repos/slugs.ts::withSlugRetry` with a per-identity derivation (`slugForTgId`, `slugForWallet`, `slugFromEmail`, `slugForRefCode`). |
 
 ## Related
 
