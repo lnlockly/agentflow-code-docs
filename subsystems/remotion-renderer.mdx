@@ -142,6 +142,20 @@ Response (`result.content[0].text` is the JSON-encoded runner envelope):
 | Render >5 min | MCP tool returns `{ok:false, error:"remotion_runner_timeout"}` (AbortSignal.timeout fires) | Either shorten composition `duration_frames` or split into smaller renders. |
 | Runner replies non-json | MCP tool returns `{ok:false, error:"remotion_runner_bad_response", details:"..."}` | Renderer regression — check pod logs for stack trace. |
 
+## Available presets
+
+PR-3 (2026-05-17) ships three chat-callable agents wired to the renderer + the shared Playwright pod:
+
+| Slug | Plugins declared | MCP servers wired | Use-case |
+|---|---|---|---|
+| `remotion-video-operator` | `@agentflow-video` | `video` | One-shot Remotion render. Built-in `simple-card` composition (title/subtitle/bgColor). 5¢ per run. |
+| `playwright-screencast-operator` | `@agentflow-playwright` | `browser` | Frame-by-second capture of any public URL via the shared playwright-mcp pod. Suggests `video.record_graph_demo` when ffmpeg-merge isn't in scope. 8¢ per run. |
+| `video-screencast-remotion` | `@agentflow-video` + `@agentflow-playwright` | `video` + `browser` | End-to-end promo: Remotion intro/outro card + scripted screencast of `target_url`. 20¢ per run. |
+
+Files: `agentflow-agents/presets/remotion-video-operator.json`, `agentflow-agents/presets/playwright-screencast-operator.json`, `agentflow-agents/presets/video-screencast-remotion.json`. Contract tests in `agentflow-agents/tests/unit/video-presets.test.ts` (36 assertions: JSON parseable, plugin namespace honesty, MCP server wiring matches plugin claim, no user-supplied secrets, pricePerRunMicroUsd > 0).
+
+The `@agentflow-video` plugin namespace is advertisement only — actual tool reachability comes from `settings.mcp.servers.video.url = ${AGENTFLOW_INTERNAL}/video` which the resolver substitutes to the owner-pinned mount described above. Same pattern for `@agentflow-playwright` ↔ `settings.mcp.servers.browser.url = ${PLAYWRIGHT_MCP_URL}`.
+
 ## Related
 
 - [code-exec MCP](/subsystems/code-exec-mcp) — sibling MCP-driven pod pattern.
