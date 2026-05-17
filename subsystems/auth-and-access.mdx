@@ -41,6 +41,9 @@ description: "Три пути auth: x-api-key (af_live_, HMAC-SHA256), Bearer JW
 | `agentflow-agents/src/routes/auth-password.ts:368` | `POST /auth/logout` — clears the `af_session` cookie. |
 | `agentflow-agents/src/routes/auth-password.ts:476` | `POST /auth/password-reset/request` — HMAC-SHA256 hashes the reset token with `API_KEY_HMAC_SECRET`/`AUTH_JWT_SECRET`. |
 | `agentflow-agents/src/routes/auth-password.ts:566` | `POST /auth/password-reset/confirm` — verifies hashed token, bcrypts new password. |
+| `agentflow-agents/src/routes/auth-tg-callback.ts:129` | `verifyErrorStatus(error)` — maps `verifyTelegramAuth`/`verifyMiniAppInitData` failure codes to HTTP status: malformed payload → 400, bad signature / stale auth_date → 401, bot-token-unset → 503. Both `handleCallback` (widget) and `handleMiniAppAuth` (Mini App) route through this so `POST /auth/telegram` returns 400 for bad bodies (no looping "session expired" redirect on the client). |
+| `agentflow-agents/src/routes/auth-tg-callback.ts:401` | `verifyMiniAppInitData(botToken, initData, now?)` — Mini App HMAC verifier (`createHmac('sha256', 'WebAppData').update(botToken)` as secret key, sorted data_check_string excluding `hash`, parses embedded `user` JSON). |
+| `agentflow-agents/src/routes/auth-tg-callback.ts:595` | `POST /auth/telegram` mount — Mini App `init_data` auth (distinct from `/auth/telegram/callback` Login Widget). |
 | `agentflow-agents/migrations/2026-05-11e-password-auth.sql` | Adds `users.password_hash` nullable + `auth_password_resets` table. |
 | `agentflow-agents/migrations/2026-05-16d-users-deleted-at-and-slug-backfill.sql` | Adds `users.deleted_at` + backfills `users.slug = 'user_' \|\| id` for legacy NULL rows. **Side-effect:** `users.slug` is now `text NOT NULL UNIQUE` with no DEFAULT — every INSERT must supply a slug or the row rejects with `23505`/`23502`. |
 | `agentflow-api/src/db/schema.ts:32` | `slug: text('slug').notNull().unique()` — drizzle column added 2026-05-17 to match the prod DDL after fresh signups began 500ing. |
@@ -113,6 +116,17 @@ Optional: FF_API_KEY_TIERS=1 →
 - 500 `jwt_not_configured` — `AUTH_JWT_SECRET` отсутствует в env.
 - 403 `forbidden` — ACL deny.
 
+**Telegram callback / Mini App contract** (`POST /auth/telegram` + `/auth/telegram/callback`):
+
+`verifyErrorStatus()` at `agentflow-agents/src/routes/auth-tg-callback.ts:110` decides the HTTP status from the verdict error. Clients distinguish "fix your payload" (400) from "fix your session" (401) from "platform broken" (503).
+
+- **400** (malformed body / payload — client bug):
+  `missing_init_data`, `invalid_body`, `invalid_init_data`, `missing_hash`,
+  `missing_id`, `missing_auth_date`, `invalid_id`, `invalid_auth_date`,
+  `missing_user`, `invalid_user_json`, `invalid_user_id`.
+- **401** (valid shape, untrusted signature): `invalid_hash`, `auth_date_expired`.
+- **503** `login_bot_not_configured` — `TELEGRAM_LOGIN_BOT_TOKEN` / `AGENTFLOW_BOT_TOKEN` unset in env.
+
 ## Failure modes
 
 | Симптом | Лог-строка для grep | Где починить |
@@ -130,6 +144,7 @@ Optional: FF_API_KEY_TIERS=1 →
 | Internal endpoint не пускает (свой сервис) | `internal_secret_mismatch` | check `INTERNAL_API_SECRET` aligned между API-pod и runtime-supervisor / tg-mcp |
 | Successful login → /my/agents всё равно показывает «Нужен вход / Войти через Telegram» | curl `/_api/me` returns 503 while `/_agents/auth/me` returns 200 | `agentflow-api` service down. Now non-fatal: `AuthProvider` (`agentflow-landing/src/lib/auth.tsx:63`) bootstraps from `agentflow-agents` `/auth/me` first; agentflow-api `/me` is only an enrichment call. If both fail, user is anonymous. Fix root cause by reviving the `agentflow-api` deployment. |
 | `POST /internal/users` 500 for every new TG `/start`; all SIWE/email/TG-link signups also broken | `null value in column "slug" of relation "users" violates not-null constraint` | Drizzle schema in `agentflow-api/src/db/schema.ts` was missing the `slug` column after migration `2026-05-16d-users-deleted-at-and-slug-backfill.sql` added `users.slug text NOT NULL UNIQUE` to prod. Fixed 2026-05-17 by adding the column to the schema and routing every `db.insert(users)` through `src/repos/slugs.ts::withSlugRetry` with a per-identity derivation (`slugForTgId`, `slugForWallet`, `slugFromEmail`, `slugForRefCode`). |
+| Mini App `POST /auth/telegram` returns 401 for malformed `init_data`; clients treat it as "session expired" and loop instead of surfacing the validation bug | `[auth-tg-miniapp] verify_failed status=401 error=missing_hash` (or `error=missing_init_data`/`invalid_init_data`/`missing_user`/...) on payload with no hash, no user, or missing fields | `agentflow-agents/src/routes/auth-tg-callback.ts:110` — `verifyErrorStatus(error)` maps malformed-payload codes to **400**, signature/expiry codes (`invalid_hash`, `auth_date_expired`) to **401**, `login_bot_not_configured` to **503**. Both `handleCallback` (widget) and `handleMiniAppAuth` (mini app) now route the verdict error through this helper instead of hard-coding 401. Fixed 2026-05-17 per qa-issue `2026-05-16-auth-tg-401-vs-400-contract.md`. |
 
 ## Related
 
