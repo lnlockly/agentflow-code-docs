@@ -111,6 +111,37 @@ Files:
 - `agentflow-agents/tests/routes/me-agents-list.test.ts` — shape + filter contract tests (15 cases).
 - `agentflow-landing/src/pages/CabinetDashboard.tsx:119` — frontend consumer.
 
+## Secrets — provision + upsert
+
+Per-agent secrets live in `agent_secrets` (PK = `agent_id`, one row per agent, all keys sealed together as a single AES-256-GCM payload — see `services/seal.ts::sealSecrets`). Plaintext never touches disk; the master key is env `AGENTS_MASTER_KEY` (base64, 32 bytes).
+
+Two write paths:
+
+| Path | When | File |
+|---|---|---|
+| Bulk seal on agent create | First insert via `provisionAgent` | `agentflow-agents/src/services/agent-provision.ts:233` |
+| Incremental upsert (one or more keys) | Owner-facing edits from the workspace Settings panel | `agentflow-agents/src/routes/me-agents-secrets.ts` |
+
+`PATCH /me/agents/:slug/secrets` reads the existing sealed row, unseals into `Record<string, string>`, layers the new keys on top, re-seals, and `onConflictDoUpdate(agentSecrets.agentId)`. Required because the PK is `agent_id` (single row) — naive insert hits unique-violation on every retry. Returns `{ ok, set, failed, secret_keys }`. Validation: ASCII key regex (`/^[A-Za-z_][A-Za-z0-9_]{0,119}$/`), value ≤16 KiB. 404 on slug not owned, 410 on tombstoned, 500 if existing payload unsealable (key rotated — refuses to overwrite).
+
+Both `publicAgent` (returned by `GET /agents`, `GET /agents/:slug`) and the `/agents/:slug/settings` payload include `required_secrets` (mirrors `agents.requiredSecrets` jsonb column from the hire-from-preset contract) and — on the settings endpoint — `secret_keys` (the `keyIds` array from `agent_secrets`, so the workspace panel renders ✓ Set badges without an extra round-trip).
+
+Files:
+- `agentflow-agents/src/routes/me-agents-secrets.ts` — the upsert route.
+- `agentflow-agents/src/routes/agents.ts:107` — `publicAgent` carries `required_secrets`.
+- `agentflow-agents/src/routes/agents.ts:419` — `/agents/:slug/settings` carries `required_secrets` + `secret_keys`.
+- `agentflow-agents/src/services/seal.ts:31` — `sealSecrets` envelope shared with the provision path.
+- `agentflow-agents/tests/unit/me-agents-secrets-route.test.ts` — 14 source-contract assertions.
+- `agentflow-landing/src/components/agents/AgentSettingsPanel.tsx:325` — frontend consumer.
+
+### Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Panel says "сохранение пока недоступно" (404) | (frontend) network panel shows 404 on `PATCH /me/agents/:slug/secrets` | Confirm `meAgentsSecretsApp` is imported AND `app.route('/', meAgentsSecretsApp)` is registered in `src/server.ts`. |
+| Save returns 500 `existing_secrets_unreadable` | `existing_secrets_unreadable` in response body | Master key rotated since the row was sealed. Either restore the old `AGENTS_MASTER_KEY` for a one-off re-seal script, or delete + re-create the agent. |
+| Panel shows zero rows after hire | (frontend) `required_secrets` is `[]` in `/agents/:slug/settings` response | Preset's `requiredSecrets` field is missing — fix in `presets/<slug>.json` then re-run `bootstrap-marketplace`. |
+
 ## Related
 - [Souls Collective](/subsystems/souls) — souls have their own taxonomy in `data.soul` graph nodes, separate from `agents.category`.
 - [Auth and Access](/subsystems/auth-and-access)
