@@ -92,6 +92,25 @@ WHERE (character ? 'category') AND (category IS NULL OR category = '');
 
 Run **after** the code fix is deployed (otherwise the next preset hire re-introduces a `NULL` for any row created in the gap).
 
+## Listing endpoints — `/agents` vs `/me/agents`
+
+Two routes return the caller's owned agents:
+
+| Route | Envelope | Row shape | Use case |
+|---|---|---|---|
+| `GET /agents` | `{ ok, items: [...] }` | `publicAgent` — slim: id/slug/name/state/engine/secret_keys | Legacy sidebar, MyAgentsV2 page |
+| `GET /me/agents` | `{ ok, agents: [...], count }` | `summaryAgent` — rich: bio/topics/emoji/category/keywords/owner_id/published/hire_count/rating | Cabinet tile, profile listing, picker dropdowns |
+
+Both filter `state != 'tombstoned'` and `owner_user_id = session.sub`. The hire endpoint (`POST /me/agents/hire`) stamps `ownerUserId = sub` on the new row, so "owned" and "hired" collapse into the same WHERE predicate — no JOIN against a separate namespace table.
+
+Files:
+- `agentflow-agents/src/routes/agents.ts:300` — `GET /agents` handler (`publicAgent` shape).
+- `agentflow-agents/src/routes/agents.ts:80` — `publicAgent(row, keyIds)` slim mapper.
+- `agentflow-agents/src/routes/agents.ts:107` — `summaryAgent(row)` rich mapper.
+- `agentflow-agents/src/routes/agents.ts:1595` — `GET /me/agents` handler.
+- `agentflow-agents/tests/routes/me-agents-list.test.ts` — shape + filter contract tests (15 cases).
+- `agentflow-landing/src/pages/CabinetDashboard.tsx:119` — frontend consumer.
+
 ## Related
 - [Souls Collective](/subsystems/souls) — souls have their own taxonomy in `data.soul` graph nodes, separate from `agents.category`.
 - [Auth and Access](/subsystems/auth-and-access)
