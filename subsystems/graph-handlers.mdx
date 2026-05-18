@@ -73,12 +73,12 @@ through to maestro for them.
 | `scaffold_vite` | `handlers/mini-app.ts` | coder-spa delegate (Vite + React + @twa-dev/sdk) | 1 / 3s / false | 600s |
 | `tg_webapp_init` | `handlers/mini-app.ts` | coder-spa delegate (initData validation + tma-auth route) | 1 / 3s / false | 600s |
 | `routes` | `handlers/mini-app.ts` | coder-spa delegate (react-router + TG BackButton/MainButton) | 1 / 3s / false | 600s |
-| `scaffold_nest` | `handlers/spa.ts` | coder-backend delegate (NestJS 11 skeleton) | 1 / 3s / false | 600s |
-| `scaffold_prisma` | `handlers/spa.ts` | coder-backend delegate (Prisma 6 + User/Org/Membership) | 1 / 3s / false | 600s |
-| `jwt_auth` | `handlers/spa.ts` | coder-backend delegate (passport-jwt + /auth routes) | 1 / 3s / false | 600s |
-| `billing_stripe` | `handlers/spa.ts` | coder-backend delegate (Stripe Checkout + webhook) | 1 / 3s / false | 600s |
-| `multi_tenant` | `handlers/spa.ts` | coder-backend delegate (X-Org-Id + Membership guard) | 1 / 3s / false | 600s |
-| `admin_panel` | `handlers/spa.ts` | coder-spa delegate (React admin under admin-frontend/) | 1 / 3s / false | 600s |
+| `scaffold_nest` | `handlers/spa.ts` | coder-backend delegate writing `backend/src/main.ts`, `backend/src/app.module.ts`, `backend/package.json` (LAYOUT_DIRECTIVE forbids `apps/*`) | 1 / 3s / false | 600s |
+| `scaffold_prisma` | `handlers/spa.ts` | coder-backend delegate writing `backend/prisma/schema.prisma`, `backend/src/prisma/prisma.module.ts` | 1 / 3s / false | 600s |
+| `jwt_auth` | `handlers/spa.ts` | coder-backend delegate writing `backend/src/auth/auth.module.ts`, `backend/src/auth/jwt.strategy.ts` | 1 / 3s / false | 600s |
+| `billing_stripe` | `handlers/spa.ts` | coder-backend delegate writing `backend/src/billing/billing.module.ts`, `backend/src/billing/stripe.service.ts` | 1 / 3s / false | 600s |
+| `multi_tenant` | `handlers/spa.ts` | coder-backend delegate writing `backend/src/orgs/orgs.module.ts`, `backend/src/orgs/org-context.guard.ts` | 1 / 3s / false | 600s |
+| `admin_panel` | `handlers/spa.ts` | coder-spa delegate writing `frontend/src/pages/admin/index.tsx`, `frontend/src/pages/admin/Users.tsx` (lives inside existing Vite project, NOT a separate `admin-frontend/`) | 1 / 3s / false | 600s |
 | `tg.get_user` | `handlers/tg.get_user.ts` | MCP `telegram/get_user` (peer lookup → username/user_id) | 2 / 3s / true | 60s |
 | `tg.send_text` | `handlers/tg-composite.ts` | MCP `telegram/send_message`, peer fallback to upstream `tg.get_user.username`. Optional `text_by_intent` map (diploma v2 preemptive deliver) reads `ctx.steps[intent_source_id].output.intent` and picks the template — `intent_source_id` defaults to `llm.classify_intent`. | 1 / 0s / false | 60s |
 | `tg.wait_reply` | `handlers/tg-composite.ts` | MCP `telegram/get_history` cursor poll, emits `node_waiting` | 1 / 0s / true | 1800s |
@@ -193,6 +193,9 @@ ctx.emit({ kind: 'node_finished', payload: { output } })
 | `voice.synthesize` returns `error=elevenlabs_empty_audio` | Literal in handler return | Upstream returned 200 + zero bytes. Retry once (handler is idempotent, max=2). If persistent, ElevenLabs degraded — see status page. |
 | `tg.send_file` returns `error=workspace_read_failed` (or `file_not_found` from `read_file_b64`) | `code-exec.read_file_b64` `file_not_found` (exit 23) or `file_too_large` (exit 24) | Upstream node never produced the artefact, or it exceeds 25 MiB. Check the producing handler's exit code; for >25 MiB pipe through `upload_to_storage` and use Telegram bot token + `send_document` URL flow instead. |
 | `tg.send_file` returns `error=flood_wait, detail="wait <N>s"` | tg-mcp `_structured_error` returns `error=flood_wait, seconds=N` | Account hit rate limit. Walker keeps `max=1, idempotent=false` so it does NOT retry (would re-spam). Re-queue manually after the flood window. |
+| SPA preview ships an empty 420-byte `<div id="root"></div>` bundle | `spa_bundle_too_small` in `landing_gate_fail`; coder reply lists `apps/frontend/src/pages/*.tsx` | 3-way layout mismatch — scaffold lays single-package `frontend/`, coder writes Turborepo `apps/*`, Procfile only builds `frontend/`. Fix `fix/spa-monorepo-layout-2026-05-18`: scaffold adds `backend/.gitkeep`, `handlers/spa.ts` injects LAYOUT_DIRECTIVE + throws `<kind>_apps_dir_forbidden` on `apps/*` writes, `presets/coder-spa.json` purged of webapp-boilerplate references. See [spa-scaffold](/subsystems/spa-scaffold). |
+| Any SPA handler (`scaffold_nest`, `jwt_auth`, `admin_panel`, …) throws `<kind>_coder_did_nothing` | Literal `_coder_did_nothing` in graph executor error stack | Coder turn returned `files_written=[]`. Reading files without writing is not work — parity with `render_landing` PR #467. Walker re-briefs once; escalate via brief-fidelity-supervisor if it persists. |
+| Any SPA handler throws `<kind>_apps_dir_forbidden` | Literal `_apps_dir_forbidden` in graph executor error stack | Coder ignored the layout directive and wrote `apps/*`. Inspect `presets/coder-spa.json` for stale `apps/` strings; the directive must reach the coder via `handlers/spa.ts` LAYOUT_DIRECTIVE. |
 
 ## Related
 

@@ -62,6 +62,8 @@ Two slot syntaxes — coder MUST replace both before audit passes:
 ### spa
 `brief.title`, `brief.nav_home`, `brief.nav_about`, `brief.home_title`/`_body`, `brief.about_title`/`_body`. Procfile uses `npx serve -s dist` so subpaths 200 instead of 404 (python3 `http.server` breaks SPA history-mode routing).
 
+**Layout contract** (fix `fix/spa-monorepo-layout-2026-05-18`): single-package `/workspace/frontend/` (Vite SPA) + `/workspace/backend/.gitkeep` placeholder. NO Turborepo, NO `pnpm-workspace.yaml`, NO `apps/*`. The 6-node `webapp-full` graph writes into `backend/src/*` (Nest server) and `frontend/src/pages/admin/*` (admin React pages inside the same Vite project). `handlers/spa.ts` injects a LAYOUT_DIRECTIVE into every coder brief and throws `<kind>_apps_dir_forbidden` if the coder writes `apps/*`. See [spa-scaffold](/subsystems/spa-scaffold).
+
 ### tg_bot
 `brief.start_greeting`, `brief.help_reply`, `brief.about_reply`, `brief.system_prompt`, `brief.fallback_reply`. Commands beyond `/help` and `/about` are added by appending to `backend/commands.py::COMMAND_REGISTRY` — `bot.py` auto-registers them at startup.
 
@@ -85,6 +87,7 @@ See `architecture/visitka-tg-profile.mdx`. Existing scaffold (PR #222), unchange
 | File written as directory (root-level Procfile) | `sh: cannot create Procfile: Is a directory` | regression — `buildScaffoldShellScript` dirname fallback to `.` |
 | Coder shipped unresolved slots | `<!-- SLOT:brief.` in `/workspace/frontend` | audit must call `listUnresolvedSlots` per file before marking `done` |
 | SPA subpath returns 404 | `python3 -m http.server` in `Procfile` of spa kind | spa Procfile must use `npx serve -s dist -l 8080` |
+| SPA preview shows empty 420-byte bundle (`<div id="root"></div>` only) | `spa_bundle_too_small` in `landing_gate_fail`; coder reply lists `apps/frontend/src/*` paths | Layout drift — scaffold lays single-package `frontend/` but coder wrote `apps/*` (Turborepo). Fix `fix/spa-monorepo-layout-2026-05-18` adds `backend/.gitkeep`, LAYOUT_DIRECTIVE in `handlers/spa.ts`, and `<kind>_apps_dir_forbidden` gate. See [spa-scaffold](/subsystems/spa-scaffold). |
 | Mini App white-screen | `window.Telegram.WebApp is undefined` in browser console | `index.html` must load `telegram-web-app.js` synchronously |
 
 ## Related

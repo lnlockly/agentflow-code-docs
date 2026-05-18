@@ -1,0 +1,66 @@
+---
+title: "SPA scaffold (kind=spa)"
+description: "Canonical /workspace/frontend + /workspace/backend layout for kind=spa projects."
+---
+
+# SPA scaffold
+
+## TL;DR
+`kind=spa` ships a single-package Vite SPA at `/workspace/frontend/` plus an empty `/workspace/backend/` placeholder. `Procfile` builds `cd frontend && npm run build` and serves `dist/` via `serve -s`. Coder agents add pages under `frontend/src/` and (when the brief needs a server) modules under `backend/src/`. There is no Turborepo, no `pnpm-workspace.yaml`, no `apps/*` tree.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/spa-scaffold.ts:229` | `FILES` — the 12 paths laid into `/workspace/` on `approve` (`frontend/*` + `backend/.gitkeep` + `Procfile` + `README.md`) |
+| `agentflow-agents/src/services/spa-scaffold.ts:197` | `PROCFILE` — `web: cd frontend && npm install && npm run build && cd .. && npx serve -s dist -l 8080` |
+| `agentflow-agents/src/services/projects.ts:2503` | `runProjectApprovalBackground` calls `scaffoldSpa(...)` for `proj.kind === 'spa'` |
+| `agentflow-agents/src/services/graph-executor/handlers/spa.ts:60` | `LAYOUT_DIRECTIVE` injected into every coder brief (`apps/*` forbidden, backend → `backend/`, frontend → `frontend/`) |
+| `agentflow-agents/src/services/graph-executor/handlers/spa.ts:88` | `<kind>_apps_dir_forbidden` gate — throws if `files_written` contains `apps/...` |
+| `agentflow-agents/src/services/graph-executor/handlers/spa.ts:78` | `<kind>_coder_did_nothing` gate — throws on `files_written=[]` |
+| `agentflow-agents/presets/coder-spa.json` | Coder system prompt — single-package layout, NEVER `find_boilerplate({kind:'webapp'})` |
+| `agentflow-agents/migrations/2026-05-02-boilerplates.sql:56-64` | DB row `agent_boilerplates id=3` (`spa/vite-react-ts`). No `webapp-boilerplate` is registered. |
+
+## Data flow
+```
+approve →
+  runProjectApprovalBackground(proj.kind='spa') →
+    scaffoldSpa(input, slotValues)              # spa-scaffold.ts:245
+      └─ applyScaffoldInPod(FILES)              # writes /workspace/frontend/* + backend/.gitkeep + Procfile
+      └─ finalizeSlotsInPod(slotValues)         # fills {{SLOT:brief.*}} in App.tsx + pages/
+
+graph executor walks workflow_schema (id=14 webapp-full):
+  scaffold_nest    → coder-backend writes backend/src/main.ts, backend/src/app.module.ts, backend/package.json
+  scaffold_prisma  → coder-backend writes backend/prisma/schema.prisma, backend/src/prisma/prisma.module.ts
+  jwt_auth         → coder-backend writes backend/src/auth/*
+  billing_stripe   → coder-backend writes backend/src/billing/*
+  multi_tenant     → coder-backend writes backend/src/orgs/*
+  admin_panel      → coder-spa writes frontend/src/pages/admin/*
+  deploy           → runtime-supervisor.deploy
+
+  EACH handler gate:
+    files_written=[]            → throw `<kind>_coder_did_nothing`
+    files_written ∋ 'apps/...'  → throw `<kind>_apps_dir_forbidden`
+
+Procfile runtime (runtime-supervisor on pod start):
+  cd frontend && npm install && npm run build  → /workspace/dist/
+  npx serve -s dist -l 8080                    → preview Caddy proxies :8080
+```
+
+## DB / Env / API
+- Tables: `agent_boilerplates` (row id=3 + id=14 with workflow_schema), `projects.kind`, `project_events`.
+- Env: none specific to SPA.
+- Routes: SPA pod exposes `:8080` for the static bundle.
+- MCP tools: `code-exec.exec` / `code-exec.write_file` (used by coder-backend + coder-spa).
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Preview shows empty `<div id="root"></div>` (~420 bytes) | `spa_bundle_too_small` in `landing_gate_fail`; coder reply lists `apps/frontend/src/pages/*.tsx` | Coder wrote into `/workspace/apps/*`. Gate now throws `<kind>_apps_dir_forbidden` instead of letting the empty bundle ship. Inspect coder turn — if it still chose `apps/*` the preset has a regression, check `presets/coder-spa.json` for any `apps/` strings. |
+| `scaffold_nest` / `jwt_auth` / `admin_panel` throws `<kind>_coder_did_nothing` | Literal `_coder_did_nothing` in graph executor error | Coder turn returned `files_written=[]`. Reading without writing is not work. Parity with `render_landing` PR #467. Auto-retry re-briefs once; escalate via brief-fidelity-supervisor if it persists. |
+| Coder tries `find_boilerplate({kind:'webapp'})` and 404s | `boilerplate_not_found` in `code-exec` stderr | Preset still trains the coder on the never-applied `webapp-boilerplate`. Verify `presets/coder-spa.json` no longer mentions `find_boilerplate` for kind=spa (purged in `fix/spa-monorepo-layout-2026-05-18`). |
+| Frontend build green but admin pages missing from bundle | bundle bytes match scaffold defaults; no `/admin` route in `frontend/src/App.tsx` | `admin_panel` handler expected new pages at `frontend/src/pages/admin/*.tsx` but coder didn't wire them into the router. Inspect `frontend/src/App.tsx` diff — should have a new `<Route path="/admin/*">`. |
+
+## Related
+- [Graph handlers](/subsystems/graph-handlers) — full registry incl. SPA's 6 nodes
+- [Canonical templates](/runbooks/canonical-templates) — all `kind=*` scaffolds
+- [Caddy preview](/subsystems/caddy-preview) — how `:8080` reaches the browser
