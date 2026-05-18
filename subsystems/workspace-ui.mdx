@@ -1,0 +1,77 @@
+---
+title: "Workspace UI (/account/projects/:id)"
+description: "Owner-facing project workspace route — which page component renders, why we run two of them, and how to swap."
+---
+
+# Workspace UI — /account/projects/:id
+
+## TL;DR
+The owner-only project page mounts `ProjectWorkspace` (v0.dev split layout:
+chat column ↔ Preview/Code/Terminal/Tools tabs). The thinner `WorkspaceV2`
+(2-column center+rail with breadcrumbs) still backs `/workspace/:id` for
+shared/public surfaces. Owner directive 2026-05-18 reverted the
+`/account/projects/:id` route back to `ProjectWorkspace` after a quiet swap
+to `WorkspaceV2` made the page feel thin.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/main.tsx:283` | `WorkspaceV2` lazy import (backs `/workspace/:id` via `WorkspaceRouter`) |
+| `agentflow-landing/src/main.tsx:285` | `ProjectWorkspace` lazy import (added 2026-05-18) |
+| `agentflow-landing/src/main.tsx:577` | `/account/projects/:id` Route — owner-only, mounts `ProjectWorkspace` |
+| `agentflow-landing/src/main.tsx:689` | `/workspace/:id` Route — mounts `WorkspaceRouter` (still `WorkspaceV2`) |
+| `agentflow-landing/src/pages/ProjectWorkspace.tsx:67` | Rich v0.dev split layout (chat ↔ tabs) |
+| `agentflow-landing/src/pages/WorkspaceV2.tsx:194` | Centered AppShellV2 layout w/ breadcrumbs |
+| `agentflow-landing/src/pages/WorkspacePageV2.tsx:114` | Experimental 3-column redesign behind `?v2=1` |
+| `agentflow-landing/src/components/workspace/ProjectHeader.tsx:114` | Header bar w/ LiveToggle (used by ProjectWorkspace) |
+| `agentflow-landing/src/hooks/useProjectData.ts` | Data hook that powers ProjectWorkspace |
+| `agentflow-landing/src/hooks/useWorkspaceLayout.ts` | Mobile/desktop/Tg layout switching |
+
+## Data flow
+
+```
+                  /account/projects/:id  ──┐
+                                           │ owner-only (AccessGate)
+                                           ▼
+                                  ProjectWorkspace
+                                  ├── useProjectData(id)  → /me/projects/:id
+                                  ├── ProjectHeader (LiveToggle, status, stop)
+                                  ├── ProgressBar / ChipStrip / ProvisioningBanner
+                                  ├── LEFT: ChatPane · TeamRosterRail · ProjectChat
+                                  │         · TokenHealthBar · OwnerInputBar
+                                  └── RIGHT: TabBar →
+                                       Preview · Code · Terminal · Git ·
+                                       Tools · Tasks · Brief · Secrets ·
+                                       Marketplace · AiModels · Metrics ·
+                                       Domain · Firehose · Settings
+
+                  /workspace/:id  ──────────┐
+                                           ▼
+                                  WorkspaceRouter ── ?v2=1 ── WorkspacePageV2
+                                                  └── else  ── WorkspaceV2
+                                                              (AppShellV2 +
+                                                               Preview · Files ·
+                                                               Plan · Events ·
+                                                               Team · Secrets)
+```
+
+## DB / Env / API
+- Routes consumed: `GET /me/projects/:id`, `POST /me/projects/:id/messages`,
+  `POST /me/projects/:id/approve|reject|repropose|stop`,
+  `GET /me/projects/:id/files`.
+- Env: none owner-facing; `VITE_FEED_ENABLED` gates an unrelated route.
+- Tables: `projects`, `project_events`, `project_artifacts`, `plan_tasks`,
+  `project_team` (read-only from the page).
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Owner sees the "thin" 2-column page on `/account/projects/:id` | `<WorkspaceV2 />` inside the `/account/projects/:id` Route | `agentflow-landing/src/main.tsx:577` (swap to `<ProjectWorkspace />`) |
+| `/workspace/:id` redirects flap between V2 designs | `?v2=1` toggle in `WorkspaceRouter` | `agentflow-landing/src/main.tsx:210` |
+| Hard-reload of project page bounces to marketplace | `useQuery` fires before JWT hydration | `WorkspaceV2.tsx:296` (gated on `isAuthenticated`); `ProjectWorkspace.tsx:218` (gated on `authLoading`) |
+| Build fails with `Missing opening {` in `agent-workspace.css` | `[@tailwindcss/vite:generate:build] Missing opening {` | `agentflow-landing/src/styles/agent-workspace.css` — duplicate selector block (fixed 2026-05-18) |
+
+## Related
+- [Projects frontend](/subsystems/projects-frontend)
+- [Auth and access](/subsystems/auth-and-access)
+- [Assistant UI blocks](/subsystems/assistant-ui-blocks)
