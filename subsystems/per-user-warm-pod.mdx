@@ -1,0 +1,133 @@
+---
+title: "Per-user warm pod (POC)"
+description: "One always-running pod per power-user (avsee4 / user_id=1 to start). New projects become subdirs of /workspace instead of fresh StatefulSets — eliminates the 30-90 s cold-start that the per-tenant warm pool still pays."
+---
+
+# Per-user warm pod (POC)
+
+## TL;DR
+
+For `owner_user_id ∈ PERUSER_POD_ENABLED_USER_IDS` (POC: `"1"`, i.e. avsee4)
+the platform skips per-project StatefulSet provisioning. Projects become
+subdirectories of `/workspace/<slug>` inside a single always-running
+`user-workspace-1` Deployment in namespace `af-tenant-1`. Tooling
+(node 22, python 3.12, git, pnpm) and the three baked boilerplates are
+already on disk in the image, so `create_project` is `mkdir + cp -r` —
+sub-second. The same pod's Caddy sidecar serves
+`p-<slug>.proj.agentflow.website` from `/workspace/<slug>/dist/`.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/k8s/user-workspace.yaml` | PVC + Deployment + Service + Ingress manifest for user-workspace-1. Applied manually via `ssh ff-france "kubectl apply -f -"`. |
+| `agentflow-agents/runtime-image/Dockerfile` | The `agentflow-project` image reused as the tools container — already bakes node 22, python 3.12, pnpm, git, and `/opt/agentflow/boilerplates/{landing,spa,mini_app}/`. |
+| `agentflow-agents/docs/specs/2026-05-18-per-user-warm-pod-poc.md` | POC spec — chunked rollout plan, failure modes, verification checklist. |
+| `agentflow-agents/src/services/env.ts` (PR-2) | `PERUSER_POD_ENABLED_USER_IDS` env knob parsing. |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts` (PR-2) | `create_project` / `destroy_project` branching on flag. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/kubectl.ts` (PR-3) | `exec` / `write_file` / `read_file` routing to `user-workspace-1` pod when project's `host_pod_name` matches. |
+
+## Data flow
+
+```
+user approves project (kind=landing, owner_user_id=1)
+  → runProjectApprovalBackground
+    → provisionWorkspaceWithRetry
+      → callCodeExecTool('create_project', { name=<slug>, ownerUserId=1 })
+
+PR-2 branch: ownerUserId ∈ PERUSER_POD_ENABLED_USER_IDS
+  → skip claimWarmPod / skip kubectl apply StatefulSet
+  → kubectl exec -n af-tenant-1 deploy/user-workspace-1 -c tools \
+        -- sh -c 'mkdir -p /workspace/<slug> && cp -a /opt/agentflow/boilerplates/landing/. /workspace/<slug>/'
+  → DB: update projects row → host_pod_name='user-workspace-1', workspace_path='/workspace/<slug>'
+  → return { ok, project, pod: 'user-workspace-1', workspace: '/workspace/<slug>' }
+
+coder writes files:
+  → callCodeExecTool('write_file', { workspace_project_name=<slug>, path='src/App.tsx', content=... })
+  → PR-3 routes via host_pod_name → kubectl exec user-workspace-1 -c tools -- tee /workspace/<slug>/src/App.tsx
+
+build:
+  → callCodeExecTool('exec', { workspace_project_name=<slug>, cmd='pnpm install && pnpm build' })
+  → kubectl exec user-workspace-1 -- sh -c 'cd /workspace/<slug> && pnpm install && pnpm build'
+
+preview:
+  → expose_public is a no-op for per-user-pod projects — the wildcard Ingress
+    user-workspace-1-preview already routes p-<slug>.proj.agentflow.website
+    to user-workspace-1:8080. Caddy reads Host header, serves
+    /workspace/<slug>/dist/ (or /workspace/<slug>/ if no dist).
+```
+
+## DB / Env / API
+
+- **Tables:** `projects` gains a (logical) `host_pod_name` column in PR-2.
+  Until PR-2 lands, only the manifest exists and no projects are routed
+  through it.
+- **Env (agentflow-agents Deployment):**
+  - `PERUSER_POD_ENABLED_USER_IDS` — comma-separated user IDs that use the
+    fast path. Empty / unset → everyone keeps the existing per-project STS
+    pipeline. POC: `"1"`.
+- **K8s (host k3s, after PR-1 manifest applied):**
+  - Namespace `af-tenant-1` (existing vcluster for user 1).
+  - PVC `user-workspace-1` (20 Gi RWO).
+  - Deployment `user-workspace-1` (1 replica, recreate strategy).
+  - Service `user-workspace-1` (ClusterIP, :8080).
+  - Ingress `user-workspace-1-preview` in `franchise-factory` ns —
+    `*.proj.agentflow.website` → `user-workspace-1:8080`, wildcard cert
+    `wildcard-proj-agentflow-tls`.
+- **MCP tools:** unchanged surface. `create_project` /
+  `destroy_project` / `write_file` / `exec` etc. all continue to take
+  `workspace_project_name`; the routing change in PR-2/PR-3 is invisible
+  to callers.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `kubectl apply -f user-workspace.yaml` returns `Service "user-workspace-1" not found` from the Ingress | (none — apply order) | Apply PVC + Deployment + Service first, Ingress last. Or `kubectl apply` the whole file twice. |
+| Caddy preview returns 404 on `p-<slug>.proj.agentflow.website` | (Caddy stdout shows `no such file or directory: /workspace/<slug>`) | `code-exec.create_project` (PR-2) didn't mkdir the slug. Check `kubectl exec deploy/user-workspace-1 -c tools -- ls /workspace`. |
+| Caddy serves stale build after `pnpm build` | (none — `Cache-Control: no-cache` set, but client cache may still serve) | Force-refresh in browser. If persists: check `/workspace/<slug>/dist/index.html` mtime via `kubectl exec`. |
+| User 1 PVC fills (>90%) | `df -h` on the pod | Bump PVC to 50 Gi or wire an LRU eviction job for idle project subdirs. |
+| Pod restart loses in-flight project state | Pod restart event | Recreate strategy is intentional — projects re-clone from git remote on next coder turn. For long-running builds, snapshot state before any planned restart. |
+| Ingress wildcard routing collides with existing per-project ingresses | nginx-ingress reload warning about duplicate host | Per-project Ingresses (`ensurePreviewIngressPlaceholder`) target the same wildcard host pattern. With ingress class `nginx` the most-specific Ingress wins; if a per-project Ingress for `p-<slug>.proj.agentflow.website` exists it'll mask the wildcard. PR-2 must skip `ensurePreviewIngressPlaceholder` for per-user-pod projects. |
+
+## Operational commands
+
+```bash
+# Apply the manifest (POC: from your workstation, against host k3s)
+ssh ff-france "kubectl apply -f -" < agentflow-agents/k8s/user-workspace.yaml
+
+# Verify pod up
+ssh ff-france "kubectl -n af-tenant-1 get deploy user-workspace-1"
+
+# Smoke-test caddy fallback
+curl -I https://p-smoketest.proj.agentflow.website/
+
+# Test the tools container
+ssh ff-france "kubectl -n af-tenant-1 exec deploy/user-workspace-1 -c tools -- \
+    sh -c 'which node python3 git pnpm && ls /opt/agentflow/boilerplates/'"
+
+# Rollback (the per-project STS pipeline is unchanged, so this is non-destructive
+# until PR-2 ships and starts routing user 1 traffic here)
+ssh ff-france "kubectl delete -f -" < agentflow-agents/k8s/user-workspace.yaml
+```
+
+## Verification (real, not surface signals)
+
+Per `feedback_real_verification_or_silence.md`, "verified" requires
+rendered DOM containing brief-derived content. After PR-2 + PR-3 deploy:
+
+1. Create a new landing project as user 1 via `POST /me/projects` (e.g. brief
+   "Лендинг для онлайн-курса йоги, оранжевый, секции about/программа/цена").
+2. Measure `created_at` → `status='done'`. Target < 3 min.
+3. Open `https://p-<slug>.proj.agentflow.website/` via Playwright MCP,
+   screenshot, grep rendered DOM for brief-derived strings ("йог" / "програм"
+   / "Записаться"). DOM-presence is the gate, not 200 + bundle size.
+
+## Related
+
+- [pod-prewarm-pool](/subsystems/pod-prewarm-pool) — the per-tenant warm pool
+  the POC builds on top of. The pool keeps 3 idle pods per tenant for cold-tenant cases; the per-user pod sidesteps the pool entirely for power users.
+- [workspace-provisioning](/subsystems/workspace-provisioning) — the
+  `provisionWorkspaceWithRetry` loop the POC short-circuits when the flag matches.
+- [code-exec MCP](/subsystems/code-exec-mcp) — the tools that get rewired in PR-2 / PR-3.
+- [caddy-preview](/subsystems/caddy-preview) — per-pod sidecar pattern this manifest mirrors at the multi-tenant level.
