@@ -1,0 +1,115 @@
+---
+title: "Landing scaffold (kind=landing)"
+description: "Canonical /workspace template for landing projects: Procfile at root, fallback Vite stub under frontend/, boilerplate-first preset clones into the same root."
+---
+
+# Landing scaffold
+
+## TL;DR
+
+`scaffoldLanding` drops a Procfile + a 3-file Vite fallback stub
+(`frontend/*`) into `/workspace` right after project approval. The
+boilerplate-first preset (PR #469) then asks the coder to clone
+`lnlockly/landing-boilerplate` into `/workspace` root and edit
+`src/config/landing.config.ts`. Two scaffolds coexist by design — the
+fallback stub never runs unless the coder skips the clone. The Procfile
+ALWAYS builds at workspace root so the rich landing wins.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/landing-scaffold.ts:204` | `PROCFILE` — `web: npm install + npm run build + python3 -m http.server 8080` at `/workspace` root |
+| `agentflow-agents/src/services/landing-scaffold.ts:271` | Procfile entry tagged `force: true` (overwrites pool-reclaimed pods) |
+| `agentflow-agents/src/services/landing-scaffold.ts:255` | `scaffoldLanding(input, slotValues)` — entry point called by `projects.ts:2487` |
+| `agentflow-agents/src/services/projects.ts:2487` | Invokes `scaffoldLanding` on `kind=landing` approval |
+| `agentflow-agents/src/services/graph-executor/handlers/landing.ts:62` | `RENDER_LANDING_BRIEF_LANDING` — boilerplate-clone instructions for the coder |
+| `agentflow-agents/src/services/graph-executor/handlers/landing.ts:131` | `probeLandingConfigSha1` — gate cross-check (Edit/MultiEdit signal) |
+
+## Data flow
+
+```
+project approve (kind=landing)
+   │
+   ▼
+scaffoldLanding ─▶ /workspace/Procfile (force:true, root build)
+                ├▶ /workspace/frontend/{package.json,vite.config.ts,src/*}   (fallback stub, [ ! -f ] guarded)
+                ├▶ /workspace/README.md                                       ([ ! -f ] guarded)
+                └▶ finalize SLOT markers in fallback stub
+   │
+   ▼
+graph walk: render_landing
+   │   coder-landing turn:
+   │     1. cd /workspace && (ls src/config/landing.config.ts || git clone landing-boilerplate . && rm -rf .git)
+   │     2. write_file or Edit  →  /workspace/src/config/landing.config.ts
+   │   gate: SHA1(landing.config.ts) before/after; pass if hashes differ
+   │   OR files_written non-empty
+   ▼
+graph walk: deploy_caddy
+   │
+   ▼
+runtime-supervisor reads /workspace/Procfile
+   web: npm install → npm run build  (vite at root → /workspace/dist/)
+                    → python3 -m http.server 8080 (serves /workspace/dist)
+```
+
+## DB / Env / API
+
+- Tables: none (scaffold is filesystem-only).
+- Env: standard pod env — `code-exec` MCP credentials, `NODE_ENV`.
+- Routes: triggered by `POST /me/projects/<id>/approve`.
+- MCP tools: `code-exec.exec` (heredoc-based scaffold writer), `code-exec.exec` for SHA1 probe.
+
+## Procfile contract (post `fix/landing-procfile-gate-2026-05-18`)
+
+```
+web: npm install --silent --no-audit --no-fund && npm run build && (cd dist && python3 -m http.server 8080)
+```
+
+- Runs in `/workspace`. NEVER `cd frontend`.
+- Tagged `force: true` in the `FILES` table so re-runs on pool-reclaimed
+  pods overwrite stale Procfiles (parity with PR #470 for tg_bot).
+- Vite build output defaults to `/workspace/dist` (boilerplate config).
+- HTTP server binds 0.0.0.0:8080, matching the runtime-supervisor port
+  expectations.
+
+The `frontend/` fallback stub stays in the scaffold but is no longer on
+the critical path. If `npm install + npm run build` fails at root (e.g.
+coder never cloned the boilerplate), runtime-supervisor surfaces the
+failure rather than silently serving an empty 28-module bundle.
+
+## Gate (SHA1 cross-check)
+
+`makeCoderLandingHandler` in `handlers/landing.ts` runs:
+
+1. `preHash  = sha1sum /workspace/src/config/landing.config.ts || ''`
+2. `coderInvoke({slug: 'coder-landing', brief: RENDER_LANDING_BRIEF_LANDING})`
+3. `postHash = sha1sum /workspace/src/config/landing.config.ts || ''`
+4. Decision matrix:
+
+| `files_written` | `preHash` | `postHash` | Decision |
+|---|---|---|---|
+| non-empty | * | * | **pass** (writes recorded) |
+| empty | * | `''` | **throw** (`coder_landing_did_nothing` — file never landed) |
+| empty | `'A'` | `'A'` | **throw** (file existed, coder skipped) |
+| empty | `'A'` | `'B'` | **pass** (Edit/MultiEdit changed the file) |
+| empty | `''` | `'B'` | **pass** (boilerplate cloned + edited in same turn) |
+
+Probe failures (codeExec throws, stdout malformed) return `''` and feed
+the strict branch — the gate stays loud rather than silent.
+
+## Failure modes
+
+| Symptom | Log / grep signature | Where to fix |
+|---|---|---|
+| Preview returns 823-byte HTML with empty `<div id="root"></div>` | Bundle ships from `/workspace/frontend/dist`, not `/workspace/dist` | Procfile still on a pre-`fix/landing-procfile-gate-2026-05-18` pod. Roll out `agentflow-agents`; pool-reclaimed pods get the force-overwrite on next scaffold. |
+| `render_landing` throws `coder_landing_did_nothing` though config looks right | `coder_landing_did_nothing:render_landing ... pre=<sha> post=<sha>` | If `pre==post` and both non-empty → coder wrote identical bytes (idempotent). Widen `RENDER_LANDING_BRIEF_LANDING`. If `post==''` → boilerplate clone failed; check pod disk + git network access from the tenant ns. |
+| Boilerplate clone fails because `/workspace` is non-empty | `git clone . ` errors with `destination path '.' already exists and is not an empty directory` | The fallback stub is `frontend/*` (subdir) + `Procfile` + `README.md` (root files). The brief uses `cp -a /tmp/lb/. .` in newer coder presets; if you see the literal `git clone . ` failure, bump `RENDER_LANDING_BRIEF_LANDING` to clone via `/tmp` + `cp -a`. |
+| Pool-reclaimed pod still serves the previous tenant's bundle | Procfile on disk reads `cd frontend && …` | Procfile entry must be `force: true` in `FILES` (`landing-scaffold.ts:271`). If missing, default `[ ! -f Procfile ]` guard keeps the stale file. |
+
+## Related
+
+- [Graph handlers](/subsystems/graph-handlers) — `render_landing`, `deploy_caddy`
+- [Runtime supervisor](/subsystems/runtime-supervisor) — how Procfile is read + the deploy loop
+- [Caddy preview](/subsystems/caddy-preview) — `expose_public` wiring
+- [Scaffold utils](/subsystems/scaffold-utils) — `force: true` semantics, slot finalize
