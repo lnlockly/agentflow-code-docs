@@ -24,8 +24,12 @@ sub-second. The same pod's Caddy sidecar serves
 | `agentflow-agents/runtime-image/Dockerfile` | The `agentflow-project` image reused as the tools container — already bakes node 22, python 3.12, pnpm, git, and `/opt/agentflow/boilerplates/{landing,spa,mini_app}/`. |
 | `agentflow-agents/docs/specs/2026-05-18-per-user-warm-pod-poc.md` | POC spec — chunked rollout plan, failure modes, verification checklist. |
 | `agentflow-agents/src/services/env.ts` (PR-2) | `PERUSER_POD_ENABLED_USER_IDS` env knob parsing. |
-| `agentflow-agents/src/mcp-servers/code-exec/index.ts` (PR-2) | `create_project` / `destroy_project` branching on flag. |
-| `agentflow-agents/src/mcp-servers/code-exec/helpers/kubectl.ts` (PR-3) | `exec` / `write_file` / `read_file` routing to `user-workspace-1` pod when project's `host_pod_name` matches. |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts` (PR-2, PR-3) | PR-2: `create_project` / `destroy_project` branching on flag. PR-3: every other tool (`write_file`, `write_file_b64`, `read_file_b64`, `upload_to_storage`, `exec`, `start_service`, `stop_service`, `list_services`, `expose_public` build-probe, `get_logs`) calls `assertWorkspaceExists` + routes through the wrappers below. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/tenant.ts:190` | `assertWorkspaceExists` — peruser probe via `test -d /workspace/<slug>` against `deployment/user-workspace-<id>` `-c tools`; falls through to `assertProjectExists` STS path when flag off. Injectable `_kubectlRun` seam for tests. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/kubectl.ts:526` | `kubectlExecInWorkspace` — peruser: sudo-wraps via `buildSudoWrapper`, targets `deployment/user-workspace-<id>` in `af-tenant-<id>`. Legacy: delegates to `kubectlExec` (STS). Rejects `cwd` outside slug with `{ok:false, error:'path_outside_workspace'}`. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/kubectl.ts:586` | `kubectlExecInWorkspaceBinary` — binary-stdout variant for `read_file_b64` / `upload_to_storage`. No sudo (files are 0644). Path-validated via `validateProjectPath`. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/kubectl.ts:638` | `writeFileInWorkspace` — resolves abs path (`/workspace/<slug>/<rel>` peruser, `/workspace/<rel>` legacy), runs `mkdir -p && tee && chmod` via sudo wrapper on peruser. |
+| `agentflow-agents/tests/unit/code-exec-peruser-helpers.test.ts` | 10 TDD unit tests covering the routing matrix above with `_runKubectl` / `_runKubectlBinary` / `_runLegacyExec` injected stubs. |
 
 ## Data flow
 
@@ -89,6 +93,11 @@ preview:
 | User 1 PVC fills (>90%) | `df -h` on the pod | Bump PVC to 50 Gi or wire an LRU eviction job for idle project subdirs. |
 | Pod restart loses in-flight project state | Pod restart event | Recreate strategy is intentional — projects re-clone from git remote on next coder turn. For long-running builds, snapshot state before any planned restart. |
 | Ingress wildcard routing collides with existing per-project ingresses | nginx-ingress reload warning about duplicate host | Per-project Ingresses (`ensurePreviewIngressPlaceholder`) target the same wildcard host pattern. With ingress class `nginx` the most-specific Ingress wins; if a per-project Ingress for `p-<slug>.proj.agentflow.website` exists it'll mask the wildcard. PR-2 must skip `ensurePreviewIngressPlaceholder` for per-user-pod projects. |
+| Tool returns `unknown_project` for a fresh peruser-pod project | `[code-exec] assertWorkspaceExists` miss; `test -d` exit 1 | Check `kubectl -n af-tenant-1 exec deploy/user-workspace-1 -c tools -- ls /workspace`. If slug dir missing, rerun `create_project`. |
+| Tool returns `{ok:false, error:'path_outside_workspace'}` | (handler-side, never hits kubectl) | Coder passed a `cwd` / `path` outside `/workspace/<slug>/`. Fix the coder prompt — never widen the gate. |
+| sudo prompts for a password inside the tools container | `sudo: a password is required` in stderr | The tools image is missing the `proj-<slug> ALL=(ALL) NOPASSWD: ALL` sudoers entry from `buildSudoWrapper`. Bump the user-workspace manifest image to one with sudoers seeded at boot. |
+| `kubectl exec` to `user-workspace-1` errors with `pods "user-workspace-1" not found` | `pods "user-workspace-1" not found` | Use the `deployment/user-workspace-1` target (already done by the wrappers). Pod name carries a ReplicaSet hash suffix; never address the bare pod name. |
+| `get_logs` returns `{logs_unavailable: true}` for a peruser project | `mode: 'peruser_pod'` in tool response | Expected: shared-pod stdout is meaningless. Use `list_services` to enumerate and `exec` to tail the service log under `/workspace/<slug>/.services/<name>.log`. |
 
 ## Operational commands
 
