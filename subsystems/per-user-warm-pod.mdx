@@ -70,6 +70,13 @@ preview:
   - `PERUSER_POD_ENABLED_USER_IDS` — comma-separated user IDs that use the
     fast path. Empty / unset → everyone keeps the existing per-project STS
     pipeline. POC: `"1"`.
+  - `PERUSER_POD_USE_SUDO` — set to `"1"` to wrap exec/write helpers with
+    `sudo -n -u proj-<slug>`. Default is **off**: the current `tools`
+    container ships no `sudo` binary and no `proj-<slug>` users (see
+    failure mode below). `validateProjectPath` is the only enforced
+    security boundary in the no-sudo mode, which is acceptable for the
+    single-user-per-pod POC. Flip on once the manifest bumps to a
+    sudo-capable tools image.
 - **K8s (host k3s, after PR-1 manifest applied):**
   - Namespace `af-tenant-1` (existing vcluster for user 1).
   - PVC `user-workspace-1` (20 Gi RWO).
@@ -95,7 +102,7 @@ preview:
 | Ingress wildcard routing collides with existing per-project ingresses | nginx-ingress reload warning about duplicate host | Per-project Ingresses (`ensurePreviewIngressPlaceholder`) target the same wildcard host pattern. With ingress class `nginx` the most-specific Ingress wins; if a per-project Ingress for `p-<slug>.proj.agentflow.website` exists it'll mask the wildcard. PR-2 must skip `ensurePreviewIngressPlaceholder` for per-user-pod projects. |
 | Tool returns `unknown_project` for a fresh peruser-pod project | `[code-exec] assertWorkspaceExists` miss; `test -d` exit 1 | Check `kubectl -n af-tenant-1 exec deploy/user-workspace-1 -c tools -- ls /workspace`. If slug dir missing, rerun `create_project`. |
 | Tool returns `{ok:false, error:'path_outside_workspace'}` | (handler-side, never hits kubectl) | Coder passed a `cwd` / `path` outside `/workspace/<slug>/`. Fix the coder prompt — never widen the gate. |
-| sudo prompts for a password inside the tools container | `sudo: a password is required` in stderr | The tools image is missing the `proj-<slug> ALL=(ALL) NOPASSWD: ALL` sudoers entry from `buildSudoWrapper`. Bump the user-workspace manifest image to one with sudoers seeded at boot. |
+| Every peruser write/exec returns `sudo: command not found` (exit 127) | `sudo: command not found` in `project_events.payload.stderr` | The tools image (reused `agentflow-project`) ships neither `sudo` nor the `proj-<slug>` users — create_project's script skips useradd/chown when not root. Default `PERUSER_POD_USE_SUDO=0` (unset) bypasses the sudo wrap entirely; flip to `"1"` only after bumping the user-workspace manifest to a tools image with sudo + sudoers + provisioned users. `validateProjectPath` remains the enforced gate in either mode. |
 | `kubectl exec` to `user-workspace-1` errors with `pods "user-workspace-1" not found` | `pods "user-workspace-1" not found` | Use the `deployment/user-workspace-1` target (already done by the wrappers). Pod name carries a ReplicaSet hash suffix; never address the bare pod name. |
 | `get_logs` returns `{logs_unavailable: true}` for a peruser project | `mode: 'peruser_pod'` in tool response | Expected: shared-pod stdout is meaningless. Use `list_services` to enumerate and `exec` to tail the service log under `/workspace/<slug>/.services/<name>.log`. |
 
