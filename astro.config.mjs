@@ -58,6 +58,7 @@ export default defineConfig({
             { label: 'Runtime Supervisor', slug: 'subsystems/runtime-supervisor' },
             { label: 'LLM Router', slug: 'subsystems/llm-router' },
             { label: 'Telegram MCP', slug: 'subsystems/tg-mcp' },
+            { label: 'tg_profile_bundle (graph + coder)', slug: 'subsystems/tg-profile-bundle' },
             { label: 'Auth and Access', slug: 'subsystems/auth-and-access' },
             { label: 'Projects Frontend', slug: 'subsystems/projects-frontend' },
             { label: 'Graph Handlers', slug: 'subsystems/graph-handlers' },
