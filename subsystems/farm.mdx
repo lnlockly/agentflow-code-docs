@@ -135,6 +135,7 @@ Enforced inside the `throttled_send` handler scaffold (see
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
 | `/me/farm/start` returns `412 tg_not_connected` | n/a (handled at handler level) | User hasn't run TG kickstart flow — show /account/settings link |
+| 412 even after `/me/tg-accounts/confirm-code` succeeded | `tg_farm_missing_account` in projects.ts dispatcher | Two root causes (fixed 2026-05-19): (1) `mcpDirect.callTool` returns the MCP envelope so `result?.status` was always undefined → confirm-code never hit the success branch. (2) Even when active, confirm-code didn't INSERT into `tg_links` — only the bot-deeplink flow did. See `routes/tg-accounts.ts` `unwrapMcp` + tg_links upsert |
 | `/me/farm/start` returns `500 project_spawn_failed` | `slug_collision` or `db_insert_failed` | Inspect Postgres connection + rerun; spawn is idempotent on the user_id side via `findActiveFarmProject` |
 | Multiple tg_farm projects per user | n/a | `findActiveFarmProject` filter is by status set; failed/cancelled rows are ignored intentionally so the user can restart after a bad run |
 | FarmPage stuck on mock | `MOCK_STATS` fallback in `FarmPage.tsx:37` | `/me/farm/stats` 401/500 — check auth + agentsBaseUrl |
