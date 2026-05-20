@@ -1,0 +1,111 @@
+---
+title: "Matrix Chat"
+description: "Self-hosted Matrix chat (Dendrite) встроен в AgentFlow с SSO и кастомным UI."
+---
+
+# Matrix Chat
+
+> **Status: planned 2026-05-21** — spec и plan написаны, Phase 1 (Dendrite deploy) в работе. Эта страница обновляется по мере реализации.
+
+## TL;DR
+
+Self-hosted Dendrite homeserver на k3s + кастомный React UI поверх `matrix-js-sdk`. Юзер логинится в AgentFlow обычным способом, при заходе на `/chat` фронт получает Matrix access_token через bridge endpoint (`agentflow-agents POST /me/chat/token`), который auto-provision'ит Matrix-юзера через shared-secret registration с deterministic-password derivation. Федерация и E2EE отключены в MVP. Mobile-клиент и Telegram bridge — следующие фазы.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/docs/specs/2026-05-21-matrix-chat-integration.md` | Полная спецификация (auth, data flow, failure modes) |
+| `agentflow-agents/docs/plans/2026-05-21-matrix-chat-integration.md` | Phase-by-phase plan с verify commands |
+| `agentflow-agents/k8s/dendrite.yaml:74` | Deployment, Service, PVC (media + jetstream), Ingress |
+| `agentflow-agents/k8s/dendrite-config.yaml:11` | ConfigMap с inline `dendrite.yaml` |
+| `agentflow-landing/public/.well-known/matrix/server:1` | `{"m.server": "matrix.agentflow.website:443"}` |
+| `agentflow-landing/public/.well-known/matrix/client:1` | `{"m.homeserver": {"base_url": "..."}}` |
+| `agentflow-agents/src/routes/chat.ts` *(Phase 2)* | `POST /me/chat/token` SSO bridge |
+| `agentflow-landing/src/chat/ChatPage.tsx` *(Phase 3)* | `/chat` route component |
+| `agentflow-landing/src/chat/ChatClientContext.tsx` *(Phase 3)* | matrix-js-sdk wrapper |
+
+## Data flow
+
+```
+Browser /chat
+   │
+   ├──[1]──> agentflow.website POST /me/chat/token  (AF JWT cookie)
+   │           │
+   │           ├── verify AF session (existing middleware)
+   │           ├── compute internal_password = HMAC(MATRIX_AUTH_KEY, af_id)
+   │           ├── try /login → 200 (existing user) or 403 (new)
+   │           ├── if 403: shared-secret register → get access_token in response
+   │           └── return { homeserver, user_id, access_token, device_id }
+   │
+   ├──[2]──> matrix-js-sdk initialized with token
+   │
+   ├──[3]──> matrix.agentflow.website/_matrix/client/v3/sync (long-poll)
+   │
+   └──[4]──> matrix.agentflow.website/_matrix/client/v3/rooms/{id}/send/m.room.message
+              │
+              └── Dendrite → Postgres → fanout to other connected /sync clients
+```
+
+## DB / Env / API
+
+### Postgres
+- DB: `dendrite` (рядом с `agentflow` в `agentflow-postgres-97fb67469-69298`)
+- User: `dendrite` (отдельный, чтобы limit blast radius)
+- Dendrite авто-создаёт ~20 таблиц при первом старте (`account_accounts`, `roomserver_*`, `syncapi_*`, и т.д.)
+
+### Media storage
+- Local PVC `dendrite-media` 50Gi (Dendrite не имеет S3 backend; миграция на MinIO — открытый item)
+
+### Env (agentflow-agents)
+- `MATRIX_HOMESERVER_URL` — internal cluster URL, обычно `http://dendrite:8008`
+- `MATRIX_PUBLIC_URL` — `https://matrix.agentflow.website` (отдаётся фронту)
+- `MATRIX_AUTH_KEY` — HMAC key для deterministic-password derivation (никогда не покидает agentflow-agents)
+- `MATRIX_REGISTRATION_SHARED_SECRET` — shared с Dendrite ConfigMap, для `/_synapse/admin/v1/register`
+- `MATRIX_SERVER_NAME` — `agentflow.website` (не `matrix.agentflow.website` — server_name по Matrix спеке)
+
+### Dendrite config (ConfigMap)
+- `global.server_name: agentflow.website`
+- `global.disable_federation: true`
+- `global.database.connection_string` — postgres URL
+- `client_api.registration_disabled: true` (public reg off)
+- `client_api.registration_shared_secret` — same as `MATRIX_REGISTRATION_SHARED_SECRET`
+- `media_api.*` — MinIO S3 backend creds
+
+### Routes (новые на agentflow-agents)
+- `POST /me/chat/token` — issue Matrix access_token (auto-provision на первом вызове)
+- `POST /me/chat/rooms` *(phase 3+)* — create room with current user as admin
+- `POST /me/chat/invite` *(phase 3+)* — invite by AF user_id
+
+### Matrix endpoints (наружу)
+- `https://matrix.agentflow.website/_matrix/client/v3/*` — standard Matrix Client-Server API
+- `https://agentflow.website/.well-known/matrix/server` — server discovery
+- `https://agentflow.website/.well-known/matrix/client` — client discovery
+
+## Failure modes
+
+| Симптом | Лог-строка для grep | Где починить |
+|---|---|---|
+| Юзер не может залогиниться в чат | `[chat-bridge] login failed after register` | `MATRIX_AUTH_KEY` ротировался — нужен fallback через `/_dendrite/admin/resetPassword/` |
+| Registration возвращает 401 invalid_mac | `[chat-bridge] register mac mismatch` | `MATRIX_REGISTRATION_SHARED_SECRET` env != `registration_shared_secret` в Dendrite ConfigMap |
+| Сообщения не сохраняются | `pq: connection refused` в Dendrite logs | Postgres connectivity, проверить `dendrite` user creds + NetworkPolicy |
+| Media upload 413 | `nginx 413 Request Entity Too Large` | Ingress `proxy-body-size` поднять до 50m для `matrix.agentflow.website` |
+| `/sync` отрубается через 30c | `sync request closed` в browser console | Ingress timeout — поднять до 60s для `/_matrix/client/v3/sync` |
+| `.well-known/matrix/server` 404 | `404 GET /.well-known/matrix/server` в landing logs | `agentflow-landing/public/.well-known/matrix/` не задеплоен или Vite plugin не копирует |
+| User auto-provision 409 conflict | `M_USER_IN_USE` в bridge logs | Race condition при первом одновременном логине — добавить retry на GET после 409 |
+| Voice/video не работает | `WebRTC: no ICE candidates` | Phase 2+, TURN не настроен (coturn out of scope MVP) |
+
+## Non-goals (MVP)
+
+- Federation (включается флагом, но требует модерации и DDoS-защиты)
+- E2EE (Olm/Megolm, device verification — отдельная фаза 4)
+- Voice/video calls (требует TURN-сервера)
+- Mobile apps (phase 6, отдельный repo)
+- Telegram/Discord/WhatsApp bridges (phase 5, `mautrix-*`)
+- Spaces hierarchies
+
+## Related
+
+- [Architecture overview](/architecture/overview)
+- [Auth and access](/subsystems/auth-and-access) — AF JWT источник identity для SSO
+- [MinIO storage](/subsystems/farm) — переиспользуется для Dendrite media repo
