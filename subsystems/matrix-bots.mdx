@@ -135,6 +135,31 @@ Auth scope: only `@user-<digits>:<serverName>` mxids may trigger. Bridge bots, T
 | Token issue fails | `[mode-c] token_issue_failed` | Same root causes as `/me/chat/tg/login` — bridge env misconfig |
 | Owner send fails | `[mode-c] owner_send_failed` | Inspect `err` — typically `send_403` if user is not joined to room |
 
+## Voice → text via ElevenLabs Scribe (@af-claude)
+
+When `@af-claude` receives an `m.room.message` with `msgtype: m.audio` (Telegram voice notes forwarded through mautrix-telegram, or native Matrix voice messages from Element), the handler:
+
+1. Pulls the MXC bytes via the authenticated v1 endpoint — `GET /_matrix/client/v1/media/download/<server>/<mediaId>` with `Authorization: Bearer <bot_token>` (`downloadMedia` in `src/services/matrix-bots/client.ts`). The legacy `/r0/media/download/` and `/v3/media/download/` paths are unauthenticated and removed from Dendrite, so v1 is the only working route for bots.
+2. Sends the bytes to ElevenLabs Scribe: `POST https://api.elevenlabs.io/v1/speech-to-text` with multipart `file=<bytes>`, `model_id=scribe_v1`, `language_code=auto`. Header `xi-api-key: $ELEVENLABS_API_KEY` (same env the project-pod TTS helper already uses).
+3. Substitutes `[voice] <transcript>` as the user-turn body. The `[voice] ` prefix tells the LLM the input was spoken vs typed so it can match register.
+4. Caches the transcript by `event_id` in an in-memory LRU (cap 200). The Claude handler walks 30 events of history on every reply, so without the cache one 10-second voice note would re-bill ElevenLabs on every later turn. Empty / failed transcripts are also cached so we don't retry a broken MXC forever.
+5. Silent fallback on any failure — no «I can't hear voice» reply. Owner explicitly asked for this; the previous behaviour broke a real 2026-05-21 TG-bridged conversation.
+
+Files:
+- `agentflow-agents/src/services/matrix-bots/stt.ts` — `transcribeAudio`, `transcribeAudioEvent` (LRU-cached), `extractAudioFromContent`.
+- `agentflow-agents/src/services/matrix-bots/client.ts:200` — `downloadMedia` helper.
+- `agentflow-agents/src/services/matrix-bots/runner.ts` — pulls `content.url` + `content.info.mimetype` off `m.audio` events and threads them through `IncomingMessage.audioUrl/audioMime`.
+- `agentflow-agents/src/services/matrix-bots/handlers/claude.ts` — live audio dispatch + historical audio walk.
+
+Env: `ELEVENLABS_API_KEY` (already injected via `agentflow-agents-env` Secret; absent key logs `[claude-stt] api_key_missing` once and skips silently).
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Bot ignores voice notes silently | `[claude-stt] api_key_missing` | Set `ELEVENLABS_API_KEY` on `deploy/agentflow-agents` |
+| Voice transcribed once but missed next turn | (no log — cache hit on success path) | n/a |
+| Transcript fails with HTTP error | `[claude-stt] transcription_failed` with `http_<status>` | Check ElevenLabs balance / API status |
+| MXC download fails | `[claude-stt] transcription_failed` with `download_<status>` | Bot token expired or media server unreachable; transient |
+
 ## Non-goals (v1)
 
 - `@af-tg-poster` is a stub. Real channel posting via mautrix-telegram comes with the chat Phase 5 wizard hookup.
