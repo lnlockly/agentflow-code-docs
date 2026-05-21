@@ -24,7 +24,8 @@ Five service bots (`@af-helper`, `@af-research`, `@af-image`, `@af-claude`, `@af
 | `agentflow-agents/src/services/matrix-bots/handlers/helper.ts:1` | `@af-helper` — static menu listing all 4 siblings |
 | `agentflow-agents/src/services/matrix-bots/handlers/research.ts:1` | `@af-research` — `firstUrl` → `extractArticle` → `useModel(TEXT_SMALL)` |
 | `agentflow-agents/src/services/matrix-bots/handlers/image.ts:1` | `@af-image` — `parseImageRequest` → `useModel(IMAGE)` → `uploadMedia` → `sendImage` |
-| `agentflow-agents/src/services/matrix-bots/handlers/claude.ts:1` | `@af-claude` — `recentMessages(10)` context → `useModel(TEXT_LARGE)` |
+| `agentflow-agents/src/services/matrix-bots/handlers/claude.ts:1` | `@af-claude` — `recentMessages(10)` context → `useModel(TEXT_LARGE)`, Mode C prefix + 👍 attach |
+| `agentflow-agents/src/services/matrix-bots/mode-c.ts:1` | Mode C — owner taps 👍 on a bot suggestion, backend re-sends as owner via `issueMatrixTokenForAfUser` |
 | `agentflow-agents/src/services/matrix-bots/handlers/tg-poster.ts:1` | `@af-tg-poster` — v1 stub (DM-only, `/help` works, `/connect-tg` / `/channels` / `/post` return "coming soon") |
 | `agentflow-agents/scripts/register-matrix-bots.mjs:1` | One-shot CLI mirroring `ensureAllBots`, runnable inside the pod for manual provisioning |
 | `agentflow-agents/src/server.ts:115` | `import { startMatrixBotsRunner }` |
@@ -104,6 +105,35 @@ agentflow-agents pod (RUN_WORKERS=true)
 | TG-poster commands say "coming soon" | (no error — visible reply) | Expected — v1 stub. Phase 5 will wire mautrix-telegram provisioning |
 | `M_USER_IN_USE` on register but login also 403 | `matrix_bot_register_rejected_400_M_USER_IN_USE` | Password drift — either rotate `MATRIX_BOT_KEY` back, or hit `/_dendrite/admin/resetPassword/{user}` to align |
 | Sync loop hot-loops on error | `[matrix-bots] sync error, backing off` | Inspect the inner `err` field; exponential backoff caps at 60s and resumes automatically |
+
+## Mode C — send-as-owner via reaction
+
+When `@af-claude` finds itself in a room that contains at least one TG-puppet member (`@telegram_<tgid>:agentflow.website`), the owner is using it as a hint assistant inside a TG-bridged dialog. Workflow:
+
+1. Bot generates the reply as usual.
+2. Body is prefixed with `💡 Предложение: ` and sent as plain text (no markdown so the eventual forward to TG is clean).
+3. Bot immediately `PUT`s its own `m.reaction` with `key: '👍'` annotating its message.
+4. Owner taps the 👍 (the count increments from 1 → 2).
+5. The runner spots the `m.reaction` on the next `/sync` batch, calls `handleModeCApprove`, which:
+   - parses the reactor's mxid via `parseOwnerMxid` (`@user-<id>:<server>` only; puppets and bots fail closed),
+   - fetches the bot's original message via `GET /rooms/<id>/event/<id>`,
+   - strips the suggestion prefix,
+   - mints a fresh Matrix token for that AF user through `issueMatrixTokenForAfUser` (same helper Element SSO uses),
+   - `PUT /rooms/<id>/send/m.room.message` as the owner.
+6. mautrix-telegram observes the owner-sent message and forwards it via the owner's TG login as a normal user message — the TG contact sees no `AF Claude:` prefix.
+
+Idempotency: `roomId|originalEventId|sender` is cached in a 200-entry FIFO so re-delivered reactions never double-post.
+
+Auth scope: only `@user-<digits>:<serverName>` mxids may trigger. Bridge bots, TG puppets, and manually registered accounts (e.g. `mlm808`) are silently dropped with `[mode-c] sender_not_authorized`.
+
+| Failure | Log signature for grep | Where to fix |
+|---|---|---|
+| Reactor isn't an AF owner | `[mode-c] sender_not_authorized` | Expected — only owners forward |
+| Bot's pre-attached 👍 leaks into approval | (no log — `sender === bot.mxUserId` early-return) | n/a |
+| Original suggestion not found (redacted) | `[mode-c] original_event_not_found` | Owner re-asks Claude for a new suggestion |
+| Reaction targets a non-suggestion message | `[mode-c] original_event_not_a_suggestion` | Expected — only `💡 Предложение: …` is forwardable |
+| Token issue fails | `[mode-c] token_issue_failed` | Same root causes as `/me/chat/tg/login` — bridge env misconfig |
+| Owner send fails | `[mode-c] owner_send_failed` | Inspect `err` — typically `send_403` if user is not joined to room |
 
 ## Non-goals (v1)
 
