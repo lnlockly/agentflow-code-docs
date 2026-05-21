@@ -1,0 +1,119 @@
+---
+title: "Matrix Bots"
+description: "Five platform service bots running inside Element/Dendrite at chat.agentflow.website."
+---
+
+# Matrix Bots
+
+## TL;DR
+
+Five service bots (`@af-helper`, `@af-research`, `@af-image`, `@af-claude`, `@af-tg-poster`) are registered on the Dendrite homeserver via shared-secret registration and run a per-bot `/sync` long-poll loop inside `agentflow-agents`. Each bot has its own message handler: a static help menu, a URL→TL;DR summariser, a text→image generator, a Claude chat, and a Telegram-poster (v1 stub). Triggered on DM or `@mention`; gated by `MATRIX_BOTS_ENABLED=1`.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/migrations/2026-05-21c-matrix-bots.sql:1` | `matrix_bots` table (slug PK + access_token + next_batch cursor) |
+| `agentflow-agents/src/db/schema.ts:3091` | `matrixBots` drizzle table definition |
+| `agentflow-agents/src/services/env.ts:172` | `matrixBotsEnabled`, `matrixBotKey` env vars |
+| `agentflow-agents/src/services/matrix-bots/lib.ts:1` | Pure helpers — slug list, deterministic password, URL regex, command parser, mention detector, image-aspect parser |
+| `agentflow-agents/src/services/matrix-bots/register.ts:1` | `ensureBot` / `ensureAllBots` — login-first, register-on-403, upsert into `matrix_bots` |
+| `agentflow-agents/src/services/matrix-bots/client.ts:1` | Thin Matrix Client-Server API wrapper: sync, join, joined_members, sendText (markdown), uploadMedia, sendImage, recentMessages |
+| `agentflow-agents/src/services/matrix-bots/types.ts:1` | `BotContext`, `IncomingMessage` types |
+| `agentflow-agents/src/services/matrix-bots/runner.ts:1` | Per-bot `/sync` loop, invite auto-join, dispatch, dedupe, cursor persistence, M_UNKNOWN_TOKEN re-login |
+| `agentflow-agents/src/services/matrix-bots/handlers/helper.ts:1` | `@af-helper` — static menu listing all 4 siblings |
+| `agentflow-agents/src/services/matrix-bots/handlers/research.ts:1` | `@af-research` — `firstUrl` → `extractArticle` → `useModel(TEXT_SMALL)` |
+| `agentflow-agents/src/services/matrix-bots/handlers/image.ts:1` | `@af-image` — `parseImageRequest` → `useModel(IMAGE)` → `uploadMedia` → `sendImage` |
+| `agentflow-agents/src/services/matrix-bots/handlers/claude.ts:1` | `@af-claude` — `recentMessages(10)` context → `useModel(TEXT_LARGE)` |
+| `agentflow-agents/src/services/matrix-bots/handlers/tg-poster.ts:1` | `@af-tg-poster` — v1 stub (DM-only, `/help` works, `/connect-tg` / `/channels` / `/post` return "coming soon") |
+| `agentflow-agents/scripts/register-matrix-bots.mjs:1` | One-shot CLI mirroring `ensureAllBots`, runnable inside the pod for manual provisioning |
+| `agentflow-agents/src/server.ts:115` | `import { startMatrixBotsRunner }` |
+| `agentflow-agents/src/server.ts:373` | `void startMatrixBotsRunner()` (under `RUN_WORKERS`) |
+| `agentflow-agents/tests/matrix-bots-lib.test.ts:1` | 26 pure-helper tests (HMAC derivation, URL regex, command parser, mention detector) |
+
+## Data flow
+
+```
+agentflow-agents pod (RUN_WORKERS=true)
+   │
+   ├─ bootstrap → startMatrixBotsRunner()
+   │     ├─ ensureAllBots() — per slug:
+   │     │      POST /_matrix/client/v3/login (m.login.password, password=HMAC(BOT_KEY, slug))
+   │     │      ├─ 200 → reuse access_token, upsert
+   │     │      └─ 403 → GET  /_synapse/admin/v1/register (nonce)
+   │     │              POST /_synapse/admin/v1/register (nonce, slug, password, mac)
+   │     │              200 → upsert access_token + device_id
+   │     │              PUT  /profile/<user>/displayname (cosmetic)
+   │     └─ for each bot → detached runBotLoop()
+   │
+   └─ runBotLoop(bot):
+         while true:
+           GET /sync?timeout=25000&since=<next_batch>
+              ├─ rooms.invite → POST /rooms/<id>/join
+              └─ rooms.join.timeline.events:
+                    skip if sender === bot.mx_user_id
+                    skip if event_id already seen
+                    isDm = joinedMembers(roomId).length === 2
+                    mentioned = body contains @<slug>(:<server>)?
+                    if isDm || mentioned:
+                       command = parseCommand(body, slug, server)
+                       handler[slug](ctx, { roomId, eventId, body, isDm, command })
+           UPDATE matrix_bots SET next_batch=…, last_synced_at=NOW()
+```
+
+## DB / Env / API
+
+### Postgres
+- Table: `matrix_bots` — one row per bot. PK `slug`. `next_batch` is the `/sync` cursor; `mx_password` is the HMAC so re-login is deterministic. Migration `2026-05-21c-matrix-bots.sql`.
+
+### Env (agentflow-agents)
+- `MATRIX_BOTS_ENABLED` — `1` to start the runner, anything else (default) skips it.
+- `MATRIX_BOT_KEY` — 32-byte random hex; HMAC key for per-bot password derivation. Must stay constant; rotation invalidates existing bot logins until each row's `mx_password` is rewritten.
+- Reuses existing matrix-chat vars: `MATRIX_HOMESERVER_URL`, `MATRIX_SERVER_NAME`, `MATRIX_REGISTRATION_SHARED_SECRET`.
+
+### Matrix endpoints used
+- `POST /_matrix/client/v3/login` — per-bot login
+- `GET / POST /_synapse/admin/v1/register` — shared-secret first-time provisioning
+- `GET /_matrix/client/v3/sync` — long-poll (25s)
+- `POST /_matrix/client/v3/rooms/{id}/join` — invite auto-accept
+- `GET /_matrix/client/v3/rooms/{id}/joined_members` — DM detection
+- `PUT /_matrix/client/v3/rooms/{id}/send/m.room.message/{txn}` — text + image events
+- `POST /_matrix/media/v3/upload` — image upload (af-image)
+- `PUT /_matrix/client/v3/profile/{user}/displayname` — first-provision cosmetic
+
+### Per-bot triggers
+| Bot | DM | @mention | Privacy |
+|---|---|---|---|
+| `@af-helper` | yes | yes | open |
+| `@af-research` | yes | yes | open |
+| `@af-image` | yes | yes | open |
+| `@af-claude` | yes | yes | open |
+| `@af-tg-poster` | yes only | ignored | DM-only by design |
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Runner never starts | `[matrix-bots] disabled (MATRIX_BOTS_ENABLED != 1)` | Set `MATRIX_BOTS_ENABLED=1` on the deployment |
+| Runner starts but no bots online | `[matrix-bots] not configured (missing homeserver/secret/botKey)` | Set `MATRIX_BOT_KEY` + reuse Matrix bridge env vars |
+| Registration fails with 401 | `matrix_bot_register_rejected_401` | `MATRIX_REGISTRATION_SHARED_SECRET` env != Dendrite ConfigMap `registration_shared_secret` |
+| Bot stops responding after token rotation | `sync_401` then `[matrix-bots] re-logged in` | `MATRIX_BOT_KEY` was rotated — re-run `scripts/register-matrix-bots.mjs` to refresh each row's password and access token |
+| Bot keeps trying to summarise the same old URL after restart | (no error) | `next_batch` cursor stale; clear with `UPDATE matrix_bots SET next_batch=NULL WHERE slug='af-research'` |
+| `@af-image` returns "Image generation failed" | `designapi image 503: model_not_found` | designapi account/group has no image channel — pivot to a working account or BYOK |
+| `@af-research` replies "page has no readable article body" | (no error — visible reply) | Source has no Readability-friendly main; this is expected for SPAs / login walls |
+| TG-poster commands say "coming soon" | (no error — visible reply) | Expected — v1 stub. Phase 5 will wire mautrix-telegram provisioning |
+| `M_USER_IN_USE` on register but login also 403 | `matrix_bot_register_rejected_400_M_USER_IN_USE` | Password drift — either rotate `MATRIX_BOT_KEY` back, or hit `/_dendrite/admin/resetPassword/{user}` to align |
+| Sync loop hot-loops on error | `[matrix-bots] sync error, backing off` | Inspect the inner `err` field; exponential backoff caps at 60s and resumes automatically |
+
+## Non-goals (v1)
+
+- `@af-tg-poster` is a stub. Real channel posting via mautrix-telegram comes with the chat Phase 5 wizard hookup.
+- No E2EE — bots stay out of encrypted rooms; messages there appear as `m.room.encrypted` and the runner silently skips them.
+- No room-create on bot side. Users invite the bot via Element's Start Chat.
+- No metrics export — `last_synced_at` per row is the only health signal until prom-client wiring lands.
+
+## Related
+
+- [Matrix Chat](/subsystems/matrix-chat) — SSO bridge, Dendrite deploy, frontend
+- [Matrix TG Bridge](/subsystems/matrix-tg-bridge) — mautrix-telegram provisioning wizard (phase 5)
+- [LLM Router](/subsystems/llm-router) — `useModel(TEXT_SMALL/TEXT_LARGE/IMAGE)` providers
