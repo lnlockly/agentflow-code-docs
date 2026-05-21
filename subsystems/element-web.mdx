@@ -65,20 +65,47 @@ All branding lives in the same `element-web-config` ConfigMap — no fork, no re
 
 ### Custom theme `AgentFlow Dark`
 
-Registered via `setting_defaults.custom_themes[]` and pinned with `default_theme: "custom-AgentFlow Dark"` (Element prefixes registered names with `custom-`).
+Registered via `setting_defaults.custom_themes[]` and pinned with `default_theme: "custom-AgentFlow Dark"` (Element prefixes registered names with `custom-`). Values mirror `agentflow-landing/src/styles/dark-tokens.css` so chat and cabinet read as one product.
 
 | Color key | Hex / RGBA | Brand role |
 |---|---|---|
-| `accent-color`, `primary-color` | `#22d3b9` | Teal accent (links, buttons, send) |
-| `warning-color` | `#ec4899` | Pink — destructive / banner accent |
-| `sidebar-color` | `#17171a` | Left rail surface |
-| `roomlist-background-color`, `timeline-background-color` | `#0e0e10` | App background |
-| `roomlist-text-color`, `timeline-text-color` | `#f5f5f7` | Primary text |
-| `roomlist-text-secondary-color`, `timeline-text-secondary-color` | `#a1a1aa` | Secondary text |
-| `roomlist-highlights-color`, `timeline-highlights-color`, `menu-selected-color`, `reaction-row-button-selected-bg-color` | `rgba(34,211,185,0.16)` | Teal tint for selected/hover/unread |
-| `roomlist-separator-color` | `#2a2a2f` | Hairline dividers |
+| `accent-color`, `primary-color` | `#a6f25c` | AgentFlow lime — buttons, send, links, active states |
+| `warning-color`, `alert` | `#ef4444` | Destructive / error |
+| `sidebar-color` | `#0f0f12` | Left rail surface (`--af-elev1`) |
+| `roomlist-background-color`, `timeline-background-color` | `#0a0a0c` | App background (`--af-bg`) |
+| `roomlist-text-color`, `timeline-text-color` | `#fafafa` | Primary text (`--af-text-primary`) |
+| `roomlist-text-secondary-color`, `timeline-text-secondary-color` | `#9a9a9f` | Secondary text (`--af-text-secondary`) |
+| `roomlist-highlights-color` | `rgba(166,242,92,0.14)` | Selected room tint |
+| `timeline-highlights-color`, `event-highlight-bg-color` | `rgba(166,242,92,0.10)` | Mention / highlight pill |
+| `menu-selected-color`, `reaction-row-button-selected-bg-color` | `rgba(166,242,92,0.16–0.18)` | Selected menu / reaction |
+| `roomlist-separator-color` | `#1f1f23` | Hairline dividers (`--af-border-subtle`) |
+| `header-panel-bg-color` | `#0f0f12` | Right panel surface |
+| `header-panel-text-primary-color` / `-secondary-color` | `#fafafa` / `#9a9a9f` | Right panel text |
+| `event-selected-color` | `#141417` | Selected message background (`--af-elev2`) |
+| `event-highlight-fg-color` | `#a6f25c` | Highlight foreground |
+| `togglesw-on-color`, `progressbar-color` | `#a6f25c` | Toggle on / progress fills |
+| `togglesw-off-color` | `#3a3a40` | Toggle off (`--af-border-chip`) |
+| `username-colors`, `avatar-background-colors` | 8-color palette starting `#a6f25c` then cyan / pink / amber / blue / purple / mint / coral | Per-user accent rotation |
 
-Source of color keys: https://github.com/element-hq/element-web/blob/develop/docs/theming.md.
+#### `compound` overrides (Element design-system tokens)
+
+Element 1.12 also reads a `compound` block that maps semantic tokens directly. We pin the action and accent tokens to lime so primary buttons, link rest states, and accent icons follow the brand even where the legacy keys don't reach.
+
+| Token | Value | Effect |
+|---|---|---|
+| `--cpd-color-bg-action-primary-rest/hovered/pressed` | `#a6f25c` / `#b8f578` / `#94e043` | Primary CTA states |
+| `--cpd-color-bg-accent-rest/hovered/pressed` | same trio | Accent surfaces |
+| `--cpd-color-text-action-accent` | `#a6f25c` | Action accent text |
+| `--cpd-color-text-link-external` | `#22d3ee` | External links use cyan secondary (legible vs. lime) |
+| `--cpd-color-icon-accent-primary/tertiary` | `#a6f25c` | Accent icons |
+| `--cpd-color-text-on-solid-primary` | `#0a0a0c` | Black text on lime fills (WCAG contrast) |
+| `--cpd-color-border-interactive-primary` | `#a6f25c` | Focus rings |
+
+#### Typography
+
+`fonts.general` is set to `"Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"` and `fonts.monospace` to `"'Geist Mono', 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace"`. Inter is the same family the landing imports via `@fontsource/inter`, so room names, timelines, and composer copy match the cabinet at the OS-font level.
+
+Source of color keys: https://github.com/element-hq/element-web/blob/develop/docs/theming.md. The `compound` block is Element's mapping to its Compound design system; semantic tokens documented at https://compound.element.io/?path=/docs/tokens-semantic-colors--docs.
 
 ### Branding block
 
@@ -111,10 +138,26 @@ Source of color keys: https://github.com/element-hq/element-web/blob/develop/doc
 ```
 curl -s https://chat.agentflow.website/config.json \
   | python3 -c "import sys,json; d=json.load(sys.stdin); \
+t=d['setting_defaults']['custom_themes'][0]; \
 print('default_theme:', d['default_theme']); \
-print('themes:', [t['name'] for t in d['setting_defaults']['custom_themes']])"
+print('accent:', t['colors']['accent-color']); \
+print('font:', t['fonts']['general'][:30]); \
+print('compound keys:', len(t.get('compound', {})))"
 # default_theme: custom-AgentFlow Dark
-# themes: ['AgentFlow Dark']
+# accent: #a6f25c
+# font: Inter, system-ui, -apple-syst
+# compound keys: 12
+```
+
+#### Editing the palette
+
+The ConfigMap is NOT applied by the `deploy.yml` GitHub Action — k8s manifests outside of agentflow-agents itself need a manual apply:
+
+```
+scp k8s/element-web-config.yaml ff-france:/tmp/
+ssh ff-france 'kubectl apply -f /tmp/element-web-config.yaml \
+  && kubectl -n franchise-factory rollout restart deploy/element-web \
+  && kubectl -n franchise-factory rollout status deploy/element-web --timeout=90s'
 ```
 
 ## Phase 3: SSO bounce (shipped 2026-05-21)
