@@ -115,6 +115,14 @@ Source of color keys: https://github.com/element-hq/element-web/blob/develop/doc
 | `branding.auth_footer_links` | `[AgentFlow → /, Поддержка → /support]` | Footer of auth screens |
 | `branding.welcome_background_url` | *omitted* | `chat-welcome-bg.jpg` does not exist on landing — landing SPA returns HTML for unknown paths. Add asset, then re-enable. |
 
+### Custom Home page (no room selected)
+
+Element fetches `embedded_pages.home_url` and renders it in place of the upstream "Welcome to Element" panel when the user has no room open. We keep the file in the same `element-web-config` ConfigMap (`data.home.html`) and mount it at `/app/home.html` so nginx serves it from the chat origin — `home_url` is therefore the relative string `"home.html"`.
+
+Copy points new users at the five service bots (`@af-helper`, `@af-claude`, `@af-image`, `@af-research`) and the TG bridge page in cabinet. Background `#0a0a0c`, accent `#a6f25c`, Inter font — matches the `custom-AgentFlow Dark` theme. No marketing words, no «бесплатно».
+
+Editing: bump the `home.html` block under `data:` in `k8s/element-web-config.yaml`, re-apply ConfigMap, rollout-restart deploy/element-web. Nothing in the Element image changes.
+
 ### Localization defaults
 
 `setting_defaults.language: "ru"`, `setting_defaults.default_country_code: "RU"`, top-level `default_country_code: "RU"`. New sessions land on Russian UI.
@@ -335,6 +343,7 @@ Element Web with #lobby:agentflow.website visible
 | Login screen lets users type any homeserver | `disable_custom_urls` flipped to false | Same ConfigMap |
 | Login fails with `M_FORBIDDEN` | n/a (Dendrite-side) | Check `dendrite` pod logs, registration shared-secret + appservice config |
 | Theme reverts to upstream dark | `default_theme: "dark"` in ConfigMap | Restore `default_theme: "custom-AgentFlow Dark"` and verify `setting_defaults.custom_themes[].name == "AgentFlow Dark"` (Element prepends `custom-` automatically) |
+| Home shows "Welcome to Element" instead of AF copy | `embedded_pages.home_url` missing or 404 on `/home.html` | `kubectl -n franchise-factory get cm element-web-config -o jsonpath='{.data.home\.html}'` should print HTML; if 404, the volume `items[]` entry for `home.html` is missing in `k8s/element-web.yaml` |
 | Auth screen shows Element logo | `branding.auth_header_logo_url` empty or pointing at `logos/element-logo.svg` | Set to `https://agentflow.website/favicon.svg` |
 | "Get Element on iOS" banner appears | `mobile_guide_toast` true or `mobile_builds` missing | Set `mobile_guide_toast: false`, `mobile_builds: {ios:null, android:null, fdroid:null}` |
 | SSO bounce returns 401 unauthenticated | `unauthenticated` from `requireSession` | Cookie `Domain=` missing — verify `SESSION_COOKIE_DOMAIN` env in `k8s/agentflow-agents.yaml` |
