@@ -109,11 +109,12 @@ agentflow-agents pod (RUN_WORKERS=true)
 
 - `@af-tg-poster` is a stub. Real channel posting via mautrix-telegram comes with the chat Phase 5 wizard hookup.
 - No E2EE — bots stay out of encrypted rooms; messages there appear as `m.room.encrypted` and the runner silently skips them.
-- No room-create on bot side. Users invite the bot via Element's Start Chat.
+- ~~No room-create on bot side. Users invite the bot via Element's Start Chat.~~ As of 2026-05-21 the **Element SSO bounce** reads `matrix_bots.access_token` for each enabled row and calls `POST /createRoom` per bot the first time a user lands in Element. See [Element Web SSO bounce](/subsystems/element-web) (Phase 3b) for the gate (`users.chat_onboarded_at`) and failure modes.
 - No metrics export — `last_synced_at` per row is the only health signal until prom-client wiring lands.
 
 ## Related
 
+- [Element Web SSO bounce](/subsystems/element-web) — consumes `matrix_bots.access_token` for first-bounce DM invites + welcome room
 - [Matrix Chat](/subsystems/matrix-chat) — SSO bridge, Dendrite deploy, frontend
 - [Matrix TG Bridge](/subsystems/matrix-tg-bridge) — mautrix-telegram provisioning wizard (phase 5)
 - [LLM Router](/subsystems/llm-router) — `useModel(TEXT_SMALL/TEXT_LARGE/IMAGE)` providers
