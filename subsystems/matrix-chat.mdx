@@ -24,6 +24,8 @@ Self-hosted Dendrite homeserver на k3s + кастомный React UI пове�
 | `agentflow-agents/src/routes/chat.ts` *(Phase 2)* | `POST /me/chat/token` SSO bridge |
 | `agentflow-landing/src/chat/ChatPage.tsx` *(Phase 3)* | `/chat` route component |
 | `agentflow-landing/src/chat/ChatClientContext.tsx` *(Phase 3)* | matrix-js-sdk wrapper |
+| `agentflow-landing/src/chat/NewChatDialog.tsx` *(Phase 4.C)* | Модал создания комнаты — DM + group, дёргает `ContactPicker` вместо ручного ввода Matrix-id |
+| `agentflow-landing/src/chat/ContactPicker.tsx` *(Phase 4.C)* | Список AgentFlow-контактов из `GET /me/chat/contacts` с client-side filter; fallback на ручной Matrix-id если endpoint 404 |
 
 ## Data flow
 
