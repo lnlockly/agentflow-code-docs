@@ -1,13 +1,13 @@
 ---
 title: "Matrix Bots"
-description: "Five platform service bots running inside Element/Dendrite at chat.agentflow.website."
+description: "Eight platform service bots running inside Element/Dendrite at chat.agentflow.website."
 ---
 
 # Matrix Bots
 
 ## TL;DR
 
-Seven service bots (`@af-helper`, `@af-research`, `@af-image`, `@af-claude`, `@af-tg-poster`, `@af-spec`, `@af-ops`) are registered on the Dendrite homeserver via shared-secret registration and run a per-bot `/sync` long-poll loop inside `agentflow-agents`. Handlers cover a static help menu, URL→TL;DR summarisation, text→image generation, Claude chat, Telegram posting (v1 stub), spec-from-brief writing, and the owner-only ops console with constrained tool-use (see @af-ops below). Triggered on DM or `@mention`; gated by `MATRIX_BOTS_ENABLED=1`.
+Eight service bots (`@af-helper`, `@af-research`, `@af-image`, `@af-claude`, `@af-tg-poster`, `@af-poster`, `@af-spec`, `@af-ops`) are registered on the Dendrite homeserver via shared-secret registration and run a per-bot `/sync` long-poll loop inside `agentflow-agents`. Handlers cover a static help menu, URL→TL;DR summarisation, text→image generation, Claude chat, Telegram posting (v1 stub), multi-network cross-posting (`@af-poster` — TG + VK in v1, IG deferred), spec-from-brief writing, and the owner-only ops console with constrained tool-use (see @af-ops below). Triggered on DM or `@mention`; gated by `MATRIX_BOTS_ENABLED=1`.
 
 ## Files (with line refs)
 
@@ -27,6 +27,12 @@ Seven service bots (`@af-helper`, `@af-research`, `@af-image`, `@af-claude`, `@a
 | `agentflow-agents/src/services/matrix-bots/handlers/claude.ts:1` | `@af-claude` — `recentMessages(10)` context → `useModel(TEXT_LARGE)`, Mode C prefix + 👍 attach |
 | `agentflow-agents/src/services/matrix-bots/mode-c.ts:1` | Mode C — owner taps 👍 on a bot suggestion, backend re-sends as owner via `issueMatrixTokenForAfUser` |
 | `agentflow-agents/src/services/matrix-bots/handlers/tg-poster.ts:1` | `@af-tg-poster` — v1 stub (DM-only, `/help` works, `/connect-tg` / `/channels` / `/post` return "coming soon") |
+| `agentflow-agents/src/services/matrix-bots/handlers/poster.ts:1` | `@af-poster` — DM-only multi-network composer. Parses `to: tg+vk Привет`, caches plain-text composes for 5 min, dispatches via cross-poster engine |
+| `agentflow-agents/src/services/cross-poster/parser.ts:1` | `parseCompose`, `parseNetworksList` — `to:` directive grammar |
+| `agentflow-agents/src/services/cross-poster/tg.ts:1` | TG dispatch — reads `chat_tg_links.account_labels.default_channel` + `primary_login_id`, calls `mcpDirect.callTool('telegram', 'send_message', ...)` |
+| `agentflow-agents/src/services/cross-poster/vk.ts:1` | VK dispatch — `wall.post` via owner's `chat_vk_links.access_token`, per-error human hints (code 5/9/15/214) |
+| `agentflow-agents/src/services/cross-poster/ig.ts:1` | IG dispatch — v1 stub, always returns deferred reason (Business-account requirement) |
+| `agentflow-agents/src/services/cross-poster/dispatcher.ts:1` | Sequential per-network fanout + `formatStatus` Russian renderer |
 | `agentflow-agents/scripts/register-matrix-bots.mjs:1` | One-shot CLI mirroring `ensureAllBots`, runnable inside the pod for manual provisioning |
 | `agentflow-agents/src/server.ts:115` | `import { startMatrixBotsRunner }` |
 | `agentflow-agents/src/server.ts:373` | `void startMatrixBotsRunner()` (under `RUN_WORKERS`) |
@@ -90,6 +96,7 @@ agentflow-agents pod (RUN_WORKERS=true)
 | `@af-image` | yes | yes | open |
 | `@af-claude` | yes | yes | open |
 | `@af-tg-poster` | yes only | ignored | DM-only by design |
+| `@af-poster` | yes only | ignored | DM-only + `@user-<digits>:<serverName>` mxid gate (owner-only) |
 
 ## Failure modes
 
@@ -215,9 +222,42 @@ Every refusal returns `{error: 'refused:<reason>'}` JSON so the model can re-pla
 | Postgres pod resolution fails | tool_call `pg_query` result with `pod not found` | Check `kubectl -n franchise-factory get pod -l app=agentflow-postgres` returns a row |
 | Loop hits iteration cap | `[af-ops] tool_call` repeats 10× then "Не успел свести в ответ" | Owner narrows the request |
 
+## @af-poster — multi-network cross-poster
+
+DM-only composer. Owner types one message, bot fans it out to every linked network. Same auth gate as `@af-ops` (`@user-<digits>:<serverName>` only).
+
+### Compose syntax
+
+| Form | Result |
+|---|---|
+| `to: tg Привет` | TG only |
+| `to: vk Привет` | VK wall only |
+| `to: tg+vk Привет` | both |
+| `to: all Привет` | every linked network (TG + VK + IG) |
+| Plain text (no `to:`) | bot caches the body for 5 min, asks "Куда?" — owner replies with `tg` / `vk` / `tg+vk` / `all` |
+
+### Networks (v1 reality check)
+
+| Network | v1 status | How it dispatches |
+|---|---|---|
+| TG | live | Reads `chat_tg_links.account_labels.default_channel` (owner labels their channel in cabinet) + `primary_login_id` (cast to numeric `account_id`), calls `mcpDirect.callTool('telegram', 'send_message', { owner_user_id, peer, text, account_id })`. No raw TG API client. |
+| VK | live | Reads every linked `chat_vk_links` row for the owner, POSTs `wall.post` per row with the stored `access_token`. Token must have `wall` scope; VK error 15 surfaces a friendly hint. |
+| IG | deferred (v2) | Always returns `IG: Instagram Graph API требует Business аккаунт + Content Publishing API. Отложено до v2.`. v2 plan: mautrix-meta + IG Business Content Publishing. |
+
+### Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Bot ignores non-owner DM | `[af-poster] sender_not_authorized` | Expected — owner-only auth gate |
+| TG: «не настроен канал по умолчанию» | reply contains `default_channel` | Set `account_labels.default_channel` in `chat_tg_links` (cabinet → Telegram → "Канал по умолчанию") |
+| TG: missing account | reply contains `аккаунт не привязан` | Owner links a TG account via mautrix-telegram wizard |
+| VK: `error 15` | reply contains `scope \`wall\`` | Re-issue access_token with `wall` scope, update `chat_vk_links.access_token` |
+| VK: `error 5` | reply contains `протух` | Token expired — re-link VK in cabinet |
+| IG always deferred | reply contains `Отложено до v2` | Expected v1 — wait for v2 IG Business integration |
+
 ## Non-goals (v1)
 
-- `@af-tg-poster` is a stub. Real channel posting via mautrix-telegram comes with the chat Phase 5 wizard hookup.
+- `@af-tg-poster` is a stub. Real channel posting via mautrix-telegram comes with the chat Phase 5 wizard hookup. `@af-poster` is the production path — `@af-tg-poster` kept around for backward compat only.
+- `@af-poster` IG dispatch is a stub; see "Networks (v1 reality check)" row above.
 - No E2EE — bots stay out of encrypted rooms; messages there appear as `m.room.encrypted` and the runner silently skips them.
 - ~~No room-create on bot side. Users invite the bot via Element's Start Chat.~~ As of 2026-05-21 the **Element SSO bounce** reads `matrix_bots.access_token` for each enabled row and calls `POST /createRoom` per bot the first time a user lands in Element. See [Element Web SSO bounce](/subsystems/element-web) (Phase 3b) for the gate (`users.chat_onboarded_at`) and failure modes.
 - No metrics export — `last_synced_at` per row is the only health signal until prom-client wiring lands.
