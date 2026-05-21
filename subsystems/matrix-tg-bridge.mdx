@@ -88,7 +88,7 @@ Dendrite pod mounts the registration Secret via `projected` volume — adding fu
 
 ## Multi-account management (shipped 2026-05-21)
 
-bridgev2 supports several Telegram logins per Matrix user. AgentFlow surfaces this through `/account/integrations/telegram` — a card-based panel where the user adds, removes, and primes accounts without touching `!tg`-prefixed bot commands.
+bridgev2 supports several Telegram logins per Matrix user. AgentFlow surfaces this through `/account/integrations/telegram` — a card-based panel where the user adds, removes, primes, and **labels** accounts without touching `!tg`-prefixed bot commands. Owners with two or more linked accounts see them grouped into per-login Matrix spaces inside Element (`bridge.personal_filtering_spaces: true`), and per-account labels (e.g. "Work", "Личный") render on the cabinet card so two contacts with the same name are distinguishable at a glance.
 
 ### Routes (agentflow-agents)
 
@@ -97,6 +97,7 @@ bridgev2 supports several Telegram logins per Matrix user. AgentFlow surfaces th
 | `GET /me/chat/tg/accounts` | List every linked TG account for the AF user. Proxies bridge `GET /v3/whoami`, surfaces name + phone + avatar + `is_primary`. |
 | `POST /me/chat/tg/set-primary` body `{ login_id }` | Mark `login_id` as AF default. Stored locally — bridgev2 has no `set-default-login` route. |
 | `POST /me/chat/tg/logout` body `{ login_id? }` | When `login_id` set, drops only that account. When missing, wipes everything via `bridgeWhoami` → `POST /v3/logout/{id}` per login. |
+| `POST /me/chat/tg/label` body `{ login_id, label }` | Set or clear a per-account user label. `label` empty / null / whitespace clears. Max 32 chars after trim. Stored in `chat_tg_links.account_labels` JSONB — bridgev2 has no equivalent field, so AF owns it. |
 
 ### Bridge endpoints used
 
@@ -115,10 +116,12 @@ bridgev2 supports several Telegram logins per Matrix user. AgentFlow surfaces th
 | `agentflow-agents/src/services/mautrix-tg-bridge.ts:284` | `bridgeWhoami` HTTP client |
 | `agentflow-agents/src/services/mautrix-tg-bridge.ts:343` | `mapWhoamiToAccounts` — bridge → UI card shape, AF-owned `is_primary` |
 | `agentflow-agents/src/services/mautrix-tg-bridge.ts:317` | `mxcToHttpUrl` — mxc:// → `/_matrix/media/v3/thumbnail` URL |
-| `agentflow-agents/src/db/schema.ts:1362` | `primary_login_id text` column on `chat_tg_links` |
-| `agentflow-agents/src/services/bootstrap-schema.ts:34` | Idempotent `ADD COLUMN IF NOT EXISTS primary_login_id` on startup |
-| `agentflow-landing/src/pages/AccountTelegramIntegration.tsx` | `/account/integrations/telegram` page (card list + wizard) |
-| `agentflow-landing/src/lib/agentsApi.ts` | `fetchTgAccounts`, `setPrimaryTg`, `logoutTg(login_id?)` helpers |
+| `agentflow-agents/src/db/schema.ts:1362` | `primary_login_id text` + `account_labels jsonb` columns on `chat_tg_links` |
+| `agentflow-agents/src/services/bootstrap-schema.ts:33` | Idempotent `ADD COLUMN IF NOT EXISTS primary_login_id` + `account_labels` on startup |
+| `agentflow-agents/src/routes/me-chat-tg.ts:75` | `parseLabelBody`, `applyLabelUpdate`, `MAX_LABEL_LENGTH=32` pure helpers |
+| `agentflow-agents/k8s/mautrix-telegram-config.yaml:95` | `bridge.personal_filtering_spaces: true` — per-login Matrix spaces in Element |
+| `agentflow-landing/src/pages/AccountTelegramIntegration.tsx` | `/account/integrations/telegram` page (card list + wizard + label editor) |
+| `agentflow-landing/src/lib/agentsApi.ts` | `fetchTgAccounts`, `setPrimaryTg`, `logoutTg`, `setTgAccountLabel` helpers |
 
 ### `GET /_matrix/provision/v3/whoami` response sample
 
@@ -160,6 +163,9 @@ bridgev2 supports several Telegram logins per Matrix user. AgentFlow surfaces th
 | `/me/chat/tg/set-primary` → 404 `login_id_unknown` | `[chat-tg] set-primary failed` | UI sent a stale login id — bridge state changed between list + click. Refresh accounts. |
 | Avatar 404 in browser | `404 GET /_matrix/media/v3/thumbnail/...` | Dendrite media repo missing the mxc, or `MATRIX_PUBLIC_URL` env wrong. `mxcToHttpUrl` returns null gracefully when the input is empty. |
 | Bulk logout leaves an orphan account | `[chat-tg] bridge logout one failed` | One of the per-id logouts threw — bridgev2 is idempotent, retry the call manually with curl. |
+| `/me/chat/tg/label` returns 400 `label_too_long` | `[chat-tg] label failed` with `error: label_too_long` | UI bypassed `maxLength=32` — server enforces a hard cap; trim client-side before submit. |
+| `/me/chat/tg/label` returns 404 `login_id_unknown` | `[chat-tg] label failed` with `error: login_id_unknown` | Stale `login_id` (bridge state changed between list + submit). Refetch `/me/chat/tg/accounts`. |
+| Per-login spaces not appearing in Element | bridge log: still loading after `personal_filtering_spaces` flip | Wait one full bridge-sync (≈ 30s) after rollout. Existing rooms join their owner-login space on the next message or `!tg sync`. |
 
 ## Element widget (shipped 2026-05-21)
 
