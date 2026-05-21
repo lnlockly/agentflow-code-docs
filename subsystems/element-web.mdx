@@ -224,6 +224,63 @@ Total round-trips: ~9 to internal Dendrite ≈ 150-250ms. Inside the bounce budg
 
 `runChatOnboarding` never throws. Every Matrix call sits in its own try/catch and logs with the `[chat-onboard]` prefix. A double try in the bounce handler is defence in depth so a logic bug cannot break the user's primary chat session — the seed HTML always returns 200 regardless of Dendrite health.
 
+## Phase 3c: Unauth signup bounce (shipped 2026-05-21)
+
+`/sso/element-sso` used to return JSON `401 unauthenticated` to anyone without an `af_session` cookie. The owner needed a single shareable link to invite people into the lobby — `https://chat.agentflow.website/sso/element-sso` itself, plus a public `/join-chat` page on the landing — so the unauth path now bounces to signup instead of 401.
+
+### Wire diagram
+
+```
+recipient (no af_session)
+  │  click https://chat.agentflow.website/sso/element-sso
+  ▼
+agentflow-agents GET /me/chat/element-sso
+  │  readSessionOrNull(cookie, bearer) → null
+  │  return 200 text/html (no-store) meta-refresh + JS to
+  │  https://agentflow.website/auth/signup?next=<chat-sso-url>
+  ▼
+agentflow-landing /auth/signup
+  │  React Router → /login?mode=register (query preserved by NavigateWithQuery)
+  │  LoginV2 reads ?next, validates via validateNextRedirect()
+  ▼
+user submits email + password → POST /auth/register (af_session cookie set)
+  ▼
+window.location.href = next (whitelisted https://chat.agentflow.website/sso/element-sso)
+  ▼
+chat.agentflow.website/sso/element-sso  (now authenticated)
+  │  runChatOnboarding, ensureLobbyJoin, seed localStorage, location.replace('/')
+  ▼
+Element Web with #lobby:agentflow.website visible
+```
+
+### Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/element-sso.ts:60` | `readSessionOrNull` — cookie-or-bearer parser, no 401 fallthrough |
+| `agentflow-agents/src/routes/element-sso.ts:100` | `buildSignupBounceHtml` — meta-refresh + JS redirect page |
+| `agentflow-agents/src/routes/element-sso.ts:131` | Unauth branch at top of `/me/chat/element-sso` handler |
+| `agentflow-landing/src/pages/JoinChat.tsx:1` | `/join-chat` public invite landing — primary shareable URL |
+| `agentflow-landing/src/lib/nextRedirect.ts:1` | `validateNextRedirect` — open-redirect whitelist (`agentflow.website`, `chat.agentflow.website`) |
+| `agentflow-landing/src/pages/LoginV2.tsx:89` | LoginV2 honours `?next=` post-auth, absolute URL → `window.location.replace` |
+| `agentflow-landing/src/main.tsx` (`NavigateWithQuery`) | `/auth/signup` and `/auth/login` redirect to `/login`, preserving query string |
+| `agentflow-agents/tests/element-sso.test.ts` | Adds bounce-page unit test (status, copy, no-store header) |
+
+### Shareable URLs
+
+| URL | Use |
+|---|---|
+| `https://agentflow.website/join-chat` | Primary share — landing page with explanation + CTA |
+| `https://agentflow.website/join-chat?from=<name>` | Same with attribution heading |
+| `https://chat.agentflow.website/sso/element-sso` | Direct deep-link — unauth users see signup bounce, signed-in users go straight to Element |
+
+### Security
+
+- `next=` whitelist (landing): `agentflow.website`, `www.agentflow.website`, `chat.agentflow.website` only. Anything else collapses to `/my/agents`.
+- `signupUrl` in the bounce HTML is `JSON.stringify`-quoted inside the `<script>` and `&quot;`-escaped inside the meta tag attribute.
+- Bounce page is `Cache-Control: no-store` so a logged-in → logged-out user can't replay a stale seeded response.
+- `from=` attribution param is stripped to `\p{L}\p{N}\-_. ` and capped at 40 chars.
+
 ## Failure modes
 
 | Symptom | Log signature for grep | Where to fix |
