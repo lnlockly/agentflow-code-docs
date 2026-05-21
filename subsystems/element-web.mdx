@@ -159,14 +159,11 @@ print('compound keys:', len(t.get('compound', {})))"
 
 #### Editing the palette
 
-The ConfigMap is NOT applied by the `deploy.yml` GitHub Action — k8s manifests outside of agentflow-agents itself need a manual apply:
+Edit `k8s/element-web-config.yaml`, push to `main`, and let CI handle the rollout. The `Detect changed Matrix manifests` step in `.github/workflows/deploy.yml` runs `git diff HEAD~1 HEAD -- k8s/element-web*.yaml` on every push; when the diff is non-empty, the next step runs `kubectl apply -f <file>` and `kubectl rollout restart deploy/element-web`.
 
-```
-scp k8s/element-web-config.yaml ff-france:/tmp/
-ssh ff-france 'kubectl apply -f /tmp/element-web-config.yaml \
-  && kubectl -n franchise-factory rollout restart deploy/element-web \
-  && kubectl -n franchise-factory rollout status deploy/element-web --timeout=90s'
-```
+For drift recovery (eg the cluster fell behind during an incident), use the workflow dispatch with `apply_matrix_manifests=true` to force a re-apply of every Element/Dendrite/Mautrix manifest regardless of the diff.
+
+Manual `scp + kubectl apply` is a manual-deploy violation (`feedback_agentflow_no_hotfix_only_cicd`). File an incident if CI is broken instead of routing around it.
 
 ## Phase 3: SSO bounce (shipped 2026-05-21)
 
@@ -358,14 +355,16 @@ Element Web with #lobby:agentflow.website visible
 | TG-manager widget missing in Element Settings → Integrations | `[chat-onboard] widgets write failed` | `src/services/matrix-onboarding.ts:registerTgManagerWidget`. The user's access_token may have been invalidated mid-bounce; next bounce overwrites |
 | Side effects re-running on every bounce | `[element-sso] chat_onboarded_at update failed` | `src/routes/element-sso.ts` — DB write block; check Postgres connectivity |
 | `matrix_bots` table empty → no DMs created | `[chat-onboard] onboarding done` with `dms:0` | Restart agentflow-agents — `ensureAllBots` re-seeds on boot (`src/services/matrix-bots/register.ts`) |
+| Element ConfigMap edit didn't land in prod | CI log shows `[matrix-manifests] no changes — skipping.` despite obvious diff | `actions/checkout` `fetch-depth: 2` regression, or commit squashed file. Re-run via `workflow_dispatch` with `apply_matrix_manifests=true`. Source: `.github/workflows/deploy.yml` step `Detect changed Matrix manifests` |
+| Element pod stuck on old image after merge | `kubectl rollout history deploy/element-web` shows no new revision | `kubectl apply` in CI succeeded but no spec change. Bump a label or trigger `workflow_dispatch` with `apply_matrix_manifests=true` to force restart |
 
 ## Operator runbook
 
 **Update Element version:**
 ```
-# Bump image tag in k8s/element-web.yaml, then:
-scp k8s/element-web.yaml ff-france:/tmp/
-ssh ff-france 'kubectl apply -f /tmp/element-web.yaml && kubectl -n franchise-factory rollout status deploy/element-web --timeout=2m'
+# Bump image tag in k8s/element-web.yaml and push to main.
+# .github/workflows/deploy.yml detects the diff, applies the manifest,
+# and waits on the rollout. No ssh required.
 ```
 
 **Edit runtime config without rebuild:**
