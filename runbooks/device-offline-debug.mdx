@@ -1,0 +1,147 @@
+---
+title: "Device offline debug (oncall)"
+description: "User reports their Mac shows offline in /cabinet/devices despite launchd running. Server-side + client-side diagnostic recipe."
+---
+
+# Device offline debug (oncall)
+
+## TL;DR
+
+Устройство в кабинете показывает offline, но юзер уверен что launchd-юнит крутится. Чек-лист по симптомам: (1) WS endpoint не принимает upgrade → проверить логи agentflow-agents на `[device]` маркеры; (2) WS upgrade прошёл, но heartbeat пропал → reconnect logic в ws_client; (3) DB row не обновляется despite активного WS → mcp-bridge / writer pool заглох. Этот runbook — точная последовательность команд для прод и клиента.
+
+## Files
+
+| Repo / path | Role |
+|---|---|
+| `agentflow-agents/src/routes/devices-ws.ts:(line TBD — Agent B PR not yet merged)` | WS endpoint, heartbeat loop, mark-offline. |
+| `agentflow-agents/src/mcp/bridge.ts:(line TBD)` | `ComputerDeviceProvider` registration / unregistration on connect / disconnect. |
+| `agentflow-agents/src/routes/me/devices.ts:(line TBD)` | `GET /me/devices` — reads status based on `last_seen` heuristic. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_client.py:(line TBD — Agent A PR not yet merged)` | Reverse-tunnel client, reconnect loop with exponential backoff. |
+| `agentflow-computer-mcp/launchd/com.agentflow.computer-mcp.plist:(line TBD)` | KeepAlive=true, restart on crash. |
+
+## Diagnostic flow
+
+### Step 1 — Confirm symptom from server
+
+```bash
+ssh ff-france
+kubectl -n franchise-factory logs deploy/agentflow-agents --tail=500 | grep '\[device\]' | tail -30
+```
+
+Look for these markers in order:
+
+| Marker | Means |
+|---|---|
+| `[device] ws upgrade rejected reason=` | TLS / auth header issue — client never even handshaked |
+| `[device] online user=<uid> device=<did>` | Handshake OK |
+| `[device] heartbeat user=<uid> device=<did>` (every 15s) | Steady-state OK |
+| `[device] heartbeat timeout user=<uid> device=<did>` | Missed >30s; mark offline + unregister tools |
+| `[device] disconnect user=<uid> device=<did> reason=` | Clean disconnect (normal on user revoke / kill) |
+
+### Step 2 — Check the DB row directly
+
+Per QA-loop infra:
+
+```bash
+ssh ff-france 'kubectl -n franchise-factory exec agentflow-postgres-97fb67469-69298 -- \
+  psql -U agentflow -d agentflow -c "
+SELECT id, user_id, name, status, last_seen,
+       extract(epoch from (now() - last_seen))::int AS sec_since_seen
+  FROM user_devices
+ WHERE id = '\''<DEVICE_ID>'\'';"'
+```
+
+Interpret:
+
+- `last_seen` < 30s ago, `status='offline'` → bug in marker writer; check `routes/devices-ws.ts:(TBD)` heartbeat update path.
+- `last_seen` > 30s, `status='online'` → mark-offline cron didn't fire; check `services/pingers/` for device-offline pinger or scheduler crash.
+- `last_seen` NULL or hours old, `status='offline'` → client side issue, jump to Step 4.
+
+### Step 3 — Active WS connections (server side)
+
+If Agent B exposes a Prometheus metric `device_ws_connected_total{user_id="..."}` (TBD):
+
+```bash
+ssh ff-france 'kubectl -n franchise-factory exec deploy/agentflow-agents -- \
+  curl -s localhost:4100/metrics | grep device_ws_connected'
+```
+
+Or check open connections via Node debug (if exposed):
+
+```bash
+# (TBD endpoint — Agent B to expose /internal/devices/ws-status returning {device_id, last_msg_ts})
+curl -H "x-agentflow-secret: $INTERNAL_API_SECRET" \
+  https://api.agentflow.website/internal/devices/ws-status
+```
+
+### Step 4 — Client-side checks (ask user to run)
+
+Send the user (or paste into a support chat):
+
+```bash
+# 1) Is launchd alive?
+launchctl list | grep agentflow
+# Expected:  -  0  com.agentflow.computer-mcp
+#  ^-- empty PID column = job stopped; restart it:
+launchctl kickstart -k gui/$(id -u)/com.agentflow.computer-mcp
+
+# 2) Latest log lines
+tail -100 ~/Library/Logs/agentflow-computer-mcp.log
+
+# 3) Can the Mac reach the WSS endpoint at all?
+curl -I https://agentflow.website/_devices/connect
+# Expected: HTTP/2 400 or 426 (needs Upgrade headers) — endpoint reachable.
+# 5xx or timeout → corp proxy / firewall / DNS — see Device registration runbook step "Connection refused".
+
+# 4) Auth file intact?
+ls -la ~/.agentflow/auth.json
+# Expected: -rw-------  (0600)
+# If missing or world-readable → re-install.
+
+# 5) Force reconnect
+launchctl kickstart -k gui/$(id -u)/com.agentflow.computer-mcp
+# Then wait 10s and check cabinet.
+```
+
+### Step 5 — If still offline
+
+Likely a code-side bug. Collect:
+
+- 200 lines of `~/Library/Logs/agentflow-computer-mcp.log` from the user.
+- Output of `kubectl logs deploy/agentflow-agents | grep '\[device\]' | grep <device_id> | tail -200`.
+- DB row from Step 2.
+
+File an issue in [`qa-issues/`](https://github.com/lnlockly/agentflow-agents/tree/main/qa-issues) per the shared QA log convention.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Cabinet shows offline, last_seen recent (less than 30s) | `[device] heartbeat user=` present but `status='offline'` in DB | Writer path inconsistent — `routes/devices-ws.ts:(TBD)` mark-online on every heartbeat, not just connect |
+| Cabinet shows online, last_seen >5min old | mark-offline pinger crashed | `services/pingers/device-offline-pinger.ts:(TBD)` — restart deployment |
+| Client `ConnectionRefusedError` repeating | `wss handshake failed` in client log | Network / proxy issue, see Device registration step "Connection refused" |
+| Client reconnects every 30s | `[device] heartbeat timeout` repeating from same device_id | Client heartbeat sender broken — `ws_client.py:(TBD)` 15s heartbeat loop |
+| Multiple device rows online for same Mac | Old enrollment never revoked | User re-installed without revoking. UI should show "duplicates" warning + force revoke |
+| Device flips online↔offline every minute | `[device] online ... [device] heartbeat timeout` cycle | Network drop pattern (Wi-Fi sleep). Increase `DEVICE_HEARTBEAT_TIMEOUT_MS` env or fix client sleep behavior |
+| `launchctl list` shows PID but no logs | Python crashed before opening log file | `~/Library/Logs/` not writable — check perms, or path mismatch in launchd plist |
+
+(Log substrings to be backfilled after Agent A/B merge.)
+
+## Manual force-reconnect recipe
+
+If a user is offline and unreachable for hands-on debug, server-side you can force their next reconnect to be clean:
+
+```sql
+-- mark offline immediately, force unregister of any lingering provider
+UPDATE user_devices SET status = 'offline', last_seen = now() - interval '5 minutes'
+ WHERE id = '<DEVICE_ID>';
+```
+
+Combined with restart on user side via `launchctl kickstart -k`, this clears any stale state.
+
+## Related
+
+- [Computer MCP](/subsystems/computer-mcp)
+- [Device registration runbook](/runbooks/device-registration)
+- [Desktop-agent attach flow](/flows/desktop-agent-attach)
+- [Debug stuck project](/runbooks/debug-stuck-project) — pattern reference for SQL/log debugging

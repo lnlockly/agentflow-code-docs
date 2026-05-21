@@ -71,6 +71,8 @@ export default defineConfig({
             { label: 'Projects Dashboard', slug: 'subsystems/projects-dashboard' },
             { label: 'Products Hub', slug: 'subsystems/products-hub' },
             { label: 'Onboarding Quests', slug: 'subsystems/onboarding-quests' },
+            { label: 'Computer MCP (desktop)', slug: 'subsystems/computer-mcp' },
+            { label: 'Desktop-agent kind', slug: 'subsystems/desktop-agent-kind' },
           ],
         },
         {
@@ -84,6 +86,7 @@ export default defineConfig({
             { label: 'Templates Marketplace', slug: 'flows/templates-marketplace' },
             { label: 'Diploma Outreach + Build', slug: 'flows/diploma-outreach-and-build' },
             { label: 'Graph Execution', slug: 'flows/graph-execution' },
+            { label: 'Desktop-agent attach', slug: 'flows/desktop-agent-attach' },
           ],
         },
         {
@@ -97,6 +100,8 @@ export default defineConfig({
             { label: 'Chat-stack Smoke (Playwright)', slug: 'runbooks/chat-smoke-e2e' },
             { label: 'Update the RAG', slug: 'runbooks/update-rag-docs' },
             { label: 'Revolution Doctrine', slug: 'runbooks/revolution-doctrine' },
+            { label: 'Device registration (Mac)', slug: 'runbooks/device-registration' },
+            { label: 'Device offline debug', slug: 'runbooks/device-offline-debug' },
           ],
         },
       ],
