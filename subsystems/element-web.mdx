@@ -181,6 +181,49 @@ Element Web /  →  restoreSessionFromStorage  →  /sync  →  room list
 - Redirect target whitelist `/^\/[A-Za-z0-9_\-./?&=#]*$/` collapses anything else to `/` so a future `?next=` param cannot turn this into an open redirect / XSS sink.
 - Cookie remains `HttpOnly Secure SameSite=Lax|None`. The seed page reads localStorage but not the cookie.
 
+## Phase 3b: First-bounce side effects (shipped 2026-05-21)
+
+Right after `issueMatrixTokenForAfUser` succeeds, the handler checks `users.chat_onboarded_at`. When NULL, it runs three idempotent onboarding tasks before returning the seed HTML so a new user lands in Element with a roster already populated.
+
+### Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/matrix-onboarding.ts:1` | `runChatOnboarding` + helpers — entry point + per-effect logic |
+| `agentflow-agents/src/routes/element-sso.ts:161` | Gate + call site inside the bounce handler |
+| `agentflow-agents/migrations/2026-05-21d-chat-onboarded.sql:1` | Adds `users.chat_onboarded_at TIMESTAMPTZ NULL` |
+| `agentflow-agents/src/db/schema.ts` (users table) | `chatOnboardedAt` column |
+| `agentflow-agents/tests/matrix-onboarding.test.ts:1` | 12 unit tests covering DM invite, welcome room, widget, copy rules |
+
+### Effects
+
+| Effect | Identity used | Idempotency | Skip condition |
+|---|---|---|---|
+| 5 bot DMs (af-helper, af-claude, af-research, af-image, af-tg-poster) | Each bot's `matrix_bots.access_token` | Gated by `users.chat_onboarded_at`. Re-running `POST /createRoom` would dup the DM, so the column is the contract. | `chat_onboarded_at IS NOT NULL` OR `matrix_bots` empty |
+| Join `#welcome:agentflow.website` + greeting | af-helper for create / invite / message | Alias resolve handles existing rooms; M_ROOM_IN_USE on race → re-resolve. Invite to existing room is 200 no-op. | af-helper row missing |
+| Register `tg-manager-{af_id}` in user `m.widgets` | The user's own freshly-issued `access_token` | Read-merge-write preserves any other widgets. PUT upserts by key. | (none — cheap to re-run, but gated together with the trio) |
+
+Gate-flip policy: `chat_onboarded_at` flips to `NOW()` when at least one bot DM **or** the welcome room landed. Widget-only is too thin a win — leaving NULL lets the next bounce retry the substantive trio.
+
+Welcome message body (plain Russian, no «бесплатно», no jargon):
+
+> Это AgentFlow Chat. @af-helper подскажет команды, остальные боты в личке.
+
+### Matrix calls added per first bounce
+
+- `POST /_matrix/client/v3/createRoom` (×5 bot DMs, ×1 welcome if not yet created)
+- `GET  /_matrix/client/v3/directory/room/%23welcome:agentflow.website`
+- `POST /_matrix/client/v3/rooms/{id}/invite` (welcome path, existing-room branch)
+- `PUT  /_matrix/client/v3/rooms/{id}/send/m.room.message/{txn}` (welcome greeting)
+- `GET  /_matrix/client/v3/user/{userMxId}/account_data/m.widgets`
+- `PUT  /_matrix/client/v3/user/{userMxId}/account_data/m.widgets`
+
+Total round-trips: ~9 to internal Dendrite ≈ 150-250ms. Inside the bounce budget. Subsequent bounces skip the block on the `chat_onboarded_at IS NOT NULL` check.
+
+### Error handling
+
+`runChatOnboarding` never throws. Every Matrix call sits in its own try/catch and logs with the `[chat-onboard]` prefix. A double try in the bounce handler is defence in depth so a logic bug cannot break the user's primary chat session — the seed HTML always returns 200 regardless of Dendrite health.
+
 ## Failure modes
 
 | Symptom | Log signature for grep | Where to fix |
@@ -200,6 +243,11 @@ Element Web /  →  restoreSessionFromStorage  →  /sync  →  room list
 | Element shows login form after SSO redirect | no backend log — browser-side | localStorage write blocked (private mode / 3rd-party storage partition). Open chat in a top-level window, not iframe |
 | Ingress 404 on `/sso/element-sso` | nginx-ingress 404 | `nginx.ingress.kubernetes.io/use-regex: "true"` missing on `element-web-sso` Ingress |
 | SSO redirects user into wrong account | `restoreSessionFromStorage` succeeds with stale localStorage | Element didn't clear old session — user must Sign Out inside Element once, then re-hit `/sso/element-sso` |
+| Bot DMs missing after first chat open | `[chat-onboard] dm_invite failed` | `src/services/matrix-onboarding.ts:botDmInvite` — check the bot's `matrix_bots.access_token` is still valid (`/whoami` round-trip) |
+| User can't see #welcome | `[chat-onboard] welcome create failed` or `welcome invite failed` | `src/services/matrix-onboarding.ts:ensureWelcomeRoom`. Manual recovery: hit alias resolve, then invite from af-helper |
+| TG-manager widget missing in Element Settings → Integrations | `[chat-onboard] widgets write failed` | `src/services/matrix-onboarding.ts:registerTgManagerWidget`. The user's access_token may have been invalidated mid-bounce; next bounce overwrites |
+| Side effects re-running on every bounce | `[element-sso] chat_onboarded_at update failed` | `src/routes/element-sso.ts` — DB write block; check Postgres connectivity |
+| `matrix_bots` table empty → no DMs created | `[chat-onboard] onboarding done` with `dms:0` | Restart agentflow-agents — `ensureAllBots` re-seeds on boot (`src/services/matrix-bots/register.ts`) |
 
 ## Operator runbook
 
@@ -225,5 +273,7 @@ curl -s  https://chat.agentflow.website/config.json    # expect JSON with our ho
 ## Related
 
 - [Matrix Chat](/subsystems/matrix-chat) — Dendrite homeserver this client targets
+- [Matrix Bots](/subsystems/matrix-bots) — 5 service bots whose `access_token`s the first-bounce side effects use to DM the user
+- [Matrix TG Bridge](/subsystems/matrix-tg-bridge) — what the pinned TG-manager widget controls
 - Upstream: https://github.com/element-hq/element-web (Apache 2.0)
 - Upstream image: https://hub.docker.com/r/vectorim/element-web
