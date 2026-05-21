@@ -5,7 +5,7 @@ description: "Element Web deployed at chat.agentflow.website, pointed at our Den
 
 # Element Web
 
-> **Status: Phase 1 + Phase 2 shipped 2026-05-21.** Apache-2.0 image of `element-hq/element-web` deployed unbranded, then re-themed via `config.json` (custom theme + branding, no fork). Phase 3 (SSO bridge to `agentflow-agents`) still in progress.
+> **Status: Phase 1 + Phase 2 + Phase 3 shipped 2026-05-21.** Apache-2.0 image of `element-hq/element-web` deployed unbranded, then re-themed via `config.json`, then wired to AgentFlow SSO via a `/sso/element-sso` bounce that seeds Element's `localStorage` from the `af_session` cookie. No second login prompt.
 
 ## TL;DR
 
@@ -117,6 +117,70 @@ print('themes:', [t['name'] for t in d['setting_defaults']['custom_themes']])"
 # themes: ['AgentFlow Dark']
 ```
 
+## Phase 3: SSO bounce (shipped 2026-05-21)
+
+Element does not run any auth UI in our deployment. Users who are already logged into AgentFlow click "Open chat" → end up in Element's room list without typing anything.
+
+### Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/element-sso.ts:103` | `GET /me/chat/element-sso` handler |
+| `agentflow-agents/src/routes/element-sso.ts:55` | `buildElementSeedHtml()` — generates the localStorage-seeding HTML |
+| `agentflow-agents/src/routes/chat.ts:30` | `POST /me/chat/token` — shared bridge logic |
+| `agentflow-agents/src/services/matrix-bridge.ts:101` | `issueMatrixTokenForAfUser()` |
+| `agentflow-agents/src/services/env.ts:188` | `sessionCookieDomain` env (`SESSION_COOKIE_DOMAIN`) |
+| `agentflow-agents/src/routes/auth-magic-link.ts:184` | `setSessionCookie()` adds `Domain=.agentflow.website` |
+| `agentflow-agents/src/routes/auth-tg-callback.ts:93` | same, TG path |
+| `agentflow-agents/src/routes/auth-password.ts:171` | same, password path |
+| `agentflow-agents/k8s/element-web.yaml:118` | `element-web-sso` Ingress — rewrites `/sso/*` → agentflow-agents `/me/chat/*` |
+| `agentflow-agents/k8s/agentflow-agents.yaml:136` | `SESSION_COOKIE_DOMAIN=.agentflow.website` env |
+| `agentflow-agents/tests/element-sso.test.ts` | Unit tests for the seed HTML contract |
+
+### Data flow
+
+```
+Browser (signed into AgentFlow)
+   │  click "Open chat" → https://chat.agentflow.website/sso/element-sso
+   ▼
+nginx-ingress (chat.agentflow.website)
+   │  use-regex + rewrite-target: /sso/(.*) → /me/chat/$1
+   │  upstream: agentflow-agents.franchise-factory.svc:4100
+   ▼
+agentflow-agents  GET /me/chat/element-sso
+   │  requireSession reads af_session cookie (Domain=.agentflow.website)
+   │  issueMatrixTokenForAfUser(af_id)
+   │  → { user_id, access_token, device_id, homeserver }
+   │  buildElementSeedHtml(...) → text/html
+   ▼
+Browser executes inline <script>
+   │  localStorage.setItem('mx_user_id',      '@user-N:agentflow.website')
+   │  localStorage.setItem('mx_access_token', 'syt_...')
+   │  localStorage.setItem('mx_hs_url',       'https://matrix.agentflow.website')
+   │  localStorage.setItem('mx_device_id',    '...')
+   │  localStorage.setItem('mx_is_guest',     'false')
+   │  location.replace('/')
+   ▼
+Element Web /  →  restoreSessionFromStorage  →  /sync  →  room list
+```
+
+### Why the endpoint runs on the chat host
+
+`localStorage` is partitioned per origin. Setting the keys from `agents.agentflow.website` would land in the wrong storage partition and Element would boot unauthenticated. The `element-web-sso` Ingress reverse-proxies the call through `chat.agentflow.website` so the seed page returns from the same origin Element runs on.
+
+### Env additions
+
+| Var | Value (prod) | Purpose |
+|---|---|---|
+| `SESSION_COOKIE_DOMAIN` | `.agentflow.website` | `af_session` cookie scope; must include `chat.` subdomain |
+
+### Security
+
+- The bounce HTML carries a real Matrix access_token in the body. `Cache-Control: no-store` + `Referrer-Policy: no-referrer` + CSP `default-src 'none'; script-src 'unsafe-inline'` prevent caches / extensions from harvesting it.
+- The seed JSON is `JSON.stringify`'d with `<` → `<` so a `</script>` substring in any field cannot break out of the bootstrap script block.
+- Redirect target whitelist `/^\/[A-Za-z0-9_\-./?&=#]*$/` collapses anything else to `/` so a future `?next=` param cannot turn this into an open redirect / XSS sink.
+- Cookie remains `HttpOnly Secure SameSite=Lax|None`. The seed page reads localStorage but not the cookie.
+
 ## Failure modes
 
 | Symptom | Log signature for grep | Where to fix |
@@ -130,6 +194,12 @@ print('themes:', [t['name'] for t in d['setting_defaults']['custom_themes']])"
 | Theme reverts to upstream dark | `default_theme: "dark"` in ConfigMap | Restore `default_theme: "custom-AgentFlow Dark"` and verify `setting_defaults.custom_themes[].name == "AgentFlow Dark"` (Element prepends `custom-` automatically) |
 | Auth screen shows Element logo | `branding.auth_header_logo_url` empty or pointing at `logos/element-logo.svg` | Set to `https://agentflow.website/favicon.svg` |
 | "Get Element on iOS" banner appears | `mobile_guide_toast` true or `mobile_builds` missing | Set `mobile_guide_toast: false`, `mobile_builds: {ios:null, android:null, fdroid:null}` |
+| SSO bounce returns 401 unauthenticated | `unauthenticated` from `requireSession` | Cookie `Domain=` missing — verify `SESSION_COOKIE_DOMAIN` env in `k8s/agentflow-agents.yaml` |
+| SSO bounce returns 503 matrix_not_configured | `matrix_not_configured` in response body | One of `MATRIX_*` env vars missing — see `services/env.ts:166` |
+| SSO bounce returns 502 matrix_bridge_unreachable | `[element-sso] token issue failed` | Dendrite pod down or `MATRIX_AUTH_KEY` rotated; check `kubectl logs deploy/dendrite` |
+| Element shows login form after SSO redirect | no backend log — browser-side | localStorage write blocked (private mode / 3rd-party storage partition). Open chat in a top-level window, not iframe |
+| Ingress 404 on `/sso/element-sso` | nginx-ingress 404 | `nginx.ingress.kubernetes.io/use-regex: "true"` missing on `element-web-sso` Ingress |
+| SSO redirects user into wrong account | `restoreSessionFromStorage` succeeds with stale localStorage | Element didn't clear old session — user must Sign Out inside Element once, then re-hit `/sso/element-sso` |
 
 ## Operator runbook
 
