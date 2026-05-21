@@ -79,12 +79,15 @@ Registered via `setting_defaults.custom_themes[]` and pinned with `default_theme
 | `timeline-highlights-color`, `event-highlight-bg-color` | `rgba(166,242,92,0.10)` | Mention / highlight pill |
 | `menu-selected-color`, `reaction-row-button-selected-bg-color` | `rgba(166,242,92,0.16–0.18)` | Selected menu / reaction |
 | `roomlist-separator-color` | `#1f1f23` | Hairline dividers (`--af-border-subtle`) |
+| `room-highlight-color` | `#141417` | Unread / mentioned room row tint (`--af-elev2`) |
 | `header-panel-bg-color` | `#0f0f12` | Right panel surface |
 | `header-panel-text-primary-color` / `-secondary-color` | `#fafafa` / `#9a9a9f` | Right panel text |
 | `event-selected-color` | `#141417` | Selected message background (`--af-elev2`) |
 | `event-highlight-fg-color` | `#a6f25c` | Highlight foreground |
 | `togglesw-on-color`, `progressbar-color` | `#a6f25c` | Toggle on / progress fills |
 | `togglesw-off-color` | `#3a3a40` | Toggle off (`--af-border-chip`) |
+| `scrollbar-thumb-color` | `rgba(166,242,92,0.20)` | Brand-tinted scrollbars (timeline + room list) |
+| `scrollbar-track-color` | `transparent` | Track blends into surface |
 | `username-colors`, `avatar-background-colors` | 8-color palette starting `#a6f25c` then cyan / pink / amber / blue / purple / mint / coral | Per-user accent rotation |
 
 #### `compound` overrides (Element design-system tokens)
@@ -96,10 +99,21 @@ Element 1.12 also reads a `compound` block that maps semantic tokens directly. W
 | `--cpd-color-bg-action-primary-rest/hovered/pressed` | `#a6f25c` / `#b8f578` / `#94e043` | Primary CTA states |
 | `--cpd-color-bg-accent-rest/hovered/pressed` | same trio | Accent surfaces |
 | `--cpd-color-text-action-accent` | `#a6f25c` | Action accent text |
-| `--cpd-color-text-link-external` | `#22d3ee` | External links use cyan secondary (legible vs. lime) |
+| `--cpd-color-text-link-external` / `-link-external-rest` | `#22d3ee` | External links use cyan secondary (legible vs. lime) |
 | `--cpd-color-icon-accent-primary/tertiary` | `#a6f25c` | Accent icons |
+| `--cpd-color-icon-primary/secondary/tertiary` | `#fafafa` / `#9a9a9f` / `#5f5f65` | Icon hierarchy (`--af-text-*`) |
+| `--cpd-color-text-primary/secondary` | `#fafafa` / `#9a9a9f` | Text hierarchy on auth + settings screens |
 | `--cpd-color-text-on-solid-primary` | `#0a0a0c` | Black text on lime fills (WCAG contrast) |
+| `--cpd-color-bg-canvas-default` | `#0a0a0c` | Auth/login page surface, modal backdrops (`--af-bg`) |
+| `--cpd-color-bg-canvas-default-level-1` | `#0f0f12` | Elevated canvas (`--af-elev1`) |
+| `--cpd-color-bg-subtle-primary` | `#0f0f12` | Panels, room-list shell (`--af-elev1`) |
+| `--cpd-color-bg-subtle-secondary` | `#141417` | Other-user bubble background, selected event (`--af-elev2`) |
+| `--cpd-color-bg-info-subtle` | `rgba(34,211,238,0.10)` | Info pills using cyan secondary accent |
+| `--cpd-color-bg-success-subtle` | `rgba(166,242,92,0.10)` | Success pills using brand lime |
+| `--cpd-color-bg-critical-subtle` | `rgba(239,68,68,0.12)` | Destructive pills using `--af-danger` |
 | `--cpd-color-border-interactive-primary` | `#a6f25c` | Focus rings |
+| `--cpd-color-border-interactive-secondary` | `#27272b` | Input borders (`--af-border-medium`) |
+| `--cpd-color-border-disabled` | `#1f1f23` | Disabled element borders (`--af-border-subtle`) |
 
 #### Typography
 
@@ -129,7 +143,7 @@ Editing: bump the `home.html` block under `data:` in `k8s/element-web-config.yam
 
 ### Suppress upstream Element apps
 
-`desktop_builds: null`, `mobile_builds: {ios:null, android:null, fdroid:null}`, `mobile_guide_toast: false` — kills banners that nudge users toward Element-Desktop and the App Store.
+`desktop_builds: null`, `mobile_builds: {ios:null, android:null, fdroid:null}`, `mobile_guide_toast: false` — kills banners that nudge users toward Element-Desktop and the App Store. Verify the ios/android fields stay `null` (not Element-X store URLs); flipping these re-enables the "Get Element on iOS / Google Play" CTA on the auth screen.
 
 ### Feature toggles
 
@@ -154,7 +168,7 @@ print('compound keys:', len(t.get('compound', {})))"
 # default_theme: custom-AgentFlow Dark
 # accent: #a6f25c
 # font: Inter, system-ui, -apple-syst
-# compound keys: 12
+# compound keys: 27
 ```
 
 #### Editing the palette
