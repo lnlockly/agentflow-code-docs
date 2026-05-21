@@ -1,116 +1,172 @@
 ---
-title: "Matrix → Telegram Bridge"
-description: "mautrix-telegram bridgev2 provisioning wizard wired into /chat — phone-number login surfaces TG chats as Matrix rooms."
+title: "Matrix Telegram Bridge"
+description: "mautrix-telegram appservice bridges Telegram chats into our Dendrite homeserver."
 ---
 
-# Matrix → Telegram Bridge
+# Matrix Telegram Bridge
+
+> **Status: shipped 2026-05-21** — bridge pod running, registered with Dendrite, `@telegrambot:agentflow.website` provisioned. Login UI is a follow-up PR.
 
 ## TL;DR
 
-`mautrix-telegram` (bridgev2, `v26.05`) runs as an appservice next to Dendrite. A user in `/chat` opens the Telegram wizard, types phone + code, and the bridge starts puppeting their TG dialogs as Matrix rooms. `agentflow-agents` proxies the bridgev2 provisioning API (`POST /me/chat/tg/start|step|logout`, `GET /me/chat/tg/status`) and mirrors wizard state in `chat_tg_links` so the UI can resume across refreshes.
+`mautrix-telegram` runs as a Matrix appservice in `franchise-factory` and talks to our Dendrite homeserver over the cluster network. Telegram credentials (api_id / api_hash) come from the existing `agentflow-tg-mcp-env` Secret. Each AgentFlow user can later log a Telegram session into the bridge so their Telegram DMs land as Matrix rooms inside the AF chat UI. Phase 4.B = bridge deployed; Phase 4.C = login flow in `/me/chat`.
 
 ## Files (with line refs)
 
 | Path | Role |
 |---|---|
-| `agentflow-agents/src/routes/me-chat-tg.ts:1` | Hono routes: status / start / step / logout |
-| `agentflow-agents/src/services/mautrix-tg-bridge.ts:1` | bridgev2 HTTP client (URL + header builders, error mapper) |
-| `agentflow-agents/src/services/env.ts:172` | `MAUTRIX_TG_INTERNAL_URL`, `MAUTRIX_TG_PROVISIONING_SECRET` env wiring |
-| `agentflow-agents/src/db/schema.ts` | `chatTgLinks` table (drizzle) |
-| `agentflow-agents/src/db/migrations/0070_chat_tg_links.sql:1` | Migration creating `chat_tg_links` |
-| `agentflow-agents/src/server.ts:34` | Route mount under `app.route('/', meChatTgApp)` |
-| `agentflow-agents/tests/me-chat-tg.test.ts:1` | 24 unit tests for URL/state-machine/body-parsing helpers |
-| `agentflow-landing/src/chat/TelegramLink.tsx:1` | `/chat/integrations/telegram` page (intro → wizard → linked) |
-| `agentflow-landing/src/chat/useTelegramLink.ts:1` | Hook driving the wizard, polls `/me/chat/tg/status` |
-| `agentflow-landing/src/main.tsx:128` | Route + lazy import |
-| `k8s/mautrix-telegram-config.yaml` (in `agentflow-agents`) | Bridge ConfigMap with `provisioning.prefix: /_matrix/provision` + `shared_secret` |
+| `agentflow-agents/k8s/mautrix-telegram.yaml:84` | Deployment + Service + PVC, sed-template startup |
+| `agentflow-agents/k8s/mautrix-telegram-config.yaml:10` | ConfigMap with the bridgev2 `config.template.yaml` |
+| `agentflow-agents/k8s/dendrite-config.yaml:66` | `app_service_api.config_files` adds `/etc/dendrite/appservices/telegram.yaml` |
+| `agentflow-agents/k8s/dendrite.yaml:175` | Mounts `mautrix-telegram-registration` Secret under `/etc/dendrite/appservices` via `projected` volume |
 
 ## Data flow
 
 ```
-Browser /chat/integrations/telegram
-   │
-   ├──[1]──> GET /me/chat/tg/status                    (AF session cookie)
-   │           │
-   │           └── SELECT * FROM chat_tg_links WHERE af_user_id = $1
-   │
-   ├──[2]──> POST /me/chat/tg/start  {}
-   │           │
-   │           ├── derive mxid = @user-<af_id>:agentflow.website
-   │           ├── POST mautrix-telegram:29317/_matrix/provision/v3/login/start/phone
-   │           │     headers: Authorization: Bearer <provisioning_secret>
-   │           │     query:   ?user_id=<mxid>
-   │           ├── { login_id, step_id, type:'user_input',
-   │           │     user_input.fields:[phone_number] }
-   │           └── upsert chat_tg_links (af_user_id, login_process_id, status='pending_phone')
-   │
-   ├──[3]──> POST /me/chat/tg/step  { step_id, step_type:'user_input',
-   │                                  step_data:{ '…phone_number':'+34…' } }
-   │           │
-   │           ├── POST bridge /v3/login/step/{login_id}/{step_id}/user_input
-   │           ├── bridge replies { step_id:'…code', user_input.fields:[code] }
-   │           └── upsert chat_tg_links (status='pending_code')
-   │
-   ├──[4]──> POST /me/chat/tg/step  { step_data:{ '…code':'12345' } }
-   │           │
-   │           ├── bridge → either { type:'complete', user_login_id }
-   │           │             or   { step_id:'…password' } (2FA)
-   │           └── upsert chat_tg_links (status='linked', telegram_user_id=user_login_id)
-   │
-   └──[5]──> bridge starts puppeting → TG chats appear as @telegram_<tgid>:agentflow.website
-              Matrix rooms in /sync, which RoomsList renders inline.
+Telegram MTProto cloud
+       │  (gotd session per AF user — once login UI ships)
+       ▼
+mautrix-telegram pod  (29317)
+       │  ▲   ▲
+       │  │   │ POST /_matrix/app/v1/transactions   (Dendrite → bridge)
+       │  │   │ as_token in registration.yaml
+       │  ▼   │
+       │  uses hs_token to call back into:
+       │  POST /_matrix/client/v3/createRoom, /sendEvent, /register
+       │       │
+       ▼       ▼
+dendrite (8008)
+       │
+       ▼
+agentflow-postgres (DBs: `dendrite` + `mautrix_telegram`)
 ```
 
 ## DB / Env / API
 
 ### Postgres
-- New table: `chat_tg_links (af_user_id PK FK→users, mx_user_id, login_process_id, status, telegram_user_id, updated_at)`
-- Index: `idx_chat_tg_links_status` for "show all users mid-login" admin queries.
-- Bridge owns its own DB `mautrix_telegram` (separate from `agentflow`) — managed by the bridge itself, not by drizzle.
+- DB: `mautrix_telegram` (separate from `dendrite` and `agentflow` — own user, no shared rows).
+- User: `mautrix_telegram`, password in Secret `mautrix-telegram-secrets` key `MAUTRIX_TG_DB_PASSWORD`.
+- Bridge migrates its own schema on first start (sections `main` v29, `matrix_state` v10, `telegram` v9 as of 2026-05-21).
 
-### Env (agentflow-agents)
-- `MAUTRIX_TG_INTERNAL_URL` — default `http://mautrix-telegram.franchise-factory.svc.cluster.local:29317`
-- `MAUTRIX_TG_PROVISIONING_SECRET` — matches `provisioning.shared_secret` in the bridge ConfigMap. Sourced from k8s Secret `mautrix-telegram-secrets` key `MAUTRIX_TG_PROVISIONING_SECRET`.
-- Reused: `MATRIX_SERVER_NAME=agentflow.website` (mxid construction).
+### Env / Secrets
+- `mautrix-telegram-secrets` (created by operator, see manifest header):
+  - `MAUTRIX_TG_DB_PASSWORD`
+  - `MAUTRIX_TG_AS_TOKEN` — appservice token, matches `as_token` in `mautrix-telegram-registration` Secret
+  - `MAUTRIX_TG_HS_TOKEN` — homeserver token, matches `hs_token` in registration
+  - `MAUTRIX_TG_PROVISIONING_SECRET` — guards the bridge's `/_matrix/provision/*` HTTP API used for login
+- `agentflow-tg-mcp-env` (existing, reused via `envFrom`):
+  - `TG_API_ID` — Telegram app api_id
+  - `TG_API_HASH` — Telegram app api_hash
+- `mautrix-telegram-registration` Secret: one key `telegram.yaml` containing the appservice manifest Dendrite mounts.
 
-### Routes (agentflow-agents)
-| Method + path | Auth | Purpose |
-|---|---|---|
-| `GET /me/chat/tg/status` | `requireSession` | Current wizard stage + `login_process_id` |
-| `POST /me/chat/tg/start` | `requireSession` | Kick off bridgev2 `login/start/phone` |
-| `POST /me/chat/tg/step` | `requireSession` | Forward `{ step_id, step_type, step_data }` to the bridge |
-| `POST /me/chat/tg/logout` | `requireSession` | `cancel` (mid-wizard) or `logout` (linked) + clear row |
+### Dendrite config delta
+```yaml
+app_service_api:
+  config_files:
+    - /etc/dendrite/appservices/telegram.yaml
+```
+Dendrite pod mounts the registration Secret via `projected` volume — adding future bridges (whatsapp, discord) means appending one more `secret:` source to the same volume.
 
-### bridgev2 endpoints (consumed)
-- `GET  /_matrix/provision/v3/login/flows?user_id=<mxid>`
-- `POST /_matrix/provision/v3/login/start/{flowID}?user_id=<mxid>`
-- `POST /_matrix/provision/v3/login/step/{login_id}/{step_id}/{step_type}?user_id=<mxid>`
-- `POST /_matrix/provision/v3/login/cancel/{login_id}?user_id=<mxid>`
-- `POST /_matrix/provision/v3/logout/{user_login_id}?user_id=<mxid>`
-- `GET  /_matrix/provision/v3/logins?user_id=<mxid>`
-
-Auth on every call: `Authorization: Bearer <provisioning_secret>`. User identity: `?user_id=<mxid>` query param. The bridge enforces `bridge.permissions:` from its config against that mxid — `agentflow.website` is granted `user` which is enough to log in.
+### Routes
+- `http://mautrix-telegram.franchise-factory.svc.cluster.local:29317/_matrix/app/v1/*` — appservice transactions (Dendrite → bridge)
+- `http://mautrix-telegram:29317/_matrix/provision/*` — bridge management (login, logout, list portals)
+- `@telegrambot:agentflow.website` — bridge bot user (DM it `!tg login` to start a Telegram session)
+- User regex: `@telegram_<tgid>:agentflow.website` (exclusive)
+- Alias regex: `#telegram_<tgid>:agentflow.website` (exclusive)
 
 ## Failure modes
 
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
-| `POST /me/chat/tg/start` → 502 `mautrix_tg_unreachable` | `[chat-tg] start failed` + `code=mautrix_tg_unreachable` | Bridge svc DNS — check `kubectl -n franchise-factory get svc mautrix-telegram` resolves; pod may be in CrashLoopBackOff |
-| Wizard returns 503 `mautrix_tg_not_configured` | `[chat-tg] start failed` with code `mautrix_tg_not_configured` | `MAUTRIX_TG_PROVISIONING_SECRET` env empty on `agentflow-agents` — patch Deployment from `mautrix-telegram-secrets` Secret |
-| 403 `M_FORBIDDEN` "User does not have login permissions" | `bridge_error` + bridge body `M_FORBIDDEN` | `bridge.permissions:` in the bridge ConfigMap doesn't include `agentflow.website` — owner can edit to grant `user` |
-| Step returns 409 `no_active_login` | `[chat-tg] step failed` + `no_active_login` | Wizard expired or row missing — frontend should call `start` again |
-| Bridge step replies with `errcode: PHONE_CODE_INVALID` | `bridge_error` + detail `PHONE_CODE_INVALID` | User typed wrong code — render the field again, keep `login_process_id` |
-| Bridge step asks for `…password` after code | `step_id=…password`, status saved as `pending_2fa` | Expected — wizard renders the 2FA field automatically |
-| Homeserver outdated warning at boot | `The homeserver is outdated (supported spec versions are below minimum required by bridge)` `bridge_requires=v1.4 server_supports=v1.2` | Dendrite spec lag — bridgev2 still works for provisioning + Matrix Client-Server traffic, but bump Dendrite when the next release covers v1.4 |
+| Bridge can't reach homeserver, then crashes | `The homeserver is outdated` `bridge_requires=v1.4 server_supports=v1.2` | Dendrite advertises v1.2 only — startup uses `--ignore-unsupported-server`. If a runtime call breaks because Dendrite lacks a v1.4 endpoint, log the call and either backport or wait for Dendrite to roll. |
+| Dendrite rejects appservice transactions | `received transaction with invalid hs_token` in `kubectl logs deploy/dendrite` | `hs_token` in `mautrix-telegram-secrets` ≠ `hs_token` in `mautrix-telegram-registration` Secret. Bootstrap script generates both from one variable — re-run if drifted. |
+| Bridge pod evicted, scheduler refuses to place it | `The node had condition: [DiskPressure]` | `df -h /` on ff-france > 85% → kubelet taints node `unschedulable`. Run `sudo docker system prune -af` + `journalctl --vacuum-size=300M`. |
+| Pod stuck `0/1 Running` with no restarts | `Readiness probe failed: HTTP probe failed with statuscode: 404` | mautrix bridges serve no GET health path. We use `tcpSocket: 29317` instead. Don't replace with `httpGet` — every URL returns 404. |
+| Container exits immediately on config change | `Configuration error error="invalid value for ..."` | bridgev2 fails closed on schema. Read the FTL log line, fix the field, `kubectl rollout restart deploy/mautrix-telegram`. |
+| `CREATE DATABASE` fails during bootstrap | `ERROR: CREATE DATABASE cannot run inside a transaction block` | Run the `CREATE USER` and `CREATE DATABASE` statements as separate `psql -c` calls (psql wraps a multi-statement `-c` in one txn). |
+| Bridge can't log a user in | `M_FORBIDDEN: appservice not registered` from Dendrite | Restart Dendrite after applying the appservice — registration files are loaded only at startup. |
 
-## Non-goals (this PR)
+## Multi-account management (shipped 2026-05-21)
 
-- QR-code login flow (`flow=qr`) — backend is generic enough, frontend only renders the `phone` flow today.
-- Bot-token login (`flow=bot`) — same.
-- Mounting the wizard inside `/chat` settings drawer — current PR ships it as a standalone page (`/chat/integrations/telegram`); the chat redesign sprint owns the entry-point integration.
-- E2EE — Dendrite + bridge run unencrypted in MVP.
+bridgev2 supports several Telegram logins per Matrix user. AgentFlow surfaces this through `/account/integrations/telegram` — a card-based panel where the user adds, removes, and primes accounts without touching `!tg`-prefixed bot commands.
+
+### Routes (agentflow-agents)
+
+| Route | Purpose |
+|---|---|
+| `GET /me/chat/tg/accounts` | List every linked TG account for the AF user. Proxies bridge `GET /v3/whoami`, surfaces name + phone + avatar + `is_primary`. |
+| `POST /me/chat/tg/set-primary` body `{ login_id }` | Mark `login_id` as AF default. Stored locally — bridgev2 has no `set-default-login` route. |
+| `POST /me/chat/tg/logout` body `{ login_id? }` | When `login_id` set, drops only that account. When missing, wipes everything via `bridgeWhoami` → `POST /v3/logout/{id}` per login. |
+
+### Bridge endpoints used
+
+| Bridge route | Auth | Used by |
+|---|---|---|
+| `GET /_matrix/provision/v3/whoami?user_id=…` | `Authorization: Bearer <secret>` | `/me/chat/tg/accounts`, `/me/chat/tg/set-primary` (existence check), `/me/chat/tg/logout` (enumerate before wipe) |
+| `POST /_matrix/provision/v3/logout/{login_id}?user_id=…` | same | targeted + bulk logout |
+| `POST /_matrix/provision/v3/login/start/phone?user_id=…` | same | new account wizard |
+| `POST /_matrix/provision/v3/login/step/{loginProcessID}/{stepID}/{stepType}?user_id=…` | same | new account wizard |
+
+### Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-chat-tg.ts:230` | `/accounts`, `/set-primary`, multi-aware `/logout` |
+| `agentflow-agents/src/services/mautrix-tg-bridge.ts:284` | `bridgeWhoami` HTTP client |
+| `agentflow-agents/src/services/mautrix-tg-bridge.ts:343` | `mapWhoamiToAccounts` — bridge → UI card shape, AF-owned `is_primary` |
+| `agentflow-agents/src/services/mautrix-tg-bridge.ts:317` | `mxcToHttpUrl` — mxc:// → `/_matrix/media/v3/thumbnail` URL |
+| `agentflow-agents/src/db/schema.ts:1362` | `primary_login_id text` column on `chat_tg_links` |
+| `agentflow-agents/src/services/bootstrap-schema.ts:34` | Idempotent `ADD COLUMN IF NOT EXISTS primary_login_id` on startup |
+| `agentflow-landing/src/pages/AccountTelegramIntegration.tsx` | `/account/integrations/telegram` page (card list + wizard) |
+| `agentflow-landing/src/lib/agentsApi.ts` | `fetchTgAccounts`, `setPrimaryTg`, `logoutTg(login_id?)` helpers |
+
+### `GET /_matrix/provision/v3/whoami` response sample
+
+```json
+{
+  "homeserver": "agentflow.website",
+  "bridge_bot": "@telegrambot:agentflow.website",
+  "logins": [
+    {
+      "id": "1361064246",
+      "name": "avsee4",
+      "state_event": "CONNECTED",
+      "state_info": { "is_bot": false, "login_method": "phone" },
+      "profile": {
+        "phone": "+79036340462",
+        "username": "avsee4",
+        "name": "."
+      }
+    },
+    {
+      "id": "8300162083",
+      "name": "AgentFlowTEAM",
+      "state_event": "CONNECTED",
+      "profile": {
+        "phone": "+79275898956",
+        "username": "AgentFlowTEAM",
+        "avatar": "mxc://agentflow.website/1a0d6c7a..."
+      }
+    }
+  ]
+}
+```
+
+### Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `/me/chat/tg/accounts` returns `[]` while bridge has logins | `[chat-tg] accounts list failed` | `mxUserId` mismatch — verify `matrixUserIdForAfUser` formula matches the value bridge stored on first login. |
+| `/me/chat/tg/set-primary` → 404 `login_id_unknown` | `[chat-tg] set-primary failed` | UI sent a stale login id — bridge state changed between list + click. Refresh accounts. |
+| Avatar 404 in browser | `404 GET /_matrix/media/v3/thumbnail/...` | Dendrite media repo missing the mxc, or `MATRIX_PUBLIC_URL` env wrong. `mxcToHttpUrl` returns null gracefully when the input is empty. |
+| Bulk logout leaves an orphan account | `[chat-tg] bridge logout one failed` | One of the per-id logouts threw — bridgev2 is idempotent, retry the call manually with curl. |
+
+## Operator actions remaining
+
+1. **None** for the bridge to be up — it is `1/1 Running` and Dendrite has provisioned `@telegrambot:agentflow.website`.
+2. **Multi-account UI** at `/account/integrations/telegram` is live. The legacy `/chat/integrations/telegram` route still resolves but the chat shell redirects to Element Web, so the cabinet page is the canonical entry point.
 
 ## Related
 
-- [Matrix Chat](/subsystems/matrix-chat) — Dendrite + custom UI; this page builds on its SSO model.
-- [Auth and access](/subsystems/auth-and-access) — `requireSession` middleware reused for `/me/chat/tg/*`.
+- [Matrix Chat](/subsystems/matrix-chat) — Dendrite homeserver + SSO bridge
+- [Auth and access](/subsystems/auth-and-access) — AF user identity that maps to Matrix users
