@@ -1,0 +1,97 @@
+---
+title: "Matrix Telegram Bridge"
+description: "mautrix-telegram appservice bridges Telegram chats into our Dendrite homeserver."
+---
+
+# Matrix Telegram Bridge
+
+> **Status: shipped 2026-05-21** — bridge pod running, registered with Dendrite, `@telegrambot:agentflow.website` provisioned. Login UI is a follow-up PR.
+
+## TL;DR
+
+`mautrix-telegram` runs as a Matrix appservice in `franchise-factory` and talks to our Dendrite homeserver over the cluster network. Telegram credentials (api_id / api_hash) come from the existing `agentflow-tg-mcp-env` Secret. Each AgentFlow user can later log a Telegram session into the bridge so their Telegram DMs land as Matrix rooms inside the AF chat UI. Phase 4.B = bridge deployed; Phase 4.C = login flow in `/me/chat`.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/k8s/mautrix-telegram.yaml:84` | Deployment + Service + PVC, sed-template startup |
+| `agentflow-agents/k8s/mautrix-telegram-config.yaml:10` | ConfigMap with the bridgev2 `config.template.yaml` |
+| `agentflow-agents/k8s/dendrite-config.yaml:66` | `app_service_api.config_files` adds `/etc/dendrite/appservices/telegram.yaml` |
+| `agentflow-agents/k8s/dendrite.yaml:175` | Mounts `mautrix-telegram-registration` Secret under `/etc/dendrite/appservices` via `projected` volume |
+
+## Data flow
+
+```
+Telegram MTProto cloud
+       │  (gotd session per AF user — once login UI ships)
+       ▼
+mautrix-telegram pod  (29317)
+       │  ▲   ▲
+       │  │   │ POST /_matrix/app/v1/transactions   (Dendrite → bridge)
+       │  │   │ as_token in registration.yaml
+       │  ▼   │
+       │  uses hs_token to call back into:
+       │  POST /_matrix/client/v3/createRoom, /sendEvent, /register
+       │       │
+       ▼       ▼
+dendrite (8008)
+       │
+       ▼
+agentflow-postgres (DBs: `dendrite` + `mautrix_telegram`)
+```
+
+## DB / Env / API
+
+### Postgres
+- DB: `mautrix_telegram` (separate from `dendrite` and `agentflow` — own user, no shared rows).
+- User: `mautrix_telegram`, password in Secret `mautrix-telegram-secrets` key `MAUTRIX_TG_DB_PASSWORD`.
+- Bridge migrates its own schema on first start (sections `main` v29, `matrix_state` v10, `telegram` v9 as of 2026-05-21).
+
+### Env / Secrets
+- `mautrix-telegram-secrets` (created by operator, see manifest header):
+  - `MAUTRIX_TG_DB_PASSWORD`
+  - `MAUTRIX_TG_AS_TOKEN` — appservice token, matches `as_token` in `mautrix-telegram-registration` Secret
+  - `MAUTRIX_TG_HS_TOKEN` — homeserver token, matches `hs_token` in registration
+  - `MAUTRIX_TG_PROVISIONING_SECRET` — guards the bridge's `/_matrix/provision/*` HTTP API used for login
+- `agentflow-tg-mcp-env` (existing, reused via `envFrom`):
+  - `TG_API_ID` — Telegram app api_id
+  - `TG_API_HASH` — Telegram app api_hash
+- `mautrix-telegram-registration` Secret: one key `telegram.yaml` containing the appservice manifest Dendrite mounts.
+
+### Dendrite config delta
+```yaml
+app_service_api:
+  config_files:
+    - /etc/dendrite/appservices/telegram.yaml
+```
+Dendrite pod mounts the registration Secret via `projected` volume — adding future bridges (whatsapp, discord) means appending one more `secret:` source to the same volume.
+
+### Routes
+- `http://mautrix-telegram.franchise-factory.svc.cluster.local:29317/_matrix/app/v1/*` — appservice transactions (Dendrite → bridge)
+- `http://mautrix-telegram:29317/_matrix/provision/*` — bridge management (login, logout, list portals)
+- `@telegrambot:agentflow.website` — bridge bot user (DM it `!tg login` to start a Telegram session)
+- User regex: `@telegram_<tgid>:agentflow.website` (exclusive)
+- Alias regex: `#telegram_<tgid>:agentflow.website` (exclusive)
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Bridge can't reach homeserver, then crashes | `The homeserver is outdated` `bridge_requires=v1.4 server_supports=v1.2` | Dendrite advertises v1.2 only — startup uses `--ignore-unsupported-server`. If a runtime call breaks because Dendrite lacks a v1.4 endpoint, log the call and either backport or wait for Dendrite to roll. |
+| Dendrite rejects appservice transactions | `received transaction with invalid hs_token` in `kubectl logs deploy/dendrite` | `hs_token` in `mautrix-telegram-secrets` ≠ `hs_token` in `mautrix-telegram-registration` Secret. Bootstrap script generates both from one variable — re-run if drifted. |
+| Bridge pod evicted, scheduler refuses to place it | `The node had condition: [DiskPressure]` | `df -h /` on ff-france > 85% → kubelet taints node `unschedulable`. Run `sudo docker system prune -af` + `journalctl --vacuum-size=300M`. |
+| Pod stuck `0/1 Running` with no restarts | `Readiness probe failed: HTTP probe failed with statuscode: 404` | mautrix bridges serve no GET health path. We use `tcpSocket: 29317` instead. Don't replace with `httpGet` — every URL returns 404. |
+| Container exits immediately on config change | `Configuration error error="invalid value for ..."` | bridgev2 fails closed on schema. Read the FTL log line, fix the field, `kubectl rollout restart deploy/mautrix-telegram`. |
+| `CREATE DATABASE` fails during bootstrap | `ERROR: CREATE DATABASE cannot run inside a transaction block` | Run the `CREATE USER` and `CREATE DATABASE` statements as separate `psql -c` calls (psql wraps a multi-statement `-c` in one txn). |
+| Bridge can't log a user in | `M_FORBIDDEN: appservice not registered` from Dendrite | Restart Dendrite after applying the appservice — registration files are loaded only at startup. |
+
+## Operator actions remaining
+
+1. **None** for the bridge to be up — it is `1/1 Running` and Dendrite has provisioned `@telegrambot:agentflow.website`.
+2. **For users to log in (Phase 4.C work):** ship the `/me/chat/telegram/login` flow in `agentflow-agents` that proxies to the bridge's `POST /_matrix/provision/v3/login` with each AF user's Matrix access_token.
+
+## Related
+
+- [Matrix Chat](/subsystems/matrix-chat) — Dendrite homeserver + SSO bridge
+- [Auth and access](/subsystems/auth-and-access) — AF user identity that maps to Matrix users
