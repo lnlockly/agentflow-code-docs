@@ -226,6 +226,48 @@ block third-party origins, so the boot path has no CDN dependency.
 | Widget renders but `accounts` 401 | `requireSession` 401 line in agentflow-agents | af_session cookie not set on `.agentflow.website` — check `services/env.ts sessionCookieDomain` |
 | `/widget/tg-accounts` 404 from chat.agentflow.website | nginx ingress `default backend 404` | `element-web-widget` Ingress not applied — `kubectl apply -f k8s/element-web.yaml` |
 
+## Channel notification suppression
+
+TG channels (read-only broadcast feeds) bridged via mautrix-telegram show up as joined rooms in Element. Without intervention every channel message marks the room as unread, so Element's roomlist stays bold forever — owner pain after subscribing to even a handful of TG channels.
+
+The SSO bounce now sweeps `joined_rooms` once per user, identifies channel portals via the bridge state event, and PUTs a `dont_notify` push rule on each. Sweep is idempotent (PUT replaces existing rule) and gated by `users.chat_channels_muted_at` so we don't re-walk the roomlist on every page load.
+
+### Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/matrix-channel-mute.ts` | The sweep: joined_rooms → bridge state → pushrules PUT |
+| `agentflow-agents/src/routes/element-sso.ts` | Calls `muteTgChannelRooms` after the lobby-join block, gated by `chatChannelsMutedAt` |
+| `agentflow-agents/migrations/2026-05-21f-chat-channels-muted.sql` | Adds nullable `users.chat_channels_muted_at` |
+| `agentflow-agents/tests/matrix-channel-mute.test.ts` | 4 unit tests with stubbed fetchImpl |
+
+### Data flow
+
+```
+SSO bounce
+  ↓ GET /_matrix/client/v3/joined_rooms
+  for each room:
+    ↓ GET /_matrix/client/v3/rooms/<id>/state/fi.mau.bridge/   (fallback m.bridge on 404)
+    if protocol.id == 'telegram' AND channel.type == 'channel':
+      ↓ PUT /_matrix/client/v3/pushrules/global/room/<id>  body {"actions":["dont_notify"]}
+      counter scanned++ ; muted++ on 2xx
+  ↓ UPDATE users SET chat_channels_muted_at = now() WHERE scanned > 0
+```
+
+### DB / Env / API
+
+- Table column: `users.chat_channels_muted_at TIMESTAMPTZ NULL`
+- Routes called against Dendrite (internal): `GET /joined_rooms`, `GET /rooms/<id>/state/<type>/`, `PUT /pushrules/global/room/<id>`
+- Gate column behaves like `chat_lobby_joined_at` — NULL means "sweep not yet run"
+
+### Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Channel rooms still mark roomlist unread after bounce | `[chat-channel-mute] joined_rooms failed` | Dendrite reachable from agentflow-agents pod? Check `matrixHomeserverInternal` env |
+| Sweep flips column but no rooms muted | `[chat-channel-mute] scanned=0 muted=0` repeated | Bridge state event missing (old mautrix-telegram). Check fi.mau.bridge AND m.bridge return 404 on the channel room |
+| PUT pushrules consistently 500 | `[chat-channel-mute] pushrule PUT failed` | Dendrite push-rules table issue; the gate flips anyway so won't retry — manually NULL out `chat_channels_muted_at` for the user to re-trigger |
+
 ## Operator actions remaining
 
 1. **None** for the bridge to be up — it is `1/1 Running` and Dendrite has provisioned `@telegrambot:agentflow.website`.
