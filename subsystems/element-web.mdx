@@ -1,0 +1,98 @@
+---
+title: "Element Web"
+description: "Vanilla Element Web (fork target) deployed at chat.agentflow.website, pointed at our Dendrite homeserver."
+---
+
+# Element Web
+
+> **Status: shipped 2026-05-21 (Phase 1 vanilla)** — owner approved Apache-2.0 fork of `element-hq/element-web` as the AgentFlow chat client. Phase 1 ships the upstream image unbranded. Branding + SSO bridge follow in Phase 2/3.
+
+## TL;DR
+
+`vectorim/element-web:v1.12.18` deployed as a single-replica nginx-served SPA in `franchise-factory` namespace, behind ingress `chat.agentflow.website` with cert-manager LE-prod TLS. `config.json` is shipped via ConfigMap and pins `default_server_config.m.homeserver` to our Dendrite (`matrix.agentflow.website`, server name `agentflow.website`). `disable_custom_urls=true` and `disable_guests=true` keep users on our homeserver. Existing custom React `/chat` UI is untouched — switch-over happens in a later phase.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/k8s/element-web.yaml:1` | Deployment, Service, Ingress for `chat.agentflow.website` |
+| `agentflow-agents/k8s/element-web-config.yaml:1` | ConfigMap `element-web-config` — Element `config.json` |
+| `agentflow-agents/k8s/dendrite.yaml:1` | Upstream Matrix homeserver this client targets |
+
+## Data flow
+
+```
+Browser → https://chat.agentflow.website
+  │  GET /            → nginx serves SPA shell (index.html)
+  │  GET /config.json → ConfigMap-mounted Element config (homeserver pinned)
+  │
+  └── Element JS boots, reads config.json, opens session against
+      https://matrix.agentflow.website (Dendrite, federation OFF)
+         │
+         └── Phase 2: SSO via bridge endpoint /me/chat/token on agentflow-agents
+             (deterministic-password shared-secret register/login).
+             Currently users log in manually with username/password.
+```
+
+## DB / Env / API
+
+- **Tables:** none (client-only, all state in Dendrite + browser IndexedDB).
+- **Env (deployment):**
+  - `ELEMENT_WEB_PORT=80` — **required override**. Without it k8s service-link auto-injection sets `ELEMENT_WEB_PORT=tcp://<svc-ip>:80` (because the Service name matches the deployment) and the upstream nginx template crashes with `invalid host in "tcp://..." of the "listen" directive`. We also set `enableServiceLinks: false` on the pod spec to belt-and-suspender this.
+- **Routes:**
+  - `GET https://chat.agentflow.website/` — Element SPA shell (200, `<title>Element</title>`).
+  - `GET https://chat.agentflow.website/config.json` — runtime config (homeserver pin, branding hooks).
+- **MCP tools:** none.
+- **Upstream image:** `vectorim/element-web:v1.12.18` (Apache 2.0). Base layer `nginxinc/nginx-unprivileged:alpine-slim`, runs as uid 101.
+
+## Config knobs (in `element-web-config.yaml`)
+
+| Key | Value | Why |
+|---|---|---|
+| `default_server_config.m.homeserver.base_url` | `https://matrix.agentflow.website` | Pin clients to our Dendrite |
+| `default_server_config.m.homeserver.server_name` | `agentflow.website` | Matrix server name (must match `/.well-known/matrix/server`) |
+| `disable_custom_urls` | `true` | Users cannot point Element at someone else's homeserver |
+| `disable_guests` | `true` | No guest sessions; everyone authenticates |
+| `default_theme` | `dark` | Brand default |
+| `default_country_code` | `RU` | Phone-number UX (login screen) |
+| `room_directory.servers` | `["agentflow.website"]` | Directory only lists rooms on our HS |
+| `permalink_prefix` | `https://chat.agentflow.website` | matrix.to-style links land back on our deploy |
+| `brand` | `AgentFlow` | Tab title / fallback copy |
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Pod CrashLoopBackOff on first start | `invalid host in "tcp://` in nginx logs | `k8s/element-web.yaml` — keep `enableServiceLinks: false` + `ELEMENT_WEB_PORT=80` |
+| Pod stuck `CreateContainerConfigError` | `container has runAsNonRoot and image has non-numeric user (nginx)` | `k8s/element-web.yaml` — keep `runAsUser: 101, runAsGroup: 101` in `securityContext` |
+| Cert never issues | `Issuing` status on `certificate/element-web-tls`, ACME HTTP-01 challenge ingress present long-term | Verify `chat.agentflow.website` A-record points at 144.217.65.94 and nginx-ingress is reachable on :80 |
+| Element loads but homeserver dropdown asks for URL | `default_server_config` missing | Edit ConfigMap `element-web-config`, `kubectl rollout restart deploy/element-web` |
+| Login screen lets users type any homeserver | `disable_custom_urls` flipped to false | Same ConfigMap |
+| Login fails with `M_FORBIDDEN` | n/a (Dendrite-side) | Check `dendrite` pod logs, registration shared-secret + appservice config |
+
+## Operator runbook
+
+**Update Element version:**
+```
+# Bump image tag in k8s/element-web.yaml, then:
+scp k8s/element-web.yaml ff-france:/tmp/
+ssh ff-france 'kubectl apply -f /tmp/element-web.yaml && kubectl -n franchise-factory rollout status deploy/element-web --timeout=2m'
+```
+
+**Edit runtime config without rebuild:**
+```
+kubectl -n franchise-factory edit configmap element-web-config
+kubectl -n franchise-factory rollout restart deploy/element-web
+```
+
+**Smoke check from any shell:**
+```
+curl -sI https://chat.agentflow.website                # expect 200, text/html
+curl -s  https://chat.agentflow.website/config.json    # expect JSON with our homeserver
+```
+
+## Related
+
+- [Matrix Chat](/subsystems/matrix-chat) — Dendrite homeserver this client targets
+- Upstream: https://github.com/element-hq/element-web (Apache 2.0)
+- Upstream image: https://hub.docker.com/r/vectorim/element-web
