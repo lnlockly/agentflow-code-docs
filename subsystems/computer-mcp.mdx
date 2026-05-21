@@ -1,0 +1,101 @@
+---
+title: "Desktop / Computer-Agent bridge"
+description: "Server side of the agentflow-desktop daemon: WS tunnel, task dispatch, MJPEG proxy."
+---
+
+# Desktop / Computer-Agent bridge
+
+## TL;DR
+Server bridge for `agentflow-desktop` (the on-Mac daemon). Maintains a long-lived WS tunnel
+per device, dispatches high-level tasks (`task_dispatch`), persists `task_action / task_complete /
+task_error` to `device_action_log`, and proxies the daemon's local MJPEG capture to cabinet as
+`multipart/x-mixed-replace`.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/devices-ws.ts:212` | `attachDevicesWs` mounts WS on `/_devices/connect` |
+| `agentflow-agents/src/services/devices-ws.ts:411` | `handleClientTaskFrame` fans out task/stream frames |
+| `agentflow-agents/src/services/devices-ws.ts:514` | `persistTaskRow` writes `device_action_log` |
+| `agentflow-agents/src/services/device-tasks.ts:72`  | `taskEvents` EventEmitter for SSE/MJPEG fan-out |
+| `agentflow-agents/src/services/device-tasks.ts:87`  | `acquireStream / releaseStream` ref-counter |
+| `agentflow-agents/src/services/device-registry.ts`  | connection pool + `computer.*` tool dispatch |
+| `agentflow-agents/src/routes/me-devices.ts:424`     | `POST /me/devices/:id/dispatch_task` |
+| `agentflow-agents/src/routes/me-devices.ts:489`     | `GET /me/devices/:id/tasks/stream` (device-wide SSE) |
+| `agentflow-agents/src/routes/me-devices.ts:549`     | `GET /me/devices/:id/tasks/:task_id/stream` (per-task SSE) |
+| `agentflow-agents/src/routes/me-devices.ts:613`     | `GET /me/devices/:id/live_stream` (MJPEG proxy) |
+| `agentflow-agents/src/services/kind-registry.ts:18` | `desktop_agent` added to `PROJECT_KINDS` |
+| `agentflow-agents/src/services/kind-registry.ts:24` | `desktop_agent` added to `USER_FACING_PROJECT_KINDS` |
+| `agentflow-agents/migrations/2026-05-22a-device-tasks.sql` | `task_id` + `kind` columns on `device_action_log` |
+| `agentflow-agents/packages/shared-types/devices.ts:132` | `WsMessage` task/stream variants |
+
+## Data flow
+
+```
+Cabinet                 agentflow-agents (pod)                  agentflow-desktop (Mac)
+   │                            │                                       │
+   │ POST /dispatch_task        │                                       │
+   ├───────────────────────────►│                                       │
+   │   {task, scope?}           │ insert device_sessions row            │
+   │                            │ recordTaskSession(taskId, sessId)     │
+   │                            │ ws.send({task_dispatch, id, task})    │
+   │                            ├──────────────────────────────────────►│
+   │ 202 {task_id}              │                                       │
+   │◄───────────────────────────│                                       │
+   │                            │                                       │ run AI loop
+   │                            │ ws.recv({task_action, task_id, ...})  │
+   │                            │◄──────────────────────────────────────│
+   │                            │ taskEvents.emit('task_action:dev')    │
+   │                            │ persistTaskRow → device_action_log    │
+   │                            │                                       │
+   │ GET /tasks/:tid/stream     │                                       │
+   ├───────────────────────────►│                                       │
+   │  SSE event=action          │                                       │
+   │◄───────────────────────────│                                       │
+   │                            │                                       │ ... → task_complete
+   │                            │◄──────────────────────────────────────│
+   │  SSE event=complete (close)│                                       │
+   │◄───────────────────────────│                                       │
+   │                            │                                       │
+   │ GET /live_stream           │                                       │
+   ├───────────────────────────►│ acquireStream(dev)                    │
+   │                            │  └─► ws.send({subscribe_stream})      │
+   │                            ├──────────────────────────────────────►│
+   │                            │                                       │ capture 15 fps
+   │                            │ ws.recv({stream_frame, frame_b64})    │
+   │                            │◄──────────────────────────────────────│
+   │ multipart/x-mixed-replace  │                                       │
+   │◄───────────────────────────│                                       │
+   │ (client disconnect)        │ releaseStream(dev) → 0                │
+   │                            │  └─► ws.send({unsubscribe_stream})    │
+   │                            ├──────────────────────────────────────►│
+```
+
+## DB / Env / API
+- Tables:
+  - `user_devices` — owner, scope, status, secret hash, enrollment token
+  - `device_sessions` — one per dispatched task; agent_id `'desktop-task'`
+  - `device_action_log` — `task_id` + `kind` (`tool_call|task_action|task_complete|task_error`)
+- Env: `API_KEY_HMAC_SECRET` (or `AUTH_JWT_SECRET` fallback for `:apikeys` salt)
+- Routes:
+  - `POST /me/devices/:id/dispatch_task` → 202 `{task_id, session_id}` / 409 `device_offline`
+  - `GET  /me/devices/:id/tasks/stream` → SSE (device-wide)
+  - `GET  /me/devices/:id/tasks/:task_id/stream` → SSE (per-task, closes on complete/error)
+  - `GET  /me/devices/:id/live_stream` → `multipart/x-mixed-replace; boundary=frame`
+- WS protocol additions (`WsMessage` in `packages/shared-types/devices.ts`):
+  - S→C: `task_dispatch`, `subscribe_stream`, `unsubscribe_stream`
+  - C→S: `task_action`, `task_complete`, `task_error`, `stream_frame`
+- Project kind: `desktop_agent` is user-facing and bypasses the spa-collapse path.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `dispatch_task` returns 409 | none — synchronous response | check `/me/devices/:id` status, daemon offline |
+| Task progress missing from cabinet SSE | `[devices-ws] persist_task_row_failed` | DB connection / migration not applied |
+| Synthetic session row appears | none — silent fallback | daemon resumed task across pod restart (expected) |
+| MJPEG returns headers but no frames | `[device] online ... tools=0` | daemon hasn't subscribed yet OR daemon never pushes `stream_frame` |
+| `subscribe_stream` never sent | `streamSubscriberCount` flips 0→1 silently if connection missing | device offline; daemon must come online + cabinet re-opens stream |
+
+## Related
+- [Workspace provisioning](/subsystems/workspace-provisioning) — vcluster per user pattern
+- [Auth and access](/subsystems/auth-and-access) — api-key middleware + HMAC scheme reused here
