@@ -7,7 +7,7 @@ description: "Five platform service bots running inside Element/Dendrite at chat
 
 ## TL;DR
 
-Five service bots (`@af-helper`, `@af-research`, `@af-image`, `@af-claude`, `@af-tg-poster`) are registered on the Dendrite homeserver via shared-secret registration and run a per-bot `/sync` long-poll loop inside `agentflow-agents`. Each bot has its own message handler: a static help menu, a URL→TL;DR summariser, a text→image generator, a Claude chat, and a Telegram-poster (v1 stub). Triggered on DM or `@mention`; gated by `MATRIX_BOTS_ENABLED=1`.
+Seven service bots (`@af-helper`, `@af-research`, `@af-image`, `@af-claude`, `@af-tg-poster`, `@af-spec`, `@af-ops`) are registered on the Dendrite homeserver via shared-secret registration and run a per-bot `/sync` long-poll loop inside `agentflow-agents`. Handlers cover a static help menu, URL→TL;DR summarisation, text→image generation, Claude chat, Telegram posting (v1 stub), spec-from-brief writing, and the owner-only ops console with constrained tool-use (see @af-ops below). Triggered on DM or `@mention`; gated by `MATRIX_BOTS_ENABLED=1`.
 
 ## Files (with line refs)
 
@@ -159,6 +159,61 @@ Env: `ELEVENLABS_API_KEY` (already injected via `agentflow-agents-env` Secret; a
 | Voice transcribed once but missed next turn | (no log — cache hit on success path) | n/a |
 | Transcript fails with HTTP error | `[claude-stt] transcription_failed` with `http_<status>` | Check ElevenLabs balance / API status |
 | MXC download fails | `[claude-stt] transcription_failed` with `download_<status>` | Bot token expired or media server unreachable; transient |
+
+## @af-ops — owner remote-control bot
+
+Seventh bot, distinct from the chat siblings: a Claude-with-tools console that lets the owner DM the AgentFlow cluster from Element on a phone. Auth-gated to `@user-<digits>:<serverName>` mxids only — anyone else gets `[af-ops] sender_not_authorized` logged and dropped.
+
+### Tool-use loop
+
+`src/services/matrix-bots/handlers/ops.ts` runs a max-10-iteration loop around `useModel(ModelType.TEXT_LARGE, { tools: OPS_TOOLS, … })`. After each model turn:
+
+1. If the response has `tool_use` blocks, dispatch each through `ops-tools.ts` and append a `role: 'user'` `tool_result` block back into messages.
+2. If the response is text-only → ship that to the room, end.
+3. If the loop hits iteration 10 → one no-tools wrap-up call so the model has to answer with what it has.
+
+The handler never throws to the runner — any exception lands as a one-line failure reply in the room instead.
+
+### Tools + guards
+
+| Tool | What it does | Guard |
+|---|---|---|
+| `bash` | Runs a one-liner inside the agentflow-workers pod | Prefix allow-list (kubectl get/describe/logs/top, gh pr/run/repo/api, git read-only, curl GET, echo/uname/date/df/free/ps) + deny pattern set (rm, kubectl delete/exec/set/apply, sudo, redirect, curl -X POST, git push) + subshell `$()` / backtick refuse |
+| `ssh_ff_france` | Same allow-list, executed on the cluster node via `ssh ff-france '<cmd>'` | Same guard as `bash` |
+| `pg_query` | Resolves `agentflow-postgres` pod via label selector, then `psql -U agentflow -d agentflow -At -c '<sql>'` | `guardSqlReadOnly`: must start with SELECT/WITH/EXPLAIN/SHOW; refuses INSERT/UPDATE/DELETE/DROP/TRUNCATE/ALTER/CREATE/etc + multi-statement scripts |
+| `gh_pr_merge` | `gh pr merge <N> -R <repo> --squash --admin` | Repo must match `^lnlockly/agentflow-[a-z0-9-]+$` |
+| `matrix_read_room` | Reads recent events via `recentMessages` so the bot can answer "что в #lobby обсуждают" | room_id must start with `!`, limit ≤ 100 |
+
+Every refusal returns `{error: 'refused:<reason>'}` JSON so the model can re-plan rather than crash. Output bytes capped at 60 KB per tool call; timeouts default 60 s, max 180 s.
+
+### Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/matrix-bots/ops-tools.ts:1` | Five tool implementations + `guardShellCommand` / `guardSqlReadOnly` / `guardPrMergeRepo` |
+| `agentflow-agents/src/services/matrix-bots/handlers/ops.ts:1` | Tool-use loop, auth gate via `parseOwnerMxid` |
+| `agentflow-agents/src/services/matrix-bots/lib.ts:18` | `'af-ops'` in `BOT_SLUGS` |
+| `agentflow-agents/src/services/matrix-bots/register.ts:48` | `DISPLAY_NAMES['af-ops'] = 'AF Ops'` |
+| `agentflow-agents/src/services/matrix-bots/runner.ts:66` | `HANDLERS['af-ops'] = handleOpsMessage` |
+| `agentflow-agents/src/services/matrix-onboarding.ts:184` | `BOT_DM_NAMES` / `BOT_DM_INTROS` entries |
+| `agentflow-agents/tests/ops-tools.test.ts:1` | 42 guard tests (allow + refuse) |
+
+### Bootstrap (operator)
+
+1. **SSH key** — the workers pod needs `~/.ssh/id_ed25519_ff_france` + matching public key in `ff-france:~/.ssh/authorized_keys`. Mount via a `Secret` named `agentflow-workers-ssh-key`. Until that lands, `ssh_ff_france` returns `Permission denied (publickey)`.
+2. **CLI prerequisites** — `kubectl`, `gh`, `git`, `curl`, `psql` already exist in the agentflow-workers image (matrix-bots-runner uses them in other handlers).
+3. **First run** — restart `deploy/agentflow-agents`. `ensureAllBots()` provisions `@af-ops:agentflow.website` via shared-secret register on first boot.
+4. **Verification** — DM the bot in Element: "сколько подов agentflow-agents". Expect a fenced output block from `kubectl -n franchise-factory get pod -l app=agentflow-agents -o name | wc -l`.
+
+### Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Bot ignores non-owner sender | `[af-ops] sender_not_authorized` | Expected — auth gate |
+| Tool refused unexpectedly | `[af-ops] tool_call` with `isError:true` and `refused:no_allow_prefix` | Add verb to `SHELL_ALLOW_PREFIXES` after security review |
+| SSH fails with Permission denied | tool_call result `stderr` contains `Permission denied (publickey)` | Mount `agentflow-workers-ssh-key` Secret + add pubkey on ff-france |
+| Postgres pod resolution fails | tool_call `pg_query` result with `pod not found` | Check `kubectl -n franchise-factory get pod -l app=agentflow-postgres` returns a row |
+| Loop hits iteration cap | `[af-ops] tool_call` repeats 10× then "Не успел свести в ответ" | Owner narrows the request |
 
 ## Non-goals (v1)
 
