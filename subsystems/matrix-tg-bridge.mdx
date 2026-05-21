@@ -161,6 +161,65 @@ bridgev2 supports several Telegram logins per Matrix user. AgentFlow surfaces th
 | Avatar 404 in browser | `404 GET /_matrix/media/v3/thumbnail/...` | Dendrite media repo missing the mxc, or `MATRIX_PUBLIC_URL` env wrong. `mxcToHttpUrl` returns null gracefully when the input is empty. |
 | Bulk logout leaves an orphan account | `[chat-tg] bridge logout one failed` | One of the per-id logouts threw — bridgev2 is idempotent, retry the call manually with curl. |
 
+## Element widget (shipped 2026-05-21)
+
+Owners manage TG accounts without leaving Element Web. The widget is a
+self-contained HTML page served from the same origin as Element itself, so
+the iframe inherits `af_session` via `Domain=.agentflow.website`.
+
+### URL
+
+```
+https://chat.agentflow.website/widget/tg-accounts
+```
+
+### Routes (agentflow-agents)
+
+| Route | Purpose |
+|---|---|
+| `GET /me/chat/widget/tg-accounts` | Returns inline HTML + CSS + vanilla JS. Cookie-bound `requireSession`. |
+
+### Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/widget-tg.ts:1` | `buildWidgetHtml`, `buildWidgetCsp`, `WIDGET_FRAME_ANCESTORS`, `GET` handler |
+| `agentflow-agents/k8s/element-web.yaml:160` | Ingress `element-web-widget` — `/widget/(.*)` → `/me/chat/widget/$1` on agentflow-agents:4100 |
+| `agentflow-agents/tests/widget-tg.test.ts:1` | Pins DOM hooks + CSP + no-CDN contract |
+
+### CSP
+
+`frame-ancestors 'self' https://chat.agentflow.website https://app.element.io`
+plus `default-src 'self'`, `script-src 'self' 'unsafe-inline'`. The page
+ships inline scripts and styles on purpose — sandboxed widget iframes often
+block third-party origins, so the boot path has no CDN dependency.
+
+### Owner add-to-Element steps
+
+1. Open Element on `https://chat.agentflow.website` (already SSO-bounced via
+   `/sso/element-sso`).
+2. In any room or DM, click "+" near the topic → "Add widgets, bridges & bots"
+   → "Add custom widget" → paste `https://chat.agentflow.website/widget/tg-accounts`
+   → save.
+3. Widget tile loads in the right panel. The wizard ("+ Добавить ещё один
+   аккаунт") drives `/me/chat/tg/start` + `/step` inline.
+
+### v2 backlog
+
+- Auto-register `m.widgets` in user `account_data` from the `element-sso`
+  bounce so owners skip the manual add step. Endpoint is
+  `PUT /_matrix/client/v3/user/{userId}/account_data/m.widgets` with the
+  bridge bot's admin token.
+- Persist last-used country code per AF user (improves wizard UX).
+
+### Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Element refuses to embed the iframe | browser console: `Refused to frame ... frame-ancestors` | `src/routes/widget-tg.ts:WIDGET_FRAME_ANCESTORS` — add the origin you're testing from |
+| Widget renders but `accounts` 401 | `requireSession` 401 line in agentflow-agents | af_session cookie not set on `.agentflow.website` — check `services/env.ts sessionCookieDomain` |
+| `/widget/tg-accounts` 404 from chat.agentflow.website | nginx ingress `default backend 404` | `element-web-widget` Ingress not applied — `kubectl apply -f k8s/element-web.yaml` |
+
 ## Operator actions remaining
 
 1. **None** for the bridge to be up — it is `1/1 Running` and Dendrite has provisioned `@telegrambot:agentflow.website`.
