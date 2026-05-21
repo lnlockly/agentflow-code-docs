@@ -1,11 +1,11 @@
 ---
 title: "Element Web"
-description: "Vanilla Element Web (fork target) deployed at chat.agentflow.website, pointed at our Dendrite homeserver."
+description: "Element Web deployed at chat.agentflow.website, pointed at our Dendrite homeserver, branded as AgentFlow via runtime config."
 ---
 
 # Element Web
 
-> **Status: shipped 2026-05-21 (Phase 1 vanilla)** — owner approved Apache-2.0 fork of `element-hq/element-web` as the AgentFlow chat client. Phase 1 ships the upstream image unbranded. Branding + SSO bridge follow in Phase 2/3.
+> **Status: Phase 1 + Phase 2 shipped 2026-05-21.** Apache-2.0 image of `element-hq/element-web` deployed unbranded, then re-themed via `config.json` (custom theme + branding, no fork). Phase 3 (SSO bridge to `agentflow-agents`) still in progress.
 
 ## TL;DR
 
@@ -59,6 +59,64 @@ Browser → https://chat.agentflow.website
 | `permalink_prefix` | `https://chat.agentflow.website` | matrix.to-style links land back on our deploy |
 | `brand` | `AgentFlow` | Tab title / fallback copy |
 
+## Branding (Phase 2)
+
+All branding lives in the same `element-web-config` ConfigMap — no fork, no rebuild. Edit + `kubectl rollout restart deploy/element-web`.
+
+### Custom theme `AgentFlow Dark`
+
+Registered via `setting_defaults.custom_themes[]` and pinned with `default_theme: "custom-AgentFlow Dark"` (Element prefixes registered names with `custom-`).
+
+| Color key | Hex / RGBA | Brand role |
+|---|---|---|
+| `accent-color`, `primary-color` | `#22d3b9` | Teal accent (links, buttons, send) |
+| `warning-color` | `#ec4899` | Pink — destructive / banner accent |
+| `sidebar-color` | `#17171a` | Left rail surface |
+| `roomlist-background-color`, `timeline-background-color` | `#0e0e10` | App background |
+| `roomlist-text-color`, `timeline-text-color` | `#f5f5f7` | Primary text |
+| `roomlist-text-secondary-color`, `timeline-text-secondary-color` | `#a1a1aa` | Secondary text |
+| `roomlist-highlights-color`, `timeline-highlights-color`, `menu-selected-color`, `reaction-row-button-selected-bg-color` | `rgba(34,211,185,0.16)` | Teal tint for selected/hover/unread |
+| `roomlist-separator-color` | `#2a2a2f` | Hairline dividers |
+
+Source of color keys: https://github.com/element-hq/element-web/blob/develop/docs/theming.md.
+
+### Branding block
+
+| Key | Value | Why |
+|---|---|---|
+| `branding.auth_header_logo_url` | `https://agentflow.website/favicon.svg` | Logo on login / register screens |
+| `branding.auth_footer_links` | `[AgentFlow → /, Поддержка → /support]` | Footer of auth screens |
+| `branding.welcome_background_url` | *omitted* | `chat-welcome-bg.jpg` does not exist on landing — landing SPA returns HTML for unknown paths. Add asset, then re-enable. |
+
+### Localization defaults
+
+`setting_defaults.language: "ru"`, `setting_defaults.default_country_code: "RU"`, top-level `default_country_code: "RU"`. New sessions land on Russian UI.
+
+### Suppress upstream Element apps
+
+`desktop_builds: null`, `mobile_builds: {ios:null, android:null, fdroid:null}`, `mobile_guide_toast: false` — kills banners that nudge users toward Element-Desktop and the App Store.
+
+### Feature toggles
+
+| Feature | State | Reason |
+|---|---|---|
+| `feature_thread` | `labs` | Inherited from Phase 1 |
+| `feature_video_rooms` | `false` | No Element Call yet |
+| `feature_element_call_video_rooms` | `false` | Same |
+| `feature_group_calls` | `false` | Same |
+| `feature_html_topic` | `true` | Allow rich-text room topics |
+
+### Verify
+
+```
+curl -s https://chat.agentflow.website/config.json \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); \
+print('default_theme:', d['default_theme']); \
+print('themes:', [t['name'] for t in d['setting_defaults']['custom_themes']])"
+# default_theme: custom-AgentFlow Dark
+# themes: ['AgentFlow Dark']
+```
+
 ## Failure modes
 
 | Symptom | Log signature for grep | Where to fix |
@@ -69,6 +127,9 @@ Browser → https://chat.agentflow.website
 | Element loads but homeserver dropdown asks for URL | `default_server_config` missing | Edit ConfigMap `element-web-config`, `kubectl rollout restart deploy/element-web` |
 | Login screen lets users type any homeserver | `disable_custom_urls` flipped to false | Same ConfigMap |
 | Login fails with `M_FORBIDDEN` | n/a (Dendrite-side) | Check `dendrite` pod logs, registration shared-secret + appservice config |
+| Theme reverts to upstream dark | `default_theme: "dark"` in ConfigMap | Restore `default_theme: "custom-AgentFlow Dark"` and verify `setting_defaults.custom_themes[].name == "AgentFlow Dark"` (Element prepends `custom-` automatically) |
+| Auth screen shows Element logo | `branding.auth_header_logo_url` empty or pointing at `logos/element-logo.svg` | Set to `https://agentflow.website/favicon.svg` |
+| "Get Element on iOS" banner appears | `mobile_guide_toast` true or `mobile_builds` missing | Set `mobile_guide_toast: false`, `mobile_builds: {ios:null, android:null, fdroid:null}` |
 
 ## Operator runbook
 
