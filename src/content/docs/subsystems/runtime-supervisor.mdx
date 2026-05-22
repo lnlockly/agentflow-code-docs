@@ -21,6 +21,9 @@ Before 2026-05-22 these invariants drifted for legacy projects (Monar / 1292), c
 | Path | Role |
 |---|---|
 | `agentflow-agents/src/services/runtime-supervisor.ts:535-555` | Next.js runtime branch (PR #730, 2026-05-22). Detects `next` in `dependencies`/`devDependencies` BEFORE the generic build-script branch and emits `type='nextjs'` with `npx next start -H 0.0.0.0 -p <foundation_port>`. Bound to `computePortBase(projectId).port`. |
+| `agentflow-agents/src/services/runtime-supervisor.ts:481-517` | Procfile-derived Next.js branch (project 1385 fix, 2026-05-22). When the Procfile single-process command matches `\bnext\s+(start|dev|build)\b` AND `snap.packageJson?.hasNextDep` is true, classify as `type='nextjs'` with `buildCmd=[]` so the supervisor does NOT run a redundant `defaultBuildFor` on top of the already-self-contained Procfile pipeline. The Procfile line itself does `pnpm install && next build && next start -p $PORT`; without the empty buildCmd the root-level build fails in subdir-foundation layouts and deploy() short-circuits before writeS6Services + start_service. |
+| `agentflow-agents/src/services/runtime-supervisor.ts:1684-1820` | `deploy()` — now emits `runtime_supervisor_started` at the top + `runtime_supervisor_short_circuit` for every early-return path (no_workspace_project, snapshot_failed, unknown_runtime, not_in_allowed_types, no_auto_start_marker_present). Project 1385 had ZERO `runtime_supervisor_*` events even though `build_failed` fired — making the bug invisible to postmortem queries. The breadcrumb pair (started + short_circuit) closes that observability gap. |
+| `agentflow-agents/src/services/runtime-supervisor.ts:1628-1648` | `writeS6Services` → `start_service` call. Now forwards `plan.port` as the `port` arg so start_service's idempotency probe verifies the port is bound (not just that the pidfile-PID is alive). Prevents stale-pidfile false positives where a defunct process reports `already_running`. |
 | `agentflow-agents/src/services/runtime-supervisor.ts:1452-1470` | `processesForPlan` — nextjs lands as service `name='web'` (Heroku convention) so downstream tooling and the Caddy preview sidecar pick it up. |
 | `agentflow-agents/src/services/pool-worker/post-build.ts:599-614` | Always-on `deploy()` bucket now includes `'nextjs'` — fresh Next.js projects boot without `RUNTIME_SUPERVISOR_ENABLED=1`. |
 | `agentflow-agents/src/services/runtime-supervisor-health.ts:332-340` | `healthcheckByType` routes `nextjs` through `probeApi` (HTTP probe on `plan.port`). |
@@ -99,6 +102,9 @@ Before 2026-05-22 these invariants drifted for legacy projects (Monar / 1292), c
 | `build_failed` event in last 3 min but project still shipped `done` | `preview_health_failed: build_failed_recent` | `services/pingers/preview-health-strict.ts:inspectBuildFailedEvents` — extend `BUILD_RETRY_SUCCESS_KINDS` if a new success-event is added |
 | Preview HTTP=200 but real status=502 from upstream | `preview_health_failed: http_not_200` | upstream pod down — check `kubectl -n af-tenant-<u> logs project-proj-<slug>-0` |
 | Fresh Next.js project serves AgentFlow placeholder forever | classify reason was `package_json_build_script` (legacy `type='web'` skip) — fixed by `nextjs_detected` branch | `runtime-supervisor.ts:535-555` — check `package.json.dependencies.next` exists; verify `processesForPlan` emits the `web` service with `npx next start -p <foundation_port>` |
+| Procfile-driven Next.js project ships `build_failed` + `plan: "api"` and never gets `.services/web/` | `runtime_supervisor_started` fires but `runtime_supervisor_deployed` never does — only `build_failed` between them | `runtime-supervisor.ts:481-517` — `isNextProcfile` branch must classify as `type='nextjs'` with `buildCmd=[]` so the redundant `defaultBuildFor` doesn't run on top of the self-contained Procfile line |
+| deploy() invoked but ZERO `runtime_supervisor_*` events in `project_events` | no events at all — graph-executor's deploy node never called runtimeDeploy | `services/graph-executor/handlers/shared.ts:46` — check the call site reaches `await runtimeDeploy(...)` |
+| deploy() entered but short-circuited silently | `runtime_supervisor_started` present, `runtime_supervisor_short_circuit` payload `reason` tells you which gate | `runtime-supervisor.ts:1684-1820` — read the `reason` field |
 
 ## Strict preview-health gate (PR agentflow-agents#729, 2026-05-22)
 
@@ -172,6 +178,124 @@ Greppable detection signal for postmortems:
 - `runtime_detect_shadow` payload contains `"reason":"nextjs_detected"`.
 - `runtime_supervisor_deployed` payload `plan.type` = `"nextjs"`.
 - `start_service` event with `name='web'` and `port=<computePortBase(projectId).port>`.
+
+## Procfile-driven Next.js (PR agentflow-agents#TBD, 2026-05-22, project 1385 fix)
+
+The `spa.ts` foundation bridge (`services/graph-executor/handlers/spa.ts:817-823`)
+writes a self-contained Procfile of the form:
+
+```
+web: cd '/workspace/proj-<slug>' && [ -f .ports.env ] && . ./.ports.env; \
+     export DATABASE_URL='...' && pnpm install && \
+     (npx next build && npx next start -H 0.0.0.0 -p $PORT) || npx next dev ...
+```
+
+Before this fix, `classify` took the Procfile single-process branch
+(line 458+), set `type='api'` because `proc.name === 'web'`, and
+**also** set `buildCmd = defaultBuildFor(snap)` — a SECOND
+`pnpm install && npm run build` from `/workspace` root. For foundations
+that hoist the actual Next.js app into a subdir (`apps/web`) or use
+pnpm workspace protocols, that root-level build failed.
+
+The failure path:
+1. `buildPipeline` runs `pnpm install && npm run build` at workspace root.
+2. Exit code ≠ 0 → `buildPipeline` returns `{ ok: false, log: <tail> }`.
+3. `deploy()` line 1798 emits `build_failed` event with `plan: "api"` and returns.
+4. `writeS6Services` is NEVER reached → no `.services/web/` dir → no
+   `start_service` call → foundation port stays unbound.
+5. Caddy preview sidecar falls back to the AgentFlow placeholder.
+6. Strict preview-gate (PR #729) catches the placeholder → `status='failed'`.
+
+Detection rule (`runtime-supervisor.ts:481-517`):
+
+```ts
+const isNextProcfile =
+  snap.packageJson?.hasNextDep === true &&
+  /\bnext\s+(start|dev|build)\b/.test(procLine);
+if (isNextProcfile) {
+  return {
+    type: 'nextjs',
+    entrypoint: 'Procfile',
+    buildCmd: [],          // ← Procfile handles install+build itself
+    startCmd: proc.cmd,    // ← verbatim Procfile line
+    port: declaredPort ?? computePortBase(projectId).port,
+    reason: declaredPort ? `procfile_nextjs:port=${declaredPort}` : 'procfile_nextjs',
+    processes,
+    kindHintAgrees: null,
+  };
+}
+```
+
+`buildCmd=[]` makes `buildPipeline` short-circuit at line 1342 with
+`no_build_required` — deploy() advances to `writeS6Services`, which calls
+`start_service` with the Procfile line + `port=<foundation_port>` for the
+idempotency probe.
+
+`type='nextjs'` is already in the always-on `allowedTypes` bucket (PR #732
++ `pool-worker/post-build.ts:599-614`) so the pool-worker auto-deploy call
+reaches this branch without `RUNTIME_SUPERVISOR_ENABLED=1`.
+
+Greppable postmortem signals:
+- `runtime_supervisor_started` with `source: 'always_on'` event right after `task_done`.
+- `runtime_detect_shadow` payload contains `"reason":"procfile_nextjs"` (with optional `:port=N`).
+- `runtime_supervisor_deployed` payload `plan.type` = `"nextjs"`, `plan.reason` starts with `procfile_nextjs`.
+- `start_service` was called with `name='web'` and `port=<computePortBase(projectId).port>`.
+- Inside the pod: `/workspace/proj-<slug>/.services/web/pid` exists and points at a live `next-server` process.
+
+## deploy() observability (PR agentflow-agents#TBD, 2026-05-22)
+
+Before this PR, `deploy()` emitted events only when it succeeded
+(`runtime_supervisor_deployed`) or hit a known failure (`runtime_supervisor_failed`,
+`runtime_supervisor_skipped`, `auto_start_skipped`). A project that
+short-circuited at the `allowedTypes` filter, the snapshot probe, or the
+escape-hatch marker left NO trace, making it impossible to tell from
+`project_events` whether `deploy()` was even invoked.
+
+Now `deploy()` emits:
+
+1. `runtime_supervisor_started` immediately after the project-row lookup —
+   payload `{ plan_type: null, source, allowed_types }`. This is the single
+   breadcrumb that proves the function was entered. If it's missing,
+   the issue lives upstream in graph-executor / pool-worker, NOT inside
+   the supervisor.
+
+2. `runtime_supervisor_short_circuit` on EVERY early-return path, alongside
+   the existing kind-specific event. Reason strings (pinned by
+   `tests/unit/runtime-supervisor-procfile-nextjs.test.ts`):
+
+   - `no_workspace_project` — projects.workspace_project_name and slug both null.
+   - `snapshot_failed` — `detectRuntime` couldn't snapshot the workspace.
+   - `unknown_runtime` — snapshot succeeded but `classify` returned `type='unknown'`.
+   - `not_in_allowed_types` — pool-worker's `allowedTypes` filter rejected the plan
+     (normal — happens on every always-on call that classifies as static/web).
+   - `no_auto_start_marker_present` — operator wrote `/workspace/.no_auto_start`
+     for debugging.
+
+Postmortem query:
+```sql
+SELECT created_at, kind, payload->>'reason' AS reason, payload->>'plan_type' AS plan_type
+  FROM project_events
+ WHERE project_id = <id>
+   AND kind IN ('runtime_supervisor_started', 'runtime_supervisor_short_circuit',
+                'runtime_supervisor_deployed', 'runtime_supervisor_failed',
+                'build_failed', 'preview_gate_blocked')
+ ORDER BY id ASC;
+```
+
+Expected happy-path sequence for a Procfile + Next.js project:
+```
+runtime_supervisor_started   {source: "always_on"}
+runtime_supervisor_deployed  {plan.type: "nextjs", plan.reason: "procfile_nextjs..."}
+```
+
+Expected sequence when the pool-worker double-fires (always-on + flag-gated):
+```
+runtime_supervisor_started        {source: "always_on"}        ← nextjs accepted
+runtime_supervisor_deployed       {plan.type: "nextjs"}
+runtime_supervisor_started        {source: "flag_gated"}       ← nextjs rejected
+runtime_supervisor_short_circuit  {reason: "not_in_allowed_types"}
+runtime_supervisor_skipped        {reason: "not_in_allowed_types"}
+```
 
 ## Reconcile contract
 
