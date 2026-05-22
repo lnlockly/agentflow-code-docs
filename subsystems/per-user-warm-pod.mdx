@@ -79,12 +79,54 @@ preview:
   `workspace_project_name`; the routing change in PR-2/PR-3 is invisible
   to callers.
 
+## Foundation port allocation
+
+Every Next.js / SPA / mini_app project in a shared peruser pod needs its
+own listening port — multiple projects co-located in `/workspace/<slug>/`
+would otherwise collide on the same TCP socket and Caddy's host-based
+routing would send every `p-<slug>.proj.agentflow.website` request to
+whichever process bound the port first.
+
+`computePortBase(projectId)` in `agentflow-agents/src/services/peruser-pod.ts:101`
+returns a deterministic port window per project:
+
+```ts
+// Knuth multiplicative hash → port in [3001, 9999].
+const h = (projectId * 2654435761) >>> 0;
+const port = 3001 + (h % 6999);
+return { port, botPort: port + 1, vitePort: port + 2, previewPort: port + 3 };
+```
+
+Pinned overrides live in `PERUSER_POD_PORT_PINS` (currently `{ 1292 → 3091 }`
+for Monar / Golden Connect, whose Procfile was hand-configured before the
+auto-port era). `isPortPinned(projectId)` is the predicate the reconciler
+uses to skip those projects entirely.
+
+The port lands on disk in two places:
+
+| File | Writer | Consumer |
+|---|---|---|
+| `/workspace/<slug>/.ports.env` (`PORT=<n>\nBOT_PORT=<n+1>\n...`) | `renderCreateProjectScript` at create_project time | Procfile `web:` line sources it on every restart |
+| `/workspace/<slug>/.runtime/foundation_port` (just `<n>`) | graph-executor `spa.ts` foundation bridge + `peruser-services-reconcile` | Caddy preview sidecar reads it to pick the upstream localhost port |
+
+Pre-2026-05-22 bug: the formula was `30000 + pid*100`. For any
+`pid ≥ 356` the result overflowed the 16-bit TCP range (project 1389
+emitted port 168900). The s6 supervisor silently fell back to its
+hardcoded `PORT=3001` default; the foundation bridge in `spa.ts` also
+defaulted to `3001` on missing/empty `.ports.env`. Result: 7 projects
+in `user-workspace-1-599c48bff8-grx7b` all had
+`.runtime/foundation_port=3001` and Caddy routed every preview host to
+whichever next-server bound 3001 first. Fix landed via
+agentflow-agents PR #739.
+
 ## Failure modes
 
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
 | `kubectl apply -f user-workspace.yaml` returns `Service "user-workspace-1" not found` from the Ingress | (none — apply order) | Apply PVC + Deployment + Service first, Ingress last. Or `kubectl apply` the whole file twice. |
 | Caddy preview returns 404 on `p-<slug>.proj.agentflow.website` | (Caddy stdout shows `no such file or directory: /workspace/<slug>`) | `code-exec.create_project` (PR-2) didn't mkdir the slug. Check `kubectl exec deploy/user-workspace-1 -c tools -- ls /workspace`. |
+| Every preview host in one peruser pod serves the same project (port collision) | All projects' `.runtime/foundation_port` read `3001` | `computePortBase` formula overflowed pre-2026-05-22 — fixed in `agentflow-agents/src/services/peruser-pod.ts:101`. Reconciler at `pingers/peruser-services-reconcile.ts` rewrites stale `foundation_port` on next tick (skips pinned ids). |
+| Project's port doesn't match `computePortBase(id).port` after reconciler tick | `peruser_services_reconcile: foundation_port_rewritten=true` | Expected after PR #739 deploy. One-shot per project per pod lifetime. |
 | Caddy serves stale build after `pnpm build` | (none — `Cache-Control: no-cache` set, but client cache may still serve) | Force-refresh in browser. If persists: check `/workspace/<slug>/dist/index.html` mtime via `kubectl exec`. |
 | User 1 PVC fills (>90%) | `df -h` on the pod | Bump PVC to 50 Gi or wire an LRU eviction job for idle project subdirs. |
 | Pod restart loses in-flight project state | Pod restart event | Recreate strategy is intentional — projects re-clone from git remote on next coder turn. For long-running builds, snapshot state before any planned restart. |
