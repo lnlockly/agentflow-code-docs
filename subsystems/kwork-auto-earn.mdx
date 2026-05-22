@@ -24,6 +24,8 @@ we don't burn the daily DM quota on guaranteed rejections.
 | `agentflow-agents/src/services/graph-executor/handlers/kwork-send-offer.ts` | `kwork.send_offer` — pre-skip closed inboxes, gate by confidence ≥ 0.6, send via `kwork-inbox.send_message`. DM fallback boilerplate in `renderOfferText` opens with action, no AgentFlow mention. |
 | `agentflow-agents/src/services/graph-executor/handlers/kwork-respond-to-want.ts:98` | `DEFAULT_CANON_CONFIDENCE_THRESHOLD = 0.75` — tightened 2026-05-22 from 0.7. Owner wants best matches only, not borderline. |
 | `agentflow-agents/src/mcp-servers/kwork-inbox.ts` | `kwork-inbox` MCP: `list_wants`, `get_want` (surfaces `buyer_inbox_open`), `send_message`. |
+| `agentflow-agents/src/mcp-servers/kwork-inbox.ts:submitOfferViaCandidates` | Candidate-loop dispatcher for `respond_to_want`. Canonical: `POST /api/offer/createoffer` (multipart FormData, `offerType=kwork`, `kwork_id=<PID>`, `kwork_count=1`). Legacy fallbacks: `/new_offer/save`, `/new_offer`, `/offers/save`, `/projects/<id>/offer`. Tagged via `shape: 'createoffer_multipart' | 'legacy_urlencoded'`. |
+| `agentflow-agents/src/mcp-servers/kwork-inbox.ts:isAntiBotShieldHtml` | Pure detector for `<title>Технические работы</title>` maintenance HTML. Used by the dispatcher to continue past shielded candidates instead of returning `unexpected_response`. |
 
 ## Data flow
 ```
@@ -59,6 +61,8 @@ cron 30m
 | All wants skipped (`sent_count=0`, `skipped_count=N`) | `pre_skipped_count + skipped_count === wants.length` | Expected when every buyer's inbox is closed for the tick; not a bug. |
 | Sent DM contains AgentFlow brand or link | grep `kwork_want_responses` row text — any `agentflow` / `agentflow.website` substring | `ai-draft-offer.ts:stripAgentFlowMentions` — sanitiser must strip both the bare brand and the URL before send. Owner reversed promo policy 2026-05-22. |
 | Sent DM opens with "Видел задачу…" / "Заметил…" / "По вашему…" recap | grep ledger text starts with `Видел` / `Заметил` / `По вашему` / `Здравствуйте, видел` | `ai-draft-offer.ts:stripRecapOpener` — extend the banned-opener regex list if a new variant slips through. Buyer already knows what they posted; recap reads as AI-generated. |
+| `respond_to_want` returns `anti_bot_html` — kwork returned `<title>Технические работы</title>` on authenticated POST | grep step output for `anti_bot_html` or `shielded_paths` in flow_runs `kwork.respond_to_want` result | `kwork-inbox.ts:submitOfferViaCandidates` — every candidate (canonical `/api/offer/createoffer` + 4 legacy) was shielded. Body still contains `window.unreadDialogCount` proving session valid → it's an anti-bot rate-limit on the seller IP / profile, NOT `auth_expired`. Options: rotate egress IP (warmup-pool), slow the bid cadence, or back off until the shield window expires. |
+| `respond_to_want` legacy `unexpected_response` on `/new_offer/save` (PRE-FIX 2026-05-22) | grep flow_runs output for `endpoint: "/new_offer/save"` + `"unexpected_response"` | Fixed by `kwork-inbox.ts:submitOfferViaCandidates` — handler now tries `/api/offer/createoffer` (the live Vue SPA endpoint) FIRST and only falls back to `/new_offer/save` etc. for older A/B rollouts. Old kwork form path is no longer the SPA's submit URL — bundle grep of `new-offer_*.js` confirms `axios.post('/api/offer/createoffer', formData)`. |
 
 ## Related
 - [Graph handlers](/subsystems/graph-handlers)
