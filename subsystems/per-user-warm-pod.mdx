@@ -26,6 +26,8 @@ sub-second. The same pod's Caddy sidecar serves
 | `agentflow-agents/src/services/env.ts` (PR-2) | `PERUSER_POD_ENABLED_USER_IDS` env knob parsing. |
 | `agentflow-agents/src/mcp-servers/code-exec/index.ts` (PR-2) | `create_project` / `destroy_project` branching on flag. |
 | `agentflow-agents/src/mcp-servers/code-exec/helpers/kubectl.ts` (PR-3) | `exec` / `write_file` / `read_file` routing to `user-workspace-1` pod when project's `host_pod_name` matches. |
+| `agentflow-agents/src/services/peruser-pod-rbac.ts` | Auto-bootstraps `agentflow-agents-peruser-exec` RoleBinding in `af-tenant-<id>` on first peruser exec. Idempotent, in-process memoised. |
+| `agentflow-agents/k8s/agentflow-agents.yaml` (ClusterRole `agentflow-agents-peruser-rbac`) | Grants the agents ServiceAccount `rolebindings: get/create/update/patch` + `clusterroles.bind` on `agentflow-peruser-exec` so the bootstrap apply passes RBAC privilege-escalation checks. |
 
 ## Data flow
 
@@ -124,6 +126,7 @@ agentflow-agents PR #739.
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
 | `kubectl apply -f user-workspace.yaml` returns `Service "user-workspace-1" not found` from the Ingress | (none — apply order) | Apply PVC + Deployment + Service first, Ingress last. Or `kubectl apply` the whole file twice. |
+| Fresh userId added to `PERUSER_POD_ENABLED_USER_IDS` fails project create with opaque `peruser_pod_create_failed: exit=1` (pre-2026-05-23) | `Forbidden: deployments.apps "user-workspace-<id>" is forbidden` | RoleBinding `agentflow-agents-peruser-exec` missing in `af-tenant-<id>`. Auto-seeded by `ensurePeruserExecRoleBinding` on first peruser exec (`services/peruser-pod-rbac.ts`). If it still fails, check the agents SA holds `agentflow-agents-peruser-rbac` ClusterRole. |
 | Caddy preview returns 404 on `p-<slug>.proj.agentflow.website` | (Caddy stdout shows `no such file or directory: /workspace/<slug>`) | `code-exec.create_project` (PR-2) didn't mkdir the slug. Check `kubectl exec deploy/user-workspace-1 -c tools -- ls /workspace`. |
 | Every preview host in one peruser pod serves the same project (port collision) | All projects' `.runtime/foundation_port` read `3001` | `computePortBase` formula overflowed pre-2026-05-22 — fixed in `agentflow-agents/src/services/peruser-pod.ts:101`. Reconciler at `pingers/peruser-services-reconcile.ts` rewrites stale `foundation_port` on next tick (skips pinned ids). |
 | Project's port doesn't match `computePortBase(id).port` after reconciler tick | `peruser_services_reconcile: foundation_port_rewritten=true` | Expected after PR #739 deploy. One-shot per project per pod lifetime. |
