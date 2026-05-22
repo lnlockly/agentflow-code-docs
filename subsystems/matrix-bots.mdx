@@ -1,13 +1,13 @@
 ---
 title: "Matrix Bots"
-description: "Eight platform service bots running inside Element/Dendrite at chat.agentflow.website."
+description: "Nine platform service bots running inside Element/Dendrite at chat.agentflow.website."
 ---
 
 # Matrix Bots
 
 ## TL;DR
 
-Eight service bots (`@af-helper`, `@af-research`, `@af-image`, `@af-claude`, `@af-tg-poster`, `@af-poster`, `@af-spec`, `@af-ops`) are registered on the Dendrite homeserver via shared-secret registration and run a per-bot `/sync` long-poll loop inside `agentflow-agents`. Handlers cover a static help menu, URL→TL;DR summarisation, text→image generation, Claude chat, Telegram posting (v1 stub), multi-network cross-posting (`@af-poster` — TG + VK in v1, IG deferred), spec-from-brief writing, and the owner-only ops console with constrained tool-use (see @af-ops below). Triggered on DM or `@mention`; gated by `MATRIX_BOTS_ENABLED=1`.
+Nine service bots (`@af-helper`, `@af-research`, `@af-image`, `@af-claude`, `@af-tg-poster`, `@af-poster`, `@af-spec`, `@af-ops`, `@af-news`) are registered on the Dendrite homeserver via shared-secret registration and run a per-bot `/sync` long-poll loop inside `agentflow-agents`. Handlers cover a static help menu, URL→TL;DR summarisation, text→image generation, Claude chat, Telegram posting (v1 stub), multi-network cross-posting (`@af-poster` — TG + VK in v1, IG deferred), spec-from-brief writing, the owner-only ops console with constrained tool-use (see @af-ops below), and a daily 09:00 Moscow-time digest (`@af-news` — AI / crypto / AgentFlow team commits). Triggered on DM or `@mention`; gated by `MATRIX_BOTS_ENABLED=1`.
 
 ## Files (with line refs)
 
@@ -423,6 +423,105 @@ switch command:
   /post  → postToTelegram(channelOverride) → mcpDirect('telegram','send_message')
   /accounts → bridgeWhoami
 ```
+
+## @af-news — daily 09:00 digest
+
+Ninth bot. Posts an AI / crypto / AgentFlow-team morning digest into every Matrix room it has been invited to, once per day. Runs alongside the per-bot `/sync` loop as a detached `setInterval` scheduler — no Bull queue, no extra worker pod. Disable via `MATRIX_NEWS_DISABLED=1` (kill-switch) or by setting `chat_news_room_subscriptions.enabled=false` for a single room.
+
+### Slash commands
+
+| Command | Effect |
+|---|---|
+| `/news now` | One-shot digest right now, bypassing the per-day idempotency log. |
+| `/news off` | `UPDATE chat_news_room_subscriptions SET enabled=false WHERE room_id=?` — bot stays in the room but stops posting. |
+| `/news on` | Re-enable. |
+| `/news topics ai,crypto` | Replace the per-room `topics` array with canonical ids (`ai`, `crypto`, `af-team`). Unknown topics are silently dropped; empty result asks the user for valid ids instead of overwriting. |
+| `/help`, `/start` | Static Russian command menu. |
+
+`parseCommand` accepts both `/news <sub>` and the bare `/<sub>` shape so DM ergonomics match `@af-helper`.
+
+### Invite handler
+
+When the runner accepts an invite (existing auto-join path) and the slug is `af-news`, it calls `handleNewsRoomJoined` which:
+
+1. Upserts a `chat_news_room_subscriptions` row with `enabled=true` and the default topic set (`ai`, `crypto`, `af-team`).
+2. Sends a Russian welcome message describing the commands and the 09:00 cadence.
+
+A room that was disabled and then re-invited is silently re-enabled with the previously stored topics, so the owner does not lose their topic filter.
+
+### Daily scheduler
+
+`startNewsDigestScheduler` runs a 60-second `setInterval`. On each tick:
+
+1. Compute `localSlot(now, MATRIX_NEWS_TZ)` (default `Europe/Moscow`).
+2. If `hour !== MATRIX_NEWS_HOUR || minute !== MATRIX_NEWS_MINUTE` (defaults `9` / `0`) → no-op.
+3. Else fan out to every `enabled=true` row. Per-room idempotency is enforced via `INSERT ... ON CONFLICT DO NOTHING` on `chat_news_log (room_id, digest_date)` so a duplicate tick or runner restart cannot re-post.
+
+### Digest composition
+
+- AI / crypto sections: a single `useModel(ModelType.TEXT_LARGE, …)` prompt asking for 2-3 fresh items per category in Russian. The model is the freshness oracle here — we deliberately do not maintain RSS fetchers.
+- AgentFlow-team section: pulls public commit lists for `lnlockly/agentflow-agents` and `lnlockly/agentflow-landing` via `GET https://api.github.com/repos/<repo>/commits?since=<ISO>` (unauthenticated, 60 req/h per-IP). Top 5 commit subjects + short SHA + html_url are dropped into the prompt and the LLM repacks them into 2-4 lines of user-facing copy.
+
+### Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/matrix-bots/handlers/news.ts:1` | All handler logic — invite welcome, slash commands, scheduler, digest composer, GitHub commit fetcher |
+| `agentflow-agents/src/services/matrix-bots/lib.ts` (`BOT_SLUGS`, `NEWS_TOPICS`, `parseNewsCommand`) | Canonical bot list + topic enum + command parser |
+| `agentflow-agents/src/services/matrix-bots/register.ts` (`DISPLAY_NAMES['af-news']`) | First-provision display name `🗞 News by AgentFlow` |
+| `agentflow-agents/src/services/matrix-bots/runner.ts` (`HANDLERS['af-news']`, invite welcome hook, `startNewsDigestScheduler` boot) | Dispatch registration + scheduler bootstrap |
+| `agentflow-agents/src/services/matrix-onboarding.ts` (`BOT_DM_NAMES['af-news']`, `BOT_DM_INTROS['af-news']`) | First-bounce DM intro copy |
+| `agentflow-agents/migrations/2026-05-22e-af-news-subscriptions.sql:1` | `chat_news_room_subscriptions` + `chat_news_log` (UNIQUE `(room_id, digest_date)`) |
+| `agentflow-agents/src/db/schema.ts` (`chatNewsRoomSubscriptions`, `chatNewsLog`) | Drizzle table definitions |
+| `agentflow-agents/tests/matrix-bots/af-news.test.ts:1` | 18 pure-helper unit tests (parser, topic filter, TZ slot, prompt builder, GitHub fetcher) |
+
+### Env
+
+| Var | Default | Effect |
+|---|---|---|
+| `MATRIX_NEWS_TZ` | `Europe/Moscow` | IANA timezone used to compute the local slot. |
+| `MATRIX_NEWS_HOUR` | `9` | Hour-of-day the digest fires (0-23 in `MATRIX_NEWS_TZ`). |
+| `MATRIX_NEWS_MINUTE` | `0` | Minute-of-hour. |
+| `MATRIX_NEWS_DISABLED` | unset | When `=1` the scheduler is a no-op even though the bot row is registered. Kill switch without taking the runner down. |
+| `MATRIX_BOT_KEY` | (shared) | Same HMAC key every other bot uses; `af-news` is just another slug in the cluster-wide derivation. No separate key. |
+
+### DB
+
+```sql
+CREATE TABLE chat_news_room_subscriptions (
+  id BIGSERIAL PRIMARY KEY,
+  room_id TEXT NOT NULL UNIQUE,
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  topics TEXT[] NOT NULL DEFAULT ARRAY['ai','crypto','af-team'],
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE chat_news_log (
+  id BIGSERIAL PRIMARY KEY,
+  room_id TEXT NOT NULL,
+  digest_date DATE NOT NULL,
+  event_id TEXT,
+  sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (room_id, digest_date)
+);
+```
+
+### Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Bot ignores invites silently | `join failed` (runner-level) | Matrix server unreachable / token revoked — same root cause as other bots |
+| Welcome never lands | `[af-news] welcome failed` | `sendText` or `upsertSubscription` failed; inspect inner `err`. Room stays in DB so cron fanout still works |
+| `/news off` keeps posting | `[af-news] skip already_posted` would NOT fire; instead room appears in `listEnabledRooms` | Verify `enabled=false` in `chat_news_room_subscriptions` — owner may have run `/news on` after |
+| Daily digest never fires | `[af-news] scheduler started` not in logs | `MATRIX_NEWS_DISABLED=1` is set, or the news bot row never registered (check `ensureAllBots` failure list) |
+| Two digests on the same day | (would only happen if UNIQUE constraint missing) | `psql -c "SELECT room_id, digest_date, count(*) FROM chat_news_log GROUP BY 1,2 HAVING count(*)>1"` — if rows exist the migration was applied with index broken; re-run `2026-05-22e-af-news-subscriptions.sql` |
+| AF-team section says "вчера тихо" but commits exist | `[af-news] commits fetch failed` with `429` / `403` | GitHub IP rate-limit; the digest still posts (degraded) and recovers next day automatically |
+| Compose fails | `[af-news] compose failed` | LLM provider 5xx; degraded fallback body is posted so the owner sees an explicit hint to retry with `/news now` |
+| Unknown topic accepted | (would not happen — `parseNewsCommand` filters) | If it does, regression in `isNewsTopic` — run `tests/matrix-bots/af-news.test.ts` |
+
+### Mode-C / owner-gate interactions
+
+`@af-news` is **not** an owner-gated bot — anyone in a room can run `/news off` or `/news topics`. The subscription is per-room, not per-user, and the bot is informational. This matches `@af-helper` and `@af-research`, both of which also accept commands from any participant.
 
 ## Non-goals (v1)
 
