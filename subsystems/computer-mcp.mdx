@@ -143,6 +143,7 @@ Source: `agentflow-computer-mcp/src/agentflow_computer_mcp/desktop_cli.py:225` (
 | Synthetic session row appears | none — silent fallback | daemon resumed task across pod restart (expected) |
 | MJPEG returns headers but no frames | `[device] online ... tools=0` | daemon hasn't subscribed yet OR daemon never pushes `stream_frame` |
 | `subscribe_stream` never sent | `streamSubscriberCount` flips 0→1 silently if connection missing | device offline; daemon must come online + cabinet re-opens stream |
+| Live viewport black until page reload (cabinet user reports "have to refresh"); fixed 2026-05-22 | look for `[device] resync subscribe_stream device=... pending=N`; if MISSING after `[device] online` while a live tab is open, the daemon never received the re-arm | `services/devices-ws.ts:hello` calls `resyncStreamSubscription(deviceId, send)`; if absent, the daemon stays unsubscribed across reconnects (heartbeat timeout, sleep/wake) |
 | Daemon ignores `task_dispatch` | `ws task_dispatch id=... task=...` missing from `agentflow-desktop` log | upgrade daemon to ≥0.2.1 (PR auto/ws-client-task-dispatch-2026-05-22 wired routing) |
 | `task_action` SSE silent though daemon is online | `current_task_id` empty inside `DriverState` | local-input path: viewer's `POST /task` now assigns `local-*` id via `enqueue_task` — old viewer builds put raw strings and never tag the task |
 | `af_send_telegram_message` returns 503 `tg_account_not_linked` | none — synchronous response | caller has no `chat_tg_links` row; bind via cabinet → Telegram |
