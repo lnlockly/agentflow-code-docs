@@ -127,6 +127,19 @@ The SSE writer in `routes/me-devices.ts:writeTaskStreamEvent` emits each event t
 | Cabinet timeline empty after `/tasks/stream` connect | `[device-task-stream] history_load_failed` | SQL replay failed; the live path still works — check `device_action_log` join with `device_sessions` and migration `2026-05-22a-device-tasks.sql` |
 | New SSE consumer reads `data` but sees only `action/complete/error` | none — wire-shape issue | bind to default `message` event for the unified `{kind, …}` payload; named events ship the legacy camelCase shape |
 
+## Performance (streamer, updated 2026-05-22)
+
+PR lnlockly/agentflow-computer-mcp#8 applied three optimisations to `driver/streamer.py` and `platform/mac.py`:
+
+| Optimisation | Before | After | Effect |
+|---|---|---|---|
+| `width_cap` | 1400px | 1280px | ~17% fewer pixels through Pillow resize |
+| JPEG `quality` | 68 | 58 | ~25% smaller frame at negligible visual loss for monitoring UX |
+| blake2b-8 content-hash dedup | every frame emitted | identical hash → skip WS emit | static desktop: ~660 KB/s → ~0 KB/s |
+| Adaptive back-off | fixed 10 fps emit | doubles interval on publish failure (max 1s), restores on success | prevents WS queue pile-up under backpressure |
+
+Measured frame size on a 5K Retina display: **28 KB** (was ~50 KB). Dedup eliminates ≥50% of WS emits when screen content is unchanged (regression-tested in `tests/test_streamer_perf.py`).
+
 ## Related
 - [Workspace provisioning](/subsystems/workspace-provisioning) — vcluster per user pattern
 - [Auth and access](/subsystems/auth-and-access) — api-key middleware + HMAC scheme reused here
