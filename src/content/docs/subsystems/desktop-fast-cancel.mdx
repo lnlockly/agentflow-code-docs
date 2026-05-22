@@ -1,0 +1,112 @@
+---
+title: "Desktop daemon: fast task_cancel (≤2 s)"
+description: "Streaming-LLM teardown + pre-tool-dispatch gate + immediate ACK so the Стоп button in /cabinet halts a running task within ~2 s instead of ~30-90 s"
+---
+
+# Desktop daemon: fast task_cancel (≤2 s)
+
+## TL;DR
+
+Before this change, `task_cancel` from the cabinet only fired at iteration
+boundaries — between an LLM call and the next iteration's top-of-loop check.
+A running task with a 30 s LLM call + a 60 s tool call would ignore Стоп
+for ~90 s. Now the daemon honors cancel in ≤2 s by streaming the Anthropic
+SSE response with a watchdog that closes the socket on `abort_flag`,
+adding a pre-tool-dispatch gate, and slicing the `wait` tool's sleep.
+The cabinet also sees a `task_action: cancel_received` frame within
+<500 ms so the UI shows "Останавливаю задачу..." immediately.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py:212` | `TaskCancelled` exception — raised inside the LLM stream watchdog and pre-tool gate |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py:243` | `_assemble_anthropic_sse(events)` — folds streamed events back into the non-stream response dict shape |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py:329` | `post_llm_cancellable(url, key, payload, abort_flag, poll_interval=0.2)` — replacement for `post_llm` used by `run_task` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py:373` | watchdog thread closing the urllib response on `abort_flag.set()` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py:477` | `run_task` — iteration-boundary check + `TaskCancelled` catch + pre-tool-dispatch gate |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/state.py:56` | `DriverState.request_abort` — emits the immediate `cancel_received` `task_action` frame |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/desktop_tools.py:703` | `wait` tool sliced into 0.2 s polls, returns `aborted after N s` on flag |
+| `agentflow-computer-mcp/tests/test_run_task_cancel.py:1` | 9 tests covering SSE reassembly, watchdog timing, gate, sliced wait, ACK frame, end-to-end ≤2 s |
+| `agentflow-computer-mcp/tests/test_task_cancel.py:1` | pre-existing tests (still green): WS dispatch + iteration-boundary path |
+
+## Data flow
+
+```
+Cabinet UI clicks Стоп
+   │
+   ▼
+agentflow-agents :3000   →   WS frame {type: task_cancel, task_id}
+   │
+   ▼ (daemon side)
+WSClient._handle_task_cancel
+   │
+   ▼
+DriverState.request_abort(task_id)
+   │
+   ├──► abort_flag.set()
+   ├──► publish_outbound({type: task_action, action: "cancel_received", ...})   ◄── UI sees stopping <500 ms
+   │
+   ▼ (concurrent worker thread, inside run_task)
+post_llm_cancellable
+   │
+   ├─ watchdog thread polls abort_flag every poll_interval (default 200 ms)
+   ├─ on flag set → resp.close() → main thread urllib.read() raises OSError
+   │
+   ▼
+run_task catches TaskCancelled
+   │
+   ├──► abort_flag.clear()
+   ├──► publish {type: task_error, task_id, error: "cancelled_by_user"}
+   │
+   ▼
+worker loop sets state.busy = False → ready for next task
+```
+
+## DB / Env / API
+
+- Tables: none (cancel is in-process daemon state)
+- Env:
+  - `AGENTFLOW_LLM_POLL_INTERVAL_S` (not implemented yet — default 0.2 s is hardcoded; expose as env if real-world latency makes the watchdog miss the budget)
+- WS frames:
+  - in: `{type: "task_cancel", task_id?: string}` from server
+  - out: `{type: "task_action", task_id, action: "cancel_received", detail: "Останавливаю задачу..."}`
+  - out: `{type: "task_error", task_id, error: "cancelled_by_user"}`
+- LLM endpoint: `POST https://agentflow.website/_agents/llm/v1/messages` with `stream: true`. Server (`agentflow-agents/src/routes/public-llm.ts:147`) already proxies streamed SSE; no server change needed.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Cancel takes >2 s | `=== CANCELLED ===` shows late in stdout | bump `poll_interval` down or check that `post_llm_cancellable` is on the call path (not the legacy `post_llm`); `driver/loop.py:381` |
+| `urlopen` blocked on connect — flag set, nothing happens | (no log) | watchdog only closes an established connection; if upstream stalls on TCP handshake, set `timeout=` shorter in `post_llm_cancellable`; `driver/loop.py:341` |
+| Tool dispatch finishes before gate fires | `cancel_received` then full tool output | only the `wait` tool is gate-aware today. Long browser/firefox/code_run_command tools still finish their current call; add per-tool `state.abort_flag` checks if this becomes the long pole; `driver/desktop_tools.py:703` |
+| `cancel_received` frame missing in cabinet | `task_cancel handler failed` in daemon log | the publisher raised — check `state.outbound_publisher` is wired in the WS bridge; `driver/state.py:91` |
+| Cancel during local CLI task (no remote id) | no WS frames emitted, flag still cleared | by design — `request_abort` skips the ACK when `current_task_id == ""`; `driver/state.py:88` |
+
+## Why a watchdog instead of `asyncio` or the Anthropic SDK
+
+- The daemon uses `urllib.request.urlopen` (no Anthropic SDK dep on the device). `urlopen` does not expose a thread-safe cancel — the only reliable interrupt is `response.close()`, which severs the TCP socket and surfaces as `OSError` on the reading thread.
+- The `run_task` loop is synchronous (driven by a worker thread off the task queue); a full `asyncio` rewrite would touch the WS bridge, the executor, and the streamer. Out of scope for a hot-path fix.
+- A streaming approach was chosen over thread-pool-with-discarded-result because the latter leaks a thread per cancel; the SSE watchdog closes the connection and frees the socket immediately.
+
+## Test plan (verifiable)
+
+```
+pytest tests/test_run_task_cancel.py -v
+```
+
+- `test_post_llm_cancellable_aborts_mid_stream_within_500ms` — asserts <0.5 s
+- `test_run_task_end_to_end_cancel_within_2s` — asserts <2 s
+- `test_wait_tool_aborts_within_300ms` — asserts <0.5 s
+
+Live test on enrolled device:
+
+1. Cabinet → dispatch task "open Safari, wait 60 seconds, close it".
+2. 3 s after start → cabinet Стоп.
+3. Within ≤2 s, server gets `task_error: cancelled_by_user`. Cabinet shows the task stopped.
+
+## Related
+
+- [Desktop Firefox + memory](/subsystems/desktop-firefox-and-memory)
+- [Public LLM façade](/subsystems/public-llm-facade) — server side of `/llm/v1/messages` streaming
