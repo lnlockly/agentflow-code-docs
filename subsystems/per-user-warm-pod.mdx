@@ -28,6 +28,7 @@ sub-second. The same pod's Caddy sidecar serves
 | `agentflow-agents/src/mcp-servers/code-exec/helpers/kubectl.ts` (PR-3) | `exec` / `write_file` / `read_file` routing to `user-workspace-1` pod when project's `host_pod_name` matches. |
 | `agentflow-agents/src/services/peruser-pod-rbac.ts` | Auto-bootstraps `agentflow-agents-peruser-exec` RoleBinding in `af-tenant-<id>` on first peruser exec. Idempotent, in-process memoised. |
 | `agentflow-agents/k8s/agentflow-agents.yaml` (ClusterRole `agentflow-agents-peruser-rbac`) | Grants the agents ServiceAccount `rolebindings: get/create/update/patch` + `clusterroles.bind` on `agentflow-peruser-exec` so the bootstrap apply passes RBAC privilege-escalation checks. |
+| `agentflow-agents/src/services/pingers/peruser-web-supervisor.ts` | Server-side ticker (60s) that scans peruser landing/spa/mini_app projects for dead `web:` PIDs and restarts them via setsid+nohup. Also installs `/workspace/.tools/supervisor.sh` in-pod for 30s in-pod recovery. |
 
 ## Data flow
 
@@ -133,6 +134,7 @@ agentflow-agents PR #739.
 | Caddy serves stale build after `pnpm build` | (none — `Cache-Control: no-cache` set, but client cache may still serve) | Force-refresh in browser. If persists: check `/workspace/<slug>/dist/index.html` mtime via `kubectl exec`. |
 | User 1 PVC fills (>90%) | `df -h` on the pod | Bump PVC to 50 Gi or wire an LRU eviction job for idle project subdirs. |
 | Pod restart loses in-flight project state | Pod restart event | Recreate strategy is intentional — projects re-clone from git remote on next coder turn. For long-running builds, snapshot state before any planned restart. |
+| `next dev` / `next start` not restarted after peruser pod restart (preview → 502) | `peruser-web-supervisor: tick done ... restarted=N` in agentflow-agents logs; per-project `peruser_web_restarted` event | Fixed by `pingers/peruser-web-supervisor.ts` (60s server-side tick) + in-pod `/workspace/.tools/supervisor.sh` (30s loop). Both are idempotent; cooldown 3min per project after restart attempt. Manual fallback: `kubectl -n af-tenant-<id> exec deployment/user-workspace-<id> -c tools -- bash /workspace/.tools/supervisor.sh &`. |
 | Ingress wildcard routing collides with existing per-project ingresses | nginx-ingress reload warning about duplicate host | Per-project Ingresses (`ensurePreviewIngressPlaceholder`) target the same wildcard host pattern. With ingress class `nginx` the most-specific Ingress wins; if a per-project Ingress for `p-<slug>.proj.agentflow.website` exists it'll mask the wildcard. PR-2 must skip `ensurePreviewIngressPlaceholder` for per-user-pod projects. |
 
 ## Operational commands
@@ -154,7 +156,55 @@ ssh ff-france "kubectl -n af-tenant-1 exec deploy/user-workspace-1 -c tools -- \
 # Rollback (the per-project STS pipeline is unchanged, so this is non-destructive
 # until PR-2 ships and starts routing user 1 traffic here)
 ssh ff-france "kubectl delete -f -" < agentflow-agents/k8s/user-workspace.yaml
+
+# Tail in-pod web supervisor log (auto-restart of dead next dev / next start)
+ssh ff-france "kubectl -n af-tenant-1 exec deploy/user-workspace-1 -c tools -- \
+    tail -n 50 /workspace/.tools/supervisor.log"
+
+# Manually kick the in-pod supervisor if /workspace/.tools/supervisor.lock is stale
+ssh ff-france "kubectl -n af-tenant-1 exec deploy/user-workspace-1 -c tools -- \
+    sh -c 'rm -f /workspace/.tools/supervisor.lock && \
+           setsid nohup bash /workspace/.tools/supervisor.sh \
+           > /workspace/.tools/supervisor.boot.log 2>&1 &'"
 ```
+
+## Web auto-restart (T2, 2026-05-23)
+
+Pod restarts (image roll, OOM, node drain) kill every detached
+`setsid bash` that scaffold-time `runtime-supervisor.deploy()` spawned.
+The PID files in `/workspace/<slug>/.services/web/pid` go stale,
+`next dev` / `next start` is gone, the preview returns 502 until a
+human steps in. PR #748 deploy on 2026-05-23 took down projects 1411,
+1445, 1446 this way.
+
+Two complementary layers handle this:
+
+1. **Server-side (`pingers/peruser-web-supervisor.ts`)** — 60s ticker
+   in agentflow-agents. For every peruser landing/spa/mini_app project,
+   exec a single probe script in the workspace pod:
+   - read `.services/web/pid`, `kill -0` to liveness-check
+   - check the deterministic per-project port (`computePortBase(id).port`)
+     via `ss` / `/proc/net/tcp`
+   - if pid dead AND port not bound → re-execute the recorded
+     `.services/web/cmd` (falls back to the Procfile `web:` line) via
+     `setsid nohup bash -c` so the spawn survives the kubectl-exec
+     teardown
+   - emit `peruser_web_restarted` / `peruser_web_restart_failed`
+     project_events.
+   3-min per-project cooldown to avoid pinning exec slots on a
+   chronically-broken project.
+
+2. **In-pod (`/workspace/.tools/supervisor.sh`)** — installed + booted
+   by the same server-side ticker. Loops every 30s, walks
+   `/workspace/*\/.services/web/pid`, restarts dead PIDs from
+   `.services/web/cmd`. Single-flight via `/workspace/.tools/supervisor.lock`
+   (stale-lock detection via `kill -0` on the recorded PID). Survives
+   the agents pod being unreachable.
+
+Both layers honour `/workspace/<slug>/.no_auto_start` as an operator
+escape hatch (same marker `runtime-supervisor.deploy()` checks). Pinned
+ports (`PERUSER_POD_PORT_PINS`, currently `{1292: 3091}` for Monar) are
+skipped server-side — manual ops owns those.
 
 ## Verification (real, not surface signals)
 
