@@ -113,6 +113,39 @@ agentflow-agents pod (RUN_WORKERS=true)
 | `M_USER_IN_USE` on register but login also 403 | `matrix_bot_register_rejected_400_M_USER_IN_USE` | Password drift — either rotate `MATRIX_BOT_KEY` back, or hit `/_dendrite/admin/resetPassword/{user}` to align |
 | Sync loop hot-loops on error | `[matrix-bots] sync error, backing off` | Inspect the inner `err` field; exponential backoff caps at 60s and resumes automatically |
 
+## @af-research follow-ups — 📄 / 🔗 / 💾 reactions
+
+After @af-research posts a TL;DR, it pre-attaches three reactions on its own message. Owner taps one to drive a follow-up without re-pasting the URL:
+
+| Reaction | Action |
+|---|---|
+| 📄 | Longer expansion (TEXT_LARGE, 8-12 sentences with one counter-argument + practical takeaway). |
+| 🔗 | 5 related resources / sub-topics (TEXT_SMALL numbered list). |
+| 💾 | Save article into the owner's knowledge base — ingests into the most recent `category='researcher'` agent (fallback: most recent agent of any category). Reply confirms `agent_slug` + chunk count. |
+
+Reactions on the af-research bot's sync stream are dispatched through `parseAnnotationReaction(ev)` from `mode-c.ts:90` → `handleResearchFollowup` in `src/services/matrix-bots/handlers/research-followups.ts:213`. Auth boundary: only `@user-<digits>:<serverName>` mxids may trigger (same `parseOwnerMxid` gate Mode C uses). Bot self-reactions, TG puppets, and non-followup emojis fail closed.
+
+Payload cache: TL;DR payload (`url`, `title`, `summary`, `articleText`) is keyed by the TL;DR event id in a 200-entry FIFO `Map`. Cache miss (runner restart) replies «Не нашёл оригинал TL;DR в кеше — пришли ссылку ещё раз» instead of failing silently.
+
+Idempotency: `(roomId|originalEventId|sender|key)` recorded in a 200-entry `Set` — re-delivered reactions never double-post.
+
+Save-to-KB target resolution lives in `findIngestTargetAgent(afUserId)` and reuses the same `ingestForAgent` / `chunkText` / `resolveAgentUuid` helpers `/me/agents/:slug/knowledge/url` uses, so saved articles show up in retrieval immediately.
+
+| Failure | Log signature for grep | Where to fix |
+|---|---|---|
+| Reactor isn't an AF owner | `[af-research-followup] sender_not_authorized` | Expected — only owners drive follow-ups |
+| Cache miss after runner restart | `[af-research-followup] payload_missing` | Owner re-pastes URL — payload cache is in-process |
+| Owner has no agents to ingest into | `[af-research-followup] save_failed_no_agent` | Create an agent in /agents — KB ingest is per-agent |
+| Reaction attached but follow-up never lands | `[af-research-followup] followup_error` | Inspect inner `err` — LLM / DB exception, retry safe |
+| Reactions not visible on TL;DR | `[af-research] reaction_attach_failed` | Matrix 5xx during attach loop — TL;DR still posts |
+
+Files:
+- `agentflow-agents/src/services/matrix-bots/handlers/research-followups.ts:1` — module
+- `agentflow-agents/src/services/matrix-bots/handlers/research.ts:140` — attaches 3 reactions after TL;DR + populates payload cache
+- `agentflow-agents/src/services/matrix-bots/runner.ts:148` — reaction dispatch in af-research's `/sync` loop
+- `agentflow-agents/src/services/matrix-bots/mode-c.ts:90` — generic `parseAnnotationReaction`
+- `agentflow-agents/tests/research-followups.test.ts:1` — 16 unit tests (pure helpers + dispatcher auth/dedup paths)
+
 ## Mode C — send-as-owner via reaction
 
 When `@af-claude` finds itself in a room that contains at least one TG-puppet member (`@telegram_<tgid>:agentflow.website`), the owner is using it as a hint assistant inside a TG-bridged dialog. Workflow:
