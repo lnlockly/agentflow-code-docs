@@ -144,6 +144,40 @@ Both `install.sh` and `install.ps1` call `agentflow-desktop selftest` at the end
 
 Source: `agentflow-computer-mcp/src/agentflow_computer_mcp/desktop_cli.py:225` (`cmd_selftest`).
 
+## Install onboarding (2026-05-22)
+
+The cabinet's offline-state card (`/cabinet/devices/:id/live`) auto-mints
+an API key on open and inlines it into the install one-liner, so the
+user pastes a single line and the daemon enrols with no further input.
+
+Flow:
+
+1. `OfflineState` mounts → calls `devicesApi.mintInstallToken()` →
+   `POST /me/api-keys/install-token` (route file
+   `agentflow-agents/src/routes/me-api-keys.ts`). Returns the raw
+   `af_live_*` key once; backend persists only the HMAC hash into the
+   shared `api_keys` table with `name = 'Desktop install <uuid>'`.
+2. UI renders `AGENTFLOW_API_KEY=af_live_… curl -fsSL …/install/computer-mcp.sh | bash`
+   with reveal/hide, copy, regenerate buttons.
+3. `install.sh` / `install.ps1` bridge `AGENTFLOW_API_KEY` → `AF_KEY`
+   for the existing `auth.json` writer. `AF_DEVICE_ID` / `AF_DEVICE_TOKEN`
+   are now optional — the daemon enrols on first launch with just the
+   key.
+
+Revoke a stale install token via the normal cabinet API-keys page —
+they show up alongside the user's other keys.
+
+Files:
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-api-keys.ts` | `POST /me/api-keys/install-token` mint endpoint |
+| `agentflow-agents/src/server.ts:790` | route mount (between `meDevicesApp` and `meTelegramApp`) |
+| `agentflow-landing/src/pages/CabinetDeviceLive.tsx:OfflineState` | calls mint, renders command, reveal/regenerate UX |
+| `agentflow-landing/src/lib/devicesApi.ts:mintInstallToken` | client wrapper |
+| `agentflow-computer-mcp/install.sh:30` | `AGENTFLOW_API_KEY` → `AF_KEY` bridge |
+| `agentflow-computer-mcp/install.ps1:20` | same for Windows |
+
 ## Failure modes
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
@@ -169,6 +203,8 @@ Source: `agentflow-computer-mcp/src/agentflow_computer_mcp/desktop_cli.py:225` (
 | `agentflow-desktop selftest` fails `ws_endpoint_reachable` | TCP connection refused or TLS error | Check firewall / VPN; endpoint is `wss://agentflow.website/_agents/_devices/connect` |
 | Reconnect loop plateaus at 60s; cabinet reads "Mac offline" for a full minute after a single packet drop | `ws session ended:` followed by `reconnecting in 60.` | Fixed 2026-05-22 (`feat/daemon-ws-resilience`): backoff cap now 30s, resets to 1s after a successful `hello_ack`, `open_timeout` raised from 10s → 30s. See `ws_client.py:WS_OPEN_TIMEOUT_S` + `RECONNECT_BACKOFF_CAP_S`. |
 | Daemon stuck in reconnect cycles; cabinet can't tell "reconnecting" from "process dead" | `ws degraded — restart recommended (5 consecutive failures)` | Curl `http://127.0.0.1:8765/api/health` and inspect `ws_status` + `consecutive_failures`. Daemon does not self-kill; rely on launchd / systemd / Task Scheduler `KeepAlive`. |
+| Cabinet Action Timeline shows a task as "running" for hours after the WS bridge silently dropped | `[device-task-timeout] closed=` (when sweeper fires) | `agentflow-agents/src/services/device-task-timeout-worker.ts` runs every 60s, picks `device_sessions` rows older than 15 min with no `task_complete` / `task_error` row, writes a synthetic `task_error` with `error: 'task_timeout_no_progress'`, fans out via SSE. Cabinet also has a client-side guard that flips bucket.status to 'error' if startedAt < now - 15 min (`CabinetDeviceLive.tsx:STUCK_AFTER_MS`). |
+| `dispatch_task` returns 500 `secret_not_configured` on install-token mint | `[me-api-keys] install_token_insert_failed` | `API_KEY_HMAC_SECRET` or `AUTH_JWT_SECRET` not exported on the agents pod — verify with `kubectl exec deploy/agentflow-agents -- env \| grep HMAC` |
 
 ## Performance (streamer, updated 2026-05-22)
 
