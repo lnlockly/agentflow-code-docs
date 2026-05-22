@@ -23,7 +23,10 @@ with the top recommendation when the client passes no `selected_foundation`.
 | `agentflow-agents/src/services/curated-foundations.ts:41` | The 24-entry `CURATED_FOUNDATIONS` list + `matchesCuratedFoundation` substring matcher (fallback) |
 | `agentflow-agents/src/services/foundation-llm-scorer.ts:170` | `scoreCuratedFoundations` — single LLM call ranks curated entries 0-10 for the brief, 5-min cache |
 | `agentflow-agents/src/services/scoring-tweaks.ts:1` | Deterministic bonus matrix: curated bias (+3), anti-monorepo (-4), domain keyword match (+5) |
-| `agentflow-agents/src/services/foundation-structural-filter.ts:1` | **Structural probe + hard-reject** — `deriveStructuralSignals`, `decideHardReject`, `structuralBias`, `shouldUseMarketingCuratedBypass`, `pickCuratedBypassList`, `isMlmBrief`, `MARKETING_CURATED_LIST` (5-entry generic Next.js list), `MLM_CURATED_LIST` (golden-connect only) |
+| `agentflow-agents/src/services/foundation-structural-filter.ts:1` | **Structural probe + hard-reject** — `deriveStructuralSignals`, `decideHardReject`, `structuralBias`, `shouldUseMarketingCuratedBypass`, `pickCuratedBypassList`, `isMlmBrief`, `parseMajor` (Next major-version parser), `MARKETING_CURATED_LIST` (5-entry generic Next.js list), `MLM_CURATED_LIST` (golden-connect only). Hard-reject reasons include `next_config_ts_unsupported` (orphan `next.config.ts` + Next < 15). |
+| `agentflow-agents/src/services/graph-executor/handlers/spa.ts` (`_transpile_next_config_ts`) | SPA foundation bridge: after the clone, transpiles orphan `next.config.ts` → `next.config.mjs` via sed pipeline (strips type imports + annotations). Falls back to stub `export default {};` on sed failure. Runs over `/workspace` root AND `$APP_DIR` BEFORE Procfile generation. Salvages already-cloned legacy workspaces. |
+| `agentflow-agents/tests/unit/foundation-bridge-nextconfig.test.ts` | Source-contract tests pinning the bridge transpile shell snippet (function definition, ordering before Procfile, orphan removal, sed clauses, stub fallback, `.bak` backup). |
+| `agentflow-agents/tests/unit/scoring-next-config-ts.test.ts` | Signal + decision tests for the `next_config_ts_unsupported` reject reason (Next 14 reject, Next 15 accept, sibling `.mjs` accept, unknown-version accept). |
 | `agentflow-agents/src/services/project-foundations.ts:406` | `recommendProjectFoundations` — orchestrates marketing-bypass → LLM proposer → LLM scorer → GitHub enrichment → structural filter → scoring tweaks |
 | `agentflow-agents/src/routes/projects.ts:734` | `POST /me/project-foundations/recommend` (returns up to 15 candidates) |
 | `agentflow-agents/src/routes/projects.ts:815` | `POST /me/projects` default-foundation resolution (no scratch unless `ALLOW_SCRATCH_FOUNDATION=1`) |
@@ -231,6 +234,83 @@ All 24 verified 200 OK on `https://api.github.com/repos/<owner>/<name>`
 (2026-05-22). Redirected names resolved at verification time:
 `vercel/ai-chatbot` → `vercel/chatbot`, `calcom/cal.com` → `calcom/cal.diy`.
 
+## next.config.ts handling (2026-05-22)
+
+Next.js 14.x does not support `next.config.ts`. Foundations that ship a
+TypeScript config and pin `next < 15` crashed every project that cloned them:
+
+```
+Error: Configuring Next.js via 'next.config.ts' is not supported.
+Please replace the file with 'next.config.js' or 'next.config.mjs'.
+    at loadConfig (.../next/dist/server/config.js:787:19)
+```
+
+Live incident: projects 1388-1392 (2026-05-22) all on
+`vercel/nextjs-subscription-payments` (next@14.2.3, ships `next.config.ts`)
+never bound the preview port.
+
+Defence in depth — both layers ship together:
+
+### Layer 1 — scorer hard-reject (prevent new projects from picking it)
+
+`deriveStructuralSignals` exposes two new fields:
+
+- `has_orphan_next_config_ts` — root contains `next.config.ts` AND no sibling
+  `next.config.{js,mjs,cjs}`.
+- `next_major_version` — major version from `dependencies.next` /
+  `devDependencies.next` (via `parseMajor`), or `null` for non-numeric ranges
+  (`latest`, `workspace:*`).
+
+`decideHardReject` then returns
+`{ reject: true, reason: 'next_config_ts_unsupported' }` when:
+
+```
+has_orphan_next_config_ts === true
+&& typeof next_major_version === 'number'
+&& next_major_version < 15
+```
+
+Edge cases that accept:
+
+- **Next ≥ 15** — TS-config support is native.
+- **Sibling `.mjs`/`.js`/`.cjs` exists** — Next.js loads the JS file first; the
+  orphan flag is false.
+- **Major version unparseable** (`latest`, `workspace:*`) — defer to the bridge
+  transpile below.
+
+### Layer 2 — bridge transpile (salvage already-cloned workspaces)
+
+After the foundation clone in `services/graph-executor/handlers/spa.ts`, the
+bridge runs `_transpile_next_config_ts` over BOTH `/workspace` root AND the
+resolved `$APP_DIR` (monorepo foundations like `vercel/commerce` keep the
+config at workspace root, single-package ones at the app root). The function
+runs BEFORE Procfile generation, so the supervisor never sees the `.ts` file.
+
+Decision tree:
+
+1. **No `next.config.ts` at this path** → noop.
+2. **Sibling `.js`/`.mjs`/`.cjs` already exists** → remove orphan `.ts`. Next.js
+   loaded the JS file first anyway; the `.ts` was dead weight.
+3. **Sed pipeline** strips:
+   - `import type { ... } from 'next';`
+   - `import { type NextConfig } from 'next';`
+   - `import { NextConfig } from 'next';`
+   - `: NextConfig` annotations
+   - `satisfies NextConfig` clauses
+   - `as const` casts
+   Writes the result to `next.config.mjs` and removes the `.ts`.
+4. **Sed fails** (exotic TS-only syntax — enums, namespaces, …) → write a
+   minimal `export default {};` stub so `next` boots and renders.
+
+The original `.ts` is preserved at `next.config.ts.foundation-bak` for the
+coder to inspect. Bridge stdout (echo lines like
+`[foundation] transpiled next.config.ts → next.config.mjs in /workspace`) lands
+in the `admin_panel: preserved github foundation frontend` project_event's
+`stdout` field (last 600 chars).
+
+Idempotent: re-running the bridge over an already-transpiled workspace is a
+no-op (no `next.config.ts` left to transpile).
+
 ## Workflow rule for users
 
 The proper way to iterate on a project is:
@@ -257,6 +337,8 @@ The proper way to iterate on a project is:
 | Cafe / landing brief picks a random LLM-proposed repo instead of curated | `[foundation-scorer] marketing_bypass` should appear in logs; if missing → check `MARKETING_INTENT_RX` covers the brief's intent words | `services/foundation-structural-filter.ts:227` |
 | Non-MLM brief (cafe / yoga / barbershop) lands on `lnlockly/golden-connect-template` | `[foundation-scorer] mlm_gate dropped=lnlockly/golden-connect-template reason=non_mlm_brief` should appear in logs. If missing → check `MLM_KEYWORDS_RX` did not match a false-positive term (a brief literally mentioning "MLM" or "network marketing" will route through the MLM list correctly). | `services/foundation-structural-filter.ts:294` + `services/project-foundations.ts:550` |
 | Explicit MLM brief surfaces a generic Next.js template instead of golden-connect | check `isMlmBrief` returns true for the brief; if false → extend `MLM_KEYWORDS_RX` | `services/foundation-structural-filter.ts:294` |
+| Project crashes on first `next start` with `Configuring Next.js via 'next.config.ts' is not supported` | `[foundation] transpiled next.config.ts → next.config.mjs in ...` should appear in bridge stdout (last 600 chars live in the `admin_panel: preserved github foundation frontend` project_event). If absent — bridge didn't run; if present and crash persists — sed transpile produced syntactically invalid JS, check `next.config.ts.foundation-bak` in workspace. | `services/graph-executor/handlers/spa.ts` (`_transpile_next_config_ts`) |
+| Scorer surfaces `vercel/nextjs-subscription-payments` for a Next < 15 brief | `[foundation-scorer] hard_reject reason=next_config_ts_unsupported candidate=vercel/nextjs-subscription-payments` (expected). If still wins → verify package.json `next` dep parses major as `< 15` via `parseMajor` | `services/foundation-structural-filter.ts:283` |
 | Curated MLM/e-commerce template not in top 3 for matching brief | extend `DOMAIN_MAP` keywords or repos list | `services/scoring-tweaks.ts:63` |
 | Project lands on `scratch` mode in DB | only when `ALLOW_SCRATCH_FOUNDATION=1` or client explicitly sent `selected_foundation.mode='scratch'` | `routes/projects.ts:815` |
 
