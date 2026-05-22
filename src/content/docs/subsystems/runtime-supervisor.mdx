@@ -1,0 +1,139 @@
+---
+title: "Runtime supervisor + preview-health gate"
+description: "How peruser foundation projects stay alive after status='done' — Procfile contract, .ports.env, start_service idempotency, and the auto-pinger reconciler."
+---
+
+# Runtime supervisor + preview-health gate
+
+## TL;DR
+
+Every peruser foundation project (kind ∈ {spa, mini_app, landing} with a cloned Next.js boilerplate) keeps running because four invariants hold at all times:
+
+1. `/workspace/<slug>/.ports.env` exists with `PORT=<n>`.
+2. `/workspace/<slug>/Procfile` sources `.ports.env` on every supervisor restart.
+3. `/workspace/<slug>/.services/web/pid` points at the live web process — adopted from a running PID when missing.
+4. `start_service` is idempotent — it returns `already_running` instead of relaunching when (a) the pidfile points at a live PID and (b) any declared port is bound.
+
+Before 2026-05-22 these invariants drifted for legacy projects (Monar / 1292), causing EADDRINUSE relaunch loops, log spam, and preview-503s when `$PORT` expanded empty after a clean-env restart. The reconciler ticker now adopts legacy projects into the contract within ~10 minutes of agent boot.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/graph-executor/handlers/spa.ts:798-833` | Foundation bridge: writes `.ports.env`, generates the Procfile with the `${PORTS_SRC}` source line in every variant. |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts:1899-2240` | `start_service` MCP tool: idempotency probe + force mode. |
+| `agentflow-agents/src/services/pingers/peruser-services-reconcile.ts:1-260` | Auto-pinger reconciler: writes missing `.ports.env`, patches legacy Procfiles, adopts the running PID. |
+| `agentflow-agents/src/services/auto-pinger.ts:151-175` | Wires the reconciler into the 10-minute tick. Boot-tick fires once 5 s after startup. |
+| `agentflow-agents/src/services/peruser-pod.ts:308-353` | `renderCreateProjectScript` — the bootstrap path that writes `.ports.env` for new projects. |
+| `agentflow-agents/src/services/peruser-pod.ts:69-83` | `computePortBase(projectId)` — deterministic 4-port window per project (PORT/BOT_PORT/VITE_PORT/PREVIEW_PORT). |
+| `agentflow-agents/src/services/pingers/preview-health.ts:88-192` | `runPreviewHealthTick` — terminal-project HEAD probe + `detectAndRepointPreview` reanimation, 5-min per-project cooldown. |
+| `agentflow-agents/src/services/pingers/preview-placeholder.ts:189-214` | `shouldHoldFinalizeForPlaceholder` — preview-gate predicate the graph-executor `runProjectExecutionBackground` uses before flipping `status='done'`. |
+| `agentflow-agents/src/services/projects.ts:3098-3175` | The pre-`done` preview gate that calls `probePreviewUrl` with backoff (0/5/15/30 s) and flips to `failed` on persistent placeholder. |
+
+## Data flow
+
+```
+            ┌─────────────────────────┐
+ approve →  │ runProjectExecutionBg   │
+            │  → graph-executor walk  │
+            └────────────┬────────────┘
+                         │  every node done
+                         ▼
+            ┌─────────────────────────┐
+            │ preview-gate (4 probes) │ ← shouldHoldFinalizeForPlaceholder
+            └────────────┬────────────┘
+              hold=false │            │ hold=true
+                         ▼            ▼
+                  status='done'  status='failed' + preview_gate_blocked
+                         │
+                         ▼
+            ┌─────────────────────────┐
+            │ runtime-supervisor      │  Procfile → start_service(name=web, port=N)
+            │  (auto-pinger)          │     ↓ idempotency probe
+            │                         │     ↓ if PID alive && port bound → no-op
+            └────────────┬────────────┘
+                         │
+                         ▼
+            ┌─────────────────────────┐
+            │ preview-health watchdog │  HEAD probe terminal preview URLs every 2 min
+            │  (auto-pinger)          │  on 5xx / placeholder → detectAndRepointPreview
+            └─────────────────────────┘
+
+  Legacy projects (Monar et al.) lacking .ports.env / .services/web/pid:
+            ┌─────────────────────────────────────┐
+            │ peruser-services-reconcile (10 min) │
+            │  - writes .ports.env from           │
+            │    computePortBase(projectId)       │
+            │  - patches Procfile to source it    │
+            │  - adopts running PID via           │
+            │    lsof | ss | /proc/net/tcp        │
+            └─────────────────────────────────────┘
+```
+
+## DB / Env / API
+
+- **Tables:** `projects` (kind, status, slug, workspace_project_name, owner_user_id, preview_url, foundation_mode), `project_events` (kind='log', 'preview_gate_blocked', 'preview_dead_3x', payload source='auto-pinger').
+- **Env:** `PERUSER_POD_ENABLED_USER_IDS` (CSV of user IDs routed through the peruser pod model), `FF_BOT_AUTO_TEST`, `FF_SELF_HEAL_LOOP`.
+- **MCP tools:** `start_service` (new params `port`, `mode` ∈ `idempotent`|`force`), `stop_service`, `list_services`.
+- **Port window per project:** `30_000 + projectId * 100 + {0,1,2,3}` (PORT/BOT_PORT/VITE_PORT/PREVIEW_PORT).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `next start -p $PORT` fails with `Invalid port: 0` after auto-pinger restart | `Invalid port` in `.services/web/log` | `services/graph-executor/handlers/spa.ts:798-833` — Procfile must contain `${PORTS_SRC}` |
+| EADDRINUSE relaunch loop in pinger logs | `start_service` called repeatedly with same name and no `already_running` echo | `mcp-servers/code-exec/index.ts:2108-2186` — idempotency probe must run before launch |
+| Preview returns 502 but no `peruser_services_reconcile` event | (no reconcile event in `project_events`) | `services/pingers/peruser-services-reconcile.ts` — verify ticker is wired in `auto-pinger.ts` |
+| `preview_dead_3x` event without follow-up `repoint_ok` | `preview_dead_3x:` in `project_events` | `services/pingers/preview-health.ts:175-185` + `services/pool-worker/post-build.ts:1505` (`detectAndRepointPreview`) |
+| `.ports.env` missing for an existing peruser project | `peruser_services_reconcile: ports_written=1` event appears | `services/pingers/peruser-services-reconcile.ts:renderReconcileScript` |
+| Graph flips `status='done'` while preview serves Caddy stub | `preview_gate_blocked` event | `services/projects.ts:3098-3151` — backoff retry already covers this |
+
+## Reconcile contract
+
+`runPeruserServicesReconcileTick` is **read-mostly** — never restarts the running web process. Its single mutation is to fill in missing platform metadata:
+
+- `.ports.env` write guarded by `[ ! -f .ports.env ]`.
+- `Procfile` rewrite guarded by `! grep -q '[ -f .ports.env ]' Procfile` (sentinel skip when bridge-generated Procfile already has it).
+- PID adoption guarded by `[ ! -s .services/web/pid ]` AND `kill -0 "$CANDIDATE"` on the discovered PID.
+
+The script emits one machine-parseable line — `RECONCILE: ports=<0|1> proc=<0|1> pid=<n|none>` — so the agent-side caller records a single structured `project_events.kind='log'` entry without re-grepping stdout.
+
+PID discovery cascade: `lsof -t -i TCP:$PORT -sTCP:LISTEN` → `ss -lntp` (parse `pid=N`) → `/proc/net/tcp` (find LISTEN inode, follow `/proc/<pid>/fd/*` symlinks). The third path is the only one that works in a stripped Alpine-derived workspace image where neither `lsof` nor `ss` ship.
+
+Per-project cooldown: 10 min between attempts. On first success the project lands in the `succeeded: true` slot of the in-memory state map and is skipped forever (until agent restart).
+
+## start_service contract
+
+```ts
+{
+  project: string,    // peruser slug
+  name: string,       // service name (e.g. 'web')
+  command: string,    // foreman-style web: line, NOT a full bash script
+  cwd?: string,
+  port?: number,      // optional — required for the port-bound idempotency check
+  mode?: 'idempotent' | 'force', // default 'idempotent'
+}
+```
+
+**Idempotency probe** runs inside the workspace pod before composing the launch script:
+
+```sh
+if [ -f .services/<name>/pid ]; then
+  PID=$(cat .services/<name>/pid)
+  if [ -n "$PID" ] && kill -0 "$PID" && ( ss -tln | grep ":<port>" || netstat -lnt | grep ":<port>" ); then
+    echo "ALIVE:$PID"
+  else
+    echo "DEAD"
+  fi
+else
+  echo "NOPID"
+fi
+```
+
+Returns `{ ok: true, status: 'already_running', pid, port }` on `ALIVE:` — no kill, no relaunch. `mode: 'force'` skips the probe and always restarts; use it for code-redeploy / config-change paths.
+
+## Related
+
+- [graph-executor](./graph-executor.mdx) — owns the node DAG that runs before `status='done'`.
+- [computer-mcp](./computer-mcp.mdx) — sibling pattern: idempotent service launch over MCP.
+- `agentflow-agents/docs/specs/2026-05-22-runtime-supervisor-bulletproof.md` — spec for this PR.
