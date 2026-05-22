@@ -23,7 +23,7 @@ with the top recommendation when the client passes no `selected_foundation`.
 | `agentflow-agents/src/services/curated-foundations.ts:41` | The 24-entry `CURATED_FOUNDATIONS` list + `matchesCuratedFoundation` substring matcher (fallback) |
 | `agentflow-agents/src/services/foundation-llm-scorer.ts:170` | `scoreCuratedFoundations` — single LLM call ranks curated entries 0-10 for the brief, 5-min cache |
 | `agentflow-agents/src/services/scoring-tweaks.ts:1` | Deterministic bonus matrix: curated bias (+3), anti-monorepo (-4), domain keyword match (+5) |
-| `agentflow-agents/src/services/foundation-structural-filter.ts:1` | **Structural probe + hard-reject** — `deriveStructuralSignals`, `decideHardReject`, `structuralBias`, `shouldUseMarketingCuratedBypass`, `MARKETING_CURATED_LIST` (4-entry landing list) |
+| `agentflow-agents/src/services/foundation-structural-filter.ts:1` | **Structural probe + hard-reject** — `deriveStructuralSignals`, `decideHardReject`, `structuralBias`, `shouldUseMarketingCuratedBypass`, `pickCuratedBypassList`, `isMlmBrief`, `MARKETING_CURATED_LIST` (5-entry generic Next.js list), `MLM_CURATED_LIST` (golden-connect only) |
 | `agentflow-agents/src/services/project-foundations.ts:406` | `recommendProjectFoundations` — orchestrates marketing-bypass → LLM proposer → LLM scorer → GitHub enrichment → structural filter → scoring tweaks |
 | `agentflow-agents/src/routes/projects.ts:734` | `POST /me/project-foundations/recommend` (returns up to 15 candidates) |
 | `agentflow-agents/src/routes/projects.ts:815` | `POST /me/projects` default-foundation resolution (no scratch unless `ALLOW_SCRATCH_FOUNDATION=1`) |
@@ -42,13 +42,24 @@ POST /me/project-foundations/recommend {brief, mode:"github_first", kind_hint}
 recommendProjectFoundations(input)
   │
   ├─► shouldUseMarketingCuratedBypass(brief, kind)
-  │     │  kind=landing || MARKETING_INTENT_RX matches brief (кофейн, лендинг,
-  │     │  меню, услуги, прайс, портфолио, restaurant, …)
+  │     │  kind=landing || kind=mlm || MARKETING_INTENT_RX matches brief
+  │     │  (кофейн, лендинг, меню, услуги, прайс, портфолио, restaurant, …)
+  │     │  OR isMlmBrief(brief) → true.
   │     │
   │     │  YES → skip LLM proposer + scorer; synthesise curated hits from
-  │     │        MARKETING_CURATED_LIST (4 entries, golden-connect-template leads)
+  │     │        pickCuratedBypassList(brief, kind):
+  │     │          - isMlmBrief → MLM_CURATED_LIST (golden-connect ONLY)
+  │     │          - else        → MARKETING_CURATED_LIST (5 generic Next.js
+  │     │                          templates, NO golden-connect)
   │     │
   │     │  NO  → fall through to the usual proposer + scorer chain
+  │
+  ├─► MLM gate (after curated + LLM proposer merge)
+  │     │  if !isMlmBrief(brief, kind):
+  │     │    drop any candidate equal to `lnlockly/golden-connect-template`
+  │     │    log: `[foundation-scorer] mlm_gate dropped=...`
+  │     │  Defence-in-depth — gate runs even when curated bypass is off (so the
+  │     │  LLM proposer can't smuggle golden-connect into a non-MLM brief).
   │
   ├─► proposeWithLlm (TEXT_LARGE)     → up to 8 LLM-proposed GitHub repos
   │     (skipped on marketing bypass)
@@ -127,8 +138,16 @@ recommendProjectFoundations({brief, mode:'github_first'})
       ├── ALLOW_SCRATCH_FOUNDATION=1 → mode='scratch'
       │
       └── default                    → mode='github_repo',
-                                       repo = lnlockly/golden-connect-template
+                                       repo = steven-tey/precedent (placeholder;
+                                       bg runner overwrites with recommender pick)
 ```
+
+**Fallback repo (2026-05-22):** the sync path stamps `steven-tey/precedent` —
+a clean single-page Next.js + Tailwind + auth starter — as the placeholder
+foundation. The previous fallback was `lnlockly/golden-connect-template`, an
+MLM-specific landing. Owner caught this routing every brief (кофейн, yoga,
+barbershop) through a Monar-clone visual when the bg runner failed or the
+project was inspected before the swap.
 
 ## DB / Env / API
 
@@ -148,11 +167,54 @@ recommendProjectFoundations({brief, mode:'github_first'})
   - `project-foundations.ts` — sha1(brief|mode|kind_hint), 1h TTL, 100 max.
   - `foundation-llm-scorer.ts` — sha1(brief|kind_hint), 5min TTL, 100 max.
 
+## MLM gate (2026-05-22)
+
+`lnlockly/golden-connect-template` is gated behind explicit MLM-intent detection.
+
+- `isMlmBrief({brief, kind})` returns true when:
+  - `kind === 'mlm'`, OR
+  - brief matches `MLM_KEYWORDS_RX` (MLM, МЛМ, multi-level marketing,
+    network marketing, downline/upline, реферальная сеть, pyramid plan,
+    Monar, Golden Connect, …).
+- When `isMlmBrief === false`, every layer drops the template:
+  - `pickCuratedBypassList` returns `MARKETING_CURATED_LIST` (no
+    golden-connect) for marketing-intent briefs.
+  - `recommendProjectFoundations` filters golden-connect out of curated
+    hits and out of the merged candidate set, even if the LLM proposer
+    suggests it.
+- `curated-foundations.ts` narrows the template's `kinds` to `['mlm']`
+  and its `keywords` to strict MLM language — broad terms like `team`,
+  `community`, `сообщество` were causing collateral matches on cafe /
+  yoga / barbershop briefs.
+
+The LLM scorer's system prompt has a matching HARD GATE clause: score
+golden-connect 0-1 for non-MLM briefs.
+
+### Vertical → template map (`scoring-tweaks.ts`)
+
+`VERTICAL_TEMPLATE_MAP` and `detectVertical(brief)` provide a coarse
+business-vertical taxonomy → preferred Next.js templates. Used in
+diagnostic logging and as a future hook for the scorer.
+
+| Vertical | Templates |
+|---|---|
+| `coffee_restaurant` | `steven-tey/precedent`, `shadcn-ui/taxonomy` |
+| `fitness_wellness` | `steven-tey/precedent`, `shadcn-ui/taxonomy` |
+| `beauty_salon` | `steven-tey/precedent`, `shadcn-ui/taxonomy` |
+| `course_education` | `mickasmt/next-saas-stripe-starter`, `steven-tey/precedent` |
+| `dashboard_saas` | `shadcn-ui/taxonomy`, `mickasmt/next-saas-stripe-starter` |
+| `ecommerce_shop` | `vercel/commerce`, `saleor/storefront` |
+| `mlm_referral` | `lnlockly/golden-connect-template` |
+| `default` | `steven-tey/precedent`, `shadcn-ui/taxonomy` |
+
+Only `mlm_referral` points at golden-connect — enforced by a unit test
+(`scoring-no-golden-connect.test.ts`).
+
 ## Curated list (24 entries, 2026-05-22)
 
 | Niche | Repo |
 |---|---|
-| AgentFlow MLM | `lnlockly/golden-connect-template` |
+| AgentFlow MLM (kinds=['mlm'] only) | `lnlockly/golden-connect-template` |
 | SaaS / Stripe | `mickasmt/next-saas-stripe-starter`, `vercel/nextjs-subscription-payments` |
 | Auth-heavy | `steven-tey/precedent`, `nextauthjs/next-auth-example` |
 | Content / Blog | `shadcn-ui/taxonomy`, `vercel/platforms`, `vercel/next.js` |
@@ -193,6 +255,8 @@ The proper way to iterate on a project is:
 | Cal.com or other turbo monorepo wins ranking for a landing brief | `[foundation-scorer] hard_reject reason=monorepo candidate=calcom/cal.diy` (expected). If still wins → check root-contents fetch is returning entries | `services/foundation-structural-filter.ts:111` |
 | Electron / notesnook surfaces for a todo SPA brief | `[foundation-scorer] hard_reject reason=desktop_app candidate=streetwriters/notesnook` (expected). If still wins → verify package.json deps include `electron` | `services/foundation-structural-filter.ts:140` |
 | Cafe / landing brief picks a random LLM-proposed repo instead of curated | `[foundation-scorer] marketing_bypass` should appear in logs; if missing → check `MARKETING_INTENT_RX` covers the brief's intent words | `services/foundation-structural-filter.ts:227` |
+| Non-MLM brief (cafe / yoga / barbershop) lands on `lnlockly/golden-connect-template` | `[foundation-scorer] mlm_gate dropped=lnlockly/golden-connect-template reason=non_mlm_brief` should appear in logs. If missing → check `MLM_KEYWORDS_RX` did not match a false-positive term (a brief literally mentioning "MLM" or "network marketing" will route through the MLM list correctly). | `services/foundation-structural-filter.ts:294` + `services/project-foundations.ts:550` |
+| Explicit MLM brief surfaces a generic Next.js template instead of golden-connect | check `isMlmBrief` returns true for the brief; if false → extend `MLM_KEYWORDS_RX` | `services/foundation-structural-filter.ts:294` |
 | Curated MLM/e-commerce template not in top 3 for matching brief | extend `DOMAIN_MAP` keywords or repos list | `services/scoring-tweaks.ts:63` |
 | Project lands on `scratch` mode in DB | only when `ALLOW_SCRATCH_FOUNDATION=1` or client explicitly sent `selected_foundation.mode='scratch'` | `routes/projects.ts:815` |
 
