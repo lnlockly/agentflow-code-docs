@@ -580,6 +580,19 @@ graph-executor path is never re-entered for a deployed project.
 
 Greppable success: `[chat-iterate] direct coder dispatch project=…`.
 
+### Plan resolution (`ensurePlanForProject`)
+
+Graph-executor projects often sit at `projects.plan_id = NULL` because handlers invoke coders inline via `ctx.coderInvoke` and never insert a `plans` row. The bypass cannot insert `plan_tasks` without a `plan_id`, so [`src/services/ensure-plan.ts`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/ensure-plan.ts) walks 4 paths:
+
+1. `projects.plan_id` (fast path)
+2. Latest `plan_started` event `payload.plan_id`
+3. Latest plan tied to the project's team
+4. INSERT a stub plan (`goal = "chat-iterate stub for project #N"`) and self-heal `projects.plan_id`
+
+`plans.maestro_agent_id` is NOT NULL with FK to agents — stub creation picks `teams.maestroAgentId` → most-recent `teamMembers` row → any non-tombstoned agent owned by the team owner. If none exists the helper returns null and the bypass falls back to the legacy maestro reply background.
+
+Greppable when stub is created: `[chat-iterate] stub plan created plan_id=…`.
+
 ### Why graph-executor was re-running
 
 Live evidence project 1292 (2026-05-22): owner sent
