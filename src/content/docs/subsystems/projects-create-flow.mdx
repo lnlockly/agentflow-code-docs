@@ -1,0 +1,119 @@
+---
+title: "Projects create flow (instant-create)"
+description: "POST /me/projects returns in <2s; foundation + kind + plan resolved in background."
+---
+
+# Projects create flow (instant-create)
+
+## TL;DR
+
+`POST /me/projects` used to block 30-60s while the LLM-scored foundation
+recommender, kind classifier, and GitHub fetches all ran inline. As of
+2026-05-22 the row inserts with `status='preparing'` + a placeholder
+foundation, the response returns in <2s, and `runBackgroundProjectPrep`
+fills in the real kind + foundation + plan via `setImmediate` after Hono
+flushes the response.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/projects.ts:778` | POST handler. Now skips the inline classifier + recommender + GitHub fetch + fast-path + scout. |
+| `agentflow-agents/src/services/projects-bg-prep.ts:1` | Background runner. Classify → recommend → hydrate snapshot → UPDATE → fast-path → scout → emit `project_ready`. |
+| `agentflow-agents/src/services/projects-pipeline.ts:88` | `ApproveProjectResult.error` gains `still_preparing`. |
+| `agentflow-agents/src/services/projects-pipeline.ts:648` | `approveProject` returns 409 `still_preparing` when row is `preparing`. |
+| `agentflow-agents/src/routes/projects.ts:2728` | Approve route short-circuits on `preparing` before reading boilerplates. |
+| `agentflow-landing/src/pages/ProjectWorkspace.tsx:790` | `PreparingBanner` rendered while `summary.status === 'preparing'`. |
+| `agentflow-agents/tests/unit/projects-bg-prep.test.ts:1` | 14 unit tests for the runner. |
+
+## Data flow
+
+```
+client → POST /me/projects { brief }
+  │
+  ├─ paid gate, zod parse, idempotency probe
+  ├─ slug + personal-team + pickFirstHealthy (fast, sync)
+  ├─ if kind explicit → normalize; else resolvedKind = null
+  ├─ INSERT projects(status='preparing', foundation=placeholder, kind=resolvedKind)
+  ├─ fire-and-forget appendProjectEvent × 4 (brief, foundation_selected, project_created, maestro_thinking)
+  ├─ scheduleBackgroundProjectPrep({ … })          [setImmediate]
+  └─ return 200 { is_preparing: true, project: { status: 'preparing', … } }   ← <2s
+
+(after response flushes, on next tick)
+
+runBackgroundProjectPrep:
+  1. classifyUserFacingProjectKind(brief)         [if rawKind==='auto'/null]
+       └─ kind=null → UPDATE status='failed', return
+       └─ emit kind_resolved
+  2. recommendProjectFoundations({ brief, kind_hint })   [if no explicitFoundation]
+       └─ pick top → finalFoundation; recommendOverrodePlaceholder=true when differs
+  3. buildGithubFoundationCandidateFromSelection(finalFoundation)   [README/stars/OG fetch]
+  4. UPDATE projects SET kind, foundation_*, foundation_snapshot, status='draft'
+       └─ emit foundation_picked  (only if placeholder was overridden)
+  5. runFastPathProposal:
+       ├─ pickWorkflowSchema(kind, brief, override)
+       └─ schema && useGraphExecutor → UPDATE proposedPlan + status='awaiting_approval'
+                                       emit plan_proposed
+       └─ schema && !useGraphExecutor → kickMaestro('schema_but_routed_to_maestro')
+       └─ !schema → kickMaestro('no_schema')
+  6. ensureProjectFoundationScout(…)              [best-effort]
+  7. emit project_ready
+```
+
+## DB / Env / API
+
+- Tables: `projects.status` (text, no CHECK constraint → no migration needed for `'preparing'`)
+- New enum values touched in code: `'preparing'` (transient), already documented `'still_preparing'` error in `ApproveProjectResult`
+- Routes: `POST /me/projects` (response includes `is_preparing: true`), `POST /me/projects/:id/approve` (409 `still_preparing`)
+- Events emitted: `kind_resolved`, `foundation_picked`, `plan_proposed`, `project_ready`
+- No new env vars
+
+## Status lifecycle
+
+```
+preparing → draft → awaiting_approval → approved → running → done
+   │           │                                       │
+   │           └─ (fast-path success)                  ├─ failed
+   └─ failed  (classifier rejects brief)               └─ cancelled
+```
+
+`preparing` is purely transient (~30s). The UI polls `/me/projects/:id`
+every 1.5s and unmounts `PreparingBanner` as soon as status changes.
+
+## Idempotency
+
+Hash dropped `selectedFoundation` (the sync path only has a placeholder).
+New hash: `sha256(owner | kind-hint | team_id | (idempotency-key ?? brief))`.
+
+A second POST with the same brief inside 60s returns the existing row as
+`idempotent_replay: true` — same behaviour as before, just without the
+foundation discriminator (which was always the placeholder for the second
+call anyway).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Project stuck at `preparing` forever | `[projects-bg-prep] unhandled` | `projects-bg-prep.ts:84` (top-level catch flips to `failed`) |
+| Approve returns 409 `still_preparing` immediately after create | (expected during ~30s window) | UI must poll until status flips |
+| `kind_resolved` emitted but `foundation_picked` missing | recommender returned `[]` or threw — placeholder kept; check `foundation_recommend_failed` log event | `projects-bg-prep.ts:153` |
+| Classifier rejects brief → status flips to `failed` | `unsupported_project_kind source_kind=...` | `projects-bg-prep.ts:118` |
+| Fast-path crashes mid-runner | `[projects-bg-prep] fast-path failed` | falls through to `kickMaestro('fast_path_exception')` |
+
+## Performance impact
+
+| Path | Before | After |
+|---|---|---|
+| POST /me/projects (auto kind, no explicit foundation) | 30-60s | <2s |
+| POST /me/projects (explicit kind + explicit foundation) | 5-10s | <2s |
+| Time-to-`awaiting_approval` (auto kind) | 30-60s | ~30s (now async) |
+
+The total wall-clock time before the user can approve is unchanged; what
+changes is that the response is no longer blocked on it. The UI can
+render the project page, the workspace skeleton, and start polling — all
+within 2s instead of staring at a spinner.
+
+## Related
+
+- [Project lifecycle](/subsystems/projects-lifecycle)  *(if it exists; otherwise see `services/projects.ts` JSDoc)*
+- [Foundation recommender](/subsystems/foundation-recommend)  *(internal: `services/project-foundations.ts`)*
