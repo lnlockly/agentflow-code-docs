@@ -22,6 +22,10 @@ task_error` to `device_action_log`, and proxies the daemon's local MJPEG capture
 | `agentflow-agents/src/services/device-task-stream.ts:77` | `subscribe(deviceId, taskId\|null, send)` wraps `taskEvents` |
 | `agentflow-agents/src/services/device-task-stream.ts:135` | `publish(deviceId, event)` mirrors back to `taskEvents` |
 | `agentflow-agents/src/services/device-task-stream.ts:225` | `loadRecentEvents` replays last N rows from `device_action_log` |
+| `agentflow-agents/src/services/device-task-history.ts:1` | `groupTaskHistoryRows` + `loadDeviceTaskHistory` — flattens log rows into per-task history |
+| `agentflow-landing/src/pages/CabinetDeviceDetail.tsx`     | Tabbed device root page (История · Разрешения · Live) |
+| `agentflow-landing/src/pages/CabinetDeviceLive.tsx:TaskComposer` | 409 retry with 2/4/8s backoff + install-card on final failure |
+| `agentflow-landing/src/pages/CabinetDeviceLive.tsx:LiveScreenFeed` | "ожидаю первый кадр…" skeleton until `<img>.naturalWidth > 0` |
 | `agentflow-agents/src/services/device-registry.ts`  | connection pool + `computer.*` tool dispatch |
 | `agentflow-agents/src/routes/me-devices.ts:424`     | `POST /me/devices/:id/dispatch_task` |
 | `agentflow-agents/src/routes/me-devices.ts:489`     | `GET /me/devices/:id/tasks/stream` (device-wide SSE) |
@@ -40,6 +44,8 @@ task_error` to `device_action_log`, and proxies the daemon's local MJPEG capture
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/streamer.py:84` | `CaptureLoop._maybe_publish_ws` emits `stream_frame` ≤10 fps |
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py` | AI loop emits `task_complete` on done / max-iters, `task_error` on exception |
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/desktop_cli.py:48` | `_start_ws_bridge` runs WS client inside `agentflow-desktop run` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/health.py:1` | `HealthRegistry` — thread-safe daemon ws_status + failure counter |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/viewer.py:202` | `GET /api/health` returns the daemon health snapshot |
 
 ## Data flow
 
@@ -93,6 +99,7 @@ Cabinet                 agentflow-agents (pod)                  agentflow-deskto
   - `POST /me/devices/:id/dispatch_task` → 202 `{task_id, session_id}` / 409 `device_offline`
   - `GET  /me/devices/:id/tasks/stream` → SSE (device-wide)
   - `GET  /me/devices/:id/tasks/:task_id/stream` → SSE (per-task, closes on complete/error)
+  - `GET  /me/devices/:id/tasks/history?limit=50` → 200 `{ok, items: [{task_id, brief, started_at, ended_at, cost_usd, status}]}` — newest first; powers the cabinet "История" tab via `services/device-task-history.ts`
   - `GET  /me/devices/:id/live_stream` → `multipart/x-mixed-replace; boundary=frame`
   - `POST /me/telegram/send` → 200 `{ok, message_id}` / 503 `tg_account_not_linked` / 503 `tg_primary_login_missing` / 502 MCP error. Body `{chat_id, text}`. `chat_id="me"` routes to Saved Messages.
   - `POST /me/matrix/send` (alias `POST /me/matrix/post`) → 200 `{ok, event_id}` / 404 `room_not_found` / 502 `bridge_error` / 502 `matrix_bridge_unreachable`. Body `{room_id, text}`. Posts as the caller's Dendrite puppet via `issueMatrixTokenForAfUser`.
@@ -100,6 +107,8 @@ Cabinet                 agentflow-agents (pod)                  agentflow-deskto
   - S→C: `task_dispatch`, `subscribe_stream`, `unsubscribe_stream`
   - C→S: `task_action`, `task_complete`, `task_error`, `stream_frame`
 - Project kind: `desktop_agent` is user-facing and bypasses the spa-collapse path.
+- Local viewer (daemon-side, `http://127.0.0.1:8765`):
+  - `GET /api/health` → `{ws_status, last_hello_at, last_failure, consecutive_failures}`. `ws_status` is one of `connecting | connected | reconnecting | dead`. Read this from cabinet diagnostics or `curl` to tell "reconnecting" apart from "truly dead".
 
 ### SSE pub/sub contract
 
@@ -150,11 +159,16 @@ Source: `agentflow-computer-mcp/src/agentflow_computer_mcp/desktop_cli.py:225` (
 | `af_send_telegram_message` returns 503 `tg_primary_login_missing` | none — synchronous response | `chat_tg_links.primary_login_id` is null or non-numeric; user must pick a primary via `POST /me/chat/tg/set-primary` |
 | `af_post_matrix_room` returns 502 `matrix_bridge_unreachable` | `[chat-tg] ... token issue failed` (pattern reused) | Dendrite down or `MATRIX_AUTH_KEY` rotated; user re-login via Element SSO |
 | Cabinet timeline empty after `/tasks/stream` connect | `[device-task-stream] history_load_failed` | SQL replay failed; the live path still works — check `device_action_log` join with `device_sessions` and migration `2026-05-22a-device-tasks.sql` |
+| History tab on `/cabinet/devices/:id` empty though tasks ran | `[device-task-history] load_failed` | SQL join failed — verify `device_action_log` has `task_id` populated and `kind` set (migration `2026-05-22a-device-tasks.sql`); the dispatch endpoint now inserts a `task.dispatch` row with `args.brief` so history is non-empty from the moment a task is queued |
+| Cabinet composer shows "Mac офлайн" right after a task finished | `POST /me/devices/:id/dispatch_task` → 409 | Mid-reconnect race — daemon's WS dropped on heartbeat timeout between tasks. The cabinet composer (`CabinetDeviceLive.tsx:TaskComposer`) now retries up to 3× with 2/4/8s backoff before surfacing the error |
+| `<img src="…/live_stream">` viewport black with no overlay for >2s | none (client-side only) | The cabinet renders a "ожидаю первый кадр…" skeleton until `<img>.naturalWidth > 0`; if you see the bare black viewport, you're on an old build — check `LiveScreenFeed` for the `firstFrame` state |
 | New SSE consumer reads `data` but sees only `action/complete/error` | none — wire-shape issue | bind to default `message` event for the unified `{kind, …}` payload; named events ship the legacy camelCase shape |
 | Daemon Jetsam-killed on Mac at night (device goes offline) | `agentflow-desktop` absent from `launchctl list` | Re-run `install.sh` (adds `ProcessType=Background` + `LowPriorityIO=true` to plist) |
 | Linux daemon not running after reboot | `systemctl --user status agentflow-desktop` → not found | Run `sudo loginctl enable-linger $USER`; without linger user units don't start at boot |
 | Windows daemon missing after cold boot (not user logon) | Task Scheduler history → task never ran | Re-run `install.ps1` (adds `AtStartup` trigger alongside `AtLogon`) |
 | `agentflow-desktop selftest` fails `ws_endpoint_reachable` | TCP connection refused or TLS error | Check firewall / VPN; endpoint is `wss://agentflow.website/_agents/_devices/connect` |
+| Reconnect loop plateaus at 60s; cabinet reads "Mac offline" for a full minute after a single packet drop | `ws session ended:` followed by `reconnecting in 60.` | Fixed 2026-05-22 (`feat/daemon-ws-resilience`): backoff cap now 30s, resets to 1s after a successful `hello_ack`, `open_timeout` raised from 10s → 30s. See `ws_client.py:WS_OPEN_TIMEOUT_S` + `RECONNECT_BACKOFF_CAP_S`. |
+| Daemon stuck in reconnect cycles; cabinet can't tell "reconnecting" from "process dead" | `ws degraded — restart recommended (5 consecutive failures)` | Curl `http://127.0.0.1:8765/api/health` and inspect `ws_status` + `consecutive_failures`. Daemon does not self-kill; rely on launchd / systemd / Task Scheduler `KeepAlive`. |
 
 ## Performance (streamer, updated 2026-05-22)
 
