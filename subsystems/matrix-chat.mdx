@@ -94,6 +94,7 @@ Browser /chat
 | `.well-known/matrix/server` 404 | `404 GET /.well-known/matrix/server` в landing logs | `agentflow-landing/public/.well-known/matrix/` не задеплоен или Vite plugin не копирует |
 | User auto-provision 409 conflict | `M_USER_IN_USE` в bridge logs | Race condition при первом одновременном логине — добавить retry на GET после 409 |
 | Voice/video не работает | `WebRTC: no ICE candidates` | Phase 2+, TURN не настроен (coturn out of scope MVP) |
+| Dendrite CrashLoopBackOff после bridge PR | `Invalid config file: open /etc/dendrite/appservices/<bridge>.yaml: no such file or directory` | `app_service_api.config_files` в `k8s/dendrite-config.yaml` ссылается на bridge registration, но Secret `mautrix-<bridge>-registration` не создан. `optional: true` на projected volume позволяет поду стартовать БЕЗ Secret'а, но Dendrite фаталит на отсутствующий файл. Fix: либо закончить bootstrap bridge (см. `k8s/mautrix-<bridge>.yaml` header — создать DB, secrets, apply manifest), либо убрать строку из `config_files` до bootstrap. **Никогда не добавляй новую строку в `config_files` пока `kubectl get secret mautrix-<bridge>-registration` не вернёт ресурс.** Инцидент 2026-05-22: whatsapp.yaml |
 
 ## Lobby room (`#lobby:agentflow.website`)
 
