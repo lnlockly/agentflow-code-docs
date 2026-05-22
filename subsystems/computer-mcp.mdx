@@ -36,6 +36,9 @@ task_error` to `device_action_log`, and proxies the daemon's local MJPEG capture
 | `agentflow-agents/src/services/kind-registry.ts:18` | `desktop_agent` added to `PROJECT_KINDS` |
 | `agentflow-agents/src/services/kind-registry.ts:24` | `desktop_agent` added to `USER_FACING_PROJECT_KINDS` |
 | `agentflow-agents/migrations/2026-05-22a-device-tasks.sql` | `task_id` + `kind` columns on `device_action_log` |
+| `agentflow-agents/migrations/2026-05-22d-device-task-queue.sql` | `device_tasks` queue table (dispatch during WS blackout) |
+| `agentflow-agents/src/routes/me-devices.ts:QUEUE_TRUST_WINDOW_MS` | 60s window during which queue-when-WS-gone is permitted |
+| `agentflow-agents/src/routes/me-devices.ts:shouldQueueForOfflineDevice` | pure helper — `last_seen` ≤60s old → queue, else 409 |
 | `agentflow-agents/packages/shared-types/devices.ts:132` | `WsMessage` task/stream variants |
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_client.py:171` | `_handle_task_dispatch` queues task into `DriverState` |
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_client.py:186` | `_handle_stream_subscription` toggles the capture-loop flag |
@@ -94,9 +97,11 @@ Cabinet                 agentflow-agents (pod)                  agentflow-deskto
   - `user_devices` — owner, scope, status, secret hash, enrollment token
   - `device_sessions` — one per dispatched task; agent_id `'desktop-task'`
   - `device_action_log` — `task_id` + `kind` (`tool_call|task_action|task_complete|task_error`)
+  - `device_tasks` — queue rows used when WS map empty but `user_devices.last_seen` ≤60s old. Daemon drains via `GET /me/devices/:id/queued_tasks` after `hello_ack`. Statuses: `queued|dispatched|failed`
 - Env: `API_KEY_HMAC_SECRET` (or `AUTH_JWT_SECRET` fallback for `:apikeys` salt)
 - Routes:
-  - `POST /me/devices/:id/dispatch_task` → 202 `{task_id, session_id}` / 409 `device_offline`
+  - `POST /me/devices/:id/dispatch_task` → 202 `{task_id, session_id}` (live path) **or** 202 `{task_id, session_id: null, queued: true}` (queued during WS blackout, `last_seen` ≤60s old) **or** 409 `device_offline` (`last_seen` null or >60s old)
+  - `GET  /me/devices/:id/queued_tasks` → 200 `{ok, tasks: [{id, payload, created_at}]}` — daemon-only drain endpoint, atomically flips `queued`→`dispatched`
   - `GET  /me/devices/:id/tasks/stream` → SSE (device-wide)
   - `GET  /me/devices/:id/tasks/:task_id/stream` → SSE (per-task, closes on complete/error)
   - `GET  /me/devices/:id/tasks/history?limit=50` → 200 `{ok, items: [{task_id, brief, started_at, ended_at, cost_usd, status}]}` — newest first; powers the cabinet "История" tab via `services/device-task-history.ts`
@@ -147,7 +152,8 @@ Source: `agentflow-computer-mcp/src/agentflow_computer_mcp/desktop_cli.py:225` (
 ## Failure modes
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
-| `dispatch_task` returns 409 | none — synchronous response | check `/me/devices/:id` status, daemon offline |
+| `dispatch_task` returns 409 | none — synchronous response | check `/me/devices/:id` status; daemon offline AND `last_seen` >60s old (else the queue path takes over) |
+| `dispatch_task` returns 202 `queued:true` but daemon never picks up | none — DB row stays `status='queued'` | inspect `SELECT * FROM device_tasks WHERE status='queued' AND created_at < NOW() - INTERVAL '5 min'`; daemon never reconnected (Mac asleep / network down) — manual fix is to mark row `failed` or delete |
 | Task progress missing from cabinet SSE | `[devices-ws] persist_task_row_failed` | DB connection / migration not applied |
 | Synthetic session row appears | none — silent fallback | daemon resumed task across pod restart (expected) |
 | MJPEG returns headers but no frames | `[device] online ... tools=0` | daemon hasn't subscribed yet OR daemon never pushes `stream_frame` |
