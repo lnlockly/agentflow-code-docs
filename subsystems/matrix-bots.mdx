@@ -113,6 +113,37 @@ agentflow-agents pod (RUN_WORKERS=true)
 | `M_USER_IN_USE` on register but login also 403 | `matrix_bot_register_rejected_400_M_USER_IN_USE` | Password drift — either rotate `MATRIX_BOT_KEY` back, or hit `/_dendrite/admin/resetPassword/{user}` to align |
 | Sync loop hot-loops on error | `[matrix-bots] sync error, backing off` | Inspect the inner `err` field; exponential backoff caps at 60s and resumes automatically |
 
+## @af-image — multi-model slash commands
+
+`@af-image` exposes three command families. They mix freely:
+
+| Family | Verbs | Effect |
+|---|---|---|
+| Aspect | `/wide`, `/tall`, `/square` | Sets the output size (`1792x1024`, `1024x1792`, `1024x1024`). Default is square. |
+| Model | `/dalle3`, `/flux`, `/gpt-image` | Sets the DesignAPI model id (`dall-e-3`, `flux-pro`, `gpt-image-1`). Default is router-picked from `IMAGE_MODEL_CASCADE`. |
+| Help | `/help`, `/start` | Returns the full command list + supported model ids. |
+
+The user picks one command per message. Mixing two slashes in one body (e.g. `/dalle3 /wide ...`) is not supported — the leading slash wins. Model commands always render at square aspect; for a wide DALL·E image, use `/dalle3` first, then re-render with `/wide`.
+
+When a model command is set, the handler passes `model` to `useModel(ModelType.IMAGE, …)`. On DesignAPI rejection (typical signal: `model_not_found` / `group_no_image_access`) the handler retries once without the `model` field so the router walks its cascade, then posts a `Модель <name> временно недоступна, использую дефолт.` notice in the room. Hard failures still surface as `Image generation failed: …`.
+
+| File | Role |
+|---|---|
+| `agentflow-agents/src/services/matrix-bots/lib.ts:274` | `IMAGE_MODEL_COMMANDS` map (slash verb → DesignAPI model id) |
+| `agentflow-agents/src/services/matrix-bots/lib.ts:284` | `ASPECT_COMMANDS` map (slash verb → size) |
+| `agentflow-agents/src/services/matrix-bots/lib.ts:305` | `parseImageRequest` (returns `{prompt, size, model}`) |
+| `agentflow-agents/src/services/matrix-bots/handlers/image.ts:24` | `buildHelpText` — `/help` body sourced from the map above |
+| `agentflow-agents/src/services/matrix-bots/handlers/image.ts:102` | model-aware `useModel(IMAGE, …)` call + graceful fallback |
+| `agentflow-agents/tests/matrix-bots-lib.test.ts:184` | model-selector unit tests (`/dalle3`, `/flux`, `/gpt-image`, aliases) |
+| `agentflow-agents/tests/matrix-bots-image-help.test.ts:1` | `buildHelpText` surface tests (model list + every command family) |
+
+DesignAPI is the only image provider routed through here (memory `feedback_use_designapi`). The `IMAGE_MODEL_COMMANDS` map is the single source of truth — to add a new model the operator picks a verb, adds a row, and the `/help` body picks it up on next deploy.
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Picked model rejected, dropped to default | reply contains `временно недоступна, использую дефолт` | DesignAPI account has no access to that model — pivot the model or top up. The cascade still rendered the prompt so this is a graceful path. |
+| `/dalle3` etc. silently treated as plain prompt | (no log — handler still renders with default model) | Slash command was malformed — confirm leading `/` and a space before the prompt. |
+
 ## @af-research follow-ups — 📄 / 🔗 / 💾 reactions
 
 After @af-research posts a TL;DR, it pre-attaches three reactions on its own message. Owner taps one to drive a follow-up without re-pasting the URL:
