@@ -23,13 +23,15 @@ with the top recommendation when the client passes no `selected_foundation`.
 | `agentflow-agents/src/services/curated-foundations.ts:41` | The 24-entry `CURATED_FOUNDATIONS` list + `matchesCuratedFoundation` substring matcher (fallback) |
 | `agentflow-agents/src/services/foundation-llm-scorer.ts:170` | `scoreCuratedFoundations` — single LLM call ranks curated entries 0-10 for the brief, 5-min cache |
 | `agentflow-agents/src/services/scoring-tweaks.ts:1` | Deterministic bonus matrix: curated bias (+3), anti-monorepo (-4), domain keyword match (+5) |
-| `agentflow-agents/src/services/project-foundations.ts:406` | `recommendProjectFoundations` — orchestrates LLM proposer + LLM scorer + GitHub enrichment + scoring tweaks |
+| `agentflow-agents/src/services/foundation-structural-filter.ts:1` | **Structural probe + hard-reject** — `deriveStructuralSignals`, `decideHardReject`, `structuralBias`, `shouldUseMarketingCuratedBypass`, `MARKETING_CURATED_LIST` (4-entry landing list) |
+| `agentflow-agents/src/services/project-foundations.ts:406` | `recommendProjectFoundations` — orchestrates marketing-bypass → LLM proposer → LLM scorer → GitHub enrichment → structural filter → scoring tweaks |
 | `agentflow-agents/src/routes/projects.ts:734` | `POST /me/project-foundations/recommend` (returns up to 15 candidates) |
 | `agentflow-agents/src/routes/projects.ts:815` | `POST /me/projects` default-foundation resolution (no scratch unless `ALLOW_SCRATCH_FOUNDATION=1`) |
 | `agentflow-agents/tests/unit/curated-foundations.test.ts:1` | 20 matcher + integration tests |
 | `agentflow-agents/tests/unit/foundation-llm-scorer.test.ts:1` | 8 scorer tests with injected LLM stub |
 | `agentflow-agents/tests/unit/scoring-tweaks.test.ts:1` | 17 bonus-matrix tests (curated bias, monorepo penalty, domain match) |
 | `agentflow-agents/tests/unit/project-foundations-recommend.test.ts:1` | End-to-end recommend tests with injected LLM + fetch |
+| `agentflow-agents/tests/unit/scoring-monorepo-reject.test.ts:1` | 28 structural-filter tests (signals, hard-reject, bias, marketing bypass, integration with 3 known-bad briefs) |
 
 ## Data flow
 
@@ -39,9 +41,20 @@ POST /me/project-foundations/recommend {brief, mode:"github_first", kind_hint}
   ▼
 recommendProjectFoundations(input)
   │
+  ├─► shouldUseMarketingCuratedBypass(brief, kind)
+  │     │  kind=landing || MARKETING_INTENT_RX matches brief (кофейн, лендинг,
+  │     │  меню, услуги, прайс, портфолио, restaurant, …)
+  │     │
+  │     │  YES → skip LLM proposer + scorer; synthesise curated hits from
+  │     │        MARKETING_CURATED_LIST (4 entries, golden-connect-template leads)
+  │     │
+  │     │  NO  → fall through to the usual proposer + scorer chain
+  │
   ├─► proposeWithLlm (TEXT_LARGE)     → up to 8 LLM-proposed GitHub repos
+  │     (skipped on marketing bypass)
   │
   ├─► scoreCuratedFoundations (TEXT_SMALL)
+  │     │  (skipped on marketing bypass — synthetic hits used instead)
   │     │
   │     │  one call: scores all 24 curated entries 0-10 for the brief
   │     │  drops < 4, keeps top 15, cached 5min by sha1(brief|kind_hint)
@@ -51,8 +64,19 @@ recommendProjectFoundations(input)
   │
   ├─► merge + de-dupe by repo_full_name (lowercase)
   │
-  ├─► fetchRepoMeta + fetchStackFromPackageJson  (parallel GitHub REST)
+  ├─► fetchRepoMeta + fetchPackageJson + fetchRootContents (parallel GitHub REST)
   │     │   404 = swallowed (LLM hallucinated)
+  │     │
+  ├─► deriveStructuralSignals(meta, pkg_json, root_contents)
+  │     │   is_monorepo, is_app_template, is_desktop_app, is_framework_source,
+  │     │   has_workspace_dev_script, has_single_package_dev_script
+  │     │
+  ├─► decideHardReject(kind, signals)
+  │     │   for kind ∈ {spa, landing, marketing_site, web_app}:
+  │     │     is_framework_source       → REJECT (any kind)
+  │     │     is_desktop_app            → REJECT (electron/RN/expo)
+  │     │     is_monorepo && !is_app_template → REJECT (turbo/workspaces)
+  │     │   log: `[foundation-scorer] hard_reject reason=<x> candidate=<repo>`
   │     │
   ▼     ▼
 scoreCandidate(meta, stack, tags, briefTokens)
@@ -62,9 +86,30 @@ scoreCandidate(meta, stack, tags, briefTokens)
   │       curated → +3.0
   │       monorepo blacklist (vercel/next.js, supabase/supabase, ...) → -4.0
   │       domain keyword match (MLM, e-commerce, AI chat, …) → +5.0
+  │   + structuralBias(kind, signals):
+  │       is_app_template → +5
+  │       has_single_package_dev_script → +3
+  │       has_workspace_dev_script → -5
   ▼
 sort desc, slice top 15 → 1h LRU cache → response
 ```
+
+### Structural hard-reject — why
+
+Live incidents 2026-05-22:
+
+- Brief «лендинг для кофейни» → scorer picked `calcom/cal.diy` (turbo monorepo,
+  22 packages). `next build && next start` died on
+  `@calcom/web@workspace:apps/web doesn't provide @prisma/client`.
+- Brief "todo app" → `streetwriters/notesnook` (Electron, not a SPA).
+- Brief "PetCare" → `vercel/next.js` (framework source — `turbo run build`
+  hangs for the whole framework).
+
+PR #708 added a 20-entry `MONOREPO_BLACKLIST`. That's incomplete by
+construction. The structural probe replaces enumerate-and-blacklist with a
+deterministic decision on package.json + root contents: workspaces, turbo.json,
+apps/, electron dep, app/ router. The few legit monorepo templates (eg
+`vercel/commerce`) carry `app/` at root and pass via `is_app_template`.
 
 ## Default foundation on POST /me/projects
 
@@ -144,7 +189,10 @@ The proper way to iterate on a project is:
 | All GitHub lookups 404 | `[foundations] all github lookups failed; returning empty` | `services/project-foundations.ts:498` |
 | LLM scorer down / 5xx | `[foundations.llm-scorer] llm call failed:` | `services/foundation-llm-scorer.ts:227` |
 | Scorer JSON parse error | scorer returns `[]` silently → fallback to substring | `services/foundation-llm-scorer.ts:131` |
-| Generic framework monorepo wins ranking (e.g. `vercel/next.js` for a PetCare brief) | check `scoring-tweaks.ts` MONOREPO_BLACKLIST — repo should be in the set | `services/scoring-tweaks.ts:30` |
+| Generic framework monorepo wins ranking (e.g. `vercel/next.js` for a PetCare brief) | `[foundation-scorer] hard_reject reason=framework_source candidate=vercel/next.js` (expected — repo is being rejected). If still wins → check `FRAMEWORK_SOURCE_REPOS` set in structural filter | `services/foundation-structural-filter.ts:67` |
+| Cal.com or other turbo monorepo wins ranking for a landing brief | `[foundation-scorer] hard_reject reason=monorepo candidate=calcom/cal.diy` (expected). If still wins → check root-contents fetch is returning entries | `services/foundation-structural-filter.ts:111` |
+| Electron / notesnook surfaces for a todo SPA brief | `[foundation-scorer] hard_reject reason=desktop_app candidate=streetwriters/notesnook` (expected). If still wins → verify package.json deps include `electron` | `services/foundation-structural-filter.ts:140` |
+| Cafe / landing brief picks a random LLM-proposed repo instead of curated | `[foundation-scorer] marketing_bypass` should appear in logs; if missing → check `MARKETING_INTENT_RX` covers the brief's intent words | `services/foundation-structural-filter.ts:227` |
 | Curated MLM/e-commerce template not in top 3 for matching brief | extend `DOMAIN_MAP` keywords or repos list | `services/scoring-tweaks.ts:63` |
 | Project lands on `scratch` mode in DB | only when `ALLOW_SCRATCH_FOUNDATION=1` or client explicitly sent `selected_foundation.mode='scratch'` | `routes/projects.ts:815` |
 
