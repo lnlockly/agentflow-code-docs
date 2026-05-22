@@ -541,6 +541,80 @@ Same handler upgrades the Procfile `web:` line from `npx next dev` → `npx next
 
 Matching is cheap lowercase substring against brief keywords + kind hint. Adding a 6th entry: edit `CURATED_FOUNDATIONS` array and add a test in `tests/unit/curated-foundations.test.ts`.
 
+## Owner-message routing (deployed-project bypass, 2026-05-22)
+
+A follow-up `POST /me/projects/:id/messages` on a project where the
+workspace is already live MUST NOT re-trigger graph-executor. The
+deployed-project bypass at the top of the messages handler short-
+circuits to direct coder dispatch instead.
+
+### Decision (pure function)
+
+The routing decision lives in [`src/services/owner-message-route.ts`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/owner-message-route.ts) — pure, no DB, unit-tested.
+
+| status | preview_url | text length | verdict |
+|---|---|---|---|
+| `done` / `running` | non-null | ≥ 20 chars | `coder_iterate` |
+| `done` / `running` | non-null | < 20 chars | `maestro` |
+| `done` / `running` | null | any | `maestro` |
+| `draft` / `awaiting_approval` | any | substantial | `graph_executor` |
+| `failed` / `cancelled` | any | substantial | `maestro` |
+| any | any | empty / whitespace | `noop` |
+
+`OWNER_MESSAGE_SUBSTANTIAL_MIN_CHARS = 20` (trimmed). Short messages
+(greetings, "ok", "👍") never carry actionable intent — LLM triage
+handles those.
+
+### Wiring
+
+Two call sites:
+
+- `agentflow-agents/src/routes/projects.ts` — the `/me/projects/:id/messages` handler. Bypass block runs BEFORE the heavy-iteration trigger at line ~2290 and BEFORE the iterate-intent fallback at line ~2609.
+- `agentflow-agents/src/services/projects-pipeline.ts:enqueueOwnerMessage` — used by collaborator chat + approved-suggestion flow via `routes/live-projects.ts`.
+
+Both sites resolve the canonical coder via the same pickers used by the
+legacy fast-path: `pickRecentCoderForPlan` → `pickGraphExecutorCoderForKind`
+→ `verifyProjectAgentSlug`. On success: insert `plan_tasks` row,
+emit `coder_dispatched` event, flip `status=done` → `running`. The
+graph-executor path is never re-entered for a deployed project.
+
+Greppable success: `[chat-iterate] direct coder dispatch project=…`.
+
+### Why graph-executor was re-running
+
+Live evidence project 1292 (2026-05-22): owner sent
+`"@coder add file .test.txt with text TEST"` to a `kind=spa` project
+with `status=running` + `preview_url` set. Sequence before the fix:
+
+```
+owner_message              → handler dispatched
+log "re-iterating (iterate-intent fallback)"  ← BUG
+graph_executor_started     ← BUG: ran again
+node_skipped_idempotent    (mini_app_coder already satisfied)
+node_started admin_panel
+foundation_rebranded       ← BUG: rewrote site_name + Procfile
+node_started deploy
+```
+
+No file was created in the workspace. The iterate-intent branch
+fired `runMaestroProposeBackground`, which re-ran `runProjectApprovalBackground`,
+which re-entered the graph. Because every node is idempotent except
+`foundation_rebrand` (LLM call) + `deploy` (writes Procfile), the
+graph "succeeded" but the owner's actual message was discarded.
+
+The bypass introduced here returns BEFORE iterate-intent ever runs, so
+the only path for a deployed project is `plan_tasks` insert →
+pool-worker drains → coder edits files → `task_done` → SSE update.
+
+### Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Deployed project ignores owner message, graph_executor restarts | `re-iterating (iterate-intent fallback)` followed by `graph_executor_started` | Pre-2026-05-22 routing. Fixed by `[chat-iterate] direct coder dispatch`. If you see this log again — the bypass either misclassified the project or `pickGraphExecutorCoderForKind` returned null. |
+| Bypass picked a coder but verify failed | `[chat-iterate] picked @<slug> not verifiable for project — falling back to legacy path` | `verifyProjectAgentSlug` rejected the slug. Check agent state (tombstoned?), team ownership, and whether the slug matches the canonical coder pattern. |
+| Bypass found no canonical coder | `[chat-iterate] no canonical coder for kind=<x>` | `coderSlugForKind` returned null for this kind. Add a case to `services/kind-registry.ts:coderSlugForKind` or seed a `coder-<kind>` agent for the team owner. |
+| Bypass triggered but plan was empty | `[chat-iterate] no effective plan for deployed project` | Graph-executor should always insert a `plans` row at approve time. If this fires, check `runGraphExecutorDispatch` initialisation; falls through to legacy maestro path so the message isn't lost. |
+
 ## Failure modes
 
 | Symptom | Log signature for grep | Where to fix |
