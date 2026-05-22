@@ -26,7 +26,7 @@ Eight service bots (`@af-helper`, `@af-research`, `@af-image`, `@af-claude`, `@a
 | `agentflow-agents/src/services/matrix-bots/handlers/image.ts:1` | `@af-image` — `parseImageRequest` → `useModel(IMAGE)` → `uploadMedia` → `sendImage` |
 | `agentflow-agents/src/services/matrix-bots/handlers/claude.ts:1` | `@af-claude` — `recentMessages(10)` context → `useModel(TEXT_LARGE)`, Mode C prefix + 👍 attach |
 | `agentflow-agents/src/services/matrix-bots/mode-c.ts:1` | Mode C — owner taps 👍 on a bot suggestion, backend re-sends as owner via `issueMatrixTokenForAfUser` |
-| `agentflow-agents/src/services/matrix-bots/handlers/tg-poster.ts:1` | `@af-tg-poster` — v1 stub (DM-only, `/help` works, `/connect-tg` / `/channels` / `/post` return "coming soon") |
+| `agentflow-agents/src/services/matrix-bots/handlers/tg-poster.ts:1` | `@af-tg-poster` — v2 wizard (`/login`, `/cancel`, `/accounts`, `/post @channel <text>`) wired into bridge provisioning + cross-poster TG dispatch |
 | `agentflow-agents/src/services/matrix-bots/handlers/poster.ts:1` | `@af-poster` — DM-only multi-network composer. Parses `to: tg+vk Привет`, caches plain-text composes for 5 min, dispatches via cross-poster engine |
 | `agentflow-agents/src/services/cross-poster/parser.ts:1` | `parseCompose`, `parseNetworksList` — `to:` directive grammar |
 | `agentflow-agents/src/services/cross-poster/tg.ts:1` | TG dispatch — reads `chat_tg_links.account_labels.default_channel` + `primary_login_id`, calls `mcpDirect.callTool('telegram', 'send_message', ...)` |
@@ -95,7 +95,7 @@ agentflow-agents pod (RUN_WORKERS=true)
 | `@af-research` | yes | yes | open |
 | `@af-image` | yes | yes | open |
 | `@af-claude` | yes | yes | open |
-| `@af-tg-poster` | yes only | ignored | DM-only by design |
+| `@af-tg-poster` | yes only | ignored | DM-only + `@user-<digits>:<serverName>` mxid gate (owner-only) |
 | `@af-poster` | yes only | ignored | DM-only + `@user-<digits>:<serverName>` mxid gate (owner-only) |
 
 ## Failure modes
@@ -109,7 +109,11 @@ agentflow-agents pod (RUN_WORKERS=true)
 | Bot keeps trying to summarise the same old URL after restart | (no error) | `next_batch` cursor stale; clear with `UPDATE matrix_bots SET next_batch=NULL WHERE slug='af-research'` |
 | `@af-image` returns "Image generation failed" | `designapi image 503: model_not_found` | designapi account/group has no image channel — pivot to a working account or BYOK |
 | `@af-research` replies "page has no readable article body" | (no error — visible reply) | Source has no Readability-friendly main; this is expected for SPAs / login walls |
-| TG-poster commands say "coming soon" | (no error — visible reply) | Expected — v1 stub. Phase 5 will wire mautrix-telegram provisioning |
+| `@af-tg-poster /post` replies `not_logged_in` | `[af-tg-poster] post_start` followed by a `not linked` cross-poster error | Owner runs `/login` first to attach a TG account via the bridge wizard |
+| `@af-tg-poster /post` replies `channel_not_admin` | reply contains `channel_not_admin` | Owner's primary TG login lacks post rights on that peer — add it to channel admins or pick another channel |
+| `@af-tg-poster /post` replies `rate_limit` | reply contains `rate_limit` | Telegram floodwait / 429 surfaced via tg-mcp — retry after a minute |
+| `@af-tg-poster /login` fails immediately | `[af-tg-poster] login_failed` | mautrix-tg bridge unreachable, secrets drift, or `MAUTRIX_TG_PROVISIONING_SECRET` empty. Check pod env + bridge readiness |
+| `@af-tg-poster` ignores non-owner DM | `[af-tg-poster] sender_not_authorized` | Expected — owner-only auth gate (same `parseOwnerMxid` as `@af-poster`) |
 | `M_USER_IN_USE` on register but login also 403 | `matrix_bot_register_rejected_400_M_USER_IN_USE` | Password drift — either rotate `MATRIX_BOT_KEY` back, or hit `/_dendrite/admin/resetPassword/{user}` to align |
 | Sync loop hot-loops on error | `[matrix-bots] sync error, backing off` | Inspect the inner `err` field; exponential backoff caps at 60s and resumes automatically |
 
@@ -318,9 +322,57 @@ DM-only composer. Owner types one message, bot fans it out to every linked netwo
 | VK: `error 5` | reply contains `протух` | Token expired — re-link VK in cabinet |
 | IG always deferred | reply contains `Отложено до v2` | Expected v1 — wait for v2 IG Business integration |
 
+## @af-tg-poster — v2 login + post
+
+Single-purpose Telegram bot: provision a TG account via the mautrix-telegram bridge wizard, then publish to any channel the owner's primary TG login can post into. DM-only, owner-only (same `parseOwnerMxid` gate as `@af-poster` / `@af-ops`).
+
+### Commands
+
+| Command | Effect |
+|---|---|
+| `/login` (alias `/connect`, `/connect-tg`) | Calls `bridgeLoginStart(cfg, mxid, 'phone')`, remembers the issued `login_id` + first step descriptor in an in-memory `Map<roomKey, WizardState>` (cap 50, FIFO). Reply prompts for the phone number. |
+| Plain text reply during wizard | Treated as the value for `wiz.fieldId`, submitted via `bridgeLoginStep`. Walks phone → code → optional 2FA password until `step.type === 'complete'`, then drops the wizard state. |
+| `/cancel` | Calls `bridgeLoginCancel` and clears in-memory wizard state. Idempotent — no active wizard returns a friendly hint. |
+| `/accounts` (alias `/channels`) | Calls `bridgeWhoami` for the owner's mxid and renders one bullet per `login.id`. |
+| `/post <channel> <text>` | Resolves channel via `parsePostCommand`, calls `postToTelegram(ownerUserId, text, { channelOverride: channel })`. Channel can be `@name`, `name`, or a numeric peer id. On success: `✅ Posted to <channel>`. On failure: `classifyPostError` maps the cross-poster string to one of `not_logged_in` / `channel_not_admin` / `rate_limit` or passes verbatim. |
+| `/help` (alias `/start`) | Static Russian command menu. |
+
+### State + persistence
+
+Wizard state lives in process memory only. A pod restart drops the in-flight wizard; the owner re-runs `/login` and the bridge issues a fresh `login_id`. bridgev2 itself is the source of truth for completed logins (queryable via `/accounts`), so post-completion state survives restarts naturally.
+
+The cross-poster path (`/post`) reuses `postToTelegram` from `src/services/cross-poster/tg.ts:111`. A new optional `channelOverride` field on the deps object skips the `account_labels.default_channel` lookup so `@af-tg-poster` can target any channel without forcing the owner to relabel their default. `primary_login_id` still feeds `account_id` so tg-mcp picks the right MTProto session.
+
+### Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/matrix-bots/handlers/tg-poster.ts:1` | v2 handler — wizard state machine, `/post`, `/accounts`, `/cancel`, owner auth gate |
+| `agentflow-agents/src/services/matrix-bots/lib.ts:340` | `parsePostCommand` — `<channel> <text>` splitter shared with v1 |
+| `agentflow-agents/src/services/matrix-bots/mode-c.ts:60` | `parseOwnerMxid` — mxid → AF user id auth boundary |
+| `agentflow-agents/src/services/cross-poster/tg.ts:111` | `postToTelegram` now accepts `deps.channelOverride` for explicit channel targeting |
+| `agentflow-agents/src/services/mautrix-tg-bridge.ts:177` | `bridgeLoginStart` / `bridgeLoginStep` / `bridgeLoginCancel` / `bridgeWhoami` — bridge HTTP client used by the wizard |
+| `agentflow-agents/tests/matrix-bots/af-tg-poster.test.ts:1` | 24 pure-helper tests (`parsePostCommand`, mxid mapping, wizard step descriptor, prompt picker, error classifier) |
+
+### Wire (data flow)
+
+```
+DM in Element (owner mxid `@user-N:agentflow.website`)
+  ↓
+runner /sync → handleTgPosterMessage
+  ↓
+parseOwnerMxid → ownerUserId (auth gate)
+  ↓
+switch command:
+  /login → bridgeLoginStart      → store WizardState[roomId,owner]
+  text   → bridgeLoginStep        → advance / complete / drop
+  /post  → postToTelegram(channelOverride) → mcpDirect('telegram','send_message')
+  /accounts → bridgeWhoami
+```
+
 ## Non-goals (v1)
 
-- `@af-tg-poster` is a stub. Real channel posting via mautrix-telegram comes with the chat Phase 5 wizard hookup. `@af-poster` is the production path — `@af-tg-poster` kept around for backward compat only.
+- `@af-poster` is the multi-network production path (TG + VK). `@af-tg-poster` is the single-network specialist — owners use it when they want to post to a specific channel without juggling `to:` directives or default-channel labels.
 - `@af-poster` IG dispatch is a stub; see "Networks (v1 reality check)" row above.
 - No E2EE — bots stay out of encrypted rooms; messages there appear as `m.room.encrypted` and the runner silently skips them.
 - ~~No room-create on bot side. Users invite the bot via Element's Start Chat.~~ As of 2026-05-21 the **Element SSO bounce** reads `matrix_bots.access_token` for each enabled row and calls `POST /createRoom` per bot the first time a user lands in Element. See [Element Web SSO bounce](/subsystems/element-web) (Phase 3b) for the gate (`users.chat_onboarded_at`) and failure modes.
