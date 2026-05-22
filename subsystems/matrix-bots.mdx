@@ -543,12 +543,13 @@ Full page: [subsystems/matrix-bots/af-translator](/subsystems/matrix-bots/af-tra
 - `@af-poster` IG dispatch is a stub; see "Networks (v1 reality check)" row above.
 - No E2EE — bots stay out of encrypted rooms; messages there appear as `m.room.encrypted` and the runner silently skips them.
 - ~~No room-create on bot side. Users invite the bot via Element's Start Chat.~~ As of 2026-05-21 the **Element SSO bounce** reads `matrix_bots.access_token` for each enabled row and calls `POST /createRoom` per bot the first time a user lands in Element. See [Element Web SSO bounce](/subsystems/element-web) (Phase 3b) for the gate (`users.chat_onboarded_at`) and failure modes.
-- No metrics export — `last_synced_at` per row is the only health signal until prom-client wiring lands.
+- ~~No metrics export — `last_synced_at` per row is the only health signal until prom-client wiring lands.~~ Shipped 2026-05-22 — see [Matrix Monitoring](/subsystems/matrix-monitoring) for the `/metrics` endpoint, prom-client families (`matrix_bots_events_total`, `matrix_bots_handler_duration_seconds`, `matrix_bots_ready`), and Grafana dashboard.
 
 ## Related
 
 - [Element Web SSO bounce](/subsystems/element-web) — consumes `matrix_bots.access_token` for first-bounce DM invites + welcome room
 - [Matrix Chat](/subsystems/matrix-chat) — SSO bridge, Dendrite deploy, frontend
 - [Matrix TG Bridge](/subsystems/matrix-tg-bridge) — mautrix-telegram provisioning wizard (phase 5)
+- [Matrix Monitoring](/subsystems/matrix-monitoring) — Prometheus metrics + Grafana dashboard for the bot runner
 - [LLM Router](/subsystems/llm-router) — `useModel(TEXT_SMALL/TEXT_LARGE/IMAGE)` providers
 - [Chat-stack Smoke](/runbooks/chat-smoke-e2e) — Playwright E2E that pins login + DM-reply behaviour
