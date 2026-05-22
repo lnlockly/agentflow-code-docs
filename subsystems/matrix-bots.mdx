@@ -210,6 +210,60 @@ Auth scope: only `@user-<digits>:<serverName>` mxids may trigger. Bridge bots, T
 | Token issue fails | `[mode-c] token_issue_failed` | Same root causes as `/me/chat/tg/login` — bridge env misconfig |
 | Owner send fails | `[mode-c] owner_send_failed` | Inspect `err` — typically `send_403` if user is not joined to room |
 
+## Mode C / Whispers cabinet
+
+Owners on phones can't always tap 👍 in the room — and Mode-C suggestions scroll off Element fast when a TG-bridged chat is active. The cabinet page `/cabinet/whispers` collects every pending `💡 Предложение` from @af-claude across all rooms the owner is in, so they can review and approve in one screen.
+
+### Backend
+
+`GET /me/chat/whispers/pending` (`src/routes/me-chat-whispers.ts:47`) scans @af-claude's joined rooms (cap 80), pulls the last ~80 events per room, keeps `m.room.message` events whose body starts with `SUGGESTION_PREFIX` (`💡 Предложение: `), then subtracts every event id the owner has already 👍-reacted to in the same window. Returns up to 50 newest-first.
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-chat-whispers.ts:47` | `GET /me/chat/whispers/pending` |
+| `agentflow-agents/src/services/matrix-bots/mode-c.ts` (verify line for `SUGGESTION_PREFIX`) | Source of the `💡 Предложение: ` prefix |
+| `agentflow-landing/src/pages/CabinetWhispers.tsx` (verify line) | Frontend renderer |
+| `agentflow-landing/src/main.tsx:641` | Route mount `/cabinet/whispers` |
+
+### Response shape
+
+```jsonc
+{
+  "ok": true,
+  "suggestions": [
+    {
+      "room_id": "!abc:agentflow.website",
+      "event_id": "$xyz",
+      "body": "сообщение без префикса",
+      "ts": 1716370000000,
+      "room_name": "TG: Иван",
+      "peer_display_name": "Иван",
+      "is_dm": true
+    }
+  ]
+}
+```
+
+The cabinet renders each suggestion as a card; tapping ✅ posts a 👍 reaction from the owner (same Mode-C contract — runner spots the reaction on next `/sync` and forwards as owner).
+
+### Auth + bounds
+- `requireSession` — cookie/bearer.
+- Owner mxid is derived as `@user-<afUserId>:<serverName>` (same shape Mode C accepts).
+- `ROOMS_HARD_CAP=80`, `MESSAGES_PER_ROOM=80`, `RESULT_CAP=50` (`me-chat-whispers.ts:31-33`) — caps the scan so a chatty owner doesn't OOM the worker.
+- Fast-fail with empty list if `MATRIX_HOMESERVER_INTERNAL` / `MATRIX_SERVER_NAME` unset, or no `af-claude` bot row exists.
+
+### Apps-launcher tile
+The cabinet's apps launcher gets a "Шёпоты Claude" tile that links to `/cabinet/whispers` (verify path in `agentflow-landing/src/pages/CabinetDashboard.tsx`).
+
+### Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Cabinet always empty | response `suggestions:[]` despite known 💡 messages | `matrix_bots WHERE slug='af-claude'` returned no row — re-run `ensureAllBots` by restarting agentflow-agents |
+| Cabinet empty for an owner with bridged rooms | (no log — fetch silently returns null body) | `MATRIX_HOMESERVER_INTERNAL` env unset or pod can't reach Dendrite |
+| Suggestion still shown after owner 👍 in Element | (no log) | The owner's reaction was outside the 80-event window. Re-react inside `MESSAGES_PER_ROOM` or raise the cap |
+| 502 / unauthenticated | `requireSession` reject | Owner session expired — re-login on landing |
+
 ## Voice → text via ElevenLabs Scribe (@af-claude)
 
 When `@af-claude` receives an `m.room.message` with `msgtype: m.audio` (Telegram voice notes forwarded through mautrix-telegram, or native Matrix voice messages from Element), the handler:
