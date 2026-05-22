@@ -1,0 +1,66 @@
+---
+title: "Multi-agent project chat"
+description: "Maestro fans every project-chat feature request out to a researcher → designer → coder → qa pipeline. Single-agent shortcut allowed only for trivial copy fixes."
+---
+
+# Multi-agent project chat
+
+## TL;DR
+Project chat (`POST /me/projects/:id/chat`) routes every turn through the
+user's Maestro agent. When a request touches a feature, page, or component,
+Maestro composes a 2-4 step plan and emits one `team-manager__delegate_to_agent_sync`
+call per role. A canonical four-role team (researcher / draft-designer /
+copywriter / qa-playwright) is seeded into every new tenant via
+`tenant-bootstrap.bootstrapTenantRuntime` so the slugs always resolve.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/project-maestro-chat.ts:507` | `dispatchDirective` — the system-prompt addendum that mandates multi-step planning. |
+| `agentflow-agents/src/services/chat-tooluse.ts:679` | `forceToolUse` — keeps `tool_choice='any'` pinned on every coder iteration until at least one `write_file`/`edit_file`/`multi_edit`/`create_file` tool call lands. |
+| `agentflow-agents/src/scripts/seed-canonical-roles.ts:37` | `CANONICAL_ROLES` — the six presets every tenant gets: `implementation-architect`, `design-critic`, `researcher`, `cheap-draft-designer`, `writer`, `playwright-screencast-operator`. |
+| `agentflow-agents/src/services/tenant-bootstrap.ts:232` | `seedCanonicalRolesForOwner` invocation — fires after the tenant runtime rollout completes. |
+| `agentflow-agents/presets/coder-spa.json` | Coder system prompt now leads with `ОБЯЗАТЕЛЬНАЯ ПЕРВАЯ РЕАКЦИЯ — WRITE_FILE` so the first tool_use call is a write, not a read. |
+
+## Data flow
+
+```
+user → POST /me/projects/:id/chat
+        ↓
+   runMaestroProjectChat (project-maestro-chat.ts)
+        ↓
+   composeProjectContext  →  <project_context> block (preview_url, kind, slug, workspace)
+        ↓
+   dispatchDirective  →  multi-step plan instructions
+        ↓
+   runChatTurnNative (chat-tooluse.ts)
+        ↓                                   ↑
+   tool_choice='any' until coder writes     │
+        ↓                                   │
+   Maestro emits 2-4 tool_use blocks:       │
+     ① researcher__delegate_to_agent_sync   │   ←─ runChatTurnNative
+     ② designer__delegate_to_agent_sync     │      forces tool_choice='any'
+     ③ coder-spa__delegate_to_agent_sync    │      on coder agents until
+     ④ qa-playwright__delegate_to_agent_sync│      a write tool fires
+        ↓                                   │
+   final summary text to user
+```
+
+## DB / Env / API
+- Tables: `agents` (canonical roles owned by user), `project_events` (per-delegation `tool_call`/`tool_result` rows).
+- Env: `CHAT_TURN_TIMEOUT_MS` (default 300 000 ms — long enough for a research+design+code+qa fan-out).
+- Routes: `POST /me/projects/:id/chat` (SSE stream of `tool_call` / `tool_result` / `text` / `done`).
+- MCP tools: `team-manager__delegate_to_agent_sync`, `architect__create_agent` (escape hatch when a role is absent).
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Coder returns `files_written:[]` after a delegate | `coder_did_nothing` in `project_events.payload` | `services/chat-tooluse.ts:679` — verify `coderHasWritten` gate is alive. |
+| Maestro dumps the whole request on one coder, no researcher step | `tools_called: [{server:"team-manager",tool:"delegate_to_agent_sync",args:{agent_slug:"coder-spa-…"}}]` only | `services/project-maestro-chat.ts:507` — ensure the multi-step pipeline section is in the dispatchDirective. |
+| `delegate_to_agent_sync` returns `agent_not_found` for researcher / designer / qa | `delegate_to_agent_sync … error:"agent_not_found"` | Run `kubectl -n franchise-factory exec deploy/agentflow-agents -- node dist/scripts/seed-canonical-roles.js` to backfill the four new canonical roles for existing tenants. |
+| Trivial typo request still routes through researcher | `iterations >= 4` for a one-line edit | Tighten the trivial-fix examples in `dispatchDirective` (typos, copy swaps, button recolors). |
+
+## Related
+- [/subsystems/maestro-skip-when-schema](/subsystems/maestro-skip-when-schema)
+- [/subsystems/chat-streaming-sse](/subsystems/chat-streaming-sse)
+- [/subsystems/agents](/subsystems/agents)
