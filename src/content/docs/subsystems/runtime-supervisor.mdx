@@ -20,6 +20,10 @@ Before 2026-05-22 these invariants drifted for legacy projects (Monar / 1292), c
 
 | Path | Role |
 |---|---|
+| `agentflow-agents/src/services/runtime-supervisor.ts:535-555` | Next.js runtime branch (PR #730, 2026-05-22). Detects `next` in `dependencies`/`devDependencies` BEFORE the generic build-script branch and emits `type='nextjs'` with `npx next start -H 0.0.0.0 -p <foundation_port>`. Bound to `computePortBase(projectId).port`. |
+| `agentflow-agents/src/services/runtime-supervisor.ts:1452-1470` | `processesForPlan` — nextjs lands as service `name='web'` (Heroku convention) so downstream tooling and the Caddy preview sidecar pick it up. |
+| `agentflow-agents/src/services/pool-worker/post-build.ts:599-614` | Always-on `deploy()` bucket now includes `'nextjs'` — fresh Next.js projects boot without `RUNTIME_SUPERVISOR_ENABLED=1`. |
+| `agentflow-agents/src/services/runtime-supervisor-health.ts:332-340` | `healthcheckByType` routes `nextjs` through `probeApi` (HTTP probe on `plan.port`). |
 | `agentflow-agents/src/services/graph-executor/handlers/spa.ts:798-833` | Foundation bridge: writes `.ports.env`, generates the Procfile with the `${PORTS_SRC}` source line in every variant. |
 | `agentflow-agents/src/mcp-servers/code-exec/index.ts:1899-2240` | `start_service` MCP tool: idempotency probe + force mode. |
 | `agentflow-agents/src/services/pingers/peruser-services-reconcile.ts:1-260` | Auto-pinger reconciler: writes missing `.ports.env`, patches legacy Procfiles, adopts the running PID. |
@@ -94,6 +98,7 @@ Before 2026-05-22 these invariants drifted for legacy projects (Monar / 1292), c
 | Graph flips `status='done'` but DOM has zero brief-derived tokens | `preview_health_failed: no_brief_tokens_in_dom` | `services/pingers/preview-placeholder.ts:classifyPreviewProbe` layer 4 (brief-token check) |
 | `build_failed` event in last 3 min but project still shipped `done` | `preview_health_failed: build_failed_recent` | `services/pingers/preview-health-strict.ts:inspectBuildFailedEvents` — extend `BUILD_RETRY_SUCCESS_KINDS` if a new success-event is added |
 | Preview HTTP=200 but real status=502 from upstream | `preview_health_failed: http_not_200` | upstream pod down — check `kubectl -n af-tenant-<u> logs project-proj-<slug>-0` |
+| Fresh Next.js project serves AgentFlow placeholder forever | classify reason was `package_json_build_script` (legacy `type='web'` skip) — fixed by `nextjs_detected` branch | `runtime-supervisor.ts:535-555` — check `package.json.dependencies.next` exists; verify `processesForPlan` emits the `web` service with `npx next start -p <foundation_port>` |
 
 ## Strict preview-health gate (PR agentflow-agents#729, 2026-05-22)
 
@@ -133,6 +138,40 @@ Greppable reasons (used to triage in `kubectl logs deploy/agentflow-agents | gre
 - `no_brief_tokens_in_dom`.
 - `build_failed_recent`.
 - `http_not_200` / `unreachable` / `non_200_status`.
+
+## Next.js runtime detection (PR agentflow-agents#730, 2026-05-22)
+
+The default AgentFlow project stack is Next.js. Before this PR, `classify`
+saw `package.json.scripts.build = "next build"`, took the generic
+build-script branch, returned `type='web'` with `port=8080`, and
+`writeS6Services` short-circuited — no process bound the per-project
+foundation port, the Caddy preview sidecar fell back to the
+`<title>Запускаем проект… · AgentFlow</title>` placeholder, and every
+fresh Next.js project (#1373..#1381 on 2026-05-22) shipped broken.
+
+Detection rule in `classify` (priority order, FIRST match wins):
+
+1. Fullstack Node + Procfile / multi-process — unchanged.
+2. `/workspace/dist/index.html` present → `type='static'`. Preserves static
+   exports (`next export`, Vite production builds, etc.) — the Caddy
+   sidecar serves the prebuilt artefact and no `next start` runs.
+3. **NEW: `package.json.dependencies.next` OR `package.json.devDependencies.next`**
+   → `type='nextjs'`, `reason='nextjs_detected'`, port =
+   `computePortBase(projectId).port`. Emits a single process named `web`
+   running `[ -f .ports.env ] && . ./.ports.env; exec npx next start -H 0.0.0.0 -p "${PORT:-<port>}"`.
+4. Generic `package.json.scripts.build` → `type='web'` (Vite/CRA/etc.).
+5. Python branches — unchanged.
+
+`writeS6Services` allow-list now passes `nextjs` through to the
+`start_service` loop (the static-skip branch at L1577 covers only
+`static`/`web`/`unknown`). `pool-worker/post-build.ts` always-on bucket
+includes `'nextjs'` so the boot fires without the
+`RUNTIME_SUPERVISOR_ENABLED` flag.
+
+Greppable detection signal for postmortems:
+- `runtime_detect_shadow` payload contains `"reason":"nextjs_detected"`.
+- `runtime_supervisor_deployed` payload `plan.type` = `"nextjs"`.
+- `start_service` event with `name='web'` and `port=<computePortBase(projectId).port>`.
 
 ## Reconcile contract
 
