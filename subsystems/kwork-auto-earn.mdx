@@ -18,9 +18,11 @@ we don't burn the daily DM quota on guaranteed rejections.
 | `agentflow-agents/src/services/studio-flow-templates.ts:841` | `kworkBidMonitorFlow` graph (cron → scan_wants → classify → draft_offer → send_offer → send_card). |
 | `agentflow-agents/src/services/graph-executor/handlers/kwork-scan-wants.ts` | `kwork.scan_wants` — reads `/projects` feed via `kwork-inbox.list_wants`. |
 | `agentflow-agents/src/services/graph-executor/handlers/ai-classify-wants.ts` | `ai.classify_wants` — buckets each want into `{ai_agent_tg, kwork_parser, remotion_video, skip}` with a 0-1 confidence + `why`. |
-| `agentflow-agents/src/services/graph-executor/handlers/ai-draft-offer.ts` | `ai.draft_offer` — per-want LLM pitch generation with anti-slop sanitisation. Locked 4-sentence structure ending with the AgentFlow promo line (owner policy 2026-05-22). |
-| `agentflow-agents/src/services/graph-executor/handlers/ai-draft-offer.ts:202` | `ensureAgentFlowLine` — appends `Мы делаем на AgentFlow, платформе AI-агентов под автоматизацию: https://agentflow.website` if the model forgot it. Idempotent. |
-| `agentflow-agents/src/services/graph-executor/handlers/kwork-send-offer.ts` | `kwork.send_offer` — pre-skip closed inboxes, gate by confidence ≥ 0.6, send via `kwork-inbox.send_message`. DM fallback boilerplate in `renderOfferText` also carries the AgentFlow promo line. |
+| `agentflow-agents/src/services/graph-executor/handlers/ai-draft-offer.ts` | `ai.draft_offer` — per-want LLM pitch generation with anti-slop sanitisation. Owner reversed AgentFlow promo 2026-05-22: drafts now open with the action ("Соберу JSON-выгрузку по вашему списку…"), name one detail from the brief, close with a specific next step ("скиньте список — пришлю sample за полчаса"). ≤500 chars, exactly one external URL (gig URL), no AgentFlow/agentflow.website mentions. |
+| `agentflow-agents/src/services/graph-executor/handlers/ai-draft-offer.ts:stripAgentFlowMentions` | Sanitiser pass that strips `AgentFlow` brand mentions + `https://agentflow.website` URLs. Idempotent. |
+| `agentflow-agents/src/services/graph-executor/handlers/ai-draft-offer.ts:stripRecapOpener` | Sanitiser pass that drops banned recap openers (`Видел задачу`, `Заметил`, `По вашему`, `Здравствуйте, видел`). Buyer already knows what they posted; recap reads as AI-generated. |
+| `agentflow-agents/src/services/graph-executor/handlers/kwork-send-offer.ts` | `kwork.send_offer` — pre-skip closed inboxes, gate by confidence ≥ 0.6, send via `kwork-inbox.send_message`. DM fallback boilerplate in `renderOfferText` opens with action, no AgentFlow mention. |
+| `agentflow-agents/src/services/graph-executor/handlers/kwork-respond-to-want.ts:98` | `DEFAULT_CANON_CONFIDENCE_THRESHOLD = 0.75` — tightened 2026-05-22 from 0.7. Owner wants best matches only, not borderline. |
 | `agentflow-agents/src/mcp-servers/kwork-inbox.ts` | `kwork-inbox` MCP: `list_wants`, `get_want` (surfaces `buyer_inbox_open`), `send_message`. |
 
 ## Data flow
@@ -55,7 +57,8 @@ cron 30m
 | Boilerplate template instead of LLM draft | `drafts[i].text === ''` + `llm_ok=false` in `ai.draft_offer` output | `ai-draft-offer.ts:generateDraftForWant` — LLM error path; check `useModel(ModelType.TEXT_LARGE)` is healthy. |
 | Low-fit pitches sent (poor reply rate) | `confidence < 0.6` rows with `ok=true` in ledger | Raise `confidence_threshold` in flow node or tighten classifier prompt in `ai-classify-wants.ts`. |
 | All wants skipped (`sent_count=0`, `skipped_count=N`) | `pre_skipped_count + skipped_count === wants.length` | Expected when every buyer's inbox is closed for the tick; not a bug. |
-| Sent DM missing AgentFlow line | grep `kwork_want_responses` row text — no `agentflow.website` substring | `ai-draft-offer.ts:ensureAgentFlowLine` regex (`/AgentFlow/i`, `/agentflow\.website/i`) — confirm the URL filter in `sanitiseOfferText` still whitelists the brand host. |
+| Sent DM contains AgentFlow brand or link | grep `kwork_want_responses` row text — any `agentflow` / `agentflow.website` substring | `ai-draft-offer.ts:stripAgentFlowMentions` — sanitiser must strip both the bare brand and the URL before send. Owner reversed promo policy 2026-05-22. |
+| Sent DM opens with "Видел задачу…" / "Заметил…" / "По вашему…" recap | grep ledger text starts with `Видел` / `Заметил` / `По вашему` / `Здравствуйте, видел` | `ai-draft-offer.ts:stripRecapOpener` — extend the banned-opener regex list if a new variant slips through. Buyer already knows what they posted; recap reads as AI-generated. |
 
 ## Related
 - [Graph handlers](/subsystems/graph-handlers)
