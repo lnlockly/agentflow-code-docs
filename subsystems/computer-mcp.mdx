@@ -111,6 +111,30 @@ Cabinet                 agentflow-agents (pod)                  agentflow-deskto
 
 The SSE writer in `routes/me-devices.ts:writeTaskStreamEvent` emits each event twice: once as a named SSE event (`action` / `complete` / `error`) carrying the legacy camelCase shape the existing cabinet (`CabinetDeviceLive.tsx:319-322`) listens for, and once as a default `message` event carrying the unified `{kind, …}` payload for new consumers. Per-task subscriptions auto-close after `task_complete` or `task_error`.
 
+## Auto-start guarantees (updated 2026-05-22)
+
+| OS | Boot trigger | Restart policy | linger needed | Notes |
+|---|---|---|---|---|
+| macOS (launchd) | `RunAtLoad=true` in `com.agentflow.desktop.plist` | `KeepAlive{Crashed:true, SuccessfulExit:false}`, `ThrottleInterval=10` | N/A | `ProcessType=Background` + `LowPriorityIO=true` added to prevent Jetsam kills under memory pressure. `launchctl bootstrap gui/<uid>` on install. |
+| Linux (systemd user) | `WantedBy=default.target` + `systemctl --user enable --now` | `Restart=on-failure`, `RestartSec=10`, `StartLimitIntervalSec=0` | Yes — `loginctl enable-linger <user>` (best-effort; installer warns if it requires sudo) | Without linger the unit starts only after the user's first login session. |
+| Windows (Task Scheduler) | `AtLogon` (current user) **+** `AtStartup` (system boot) | `RestartCount=5`, `RestartInterval=PT1M` via `ScheduledTaskSettingsSet` | N/A | `RunLevel=Limited` — daemon does not require admin. Python detection falls back `python` → `py -3`; links to download page if neither found. |
+
+### selftest subcommand
+
+`agentflow-desktop selftest` is the recommended liveness probe. It checks:
+1. `capture_screen_fast` — screen capture backend works (required).
+2. `capture_screen (png)` — full PNG capture (required).
+3. `window_list` / `clipboard_read` — OS permissions in place (required).
+4. `read_terminal` — optional; FAIL here does not fail the overall exit code.
+5. `auth_file` — `~/.agentflow/auth.json` present and contains `api_key` (required).
+6. `scope_file_parseable` — `~/.agentflow/computer-scope.toml` parseable TOML (required).
+7. `ws_endpoint_reachable` — TCP + TLS handshake to the WS host succeeds (required).
+
+Exit 0 = PASS; exit 1 = one or more required checks failed.
+Both `install.sh` and `install.ps1` call `agentflow-desktop selftest` at the end of installation.
+
+Source: `agentflow-computer-mcp/src/agentflow_computer_mcp/desktop_cli.py:225` (`cmd_selftest`).
+
 ## Failure modes
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
@@ -126,6 +150,10 @@ The SSE writer in `routes/me-devices.ts:writeTaskStreamEvent` emits each event t
 | `af_post_matrix_room` returns 502 `matrix_bridge_unreachable` | `[chat-tg] ... token issue failed` (pattern reused) | Dendrite down or `MATRIX_AUTH_KEY` rotated; user re-login via Element SSO |
 | Cabinet timeline empty after `/tasks/stream` connect | `[device-task-stream] history_load_failed` | SQL replay failed; the live path still works — check `device_action_log` join with `device_sessions` and migration `2026-05-22a-device-tasks.sql` |
 | New SSE consumer reads `data` but sees only `action/complete/error` | none — wire-shape issue | bind to default `message` event for the unified `{kind, …}` payload; named events ship the legacy camelCase shape |
+| Daemon Jetsam-killed on Mac at night (device goes offline) | `agentflow-desktop` absent from `launchctl list` | Re-run `install.sh` (adds `ProcessType=Background` + `LowPriorityIO=true` to plist) |
+| Linux daemon not running after reboot | `systemctl --user status agentflow-desktop` → not found | Run `sudo loginctl enable-linger $USER`; without linger user units don't start at boot |
+| Windows daemon missing after cold boot (not user logon) | Task Scheduler history → task never ran | Re-run `install.ps1` (adds `AtStartup` trigger alongside `AtLogon`) |
+| `agentflow-desktop selftest` fails `ws_endpoint_reachable` | TCP connection refused or TLS error | Check firewall / VPN; endpoint is `wss://agentflow.website/_agents/_devices/connect` |
 
 ## Performance (streamer, updated 2026-05-22)
 
