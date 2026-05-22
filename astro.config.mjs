@@ -71,6 +71,9 @@ export default defineConfig({
             { label: 'Projects Dashboard', slug: 'subsystems/projects-dashboard' },
             { label: 'Products Hub', slug: 'subsystems/products-hub' },
             { label: 'Onboarding Quests', slug: 'subsystems/onboarding-quests' },
+            { label: 'Proxy Pool', slug: 'subsystems/proxy-pool' },
+            { label: 'VK Bridge', slug: 'subsystems/vk-bridge' },
+            { label: 'Social Network', slug: 'subsystems/social-network' },
           ],
         },
         {

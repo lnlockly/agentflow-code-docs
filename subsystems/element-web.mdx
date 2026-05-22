@@ -117,9 +117,24 @@ Source of color keys: https://github.com/element-hq/element-web/blob/develop/doc
 
 ### Custom Home page (no room selected)
 
-Element fetches `embedded_pages.home_url` and renders it in place of the upstream "Welcome to Element" panel when the user has no room open. We keep the file in the same `element-web-config` ConfigMap (`data.home.html`) and mount it at `/app/home.html` so nginx serves it from the chat origin — `home_url` is therefore the relative string `"home.html"`.
+Element fetches `embedded_pages.home_url` and renders it in place of the upstream "Welcome to Element" panel when the user has no room open. We keep the file in the same `element-web-config` ConfigMap (`data.home.html`, `k8s/element-web-config.yaml:157`) and mount it at `/app/home.html` so nginx serves it from the chat origin — `home_url` is therefore the relative string `"home.html"` (set at `k8s/element-web-config.yaml:147`).
 
-Copy points new users at the five service bots (`@af-helper`, `@af-claude`, `@af-image`, `@af-research`) and the TG bridge page in cabinet. Background `#0a0a0c`, accent `#a6f25c`, Inter font — matches the `custom-AgentFlow Dark` theme. No marketing words, no «бесплатно».
+#### 2026-05-22 rewrite — onboarding inside Element
+
+The home page now ships a full onboarding surface so first-bounce users land somewhere actionable instead of an empty Element shell:
+
+- **Hero card** with one-line value + `Начать с @af-helper →` primary CTA.
+- **3-step onboarding** (sign-in → pick a bot → start chatting), each step is a card with a `cta` linking to a bot or cabinet page.
+- **6 bot tiles** for `@af-helper`, `@af-claude`, `@af-image`, `@af-research`, `@af-spec`, `@af-ops`.
+- **Quicklinks** to cabinet pages (devices, whispers, proxies, etc).
+
+All bot links use the in-Element route shape `chat.agentflow.website/#/user/@<bot>:agentflow.website` (NOT `matrix.to`) so Element opens the DM in-place instead of bouncing through `matrix.to` and prompting "open in another client?". External links (cabinet, docs) go to `https://agentflow.website/...`.
+
+#### `<base target="_top">` is load-bearing
+
+`home.html` renders **inside Element's `<iframe>`** because that's how `embedded_pages.home_url` works. Without `<base target="_top">` (`k8s/element-web-config.yaml:167`), every `<a>` click would try to repaint the tiny home iframe instead of navigating the top frame — bot tiles would render "page not found" inside the iframe. The base tag forces every link to `target="_top"` by default; the Element router then handles the `#/user/...` route.
+
+Styling matches the `custom-AgentFlow Dark` theme: background `#0a0a0c`, accent `#a6f25c`, Inter font. Copy is plain Russian, no marketing words, no «бесплатно».
 
 Editing: bump the `home.html` block under `data:` in `k8s/element-web-config.yaml`, re-apply ConfigMap, rollout-restart deploy/element-web. Nothing in the Element image changes.
 
@@ -329,6 +344,72 @@ Element Web with #lobby:agentflow.website visible
 - Bounce page is `Cache-Control: no-store` so a logged-in → logged-out user can't replay a stale seeded response.
 - `from=` attribution param is stripped to `\p{L}\p{N}\-_. ` and capped at 40 chars.
 
+## Phase 3d: Session-restore recovery shim (shipped 2026-05-22)
+
+Element shows «Восстановление сеанса не удалось» / «Session restore failed» when localStorage carries stale matrix-js-sdk state from a prior device (we mint a new device per bounce, so old devices stay registered until 7d TTL). Users see a dialog they can't close, so the chat loop dies.
+
+Fix: a tiny recovery script (`/sso/recovery.js`) is injected into every Element HTML response via nginx `sub_filter` on the `element-web` Ingress. The script polls the DOM for the error dialog text, wipes matrix-js-sdk IndexedDB + localStorage, and bounces through `/sso/element-sso` for a fresh device.
+
+### Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/element-sso.ts:483` | `RECOVERY_SCRIPT` body — detect + wipe + bounce loop |
+| `agentflow-agents/src/routes/element-sso.ts:554` | `GET /me/chat/recovery.js` handler, 5-min cache |
+| `agentflow-agents/k8s/element-web.yaml:116` | nginx `configuration-snippet` with `sub_filter` |
+| `agentflow-agents/k8s/element-web.yaml:119` | the `sub_filter '</body>'` rewrite injecting `<script src="/sso/recovery.js" async>` |
+
+### Wire
+
+```
+Browser opens https://chat.agentflow.website/
+   │
+   ▼
+nginx-ingress → element-web pod (nginx)
+   │  response: text/html
+   ▼
+nginx sub_filter (ingress controller) rewrites </body> →
+   '<script src="/sso/recovery.js" async></script></body>'
+   (requires `allow-snippet-annotations: true` on the controller's ConfigMap)
+   │
+   ▼
+Browser parses HTML, fetches /sso/recovery.js
+   │
+   ├─ Routed via element-web-sso Ingress → /me/chat/recovery.js
+   ▼
+agentflow-agents serves RECOVERY_SCRIPT (cache-control: public, max-age=300)
+   │
+   ▼
+Script arms once (`window.__afRecoveryArmed`), then polls every 1.5s, up to 20 attempts
+   if body innerText contains any of:
+     • «Восстановление сеанса не удалось»
+     • «Session restore failed»
+     • «Your session has expired»
+     • «incompatible with a newer version»
+     • «несовместим с ней»
+   →  wipe localStorage keys starting with mx_/mxjssdk_/matrix-/dm_/im.vector.
+   →  indexedDB.deleteDatabase('matrix-js-sdk:crypto' | 'matrix-js-sdk:riot-web-sync' |
+                              'matrix-js-sdk:rust-sdk-meta' | 'matrix-js-sdk:rust-sdk' | 'logs')
+   →  location.replace('/sso/element-sso')
+   (2s safety timer always fires the bounce even if IndexedDB hangs)
+```
+
+### Idempotency + bounds
+
+- `window.__afRecoveryArmed` flag prevents double-arming across navigations.
+- 20 attempts × 1.5s ≈ 30s watchdog budget. After that the interval clears and the script becomes a no-op for the page lifetime.
+- Cache: 5 min `public, max-age=300` — short enough for hot-fix rollouts, long enough not to hammer the route.
+
+### Verify
+
+```
+curl -sI https://chat.agentflow.website/sso/recovery.js
+# expect 200, content-type application/javascript, cache-control max-age=300
+
+curl -s https://chat.agentflow.website/ | grep recovery.js
+# expect: <script src="/sso/recovery.js" async></script></body>
+```
+
 ## Failure modes
 
 | Symptom | Log signature for grep | Where to fix |
@@ -357,6 +438,11 @@ Element Web with #lobby:agentflow.website visible
 | `matrix_bots` table empty → no DMs created | `[chat-onboard] onboarding done` with `dms:0` | Restart agentflow-agents — `ensureAllBots` re-seeds on boot (`src/services/matrix-bots/register.ts`) |
 | Element ConfigMap edit didn't land in prod | CI log shows `[matrix-manifests] no changes — skipping.` despite obvious diff | `actions/checkout` `fetch-depth: 2` regression, or commit squashed file. Re-run via `workflow_dispatch` with `apply_matrix_manifests=true`. Source: `.github/workflows/deploy.yml` step `Detect changed Matrix manifests` |
 | Element pod stuck on old image after merge | `kubectl rollout history deploy/element-web` shows no new revision | `kubectl apply` in CI succeeded but no spec change. Bump a label or trigger `workflow_dispatch` with `apply_matrix_manifests=true` to force restart |
+| Recovery dialog appears repeatedly, no auto-recovery | curl returns 404 on `/sso/recovery.js` | Ingress `configuration-snippet` was not applied — verify `nginx.ingress.kubernetes.io/configuration-snippet` annotation on `Ingress/element-web` and that the controller has `allow-snippet-annotations: true` in its ConfigMap |
+| `sub_filter` rewrite missing from response body | `curl -s https://chat.agentflow.website/ \| grep recovery.js` returns empty | nginx-ingress controller deployed with snippets disabled — re-enable via the controller ConfigMap, or fall back to baking the script into Element via a custom image |
+| Recovery loops on bounce → recovery → bounce | browser console: `__afRecoveryArmed` set, then `/sso/element-sso` lands back on a page that re-triggers `SIGNALS` text | The seed HTML from `element-sso.ts` failed to write localStorage (third-party storage partition). Open chat in a top-level window, not an iframe |
+| Home page tile opens `Not found` inside Element iframe | n/a — visible only | `<base target="_top">` missing from `home.html`. All anchors must escape the iframe — keep the tag at `k8s/element-web-config.yaml:167` |
+| Home page tile opens `matrix.to` instead of in-Element DM | n/a | A bot tile was authored with a `https://matrix.to/#/@bot:server` href. Replace with `https://chat.agentflow.website/#/user/@bot:agentflow.website` so Element's router handles it in-place |
 
 ## Operator runbook
 
