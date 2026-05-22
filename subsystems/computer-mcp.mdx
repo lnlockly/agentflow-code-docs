@@ -24,6 +24,8 @@ task_error` to `device_action_log`, and proxies the daemon's local MJPEG capture
 | `agentflow-agents/src/routes/me-devices.ts:489`     | `GET /me/devices/:id/tasks/stream` (device-wide SSE) |
 | `agentflow-agents/src/routes/me-devices.ts:549`     | `GET /me/devices/:id/tasks/:task_id/stream` (per-task SSE) |
 | `agentflow-agents/src/routes/me-devices.ts:613`     | `GET /me/devices/:id/live_stream` (MJPEG proxy) |
+| `agentflow-agents/src/routes/me-telegram.ts:175`    | `POST /me/telegram/send` — backs daemon's `af_send_telegram_message` |
+| `agentflow-agents/src/routes/me-matrix.ts:192`      | `POST /me/matrix/send` (alias `/me/matrix/post`) — backs daemon's `af_post_matrix_room` |
 | `agentflow-agents/src/services/kind-registry.ts:18` | `desktop_agent` added to `PROJECT_KINDS` |
 | `agentflow-agents/src/services/kind-registry.ts:24` | `desktop_agent` added to `USER_FACING_PROJECT_KINDS` |
 | `agentflow-agents/migrations/2026-05-22a-device-tasks.sql` | `task_id` + `kind` columns on `device_action_log` |
@@ -89,6 +91,8 @@ Cabinet                 agentflow-agents (pod)                  agentflow-deskto
   - `GET  /me/devices/:id/tasks/stream` → SSE (device-wide)
   - `GET  /me/devices/:id/tasks/:task_id/stream` → SSE (per-task, closes on complete/error)
   - `GET  /me/devices/:id/live_stream` → `multipart/x-mixed-replace; boundary=frame`
+  - `POST /me/telegram/send` → 200 `{ok, message_id}` / 503 `tg_account_not_linked` / 503 `tg_primary_login_missing` / 502 MCP error. Body `{chat_id, text}`. `chat_id="me"` routes to Saved Messages.
+  - `POST /me/matrix/send` (alias `POST /me/matrix/post`) → 200 `{ok, event_id}` / 404 `room_not_found` / 502 `bridge_error` / 502 `matrix_bridge_unreachable`. Body `{room_id, text}`. Posts as the caller's Dendrite puppet via `issueMatrixTokenForAfUser`.
 - WS protocol additions (`WsMessage` in `packages/shared-types/devices.ts`):
   - S→C: `task_dispatch`, `subscribe_stream`, `unsubscribe_stream`
   - C→S: `task_action`, `task_complete`, `task_error`, `stream_frame`
@@ -104,6 +108,9 @@ Cabinet                 agentflow-agents (pod)                  agentflow-deskto
 | `subscribe_stream` never sent | `streamSubscriberCount` flips 0→1 silently if connection missing | device offline; daemon must come online + cabinet re-opens stream |
 | Daemon ignores `task_dispatch` | `ws task_dispatch id=... task=...` missing from `agentflow-desktop` log | upgrade daemon to ≥0.2.1 (PR auto/ws-client-task-dispatch-2026-05-22 wired routing) |
 | `task_action` SSE silent though daemon is online | `current_task_id` empty inside `DriverState` | local-input path: viewer's `POST /task` now assigns `local-*` id via `enqueue_task` — old viewer builds put raw strings and never tag the task |
+| `af_send_telegram_message` returns 503 `tg_account_not_linked` | none — synchronous response | caller has no `chat_tg_links` row; bind via cabinet → Telegram |
+| `af_send_telegram_message` returns 503 `tg_primary_login_missing` | none — synchronous response | `chat_tg_links.primary_login_id` is null or non-numeric; user must pick a primary via `POST /me/chat/tg/set-primary` |
+| `af_post_matrix_room` returns 502 `matrix_bridge_unreachable` | `[chat-tg] ... token issue failed` (pattern reused) | Dendrite down or `MATRIX_AUTH_KEY` rotated; user re-login via Element SSO |
 
 ## Related
 - [Workspace provisioning](/subsystems/workspace-provisioning) — vcluster per user pattern
