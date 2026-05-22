@@ -1,13 +1,13 @@
 ---
 title: "Matrix Bots"
-description: "Nine platform service bots running inside Element/Dendrite at chat.agentflow.website."
+description: "Ten platform service bots running inside Element/Dendrite at chat.agentflow.website."
 ---
 
 # Matrix Bots
 
 ## TL;DR
 
-Nine service bots (`@af-helper`, `@af-research`, `@af-image`, `@af-claude`, `@af-tg-poster`, `@af-poster`, `@af-spec`, `@af-ops`, `@af-news`) are registered on the Dendrite homeserver via shared-secret registration and run a per-bot `/sync` long-poll loop inside `agentflow-agents`. Handlers cover a static help menu, URL→TL;DR summarisation, text→image generation, Claude chat, Telegram posting (v1 stub), multi-network cross-posting (`@af-poster` — TG + VK in v1, IG deferred), spec-from-brief writing, the owner-only ops console with constrained tool-use (see @af-ops below), and a daily 09:00 Moscow-time digest (`@af-news` — AI / crypto / AgentFlow team commits). Triggered on DM or `@mention`; gated by `MATRIX_BOTS_ENABLED=1`.
+Ten service bots (`@af-helper`, `@af-research`, `@af-image`, `@af-claude`, `@af-tg-poster`, `@af-poster`, `@af-spec`, `@af-ops`, `@af-news`, `@af-translator`) are registered on the Dendrite homeserver via shared-secret registration and run a per-bot `/sync` long-poll loop inside `agentflow-agents`. Handlers cover a static help menu, URL→TL;DR summarisation, text→image generation, Claude chat, Telegram posting (v1 stub), multi-network cross-posting (`@af-poster` — TG + VK in v1, IG deferred), spec-from-brief writing, the owner-only ops console with constrained tool-use (see @af-ops below), a daily 09:00 Moscow-time digest (`@af-news` — AI / crypto / AgentFlow team commits), and on-demand + per-room auto translation (`@af-translator` — `/translate <text>`, slash- and auto-modes). Triggered on DM or `@mention`; gated by `MATRIX_BOTS_ENABLED=1`. Full per-bot pages live under [`subsystems/matrix-bots/`](/subsystems/matrix-bots/af-translator).
 
 ## Files (with line refs)
 
@@ -97,6 +97,7 @@ agentflow-agents pod (RUN_WORKERS=true)
 | `@af-claude` | yes | yes | open |
 | `@af-tg-poster` | yes only | ignored | DM-only + `@user-<digits>:<serverName>` mxid gate (owner-only) |
 | `@af-poster` | yes only | ignored | DM-only + `@user-<digits>:<serverName>` mxid gate (owner-only) |
+| `@af-translator` | yes | yes | open — also auto-dispatches in rooms with `auto_mode=true`, see [af-translator](/subsystems/matrix-bots/af-translator) |
 
 ## Failure modes
 
@@ -522,6 +523,19 @@ CREATE TABLE chat_news_log (
 ### Mode-C / owner-gate interactions
 
 `@af-news` is **not** an owner-gated bot — anyone in a room can run `/news off` or `/news topics`. The subscription is per-room, not per-user, and the bot is informational. This matches `@af-helper` and `@af-research`, both of which also accept commands from any participant.
+
+## @af-translator — `/translate <text>` + per-room auto-mode
+
+Tenth bot. Direct mode: `/translate <text>`, `/translate ja: hello`, `/translate en→fr Hello`. Auto mode: per-room toggle (`/translate auto on`) makes the bot translate every non-bot, non-command message for each participant whose preferred language differs from the detected source. Per-user preferences live in `chat_translator_user_prefs.mxid`. Idempotency via `chat_translator_log` PRIMARY KEY on `(room_id, event_id, target_lang)`. Throttle: rolling per-room window (`MATRIX_TRANSLATOR_AUTO_RATE_LIMIT_SEC`, default 5s).
+
+| File | Role |
+|---|---|
+| `agentflow-agents/src/services/matrix-bots/handlers/translator.ts:1` | Welcome, slash commands, auto-mode dispatch, throttle |
+| `agentflow-agents/src/services/matrix-bots/lib.ts:421` | `TRANSLATOR_LANGUAGES` + `parseTranslateCommand` |
+| `agentflow-agents/migrations/2026-05-22f-chat-translator.sql:1` | Three tables (`chat_translator_room_settings`, `_user_prefs`, `_log`) |
+| `agentflow-agents/tests/matrix-bots/af-translator.test.ts:1` | 25 unit tests (parser, JSON, target-resolver, fan-out, throttle) |
+
+Full page: [subsystems/matrix-bots/af-translator](/subsystems/matrix-bots/af-translator).
 
 ## Non-goals (v1)
 
