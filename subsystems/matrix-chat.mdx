@@ -171,7 +171,65 @@ kubectl -n franchise-factory logs -l app=agentflow-agents --tail=200 | grep '\[c
 - Voice/video calls (требует TURN-сервера)
 - Mobile apps (phase 6, отдельный repo)
 - Telegram/Discord/WhatsApp bridges (phase 5, `mautrix-*`)
-- Spaces hierarchies
+
+## AgentFlow Space (Discord-style folder)
+
+Element renders a `creation_content.type=m.space` room as a top-level sidebar icon. Clicking it pops out a panel with every child room — same UX shape as a Discord server.
+
+### Files
+
+| Path | Role |
+|---|---|
+| `src/services/bootstrap-channels.ts:bootstrapAgentflowSpace` | Boot-time entry point. Creates Space room, links children, invites all existing users. |
+| `src/services/bootstrap-channels.ts:inviteUserToAgentflowSpace` | Per-user invite called from `/me/chat/element-sso` on first bounce. |
+| `src/services/bootstrap-channels.ts:getAgentflowSpaceRoomId` | Cached room id helper; falls back to alias resolve. |
+| `src/server.ts` | Calls `bootstrapAgentflowSpace` after `bootstrapPublicChannels` on the 60s delay. |
+| `src/routes/element-sso.ts` | Invites the user to the Space after lobby join. |
+
+### Children
+
+| Alias | Role |
+|---|---|
+| `#agentflow-news` | release notes |
+| `#agentflow-tutorials` | walkthroughs |
+| `#agentflow-marketplace` | new agent listings |
+| `#agentflow-bridges` | bridge status |
+| `#agentflow-lobby` | общий чат — gets welcome message on first creation |
+| `#agentflow-voice` | voice room (Element Call URL configured in `k8s/element-web-config.yaml`) |
+
+### Wire shape
+
+- Space room: `POST /_matrix/client/v3/createRoom` with `creation_content: { type: 'm.space' }`, `preset: public_chat`, `room_alias_name: agentflow-space`.
+- Linking children: paired state events
+  - On the Space: `m.space.child` `state_key=<child>` content `{ via: ['agentflow.website'], suggested: true }`.
+  - On the child: `m.space.parent` `state_key=<space>` content `{ via: ['agentflow.website'], canonical: true }`.
+- Auto-invite: at boot the af-helper bot invites every `users` row (cap 5 concurrent); on bounce the SSO route invites the freshly-provisioned user. Existing-member 403 is tolerated.
+
+### Avatar
+
+Skipped in v1. The Space renders with Element's default initial-letter avatar. TODO: ship a 256x256 PNG via `POST /_matrix/media/v3/upload` + a `m.room.avatar` state event once `@napi-rs/canvas` or a precomputed base64 buffer is in the build.
+
+### Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Space icon missing from sidebar | `[bootstrap-channels] space createRoom failed` | af-helper bot row missing or Dendrite reachability — restart agentflow-agents |
+| Child room shows in main sidebar instead of inside Space | `[bootstrap-channels] state event PUT failed` event_type=`m.space.child` | af-helper lost PL100 on the Space — re-create Space or grant PL |
+| Child has no breadcrumb back to Space | `[bootstrap-channels] space.parent PUT failed` | Child was created by a different bot; m.space.parent half needs PL>=50 on the child |
+| New user doesn't see Space until second bounce | `[element-sso] space invite failed` | bootstrapAgentflowSpace hasn't run yet on this pod restart — wait 60s |
+| Voice room is just a normal chat | (no log) | Element Call not wired in `k8s/element-web-config.yaml`; v1 ships voice as a plain room |
+
+### Verify
+
+```bash
+# Space exists
+curl -s 'https://matrix.agentflow.website/_matrix/client/v3/directory/room/%23agentflow-space%3Aagentflow.website'
+# → {"room_id":"!...:agentflow.website","servers":[...]}
+
+# Children linked
+kubectl -n franchise-factory logs -l app=agentflow-agents --tail=400 | grep '\[bootstrap-channels\] space bootstrap done'
+# → ... children_linked: 6, invites_sent: <N>, users_total: <N>
+```
 
 ## Related
 
