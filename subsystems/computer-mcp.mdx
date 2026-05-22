@@ -28,6 +28,13 @@ task_error` to `device_action_log`, and proxies the daemon's local MJPEG capture
 | `agentflow-agents/src/services/kind-registry.ts:24` | `desktop_agent` added to `USER_FACING_PROJECT_KINDS` |
 | `agentflow-agents/migrations/2026-05-22a-device-tasks.sql` | `task_id` + `kind` columns on `device_action_log` |
 | `agentflow-agents/packages/shared-types/devices.ts:132` | `WsMessage` task/stream variants |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_client.py:171` | `_handle_task_dispatch` queues task into `DriverState` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_client.py:186` | `_handle_stream_subscription` toggles the capture-loop flag |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_client.py:80` | `WSClient.publish` thread-safe outbound bridge |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/state.py:44` | `DriverState.publish_outbound` + `task_action` mirror |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/streamer.py:84` | `CaptureLoop._maybe_publish_ws` emits `stream_frame` ≤10 fps |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py` | AI loop emits `task_complete` on done / max-iters, `task_error` on exception |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/desktop_cli.py:48` | `_start_ws_bridge` runs WS client inside `agentflow-desktop run` |
 
 ## Data flow
 
@@ -95,6 +102,8 @@ Cabinet                 agentflow-agents (pod)                  agentflow-deskto
 | Synthetic session row appears | none — silent fallback | daemon resumed task across pod restart (expected) |
 | MJPEG returns headers but no frames | `[device] online ... tools=0` | daemon hasn't subscribed yet OR daemon never pushes `stream_frame` |
 | `subscribe_stream` never sent | `streamSubscriberCount` flips 0→1 silently if connection missing | device offline; daemon must come online + cabinet re-opens stream |
+| Daemon ignores `task_dispatch` | `ws task_dispatch id=... task=...` missing from `agentflow-desktop` log | upgrade daemon to ≥0.2.1 (PR auto/ws-client-task-dispatch-2026-05-22 wired routing) |
+| `task_action` SSE silent though daemon is online | `current_task_id` empty inside `DriverState` | local-input path: viewer's `POST /task` now assigns `local-*` id via `enqueue_task` — old viewer builds put raw strings and never tag the task |
 
 ## Related
 - [Workspace provisioning](/subsystems/workspace-provisioning) — vcluster per user pattern
