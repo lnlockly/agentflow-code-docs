@@ -19,7 +19,9 @@ package.json scripts, missing Prisma schema, t3-env validators.
 | Path | Role |
 |---|---|
 | `agentflow-agents/src/services/graph-executor/handlers/spa.ts:560` | Main bridge — bash command executed inside the workspace pod |
-| `agentflow-agents/src/services/foundation-rebrand.ts:1` | Brand-string substitution (site_name → brief title) before the bridge runs |
+| `agentflow-agents/src/services/foundation-rebrand.ts:1` | Brand-string substitution (site_name → brief title) before the bridge runs. Patches `config/site.ts`, `package.json`, `README.md`, `app/layout.tsx`, `app/page.tsx`, `components/Navbar.tsx`, `.env`. Returns `brief_tokens_landed` count for the gate. |
+| `agentflow-agents/src/services/graph-executor/handlers/spa.ts:580` | Rebrand recovery loop — re-invokes `coder-spa` when `brief_tokens_landed===0` while `brief_tokens_total>=2`. |
+| `agentflow-agents/tests/unit/foundation-rebrand.test.ts:1` | Tests for all rebrand patchers + token gate helpers (29 cases). |
 | `agentflow-agents/src/services/foundation-structural-filter.ts:370` | `MARKETING_CURATED_LIST` — ordered marketing/landing pick list |
 | `agentflow-agents/src/services/curated-foundations.ts:46` | `CURATED_FOUNDATIONS` — full curated catalogue with kind/keyword routing |
 | `agentflow-agents/tests/unit/foundation-bridge-nextconfig.test.ts:1` | Tests for next.config.ts transpile (Fix A historical) |
@@ -34,6 +36,15 @@ project status=approved
   → graph-executor walks kind=spa
   → admin_panel handler (spa.ts:489)
      → foundation-rebrand applies brand strings
+         · probes site.ts, package.json, README, layout.tsx, page.tsx,
+           Navbar.tsx, .env / .env.local
+         · derives {site_name, site_description, hero_title, hero_subtitle}
+           via one TEXT_LARGE call from project.brief + project.title
+         · rewrites template defaults in place; never rewrites custom values
+         · returns brief_tokens_landed / brief_tokens_total
+     → If brief_tokens_landed === 0 while brief_tokens_total >= 2:
+         · re-invoke coder-spa with a tight rebrand brief
+         · coder greps for foundation defaults + write_file's the swaps
      → bridge bash runs:
          1. Detect APP_DIR (root | apps/storefront | apps/admin)
          2. Transpile next.config.ts → next.config.mjs (Fix nextconfig)
@@ -67,6 +78,8 @@ project status=approved
 | `Required: DATABASE_URL` Zod throw on first import | `Invalid environment variables` | `spa.ts` `_write_placeholder_env` + `createEnv` neutraliser |
 | `prisma: schema not found` distracting log | `Could not find a schema.prisma file` | `spa.ts` `HAS_PRISMA_SCHEMA` gates Procfile chain |
 | Monorepo `apps/*` foundation picked despite filter | `foundation_structural_rejected: monorepo_apps` | `foundation-structural-filter.ts` MONOREPO_REJECT_RX |
+| Preview shows raw foundation brand ("Next MarketPlace", "Acme") instead of brief title | `admin_panel: rebrand skipped (no_brand_strings_matched)` + `brief_tokens_landed: 0` | `foundation-rebrand.ts` — extend `TEMPLATE_DEFAULT_FRAGMENTS` or `BRAND_FILES` list to cover the new pattern |
+| Foundation reads `SITE_NAME` from env (e.g. `vercel/commerce`) and renders empty title | `<title></title>` in curl head | `foundation-rebrand.ts:rebrandEnvFile` writes `SITE_NAME` to `.env` |
 
 ## Curated foundation selection rules
 
