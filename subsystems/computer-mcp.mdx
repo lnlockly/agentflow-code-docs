@@ -19,6 +19,9 @@ task_error` to `device_action_log`, and proxies the daemon's local MJPEG capture
 | `agentflow-agents/src/services/devices-ws.ts:514` | `persistTaskRow` writes `device_action_log` |
 | `agentflow-agents/src/services/device-tasks.ts:72`  | `taskEvents` EventEmitter for SSE/MJPEG fan-out |
 | `agentflow-agents/src/services/device-tasks.ts:87`  | `acquireStream / releaseStream` ref-counter |
+| `agentflow-agents/src/services/device-task-stream.ts:77` | `subscribe(deviceId, taskId\|null, send)` wraps `taskEvents` |
+| `agentflow-agents/src/services/device-task-stream.ts:135` | `publish(deviceId, event)` mirrors back to `taskEvents` |
+| `agentflow-agents/src/services/device-task-stream.ts:225` | `loadRecentEvents` replays last N rows from `device_action_log` |
 | `agentflow-agents/src/services/device-registry.ts`  | connection pool + `computer.*` tool dispatch |
 | `agentflow-agents/src/routes/me-devices.ts:424`     | `POST /me/devices/:id/dispatch_task` |
 | `agentflow-agents/src/routes/me-devices.ts:489`     | `GET /me/devices/:id/tasks/stream` (device-wide SSE) |
@@ -98,6 +101,16 @@ Cabinet                 agentflow-agents (pod)                  agentflow-deskto
   - C→S: `task_action`, `task_complete`, `task_error`, `stream_frame`
 - Project kind: `desktop_agent` is user-facing and bypasses the spa-collapse path.
 
+### SSE pub/sub contract
+
+`deviceTaskStream` (in `services/device-task-stream.ts`) is the single subscription primitive used by both `/tasks/stream` and `/tasks/:task_id/stream`. It wraps the existing `taskEvents` EventEmitter and adds:
+
+- **Filtering** — `subscribe(deviceId, taskId | null, send)` either fans out every event for a device, or just one task.
+- **History replay** — `loadRecentEvents(deviceId, taskId | null, limit=100)` reads the last N rows of `kind IN ('task_action','task_complete','task_error')` from `device_action_log` joined through `device_sessions.device_id`. SSE handlers replay those before subscribing, so the cabinet timeline is non-empty on open.
+- **Unified payload** — `TaskStreamEvent` carries a `kind` discriminator (`task_action | task_complete | task_error`), `device_id`, `task_id`, `ts`. Action variant adds `action`, `detail?`, `screenshot_b64?`, `screenshot_url?`. Complete variant adds `answer`, `iterations?`, `tokens_used?`, `cost_usd?`. Error variant adds `error`.
+
+The SSE writer in `routes/me-devices.ts:writeTaskStreamEvent` emits each event twice: once as a named SSE event (`action` / `complete` / `error`) carrying the legacy camelCase shape the existing cabinet (`CabinetDeviceLive.tsx:319-322`) listens for, and once as a default `message` event carrying the unified `{kind, …}` payload for new consumers. Per-task subscriptions auto-close after `task_complete` or `task_error`.
+
 ## Failure modes
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
@@ -111,6 +124,8 @@ Cabinet                 agentflow-agents (pod)                  agentflow-deskto
 | `af_send_telegram_message` returns 503 `tg_account_not_linked` | none — synchronous response | caller has no `chat_tg_links` row; bind via cabinet → Telegram |
 | `af_send_telegram_message` returns 503 `tg_primary_login_missing` | none — synchronous response | `chat_tg_links.primary_login_id` is null or non-numeric; user must pick a primary via `POST /me/chat/tg/set-primary` |
 | `af_post_matrix_room` returns 502 `matrix_bridge_unreachable` | `[chat-tg] ... token issue failed` (pattern reused) | Dendrite down or `MATRIX_AUTH_KEY` rotated; user re-login via Element SSO |
+| Cabinet timeline empty after `/tasks/stream` connect | `[device-task-stream] history_load_failed` | SQL replay failed; the live path still works — check `device_action_log` join with `device_sessions` and migration `2026-05-22a-device-tasks.sql` |
+| New SSE consumer reads `data` but sees only `action/complete/error` | none — wire-shape issue | bind to default `message` event for the unified `{kind, …}` payload; named events ship the legacy camelCase shape |
 
 ## Related
 - [Workspace provisioning](/subsystems/workspace-provisioning) — vcluster per user pattern
