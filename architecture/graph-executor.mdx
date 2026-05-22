@@ -500,10 +500,54 @@ production callers go through `runGraphExecutor` which forces ON.
 | Handler accidentally reads `process.env.BOT_TOKEN_POOL` directly | Lint rule (banned import) + code review. `ExecCtx` does not expose raw env; pool reads stay inside the `request_token` handler that wraps `autoCreateTelegramBot`. |
 | What happens to `projects.proposed_plan` | Walker ignores it. `workflow_schema` is the contract; proposed_plan stays for backward-compat with maestro freestyle until Phase 6. |
 
+## Foundation rebrand (kind=spa, github_repo mode)
+
+When a SPA project clones a GitHub foundation (`projects.foundationMode='github_repo'`), the `admin_panel` handler in `src/services/graph-executor/handlers/spa.ts:519` runs a brand rewrite pass before the Procfile + build step. The pass lives in `src/services/foundation-rebrand.ts`.
+
+### Why
+
+Cloning `mickasmt/next-saas-stripe-starter` or `lnlockly/golden-connect-template` leaves the rendered landing page hardcoded with the template's brand strings — `<title>SaaS Starter</title>`, `name: "Golden Connect"`. The user briefs "Cookora — рецепты из холодильника" and lands on a 200-OK page that still says "SaaS Starter". Observed on projects 1293, 1327, 1361 (2026-05-22).
+
+### Surface
+
+| File | Replacement |
+|---|---|
+| `config/site.ts` / `src/config/site.ts` | `name: "SaaS Starter"` → brief-derived name; `description:` rewritten when template-shaped |
+| `package.json` | `name` slugified from brief; `description` rewritten when template-shaped |
+| `README.md` | First `# <template-name>` heading → `# <brief-name>` + one-line tagline |
+| `app/layout.tsx` / `src/app/layout.tsx` | Probed but not rewritten (Next.js renders title from `metadata` exported elsewhere) |
+
+The rebrand derives `{site_name, site_description, hero_title, hero_subtitle}` from the brief via one `useModel(ModelType.TEXT_LARGE)` call, parses STRICT JSON, falls back to `SAFE_DEFAULTS` on parse failure. Banned words (`free`, `бесплатно`, `platform`, `protocol`, etc.) are stripped post-LLM.
+
+### Idempotency
+
+The rebrand writes `.runtime/.rebrand_applied` on success. Subsequent admin_panel passes (e.g. graph-executor resume after pod restart) detect the marker and skip the LLM call entirely. To force a re-rebrand: delete the marker.
+
+### Production Procfile speedup
+
+Same handler upgrades the Procfile `web:` line from `npx next dev` → `npx next build && npx next start` (with fallback to dev on build failure). First paint drops from 40-60s (dev compile-on-demand) to sub-second. Owner sees their preview once; no HMR needed.
+
+## Curated foundations
+
+`src/services/curated-foundations.ts` ships 5 deterministic GitHub templates that surface in `recommendProjectFoundations` even when the LLM hallucinates dead repos:
+
+| Repo | Use case |
+|---|---|
+| `lnlockly/golden-connect-template` | MLM / community / lots / referrals |
+| `mickasmt/next-saas-stripe-starter` | Generic SaaS dashboard / Stripe billing |
+| `shadcn-ui/taxonomy` | Content sites / docs / MDX blogs |
+| `vercel/commerce` | E-commerce / storefront / marketplace |
+| `vitejs/vite` | Utility tools / MVPs / scratch builds (no auth/DB) |
+
+Matching is cheap lowercase substring against brief keywords + kind hint. Adding a 6th entry: edit `CURATED_FOUNDATIONS` array and add a test in `tests/unit/curated-foundations.test.ts`.
+
 ## Failure modes
 
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
+| Foundation preview shows template brand | `admin_panel: rebrand skipped` event in project_events | `services/foundation-rebrand.ts` — check probe path matches actual cloned layout |
+| Rebrand LLM returned garbage / no JSON | `[foundation-rebrand]` SAFE_DEFAULTS applied | LLM at `ANTHROPIC_API_KEY` / east-api-3 unreachable; rebrand returned site_name="New Project". Investigate via `project_events.foundation_rebranded`. |
+| First paint still 40s+ on Next.js foundation | Procfile contains `npx next dev` instead of `npx next build && npx next start` | Foundation Procfile generated before this PR — delete `.runtime/foundation_port` and re-trigger admin_panel node |
 | Walker doesn't run despite flag on | `[graph-executor] kind <x> not in graph_executor.kinds allowlist` | Set `feature_flags['graph_executor.kinds']` via `PATCH /admin/feature-flags/graph_executor.kinds` |
 | Cycle in workflow_schema | `[graph-executor] cycle_detected nodes=[…]` | `seed-boilerplate-workflows.ts` — the seed has a bad edge |
 | Handler missing for node id | `[graph-executor] handler missing for kind=<id>, delegating to coder-agent` | Register a handler in `src/services/graph-executor/handlers/` OR verify the coder brief is enough |
