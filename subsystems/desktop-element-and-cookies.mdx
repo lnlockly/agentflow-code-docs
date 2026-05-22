@@ -1,0 +1,76 @@
+---
+title: "Desktop: Element hub + cookie onboarding"
+description: "Element-via-Firefox as the owner's social hub plus the cookie-grab paste flow for onboarding new accounts."
+---
+
+# Desktop: Element hub + cookie onboarding
+
+## TL;DR
+The daemon treats `chat.agentflow.website` (Matrix / Element) as the owner's
+primary social hub since Telegram + other socials are bridged in. For
+account onboarding it now reads cookies from the user's real Firefox
+profile, redacts long values to the LLM, and pastes them into AgentFlow
+forms behind a native macOS confirm dialog.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/firefox.py:27` | `COOKIE_DENY_DOMAINS` — refuse bank/payment/crypto |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/firefox.py:50` | `_domain_is_denied` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/firefox.py:215` | `FirefoxHost.get_cookies` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/firefox.py:255` | `FirefoxHost.export_cookies_to` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/firefox.py:312` | `FirefoxHost.drop_cookie_tokens` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/firefox.py:386` | `firefox_get_cookies` descriptor |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/firefox.py:399` | `firefox_export_cookies_to` descriptor |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/desktop_tools.py:720` | Executor confirm-gates `firefox_export_cookies_to` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/desktop_tools.py:880` | `task_complete` auto-drops cookie tokens |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py:113` | Element / Matrix block + cookie-onboarding flow in system prompt |
+| `agentflow-computer-mcp/presets/desktop-tasks.yaml` | Element + Onboard cookies preset rows |
+| `agentflow-computer-mcp/tests/test_cookie_tools.py` | Deny-list, redaction, confirm, paste, auto-drop |
+| `agentflow-computer-mcp/tests/test_loop_prompt.py` | Asserts Element + cookie blocks land in system prompt |
+
+## Data flow
+
+```
+User asks "подключи X к AgentFlow"
+        │
+        ▼
+loop.build_system_prompt() injects cookie-onboarding section
+        │
+        ▼
+LLM emits firefox_get_cookies(domain=X)
+        │  Playwright BrowserContext.cookies(urls=["https://X/", "https://www.X/"])
+        ▼
+FirefoxHost stores raw values in _cookie_tokens, returns tokens + redacted previews
+        │
+        ▼
+LLM navigates to /cabinet/integrations/X via firefox_navigate
+        │
+        ▼
+LLM emits firefox_export_cookies_to(domain=X, dest_field_selector=...)
+        │  ToolExecutor fires native macOS confirm dialog
+        ▼
+On Allow → page.fill(selector, "name=value; name=value; …")
+        │
+        ▼
+task_complete → executor auto-calls drop_cookie_tokens, store cleared
+```
+
+## DB / Env / API
+- Tables: none (in-memory side-channel store only).
+- Env: `AGENTFLOW_FIREFOX_PROFILE` (override profile auto-discovery).
+- MCP tools: `firefox_get_cookies`, `firefox_export_cookies_to`, `firefox_drop_cookie_tokens`.
+- Confirm gate: same `osascript` dialog as `code_write_file`. Title shows
+  domain + target selector before pasting.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Cookie tool returns `ok=false`, error mentions deny-list | `domain refused by deny-list` | `driver/firefox.py:50` `_domain_is_denied` |
+| LLM tries to export but user clicks Deny | `user denied firefox_export_cookies_to` | `driver/desktop_tools.py:720` |
+| `playwright cookies() failed` in tool result | `playwright cookies() failed` | Firefox profile lock — close other Firefox or `AGENTFLOW_FIREFOX_PROFILE` clash |
+| Element page blank / login wall | `firefox profile not found` | `driver/firefox.py:117` — set `AGENTFLOW_FIREFOX_PROFILE` to the canonical profile |
+
+## Related
+- [Desktop / Computer-Agent bridge](/subsystems/computer-mcp)
+- [Matrix integration](/subsystems/matrix) (if present)
