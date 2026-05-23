@@ -74,6 +74,9 @@ export default defineConfig({
             { label: 'Proxy Pool', slug: 'subsystems/proxy-pool' },
             { label: 'VK Bridge', slug: 'subsystems/vk-bridge' },
             { label: 'Social Network', slug: 'subsystems/social-network' },
+            { label: 'Autonomous Goals', slug: 'subsystems/autonomous-goals' },
+            { label: 'Desktop Auto-Updater', slug: 'subsystems/desktop-auto-updater' },
+            { label: 'Cabinet Device — Autonomous Tab', slug: 'subsystems/cabinet-device-autonomous-tab' },
           ],
         },
         {

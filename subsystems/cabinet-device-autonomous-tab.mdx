@@ -1,0 +1,97 @@
+---
+title: "Cabinet Device — «Автономно» tab"
+description: "Phase-0 autonomous-goal UI mounted inside CabinetDeviceDetail. Goals, milestones, today, lessons, budget."
+---
+
+# Cabinet Device — «Автономно» tab
+
+## TL;DR
+The Phase-0 autonomous UI lives as a tab inside `CabinetDeviceDetail`, not a standalone `/cabinet/autonomous` route. The owner pivot on 2026-05-22 made autonomy per-device — selecting a device implicitly scopes the dispatch target. `DeviceAutonomousPanel` mounts only when the user clicks the «Автономно» tab; it renders goals, a new-goal form, and four sub-tabs (Ступеньки / Сегодня / Уроки / Бюджет) per selected goal. All reads go through `autonomousApi` (cookie-auth `af_session`), no SDK additions.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/pages/CabinetDeviceDetail.tsx:33` | `import { DeviceAutonomousPanel } from '../components/devices/DeviceAutonomousPanel'` |
+| `agentflow-landing/src/pages/CabinetDeviceDetail.tsx:125` | `const [tab, setTab] = useState<'device' \| 'autonomous'>('device')` — top-level tab state |
+| `agentflow-landing/src/pages/CabinetDeviceDetail.tsx:315` | `<nav role="tablist" aria-label="Режим устройства">` — segmented control |
+| `agentflow-landing/src/pages/CabinetDeviceDetail.tsx:337` | autonomous tab button, `aria-selected={tab === 'autonomous'}` |
+| `agentflow-landing/src/pages/CabinetDeviceDetail.tsx:350` | `{tab === 'autonomous' && <DeviceAutonomousPanel deviceId={id} />}` — mount point |
+| `agentflow-landing/src/components/devices/DeviceAutonomousPanel.tsx:76` | `GoalCard` — progress bar via `completed/total`, deadline pill, skeleton state when 0 milestones |
+| `agentflow-landing/src/components/devices/DeviceAutonomousPanel.tsx:146` | `NewGoalForm` — `useMutation` → `autonomousApi.createGoal`, 4 fields (title, description, target_metric, target_value, deadline) |
+| `agentflow-landing/src/components/devices/DeviceAutonomousPanel.tsx:308` | `MilestoneRow` — «Готово» button toggles via `markMilestoneDone` |
+| `agentflow-landing/src/components/devices/DeviceAutonomousPanel.tsx:368` | `MilestonesPanel` — flattens `parent_milestone_id` chain into a 2-level tree |
+| `agentflow-landing/src/components/devices/DeviceAutonomousPanel.tsx:413` | `TodayPanel` — receives `deviceId`, calls `autonomousApi.planToday(goalId, deviceId)`, renders plan_json as numbered list |
+| `agentflow-landing/src/components/devices/DeviceAutonomousPanel.tsx:504` | `LessonsPanel` — kind filter + topic substring search, read-only |
+| `agentflow-landing/src/components/devices/DeviceAutonomousPanel.tsx:579` | `BudgetChart` — last-7d as inline SVG bars (no chart libs) |
+| `agentflow-landing/src/components/devices/DeviceAutonomousPanel.tsx:633` | `BudgetPanel` — fetches `/me/autonomous/budget`, today vs daily_cap_usd, alert pill |
+| `agentflow-landing/src/components/devices/DeviceAutonomousPanel.tsx:722` | `SelectedGoalView` — owns the 4 sub-tab state and pause/resume/decompose actions |
+| `agentflow-landing/src/components/devices/DeviceAutonomousPanel.tsx:865` | `export function DeviceAutonomousPanel({ deviceId })` — top-level component, queries `listGoals` then switches between grid + detail view |
+| `agentflow-landing/src/lib/autonomousApi.ts:14` | `GoalStatus = 'active' \| 'paused' \| 'done' \| 'failed'` |
+| `agentflow-landing/src/lib/autonomousApi.ts:16` | `TargetMetric = 'usd_earned' \| 'followers_gained' \| 'posts_published' \| 'custom'` |
+| `agentflow-landing/src/lib/autonomousApi.ts:105` | `autonomousApi` object — 9 methods (listGoals, createGoal, getGoal, decompose, planToday, pause, resume, markMilestoneDone, budget) |
+| `agentflow-landing/src/lib/autonomousApi.ts:136` | `planToday(id, deviceId)` — only call that takes the device id |
+
+## Data flow
+
+```
+User hits /cabinet/devices/:id
+      │
+      ▼
+CabinetDeviceDetail (default tab='device')
+      │
+      │  click «Автономно» → setTab('autonomous')
+      ▼
+DeviceAutonomousPanel({ deviceId: id })
+      │
+      │  useQuery(['autonomous','goals'])  →  autonomousApi.listGoals()
+      │                                       └─► GET /me/autonomous/goals (cookie af_session)
+      ▼
+goals grid (GoalCard ×N) + NewGoalForm
+      │
+      │  click GoalCard → setSelectedId(goal.id)
+      ▼
+SelectedGoalView
+      │  useQuery(['autonomous','goal',id]) → autonomousApi.getGoal(id)
+      │
+      ├── MilestonesPanel  (renders detail.milestones, mutation: markMilestoneDone)
+      ├── TodayPanel       (mutation: planToday(id, deviceId) — wires the parent device)
+      ├── LessonsPanel     (read-only, client-side filter)
+      └── BudgetPanel      (useQuery → autonomousApi.budget())
+
+mutations invalidate ['autonomous','goal',id] / ['autonomous','goals'] / ['autonomous','budget']
+react-query refetches → UI updates without a full reload
+```
+
+## DB / Env / API
+
+- **No new tables, env vars, or routes on the client side.** All consumed endpoints belong to [`me-autonomous.ts`](/subsystems/autonomous-goals#server-mirror-agentflow-agents-postgres).
+- **Endpoints consumed**:
+  - `GET  /me/autonomous/goals`
+  - `POST /me/autonomous/goals`
+  - `GET  /me/autonomous/goals/:id`
+  - `POST /me/autonomous/goals/:id/decompose`
+  - `POST /me/autonomous/goals/:id/plan_today` — body `{device_id}` is the current device the user is viewing
+  - `POST /me/autonomous/goals/:id/pause` / `/resume`
+  - `POST /me/autonomous/goals/:id/milestones/:mid/done`
+  - `GET  /me/autonomous/budget`
+- **Auth** — `agentsGet`/`agentsPost` from `src/lib/agentsApi.ts`; the cookie `af_session` carries the session, no extra header for autonomous endpoints.
+- **Routing** — there is no `/cabinet/autonomous` route. Earlier drafts proposed one; PR #412 removed it in favour of the device-scoped tab.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| «Автономно» tab is invisible | none — DOM element missing | check `CabinetDeviceDetail.tsx:315-348` tablist; the button is unconditional, so absence means a stale build of `agentflow-landing` |
+| Tab visible but panel crashes with `AgentsApiError` | browser console `AgentsApiError` from `agentsApi.ts` | server-side `/me/autonomous/*` not deployed yet — verify the `agentflow-agents` pod includes `src/routes/me-autonomous.ts` |
+| Goals grid empty though the desktop CLI has goals | none | desktop's SQLite is not mirrored to Postgres in v1 — goals created via CLI exist only locally. Use the «Новая цель» button in the panel (which writes via `POST /me/autonomous/goals`) |
+| Decompose button stuck in loading | network panel: 502 `llm_call_failed` | `agentflow-agents/src/routes/me-autonomous.ts:540` — LLM router returned an error; re-try, or inspect `ai-router` logs |
+| «Сегодня» «Отправить на это устройство» click 404s | network panel: 404 `not_found` from `/plan_today` | goal owner mismatch — `loadOwnedGoal` returns null when `user_id` differs; check the session is for the goal's owner |
+| Budget chart shows zero usage despite LLM calls | none | `autonomous_budget_ledger` writes happen only when the worker calls `useModel` — direct planner calls from the desktop CLI write into the local `~/.agentflow/autonomous.db`, not Postgres |
+| Mutation succeeded server-side but UI didn't update | none — `useMutation` returned ok | check `invalidateQueries` keys in `SelectedGoalView` — the relevant keys are `['autonomous','goal',id]`, `['autonomous','goals']`, `['autonomous','budget']`; missing invalidation is the most common cause |
+| «Уроки» panel shows no lessons though reflection ran | network: `lessons: []` from `GET /me/autonomous/goals/:id` | reflection ran but did not extract any lessons (LLM returned empty array) — re-trigger reflection by waiting for `REFLECT_HOUR_UTC` tick or running the desktop CLI `reflect` command |
+
+## Related
+- [Autonomous Goals](/subsystems/autonomous-goals) — server + daemon source of truth
+- [Desktop / Computer-Agent bridge](/subsystems/computer-mcp) — same device root page, sibling «Устройство» tab
+- [Desktop Auto-Updater](/subsystems/desktop-auto-updater) — runs in the same daemon

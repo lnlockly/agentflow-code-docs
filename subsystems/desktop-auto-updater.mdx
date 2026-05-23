@@ -1,0 +1,105 @@
+---
+title: "Desktop Auto-Updater (no GitHub API)"
+description: "Frozen daemon self-update via /releases/latest redirect + SHA256SUMS — no GitHub API, no rate-limit risk."
+---
+
+# Desktop Auto-Updater (no GitHub API)
+
+## TL;DR
+The PyInstaller-frozen `agentflow-desktop` daemon checks for a new release by following the public `releases/latest` HTTP redirect (which exposes the tag in its `Location`), then downloads a published `SHA256SUMS` asset to verify the installer digest. No authenticated GitHub API call, so the updater survives un-authenticated daemons behind shared/corporate NAT IPs. Runs only when frozen; doubles the poll interval on every failed probe (cap 24h) and resets to the configured interval after a clean probe.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/auto_updater.py:48` | `GITHUB_RELEASES = "https://github.com/lnlockly/agentflow-computer-mcp/releases"` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/auto_updater.py:49` | `GITHUB_LATEST_PAGE = f"{GITHUB_RELEASES}/latest"` — the redirect probe target |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/auto_updater.py:50` | `GITHUB_LATEST_ASSET = f"{GITHUB_RELEASES}/latest/download"` — versioned asset shortcut |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/auto_updater.py:51` | `ASSET_NAME = "agentflow-desktop-setup.exe"` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/auto_updater.py:52` | `SHA256SUMS_NAME = "SHA256SUMS"` — release asset, standard `sha256sum` line format |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/auto_updater.py:59` | `MAX_MAJOR = 0` — refuses any `v(MAJOR+1).x.x`; manual bump only |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/auto_updater.py:62` | `class UpdateError(Exception)` — single boundary type |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/auto_updater.py:66` | `_is_frozen()` — `True` only inside a PyInstaller bundle |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/auto_updater.py:71` | `_parse_version("v0.4.3")` → `(0, 4, 3)` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/auto_updater.py:95` | `_sha256_from_body` — regex `sha256[:\s]+([0-9a-fA-F]{64})` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/auto_updater.py:111` | `_http_resolve_redirect` — GET that returns the redirect's `geturl()` (no HEAD; GitHub sometimes 404s HEAD on the tag URL) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/auto_updater.py:140` | `fetch_latest_release` — resolves redirect → regex `/releases/tag/([^/?#]+)` → fetches `SHA256SUMS` → rewrites the matching line as `sha256: <hex>` so the existing `_sha256_from_body` keeps working |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/auto_updater.py:199` | `_replace_unix` — `os.replace` then `os.execv` (re-exec same PID) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/auto_updater.py:207` | `_replace_windows` — drops `.new.exe` + `update.bat`, exits to release file lock |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/auto_updater.py:273` | `check_now(...)` — single probe; returns `status` ∈ `{current, available, applied, skipped, error}` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/auto_updater.py:357` | sha256 mismatch path — discards download, returns `status="error"` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/auto_updater.py:385` | `_interval_minutes` — parses `AF_UPDATE_INTERVAL_MIN`, `0` disables |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/auto_updater.py:399` | `start_in_background` — daemon `Thread`, doubles delay on error, caps at 24h |
+
+## Data flow
+
+```
+desktop daemon (frozen .exe / app)            github.com (public, no API)
+       │
+       │  every AF_UPDATE_INTERVAL_MIN (default 30)
+       ▼
+start_in_background → check_now()
+       │
+       │  fetch_latest_release()
+       ├──► GET /releases/latest  (follow redirect)
+       │◄── 302 Location: /releases/tag/v0.4.5
+       │  parse tag with regex /releases/tag/([^/?#]+)
+       │
+       ├──► GET /releases/latest/download/SHA256SUMS
+       │◄── 200 "<hex>  agentflow-desktop-setup.exe"
+       │  pluck hex, rewrite as "sha256: <hex>" for _sha256_from_body
+       │
+       │  _is_newer(remote, local)? _is_safe_major(remote)?
+       │  → status="skipped" if major bump
+       │  → status="current"  if not newer
+       │
+       ├──► GET /releases/latest/download/agentflow-desktop-setup.exe
+       │◄── 200 (binary)
+       │  sha256_of_file vs expected → mismatch → status="error"
+       │
+       │  copy to <exe_dir>/.<ASSET>.staged
+       │  _apply_update():
+       │    unix:    os.replace + os.execv (same PID, new binary)
+       │    windows: drop .new.exe + update.bat, sys.exit(0)
+       ▼
+status="applied" — caller logs reason, loop resets backoff
+```
+
+## DB / Env / API
+
+- **No DB.** Pure HTTP + filesystem.
+- **Env**:
+  - `AF_UPDATE_INTERVAL_MIN` — integer minutes between probes. `0` disables, default `30`. Backoff caps at `MAX_INTERVAL_MIN = 24 * 60`.
+- **External endpoints** (all unauthenticated, no API rate-limit):
+  - `GET https://github.com/lnlockly/agentflow-computer-mcp/releases/latest` — redirect probe
+  - `GET https://github.com/lnlockly/agentflow-computer-mcp/releases/latest/download/SHA256SUMS`
+  - `GET https://github.com/lnlockly/agentflow-computer-mcp/releases/latest/download/agentflow-desktop-setup.exe`
+- **Release contract** — every release MUST publish:
+  - asset `agentflow-desktop-setup.exe` (or the platform-equivalent the bundle was built with)
+  - asset `SHA256SUMS` containing a line `<64-hex>  agentflow-desktop-setup.exe`
+  - tag matching `v?<major>.<minor>.<patch>`; `MAX_MAJOR=0` blocks `v1.x.x` until the constant is bumped by a human
+- **Injection points** (for the smoke test) — `check_now(fetch=..., downloader=..., apply=...)`. The CI smoke replaces `fetch` with a stub so the test never touches the network.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `SHA256SUMS` asset missing from a release | `auto-update: SHA256SUMS unavailable` | `agentflow-computer-mcp/src/agentflow_computer_mcp/auto_updater.py:168` — fallback is `body=""`, which trips the next gate `release {tag} has no sha256 in body — refusing blind download` |
+| Release tag URL malformed or unparseable | exception `could not parse tag from redirect URL` | `auto_updater.py:161` — raise `UpdateError`; surfaces as `status="error"` |
+| Downloaded asset hash mismatches `SHA256SUMS` | `sha256 mismatch: expected` (logged via `log.error("auto-update: %s", status["reason"])`) | `auto_updater.py:362` — file is discarded, no swap, daemon keeps running |
+| Probe crashed inside background loop | `auto-update: probe crashed:` | `auto_updater.py:429` — exception swallowed, delay doubles, loop continues |
+| Probe returned status=error (network or http) | `auto-update:` followed by reason text from `result["reason"]` | `auto_updater.py:422` — typical `github fetch failed:` or `download failed:` |
+| Update silently disabled at start | `auto-update: disabled via AF_UPDATE_INTERVAL_MIN=0` | `auto_updater.py:408` — env override; no probes spawn |
+| Update skipped because we're running source | `auto-update: running from source, polling disabled` | `auto_updater.py:411` — `_is_frozen()` returned `False`; `allow_unfrozen=True` overrides for tests |
+| Refusing a major-version jump | reason text `refusing major bump <local> → <remote>` | `auto_updater.py:321` — bump `MAX_MAJOR` constant + ship a release notes link, then re-cut the build |
+| Windows swap left a stale sidecar | leftover `agentflow-desktop.new.exe` next to current `.exe` | `auto_updater.py:222` — the next `_replace_windows` deletes it with `contextlib.suppress(FileNotFoundError)` |
+| Unix re-exec didn't restart with new binary | no log line — the process just died | `auto_updater.py:204` — `os.execv` raises if the binary has lost +x; `_replace_unix` `chmod 0o755` before swap, verify perms on the staged file |
+
+## Why no GitHub API
+
+The previous implementation hit `api.github.com/repos/<o>/<r>/releases/latest` and parsed a JSON `tag_name`. On shared corporate IPs and multi-user homes the unauthenticated rate limit (60/h) trips before noon. The redirect path uses the same public endpoints a browser would — no rate limit applies — and the digest verification moves from "trust release body" to "trust a deterministically-generated `SHA256SUMS` asset that's signed by the same build pipeline".
+
+## Related
+- [Desktop / Computer-Agent bridge](/subsystems/computer-mcp) — same daemon
+- [Autonomous Goals](/subsystems/autonomous-goals) — also runs inside the daemon
+- [Cabinet Device Autonomous Tab](/subsystems/cabinet-device-autonomous-tab) — UI surface
