@@ -56,6 +56,7 @@ LlmCabinetShell (tab router via ?tab=)
 - Backend routes consumed:
   - `GET /me/api-keys` — list keys (returns `{id, name, prefix, created_at, last_used_at, tier?, rate_limit_rpm?}`).
   - `POST /me/api-keys` — create, body `{name}`, returns `{ok, key, row}` (raw key shown once).
+  - `POST /me/api-keys/install-token` — mint a key labelled `desktop-install-<YYYY-MM-DD-HH:MM>`; returns `{ok, id, name, prefix, raw_api_key, created_at}` with HTTP 201. Used by the "Установи AgentFlow Desktop" cabinet card to inline the key into the curl/PowerShell one-liner. Source: `agentflow-api/src/routes/api-keys.ts:99` (route) and `agentflow-landing/src/lib/devicesApi.ts:241` (caller).
   - `DELETE /me/api-keys/:id` — revoke.
   - `GET /me/api-keys/:id/recent?limit=100` — per-request log; rows `{id, endpoint, status_code, flow_charged, tokens_in, tokens_out, model, duration_ms, created_at}`.
   - `GET /me/api-keys/:id/usage` — aggregated `{by_endpoint, by_model, totals}` (not yet rendered in cabinet, used by `/account/usage`).
