@@ -1,21 +1,34 @@
 ---
 title: "CI/CD"
-description: "Pipelines that build, test, and deploy AgentFlow frontend and backend."
+description: "PR-time gates and push-to-main pipelines across agentflow-agents and agentflow-landing, on the ff-france self-hosted runner."
 ---
 
 # CI/CD
 
 ## TL;DR
-GitHub Actions runs build+deploy on push to `main` for both `agentflow-agents`
-and `agentflow-landing`. On `pull_request`, `agentflow-landing` runs a
-Playwright E2E smoke against prod `agentflow.website` to catch P0
-regressions (auth, autonomous-goal POST, NaN cards) before merge.
+
+Two repos, two pipelines each — all on the ff-france self-hosted runner.
+
+- `agentflow-agents` — `pr-check.yml` runs `typecheck | build | test` in parallel on every PR. `deploy.yml` builds the GHCR image and rolls k3s on push to `main`.
+- `agentflow-landing` — `e2e.yml` runs a Playwright smoke against `agentflow.website` on every PR to catch P0 regressions (auth, autonomous-goal POST, NaN cards) before merge. `deploy.yml` builds + rolls on push to `main`.
+
+Branch protection on `agentflow-agents/main` requires `typecheck`, `build`, `test` status checks. Apply via `scripts/setup-branch-protection.sh`.
 
 ## Files (with line refs)
+
+### agentflow-agents
+| Path | Role |
+|---|---|
+| `agentflow-agents/.github/workflows/pr-check.yml:1` | PR-time gates (typecheck, build, test). Parallel jobs, `cancel-in-progress` concurrency keyed by PR number. |
+| `agentflow-agents/.github/workflows/deploy.yml:1` | Push-to-main builder + deployer (self-hosted runner). |
+| `agentflow-agents/scripts/setup-branch-protection.sh:1` | One-shot `gh api` call requiring the three pr-check status contexts. |
+| `agentflow-agents/package.json:13` | `typecheck`, `build`, `test` npm scripts the gates call. |
+
+### agentflow-landing
 | Path | Role |
 |---|---|
 | `agentflow-landing/.github/workflows/deploy.yml:1` | Build image + rollout to k3s on push to main |
-| `agentflow-landing/.github/workflows/e2e.yml:1` | Playwright smoke on every PR |
+| `agentflow-landing/.github/workflows/e2e.yml:1` | Playwright smoke on every PR (self-hosted runner) |
 | `agentflow-landing/playwright.config.ts:1` | Smoke config — Chrome only, `agentflow.website` base URL |
 | `agentflow-landing/tests/e2e/autonomous-flow.spec.ts:1` | Spec: login → device → Autonomous tab → set goal |
 | `agentflow-landing/tests/e2e/__helpers/anti-nan.ts:1` | `assertNoNaN(page)` — fails if DOM has NaN/undefined/null/Invalid Date |
@@ -23,14 +36,25 @@ regressions (auth, autonomous-goal POST, NaN cards) before merge.
 
 ## Data flow
 
+### agentflow-agents PR-check
+```
+developer git push <feature>
+   ▼
+GitHub PR ─────► pr-check.yml
+                   ├── typecheck   (npm run typecheck = tsc --noEmit)
+                   ├── build       (npm run build, uploads dist/ artifact 5d)
+                   └── test        (npm test = node --test tests/**/*.test.ts; self-skips when absent)
+                                  ▼
+                                PASS → eligible for squash-merge
+                                FAIL → branch protection blocks merge
+```
+
+### agentflow-landing E2E
 ```
 PR opened
-  → GH Actions e2e-smoke job (ubuntu-latest, 15min timeout)
-     → npm ci
-     → npx playwright install chromium
-     → npm run e2e:smoke (= playwright test --repeat-each=2)
-        → goto agentflow.website/login → fill creds → /cabinet
-        → goto /cabinet/devices → click first device
+  → e2e-smoke job (self-hosted, 15 min timeout)
+     → npm ci → npx playwright install chromium → npm run e2e:smoke
+        → goto agentflow.website/login → /cabinet → /cabinet/devices
         → click "Автономно" tab
         → if "Поставить цель" CTA visible → fill form → POST autonomous/goals
         → assertNoNaN(page) on Autonomous tab DOM
@@ -39,10 +63,15 @@ PR opened
 
 ## DB / Env / API
 
+### agentflow-agents
+- No env required for `pr-check.yml` (runs without secrets).
+- `deploy.yml` reads `GITHUB_TOKEN`, `KUBECONFIG`, registry creds (configured at runner level).
+- Required status checks on `main`: `typecheck`, `build`, `test`.
+
+### agentflow-landing
 - Env (CI):
   - `E2E_BASE_URL` — defaults `https://agentflow.website`.
-  - `E2E_OWNER_EMAIL` / `E2E_OWNER_PASSWORD` — GH secret. Falls back to
-    `avsee4@agentflow.website` / brief-provided password.
+  - `E2E_OWNER_EMAIL` / `E2E_OWNER_PASSWORD` — GH secret. Falls back to `avsee4@agentflow.website` / brief-provided password.
   - `CI=true` — enables `[github]` reporter + `retries: 1`.
 - Routes hit by the smoke:
   - `POST /login` (frontend form post).
@@ -51,6 +80,19 @@ PR opened
 - Cleanup: goals named `[e2e] smoke <ts>` so owner can filter.
 
 ## Failure modes
+
+### agentflow-agents PR-check
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| PR merged despite red CI | branch protection missing status checks | run `scripts/setup-branch-protection.sh` |
+| typecheck job red | `error TS2322` (or any `error TS`) in workflow log | fix the type error in the PR |
+| build job red | `error TS` or `tsc` non-zero exit | local repro `npm run build` |
+| test job skipped on valid PR | `No tests/**/*.test.ts found — skipping.` | check `hashFiles('tests/**/*.test.ts')` — tests dir must exist |
+| `npm ci` slow | `Cache not found for keys` in setup-node step | confirm `package-lock.json` unchanged from previous PR; otherwise expected |
+| Multiple runs queued on same PR | duplicated job rows | `concurrency.cancel-in-progress: true` cancels prior runs on push — expected |
+| Jobs never start | `The job was not started because recent account payments have failed` | org billing blocked — workflow uses self-hosted `ff-france-runner`; verify runner online via `gh api repos/lnlockly/agentflow-agents/actions/runners` |
+
+### agentflow-landing E2E
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
 | Goal create returns 500 | `create-goal response was 500` | `agentflow-agents/src/routes/autonomous.ts` deadline parser |
@@ -63,3 +105,5 @@ PR opened
 - [Autonomous goals subsystem](./autonomous-goals)
 - [Cabinet — device autonomous tab](./cabinet-device-autonomous-tab)
 - [Deploy shield](./deploy-shield)
+- [Runtime supervisor](./runtime-supervisor)
+- [Projects create flow](./projects-create-flow)
