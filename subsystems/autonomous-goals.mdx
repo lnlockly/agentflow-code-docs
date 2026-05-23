@@ -128,6 +128,7 @@ See [Cabinet Device Autonomous Tab](/subsystems/cabinet-device-autonomous-tab).
 | Reflection LLM emitted prose, not JSON | `reflection_failed` AND row has non-null `reflection` text but `score IS NULL` | server-side fallback at `autonomous-worker.ts:336` stores raw text; the next reflection pass re-runs because score gate is independent |
 | Budget alert never fires though spend > cap | none — `alert_if_over` returns `{triggered:true, dispatched:false, error:"no device_id/api_key wired"}` | `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/budget.py:139` — daemon was started without `auth.json`; rerun installer |
 | Goals show 0 milestones in cabinet though decompose succeeded | none | check `autonomous_milestones.user_id` matches caller — `persistMilestones` writes per-user, cross-user reads are blocked by the `WHERE user_id =` clause |
+| Goal card renders `NaN / NaN ступенек` or bare `target_value` without unit | none — pure UI; reproduces on any fresh goal where `milestone_count`/`completed_count` are null and `target_metric` is empty | `agentflow-landing/src/components/devices/DeviceAutonomousPanel.tsx` uses `deriveMilestoneProgress` + `formatTargetValue` from `agentflow-landing/src/lib/autonomousGoalFormat.ts` — null counts collapse to 0 with «Декомпозиция готовится…»; USD/RUB/EUR/% get unit suffixes; empty metric hides the «метрика:» row |
 
 ## Related
 - [Desktop / Computer-Agent bridge](/subsystems/computer-mcp) — same daemon, transport layer
