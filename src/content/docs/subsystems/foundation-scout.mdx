@@ -1,0 +1,131 @@
+---
+title: "Foundation Scout"
+description: "Brief → vertical → curated GitHub repo. Selects the foundation repo a project clones before the foundation-bridge runs."
+---
+
+# Foundation Scout
+
+## TL;DR
+
+When a user submits a brief, the platform picks a GitHub repo as the project's
+foundation BEFORE the coder runs. The owner directive (T6 — 2026-05-23): pick a
+repo that's already ~90% the brief, then rebrand it. The coder shouldn't
+scaffold from scratch on top of a generic landing template.
+
+The scout runs three layers in order:
+1. **Curated bypass** for marketing-intent briefs — direct vertical lookup
+   (ecom → Medusa, dashboard → kiranism, blog → timlrx, portfolio → BartoszJarocki/cv,
+   landing → cruip).
+2. **LLM scorer** — TEXT_SMALL ranks every curated entry 0-10 against the brief
+   for non-marketing briefs.
+3. **LLM proposer + substring matcher** — fallback when curated bypass + scorer
+   both come back empty.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/project-foundations.ts:465` | `recommendProjectFoundations` — main entry. Orchestrates bypass → scorer → proposer → enrichment → structural filter → ranked candidates. |
+| `agentflow-agents/src/services/projects-bg-prep.ts:188` | `runBackgroundProjectPrep` — calls `recommendProjectFoundations`, persists pick on `projects.foundationRepoFullName`, emits `foundation_picked` event. |
+| `agentflow-agents/src/services/foundation-structural-filter.ts:329` | `MARKETING_INTENT_RX` — regex that triggers the curated bypass. Covers ecom (`магазин`, `shop`, `store`, `marketplace`, `каталог`), dashboard (`dashboard`, `админ-панель`), blog, portfolio, MLM, landing, restaurant, coach, booking. |
+| `agentflow-agents/src/services/foundation-structural-filter.ts:368` | `detectVertical` — maps brief text to one of 9 verticals (`mlm`, `ecom_marketplace`, `dashboard_saas`, `blog_content`, `portfolio_cv`, `booking_appointment`, `restaurant_food`, `coach_course`, `landing_generic`). |
+| `agentflow-agents/src/services/foundation-structural-filter.ts:410` | `ECOM_CURATED_LIST` — lead `medusajs/nextjs-starter-medusa`, fallback `vercel/commerce`. |
+| `agentflow-agents/src/services/foundation-structural-filter.ts:438` | `DASHBOARD_CURATED_LIST` — lead `kiranism/next-shadcn-dashboard-starter`, alt `horizon-ui/shadcn-nextjs-boilerplate`. |
+| `agentflow-agents/src/services/foundation-structural-filter.ts:464` | `BLOG_CURATED_LIST` — lead `timlrx/tailwind-nextjs-starter-blog`. |
+| `agentflow-agents/src/services/foundation-structural-filter.ts:481` | `PORTFOLIO_CURATED_LIST` — lead `BartoszJarocki/cv`, alt `vercel/nextjs-portfolio-starter`. |
+| `agentflow-agents/src/services/foundation-structural-filter.ts:506` | `MARKETING_CURATED_LIST` — generic landing fallback (cruip / precedent / shadcn-ui/taxonomy / mickasmt). Used for restaurant / coach / booking verticals + landing_generic. |
+| `agentflow-agents/src/services/foundation-structural-filter.ts:560` | `MLM_CURATED_LIST` — single entry, `lnlockly/golden-connect-template`. Gated by `isMlmBrief`. |
+| `agentflow-agents/src/services/foundation-structural-filter.ts:556` | `pickCuratedBypassList` — vertical → bucket lookup. |
+| `agentflow-agents/src/services/foundation-llm-scorer.ts:1` | LLM scorer (TEXT_SMALL ranks every curated entry 0-10). Caches by sha1(brief\|kind). |
+| `agentflow-agents/src/services/curated-foundations.ts:46` | `CURATED_FOUNDATIONS` — 32+ entries; substring matcher + LLM scorer pool. |
+| `agentflow-agents/src/services/project-foundation-scout.ts:125` | `ensureProjectFoundationScout` — provisions a permanent scout Eliza agent per project, attached via `projects.scoutAgentId`. README excerpt seeded into character.knowledge. |
+| `agentflow-agents/presets/foundation-scout.json` | Scout preset — Tavily + knowledge MCP servers. |
+| `agentflow-agents/tests/unit/foundation-vertical-routing.test.ts:1` | 24 tests covering vertical detection + bucket routing + bypass gating. |
+| `agentflow-agents/tests/unit/curated-foundations.test.ts:1` | Curated catalog invariants + 8 brief→repo cases. |
+
+## Data flow
+
+```
+POST /me/projects {brief, title, kind?}
+  → row inserted with status='preparing', placeholder foundation
+  → response returns < 2s
+  → setImmediate(runBackgroundProjectPrep)
+      ├── classifyUserFacingProjectKind (when kind=auto)
+      ├── recommendProjectFoundations
+      │     ├── shouldUseMarketingCuratedBypass(brief, kind)?
+      │     │     └── true → detectVertical → pickCuratedBypassList → bucket
+      │     │                 ├── ecom_marketplace → ECOM_CURATED_LIST
+      │     │                 ├── dashboard_saas   → DASHBOARD_CURATED_LIST
+      │     │                 ├── blog_content     → BLOG_CURATED_LIST
+      │     │                 ├── portfolio_cv     → PORTFOLIO_CURATED_LIST
+      │     │                 ├── mlm              → MLM_CURATED_LIST
+      │     │                 └── *                → MARKETING_CURATED_LIST
+      │     ├── false → scoreCuratedFoundations (LLM TEXT_SMALL, 0-10)
+      │     │           + proposeWithLlm (LLM TEXT_LARGE proposes 5 repos)
+      │     ├── enrich via GitHub REST (stars, license, package.json, root contents)
+      │     ├── deriveStructuralSignals → decideHardReject (drop monorepos / framework source)
+      │     └── score → top 15
+      ├── update projects.foundationRepoFullName + foundationSnapshot, status='draft'
+      ├── emit foundation_picked event
+      ├── ensureProjectFoundationScout (permanent scout agent)
+      └── runFastPathProposal → plan_proposed → status='awaiting_approval'
+```
+
+## DB / Env / API
+
+- Tables: `projects.foundation_mode`, `projects.foundation_repo_url`,
+  `projects.foundation_repo_full_name`, `projects.foundation_ref`,
+  `projects.foundation_snapshot` (JSONB), `projects.scout_agent_id`.
+- Events: `kind_resolved`, `foundation_selected`, `foundation_picked`,
+  `foundation_scout_attached`, `project_ready`.
+- Env: `GITHUB_TOKEN` (REST enrichment, optional but recommended).
+- Routes: `POST /me/projects` (route handler at `agentflow-agents/src/routes/projects.ts:920+`),
+  `POST /me/project-foundations/recommend` (preview during the wizard).
+- LLMs: `ModelType.TEXT_SMALL` (scorer), `ModelType.TEXT_LARGE` (proposer).
+  Routed through `ai-router/instrumented.ts:invokeAI`.
+
+## Vertical → bucket cheat sheet
+
+| Vertical | Keywords (RX) | Lead repo |
+|---|---|---|
+| `ecom_marketplace` | магазин, маркетплейс, marketplace, shop, store, storefront, ecommerce, каталог, корзин, cart, sku, checkout, shopify, medusa, saleor | `medusajs/nextjs-starter-medusa` |
+| `dashboard_saas` | dashboard, дашборд, админ-панель, admin panel, CRM, ERP, KPI, analytics dashboard, reporting tool | `kiranism/next-shadcn-dashboard-starter` |
+| `blog_content` | блог, blog, новостной сайт, news site, журнал, magazine, статьи, MDX, knowledge base, wiki | `timlrx/tailwind-nextjs-starter-blog` |
+| `portfolio_cv` | портфолио, portfolio, резюме, CV, personal site, сайт-визитка, developer portfolio | `BartoszJarocki/cv` |
+| `booking_appointment` | бронирование, booking, appointment, calendly, consultation | `cruip/open-react-template` (no dedicated booking template; rebrand) |
+| `restaurant_food` | ресторан, restaurant, кафе, cafe, кофейн, menu заведения, food delivery, доставка еды | `cruip/open-react-template` |
+| `coach_course` | коуч, coach, курсы, course, онлайн-школа, training, mentoring, webinar | `cruip/open-react-template` |
+| `mlm` | MLM, МЛМ, network marketing, downline, реферальная сеть, Monar | `lnlockly/golden-connect-template` |
+| `landing_generic` | (fallback) | `cruip/open-react-template` |
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Tea shop / ceramic shop brief lands on `cruip/open-react-template` instead of an ecom template | `[foundation-scorer] marketing_bypass vertical=landing_generic` for a brief containing «магазин» / «marketplace» | Extend `VERTICAL_RX.ecom_marketplace` in `foundation-structural-filter.ts:370` |
+| Dashboard brief picks generic landing | `[foundation-scorer] marketing_bypass vertical=landing_generic` for a brief containing «dashboard» | Extend `VERTICAL_RX.dashboard_saas` |
+| Brief contains «магазин» but is actually MLM → still picks ecom bucket | `[foundation-scorer] marketing_bypass vertical=ecom_marketplace` for a Monar / MLM brief | `detectVertical` runs `isMlmBrief` first; widen `MLM_KEYWORDS_RX` in `foundation-structural-filter.ts:344` |
+| All bypass paths return empty list | `[foundations] llm returned zero suggestions for brief` | Curated bucket entry validation failed enrichment — check `fetchRepoMeta` for 404s |
+| scaffold_vite node runs coder-spa unnecessarily for kind=spa | `coder_did_nothing` in `scaffold_vite` for a spa project | `mini-app.ts:scaffoldViteCoder` — kind=spa now noops here, foundation-bridge in `admin_panel` owns the work (T6 2026-05-23) |
+| Scout agent never attaches | `foundation_scout_provision_failed` | `project-foundation-scout.ts:262` — check Eliza is up, preset file is readable |
+
+## Test coverage
+
+- `tests/unit/foundation-vertical-routing.test.ts` — 24 tests; every vertical
+  has a sample brief that exercises bucket selection + bypass gating.
+- `tests/unit/curated-foundations.test.ts` — 27 tests; substring matcher +
+  catalog invariants + 8 brief→repo mappings.
+- `tests/unit/foundation-llm-scorer.test.ts` — LLM scorer JSON parsing, cache.
+- `tests/unit/project-foundations-recommend.test.ts` — end-to-end with stubbed
+  LLM + GitHub; covers MLM gate, structural reject, candidate hydration.
+- `tests/unit/scoring-monorepo-reject.test.ts` — hard-reject monorepos.
+- `tests/unit/scoring-no-golden-connect.test.ts` — MLM defence-in-depth.
+- `tests/unit/scoring-next-config-ts.test.ts` — orphan next.config.ts on Next 14.
+- `tests/unit/graph-executor/handlers/coder-delegate.test.ts` —
+  `scaffold_vite` noops for kind=spa (T6 2026-05-23).
+
+## Related
+
+- [Foundation Bridge](/subsystems/foundation-bridge) — the next step after the scout picks a repo.
+- [Projects create flow](/subsystems/projects-create-flow) — owns the `POST /me/projects` handler.
+- [Runtime supervisor](/subsystems/runtime-supervisor) — runs the Procfile the bridge writes.
