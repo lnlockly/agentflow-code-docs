@@ -1,0 +1,89 @@
+---
+title: "Discord voice deeplink"
+description: "Toolbar button that opens a Discord voice channel in a popup from a bridged Matrix room"
+---
+
+# Discord voice deeplink
+
+## TL;DR
+
+A toolbar button in the chat-room header that opens
+`https://discord.com/channels/<guild>/<channel>` in a popup window. Visible
+only when the Matrix room is bridged to a Discord channel by mautrix-discord.
+Replaces a 3-4 week LiveKit WHIP + DAVE E2EE build with a half-day deeplink.
+Mautrix-discord does not bridge voice — this is the pragmatic interim.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/lib/discord-deeplink.ts:46` | `buildDiscordDeeplink(room) => string \| null` |
+| `agentflow-landing/src/components/chat/DiscordVoiceButton.tsx:22` | Button — renders only when deeplink resolvable |
+| `agentflow-landing/src/chat/matrixApi.ts:27` | `MatrixRoom.canonicalAlias` + `bridgeInfo` fields |
+| `agentflow-landing/src/chat/matrixApi.ts:272` | `parseSync` harvests `m.bridge` + `m.room.canonical_alias` from state events |
+| `agentflow-landing/src/chat/RoomView.tsx:312` | Wires `<DiscordVoiceButton room={room} />` next to the Phone/Video cluster |
+| `agentflow-landing/tests/unit/discord-deeplink.test.mjs` | Pure-function tests (7) |
+| `agentflow-landing/tests/discord-voice-button.test.mjs` | Static-source assertions (5) |
+
+## Data flow
+
+```
+matrix sync ──► parseSync ──► MatrixRoom.{canonicalAlias, bridgeInfo}
+                                 │
+                                 ▼
+                       buildDiscordDeeplink(room)
+                                 │
+                  ┌──────────────┴──────────────┐
+                  ▼                             ▼
+            string url                        null
+                  │                             │
+                  ▼                             ▼
+         <button onClick>            <DiscordVoiceButton> = null
+            ▼                          (collapsed slot)
+       track('discord_voice_open_clicked', { room_id, source, url })
+       window.open(url, 'discord-voice', '...,noopener=yes')
+```
+
+## DB / Env / API
+
+- Tables: none
+- Env: none
+- Routes: none new — uses existing `POST /me/events` via `src/lib/track.ts`
+- Matrix state events read: `m.bridge`, `m.room.canonical_alias`
+
+## Source priority
+
+`buildDiscordDeeplink` evaluates two metadata sources from the sync payload:
+
+1. **`m.bridge` state event** — content shape `{ network: "discord", channel: { id, type, guild: { id } } }`. Written by current mautrix-discord versions.
+2. **`m.room.canonical_alias`** — pattern `#_discord_<guild>_<channel>:agentflow.website`. Fallback for older bridge versions.
+
+Returns `null` when neither yields both ids; the button hides.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Button renders for non-Discord room | `canonicalAlias is null and bridgeInfo is null` reaching `buildDiscordDeeplink` | `src/lib/discord-deeplink.ts:46` |
+| Popup blocked | `window.open` returns null (no log; user complains) | document; rely on browser user-gesture allowlist |
+| User not authed in browser Discord | Discord login page shown in popup | acceptable; no cabinet impact |
+| Bridge metadata missing | `bridgeInfo is null` despite room being discord-bridged | `parseSync` not seeing `m.bridge` — check Dendrite room state |
+
+## Out of scope
+
+- In-cabinet voice (LiveKit WHIP / DAVE E2EE): separate 3-4 week effort. Discord's DAVE encryption is mandatory for new voice deployments and requires a custom WHIP relay with mlspp.
+- Channel picker UI: not needed — one Matrix room maps to one Discord channel.
+- Voice-channel participants display: handled by Discord itself in the popup.
+
+## Caveat — chat page is archived in agentflow-landing
+
+`src/chat/ChatPage.tsx` is now a redirect-only stub. The live chat lives in
+the Element Web fork at `chat.agentflow.website`. The toolbar wired by this PR
+sits in the archived `RoomView.tsx` component, which is reachable only if the
+team revives the in-cabinet chat or ports the button to Element Web. See
+`qa-issues/2026-05-23-discord-voice-button-in-archived-roomview.md`.
+
+## Related
+
+- [Matrix Instagram bridge](/subsystems/matrix-ig-bridge) — parallel mautrix-meta integration pattern
+- Spec: `agentflow-landing/docs/specs/2026-05-23-discord-voice-deeplink.md`
