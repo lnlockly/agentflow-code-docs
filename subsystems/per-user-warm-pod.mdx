@@ -122,6 +122,35 @@ in `user-workspace-1-599c48bff8-grx7b` all had
 whichever next-server bound 3001 first. Fix landed via
 agentflow-agents PR #739.
 
+### Stale .ports.env divergence (PR #752, 2026-05-23)
+
+PR #739 fixed the formula but only retrofitted `.runtime/foundation_port`
+on existing projects — `.ports.env` kept the original literal `PORT=` the
+old scaffold wrote. The Procfile `web:` line sources `.ports.env`, so
+`next dev` bound the stale port (often `3001`); Caddy reverse_proxy'd to
+the correct per-project hash; the two ports never matched and the
+preview returned 502. With multiple legacy projects in one peruser pod,
+the second-onwards `next dev` crashed with `EADDRINUSE` and stayed dead.
+
+The reconciler (`services/pingers/peruser-services-reconcile.ts`) now
+detects divergence:
+
+1. Source the existing `.ports.env`, read `CURRENT_PORT`.
+2. If `CURRENT_PORT != computePortBase(id).port`, back up to
+   `.ports.env.pre-reconcile-bak` and rewrite the `PORT=` line in place
+   (POSIX sed; sibling vars like `BOT_PORT`, `VITE_PORT` are preserved).
+3. `SIGTERM → 2s grace → SIGKILL` the existing `.services/web/pid`,
+   wipe the pid file. `runtime-supervisor` and the in-pod web
+   supervisor both treat a missing pid file as "needs spawn" and
+   relaunch on the new `$PORT`.
+
+A second reconciler pass (90s realign-cooldown, vs. the usual 10 min
+success cooldown) confirms the new port is bound before flipping the
+project's reconcile state to `succeeded`. The `RECONCILE:` summary line
+gained two fields: `ports_rw=<0|1>` and `stale_pid=<pid|none>`. Parser
+still accepts the legacy 3- and 4-field shapes for mid-deploy skew
+between agent pod and the workspace tools image.
+
 ## Failure modes
 
 | Symptom | Log signature for grep | Where to fix |
@@ -131,6 +160,7 @@ agentflow-agents PR #739.
 | Caddy preview returns 404 on `p-<slug>.proj.agentflow.website` | (Caddy stdout shows `no such file or directory: /workspace/<slug>`) | `code-exec.create_project` (PR-2) didn't mkdir the slug. Check `kubectl exec deploy/user-workspace-1 -c tools -- ls /workspace`. |
 | Every preview host in one peruser pod serves the same project (port collision) | All projects' `.runtime/foundation_port` read `3001` | `computePortBase` formula overflowed pre-2026-05-22 — fixed in `agentflow-agents/src/services/peruser-pod.ts:101`. Reconciler at `pingers/peruser-services-reconcile.ts` rewrites stale `foundation_port` on next tick (skips pinned ids). |
 | Project's port doesn't match `computePortBase(id).port` after reconciler tick | `peruser_services_reconcile: foundation_port_rewritten=true` | Expected after PR #739 deploy. One-shot per project per pod lifetime. |
+| Caddy preview returns 502 even though `foundation_port` is the correct per-project hash | `EADDRINUSE` in `.services/web/log`, or `wget http://localhost:<expected_port>/` from preview container = `connection refused` while `lsof` shows next-server bound to a DIFFERENT port | `.ports.env` carries a stale literal `PORT=` from the pre-hash scaffold era. `peruser-services-reconcile` (PR #752, 2026-05-23) detects divergence, rewrites the `PORT=` line in place, SIGTERM→SIGKILLs the misbound web PID, supervisor relaunches on the right port within ~90s (realign cooldown). Manifest is unchanged — no need to hand-patch `Service.targetPort`. Look for `peruser_services_reconcile: ports_rewritten=true stale_pid_killed=<pid>` in the project log. |
 | Caddy serves stale build after `pnpm build` | (none — `Cache-Control: no-cache` set, but client cache may still serve) | Force-refresh in browser. If persists: check `/workspace/<slug>/dist/index.html` mtime via `kubectl exec`. |
 | User 1 PVC fills (>90%) | `df -h` on the pod | Bump PVC to 50 Gi or wire an LRU eviction job for idle project subdirs. |
 | Pod restart loses in-flight project state | Pod restart event | Recreate strategy is intentional — projects re-clone from git remote on next coder turn. For long-running builds, snapshot state before any planned restart. |
