@@ -23,7 +23,11 @@ record token usage in `api_key_usage`, and debit `flow_balances` via
 | `agentflow-agents/src/routes/public-llm.ts:116` | `POST /llm/v1/messages` — Anthropic wire format |
 | `agentflow-agents/src/routes/public-llm.ts:156` | `proxyOpenAi` — injects `stream_options.include_usage`, observes SSE chunks |
 | `agentflow-agents/src/routes/public-llm.ts:255` | `proxyAnthropic` — observes `message_start` + `message_delta` events |
+| `agentflow-agents/src/routes/public-llm.ts:480` | `proxyAnthropicViaOpenAi` — translates Anthropic request → OpenAI, aggregates/streams response back as Anthropic SSE |
+| `agentflow-agents/src/services/anthropic-openai-bridge.ts` | Pure helpers: `translateAnthropicToOpenAi`, `OpenAiToAnthropicStreamTranslator`, `aggregateAnthropicEvents`, `parseOpenAiSse` |
 | `agentflow-agents/src/services/public-llm-upstream.ts:46` | `loadConfigs` — 60s cache of `llm_provider_configs WHERE enabled=true` |
+| `agentflow-agents/src/services/public-llm-upstream.ts:125` | `pickUpstreamForAnthropicRequest` — exact match → DB alias → hardcoded alias → first-enabled-any-format |
+| `agentflow-agents/migrations/2026-05-23e-anthropic-model-aliases.sql` | `llm_model_aliases` table — DB-driven Anthropic→OpenAI alias overrides |
 | `agentflow-agents/src/services/public-llm-upstream.ts:96` | `MODEL_CONTEXT_WINDOWS` — hardcoded context-window map |
 | `agentflow-agents/src/services/public-llm-upstream.ts:140` | `listEnabledModels` — left-joins `flow_model_pricing` for catalog |
 | `agentflow-agents/src/services/public-llm-upstream.ts:185` | `teeSseWithObserver` — passes parsed SSE records to the observer |
@@ -31,6 +35,7 @@ record token usage in `api_key_usage`, and debit `flow_balances` via
 | `agentflow-agents/src/services/public-llm-billing.ts:114` | `normalizeClaudeModelId` — dot → dash for pricing lookup |
 | `agentflow-agents/src/services/public-llm-billing.ts:121` | `recordUsage` — `chargeLlmUsage` + `api_key_usage` insert |
 | `agentflow-agents/tests/public-llm-billing.test.ts` | 5 unit tests for the normalize helper |
+| `agentflow-agents/tests/unit/anthropic-openai-bridge.test.ts` | 8 unit tests for request/stream translation + aggregation |
 
 ## Data flow
 
@@ -90,6 +95,29 @@ proxyOpenAi / proxyAnthropic
 
 `pricing: null` when no active row in `flow_model_pricing` matches the model id. `context_window: null` when the model is not in the hardcoded map (add it in `MODEL_CONTEXT_WINDOWS`).
 
+### Anthropic→OpenAI translation bridge
+
+When `/llm/v1/messages` is called but the chosen upstream is OpenAI-shaped
+(eg codex.sale `gpt-5.3-codex`), the route delegates to
+`proxyAnthropicViaOpenAi`. That function:
+
+1. Calls `translateAnthropicToOpenAi(body, upstream.model)` — maps `system`,
+   `messages[]`, `tools[]`, `tool_choice` into OpenAI chat-completions shape.
+   `tool_result` Anthropic blocks become `role:tool` OpenAI messages.
+2. Forces `stream: true` + `stream_options.include_usage` on the upstream
+   call (codex.sale stalls on non-stream tool calls — verified 2026-05-23).
+3. Pipes chunks through `OpenAiToAnthropicStreamTranslator` which emits
+   `message_start` → `content_block_start/delta/stop` (text + tool_use) →
+   `message_delta` → `message_stop`. Tool-call `arguments` arrive as
+   incremental JSON; we forward them verbatim as `input_json_delta`.
+4. If the caller did not request streaming, the events are fed into
+   `aggregateAnthropicEvents` to rebuild a single Anthropic Message JSON.
+
+The fallback chain in `pickUpstreamForAnthropicRequest` lets Claude model
+ids resolve onto any enabled provider when no native Claude contract is
+active: exact match → DB alias (`llm_model_aliases`) → hardcoded map →
+first-enabled-any-format.
+
 ### Model id dot/dash normalization
 
 Upstreams return Claude model ids in dot form (`claude-haiku-4.5`), but `flow_model_pricing.model_id` is seeded in dash form (`claude-haiku-4-5`). `normalizeClaudeModelId(model)` replaces `.` with `-` for any model starting with `claude-`. Non-claude models pass through unchanged. The `api_key_usage.model` column still records the raw upstream string so operators can grep for drift; `chargeLlmUsage(model:)` receives the normalized form.
@@ -105,6 +133,9 @@ Upstreams return Claude model ids in dot form (`claude-haiku-4.5`), but `flow_mo
 | New model has `context_window: null` | absent key in `MODEL_CONTEXT_WINDOWS` | add to `services/public-llm-upstream.ts:MODEL_CONTEXT_WINDOWS` |
 | Invalid key returns 401 even after creation | HMAC secret mismatch | confirm `API_KEY_HMAC_SECRET` matches the secret used at key-create time |
 | Spend cap blocks user | `Spend cap reached: $X of $Y this period.` 402 response | raise `api_keys.spend_limit_flow` or wait for period reset |
+| `/llm/v1/messages` returns 400 "uses OpenAI wire format" | (removed 2026-05-23) — old behavior before bridge | upgrade to ai-router-unified deploy — bridge now translates instead of rejecting |
+| Fallback firing for Claude id | `[ai-router] anthropic_request_fallback: model=…` | seed a `llm_model_aliases` row OR enable a native Anthropic upstream |
+| Tool args truncated / unparseable | `tool_use.input._unparsed_args` present in response | upstream cut SSE mid-stream — check `upstream_http_*` log, retry, raise `max_tokens` |
 
 ## Related
 
