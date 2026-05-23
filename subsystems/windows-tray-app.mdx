@@ -12,6 +12,17 @@ local daemon status, agent slots, the last 5 cloud goals, daily budget, plus qui
 `agentflow-computer-mcp/src/agentflow_computer_mcp/winapp/`; the `winapp/` root dir holds
 the README + bundled icon assets so PyInstaller picks them up automatically.
 
+**v0.5.0 ships the tray with the installer.** `agentflow-desktop-setup.exe` now bundles
+a second PyInstaller onefile `agentflow-tray.exe` alongside the daemon. The wizard:
+
+1. copies `agentflow-tray.exe` into `%LOCALAPPDATA%\AgentFlow\`,
+2. writes `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\AgentFlowTray = "<path>"`,
+3. spawns the tray immediately (detached process).
+
+After install the user sees the AgentFlow icon in the system tray without opening
+a terminal — parity with the Mac DMG menu-bar app. A wizard checkbox «Запускать иконку
+в трее при старте Windows» (default ON) controls the Run-key write + the immediate spawn.
+
 ## Files (with line refs)
 | Path | Role |
 |---|---|
@@ -30,6 +41,11 @@ the README + bundled icon assets so PyInstaller picks them up automatically.
 | `agentflow-computer-mcp/tests/winapp/test_tray_menu.py` | menu structure assertions (3 daemon states) |
 | `agentflow-computer-mcp/tests/winapp/test_autostart.py` | Run-key install/uninstall with mocked `winreg` |
 | `agentflow-computer-mcp/tests/winapp/test_rest_client.py` | goals + budget payload parsing |
+| `agentflow-computer-mcp/installer/tray_entry.py:21` | PyInstaller entry for `agentflow-tray.exe`; delegates to `winapp.__main__:main` |
+| `agentflow-computer-mcp/installer/agentflow-setup.spec:88` | second `EXE()` block — builds `agentflow-tray.exe` from the same Analysis+PYZ as the setup wizard |
+| `agentflow-computer-mcp/installer/setup_gui.py:312` | `install_tray_binary` / `register_tray_autostart` / `launch_tray` — wizard post-install steps |
+| `agentflow-computer-mcp/installer/setup_gui.py:46` | `TRAY_RUN_KEY` / `TRAY_RUN_VALUE` constants for the Run-key write |
+| `agentflow-computer-mcp/tests/installer/test_pyinstaller_bundle.py` | static checks: spec lists both EXE targets, wizard wires tray helpers |
 
 ## Data flow
 
@@ -54,7 +70,18 @@ the README + bundled icon assets so PyInstaller picks them up automatically.
 - Env: `AGENTFLOW_API_KEY` (or `~/.agentflow/auth.json`) — read by `cli.rest_client.resolve_api_key`.
 - Routes hit: `GET /me/autonomous/goals`, `GET /me/autonomous/budget` on `agentflow.website/_agents`.
 - Local IPC: `cli.socket_client.call("list" | "pause", ...)` — UNIX socket today, Windows named pipe pending (#94).
-- Registry: `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\AgentFlowTray = "<pythonw> -m agentflow_computer_mcp.winapp"`.
+- Registry: `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\AgentFlowTray`.
+  - Source-mode (pip install): `"<pythonw>" -m agentflow_computer_mcp.winapp` (written by `winapp.autostart.install`).
+  - Installer-mode (v0.5.0+): `"<LOCALAPPDATA>\AgentFlow\agentflow-tray.exe"` (written by `installer/setup_gui.py:register_tray_autostart`).
+
+### v0.5.0 autostart registry table
+
+| Key | Value | Writer |
+|---|---|---|
+| `HKCU\…\Run\AgentFlowTray` | `"%LOCALAPPDATA%\AgentFlow\agentflow-tray.exe"` | `setup_gui.register_tray_autostart` |
+| Scheduled Task `AgentFlowDesktop` | `"%LOCALAPPDATA%\AgentFlow\agentflow-desktop.exe" --daemon` | `setup_gui.register_scheduled_task` |
+
+Both writers are idempotent (Run-key uses `SetValueEx`, schtasks uses `/F`).
 
 ## Failure modes
 | Symptom | Log signature for grep | Where to fix |
