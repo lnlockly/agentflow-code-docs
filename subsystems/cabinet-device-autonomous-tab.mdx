@@ -91,7 +91,17 @@ react-query refetches → UI updates without a full reload
 | Mutation succeeded server-side but UI didn't update | none — `useMutation` returned ok | check `invalidateQueries` keys in `SelectedGoalView` — the relevant keys are `['autonomous','goal',id]`, `['autonomous','goals']`, `['autonomous','budget']`; missing invalidation is the most common cause |
 | «Уроки» panel shows no lessons though reflection ran | network: `lessons: []` from `GET /me/autonomous/goals/:id` | reflection ran but did not extract any lessons (LLM returned empty array) — re-trigger reflection by waiting for `REFLECT_HOUR_UTC` tick or running the desktop CLI `reflect` command |
 
+## Sibling tab — «Доступы» (2026-05-23)
+
+`CabinetDeviceDetail` now hosts a third tab next to «Устройство» +
+«Автономно» — «Доступы» — which surfaces `scope.allow_apps[]` as
+delete-chips + add-modal + warning banner. The legacy `allow_apps`
+ChipsInput inside the «Устройство» scope form stays put for backwards
+compatibility, but the dedicated tab is the recommended UX. See
+[Computer MCP — «Доступы» tab](/subsystems/computer-mcp#доступы-tab).
+
 ## Related
 - [Autonomous Goals](/subsystems/autonomous-goals) — server + daemon source of truth
+- [Cabinet — goal-create CTA](/subsystems/cabinet-goals-funnel) — entry point on `/cabinet` root
 - [Desktop / Computer-Agent bridge](/subsystems/computer-mcp) — same device root page, sibling «Устройство» tab
 - [Desktop Auto-Updater](/subsystems/desktop-auto-updater) — runs in the same daemon

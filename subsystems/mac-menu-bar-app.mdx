@@ -1,0 +1,88 @@
+---
+title: "Mac menu-bar app"
+description: "Native SwiftUI status-bar app for macOS showing local agents, cloud goals, and budget. Lives in agentflow-computer-mcp/macapp/."
+---
+
+# Mac menu-bar app
+
+## TL;DR
+
+Native SwiftUI status-bar app (macOS 13+) that polls the local agentflow
+daemon socket every 10s and the cloud REST API every 30s. Ships inside the
+`agentflow-computer-mcp` repo at `macapp/`. Bundle size ~420 KB.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-computer-mcp/macapp/Sources/AgentFlow/AgentFlowApp.swift:3` | `@main` entry, wires `MenuBarExtra` with `bolt.fill` icon. |
+| `agentflow-computer-mcp/macapp/Sources/AgentFlow/AppState.swift:31` | `startPolling()` — 10s socket + 30s REST loop. |
+| `agentflow-computer-mcp/macapp/Sources/AgentFlow/SocketClient.swift:33` | AF_UNIX line-JSON one-shot to `/tmp/agentflow.sock`. |
+| `agentflow-computer-mcp/macapp/Sources/AgentFlow/RestClient.swift:38` | `fetchGoals()` against `/me/autonomous/goals`. |
+| `agentflow-computer-mcp/macapp/Sources/AgentFlow/RestClient.swift:51` | `fetchBudget()` against `/me/autonomous/budget`. |
+| `agentflow-computer-mcp/macapp/Sources/AgentFlow/AuthLoader.swift:13` | Reads `~/.agentflow/auth.json` (same file `agentflow login` writes). |
+| `agentflow-computer-mcp/macapp/Sources/AgentFlow/StatusFormatter.swift:5` | Pure formatter — `$1.23 / $5.00 (25%)`. |
+| `agentflow-computer-mcp/macapp/Sources/AgentFlow/DaemonControl.swift:23` | `Process` wrapper for `agentflow daemon start|stop`. |
+| `agentflow-computer-mcp/macapp/Sources/AgentFlow/MenuView.swift:3` | Dropdown SwiftUI view. |
+| `agentflow-computer-mcp/macapp/Sources/AgentFlow/Resources/Info.plist:14` | `LSUIElement=YES` (no Dock icon). |
+| `agentflow-computer-mcp/macapp/scripts/build-app.sh:1` | Assembles `.app` bundle. |
+| `agentflow-computer-mcp/.github/workflows/macapp.yml:1` | CI on `macos-latest`, gated by `needs-mac-runner` label on PRs. |
+
+## Data flow
+
+```
+        ┌──────────────────────────┐
+        │   AgentFlow.app (menu)   │
+        └────────────┬─────────────┘
+                     │
+        ┌────────────┼────────────────────┐
+        ▼            ▼                    ▼
+  10s socket     30s REST            Process spawn
+        │            │                    │
+        ▼            ▼                    ▼
+  /tmp/agent…    agentflow.website     agentflow daemon
+   flow.sock      /_agents/*            start | stop
+   (local         /me/autonomous/
+    daemon)        {goals,budget}
+```
+
+## DB / Env / API
+
+- No DB. State lives only in `AppState` in-memory.
+- Reads `~/.agentflow/auth.json` (written by Python CLI `agentflow login`).
+- Calls REST `https://agentflow.website/_agents/me/autonomous/{goals,budget}`
+  with `x-api-key` header.
+- Calls UNIX socket `/tmp/agentflow.sock` with line-JSON
+  `{"method":"list"}` → `{"ok":true,"result":[…]}`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Red dot, "Демон не запущен" | `SocketError.unavailable` from `SocketClient.call` | start daemon via menu "Запустить демон" button or `agentflow daemon start` |
+| Cloud sections empty, "не авторизован" | `RestError.notAuthenticated` from `RestClient.get` | `agentflow login` to write `~/.agentflow/auth.json` |
+| Cloud sections show 401 errors | `RestError.http(401, …)` | api_key in auth.json expired; re-run `agentflow login` |
+| Gatekeeper refuses first launch | macOS "cannot verify developer" dialog | right-click .app → Open until codesign #77 ships |
+| No menu-bar icon after launch | `LSUIElement` missing from Info.plist | check `Sources/AgentFlow/Resources/Info.plist:14` |
+| Bundle > 5 MB | CI step "Verify bundle size <= 5 MB" fails | inspect what was added; SwiftUI dynamically links stdlib so binary should stay < 1 MB |
+
+## Build + run
+
+```bash
+cd agentflow-computer-mcp/macapp
+swift build -c release
+./scripts/build-app.sh   # → .build/AgentFlow.app
+open .build/AgentFlow.app
+```
+
+Tests:
+
+```bash
+swift test    # 28 XCTest cases, 5 files
+```
+
+## Related
+
+- [AgentFlow CLI](/subsystems/agentflow-cli)
+- [Multi-agent runtime](/subsystems/multi-agent-runtime)
+- [Desktop auto-updater](/subsystems/desktop-auto-updater)

@@ -189,6 +189,40 @@ PR lnlockly/agentflow-computer-mcp#8 applied three optimisations to `driver/stre
 
 Measured frame size on a 5K Retina display: **28 KB** (was ~50 KB). Dedup eliminates ≥50% of WS emits when screen content is unchanged (regression-tested in `tests/test_streamer_perf.py`).
 
+## «Доступы» tab (2026-05-23)
+
+`CabinetDeviceDetail` now hosts a dedicated «Доступы» sub-tab driven by
+`DeviceAppWhitelist` (`agentflow-landing/src/components/devices/DeviceAppWhitelist.tsx`).
+The tab surfaces `scope.allow_apps[]` as delete-chips with an add-modal
+for adding new app names or bundle IDs. Empty list renders «Доступ ко
+всем приложениям»; non-empty list always shows a warning banner —
+«daemon будет работать ТОЛЬКО с этими приложениями. Остальные блокируются.»
+
+Add and remove flows hit `POST /me/devices/:id/scope` with the full
+merged `DeviceScope` (`...current, allow_apps: nextList`) and rely on
+React-Query optimistic updates (`qc.setQueryData` on the
+`['cabinet-device', id]` key) that revert on failure. The legacy
+ChipsInput for `allow_apps` inside the «Устройство» scope form stays in
+place for compatibility but is no longer the primary UX surface.
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/components/devices/DeviceAppWhitelist.tsx:1` | new component |
+| `agentflow-landing/src/components/devices/DeviceAppWhitelist.tsx:55` | `persist(next)` — optimistic update + revert pattern |
+| `agentflow-landing/src/pages/CabinetDeviceDetail.tsx:34` | `import { DeviceAppWhitelist }` |
+| `agentflow-landing/src/pages/CabinetDeviceDetail.tsx:127` | tab state union extended with `'whitelist'` |
+| `agentflow-landing/src/pages/CabinetDeviceDetail.tsx:350-370` | tab button + mount point |
+| `agentflow-landing/tests/components/DeviceAppWhitelist.test.mjs:1` | smoke test — 8 assertions on contract |
+
+### Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Chip delete flickers and comes back | network 5xx on `/me/devices/:id/scope` | `DeviceAppWhitelist.persist` revert path |
+| Daemon ignores whitelist | none on client | `agentflow-computer-mcp` enforcer ignores `allow_apps` |
+| Add-modal accepts whitespace-only input | none | client validator at `handleAdd` |
+
 ## Related
+- [Cabinet Device — «Автономно» tab](/subsystems/cabinet-device-autonomous-tab) — sibling tab on the same page
 - [Workspace provisioning](/subsystems/workspace-provisioning) — vcluster per user pattern
 - [Auth and access](/subsystems/auth-and-access) — api-key middleware + HMAC scheme reused here

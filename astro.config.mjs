@@ -78,6 +78,7 @@ export default defineConfig({
             { label: 'Desktop Auto-Updater', slug: 'subsystems/desktop-auto-updater' },
             { label: 'Cabinet Device — Autonomous Tab', slug: 'subsystems/cabinet-device-autonomous-tab' },
             { label: 'Multi-Agent Runtime (Desktop)', slug: 'subsystems/multi-agent-runtime' },
+            { label: 'Mac Menu-Bar App', slug: 'subsystems/mac-menu-bar-app' },
           ],
         },
         {
