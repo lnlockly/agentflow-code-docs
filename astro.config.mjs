@@ -73,6 +73,7 @@ export default defineConfig({
             { label: 'Onboarding Quests', slug: 'subsystems/onboarding-quests' },
             { label: 'Proxy Pool', slug: 'subsystems/proxy-pool' },
             { label: 'VK Bridge', slug: 'subsystems/vk-bridge' },
+            { label: 'Matrix Discord Bridge', slug: 'subsystems/mautrix-discord-bridge' },
             { label: 'Social Network', slug: 'subsystems/social-network' },
             { label: 'Autonomous Goals', slug: 'subsystems/autonomous-goals' },
             { label: 'Desktop Auto-Updater', slug: 'subsystems/desktop-auto-updater' },
