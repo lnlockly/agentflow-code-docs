@@ -1,0 +1,114 @@
+---
+title: "Autonomous wake-loop closure"
+description: "How the server-side autonomous worker stamps task outcomes, fans out the next plan task, hard-caps daily spend, and auto-decomposes goals on create."
+---
+
+# Autonomous wake-loop closure
+
+## TL;DR
+
+The autonomous worker (`autonomous-worker.ts`) generates a daily plan per
+active goal and dispatches the **first** task into `device_tasks`. Before
+this change, nothing on the server consumed the daemon's `task_complete`/
+`task_error` frames, so the rest of the day sat undispatched and goals
+without milestones stayed dormant forever. This PR closes the loop:
+
+1. The WS handler in `devices-ws.ts` flips `device_tasks.status` to
+   `done`/`failed` on terminal frames and calls
+   `consumeDeviceTaskOutcome` which stamps `plan_json.tasks[i].outcome`
+   and fans out the next task.
+2. Every dispatch (initial + fan-out) is gated by `assertWithinDailyCap`,
+   reading from `autonomous_budget_ledger` and either the per-goal
+   `daily_budget_usd` column or the env fallback
+   `AUTONOMOUS_DAILY_CAP_USD` (default `5.00`).
+3. `POST /me/autonomous/goals` immediately fires `decomposeGoalSync` so
+   freshly-created goals land with milestones — no more
+   `wake_skipped_no_milestone` rut.
+
+The same PR fixes a P0 from cabinet QA: `POST /me/autonomous/goals` with
+an ISO `deadline_at` was returning HTTP 500 because postgres-js was
+binding a `Date` instance through a path that wanted a string. Now the
+route passes the validated ISO string straight to the tagged template.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/autonomous-worker.ts:175` | `runWakePass` — daily plan generation + initial dispatch (now budget-gated) |
+| `agentflow-agents/src/services/autonomous-worker.ts:402` | `consumeDeviceTaskOutcome(deviceTaskId, status, summary?)` — stamps `plan_json.tasks[i].outcome`, fans out next task |
+| `agentflow-agents/src/services/autonomous-budget.ts:1` | `assertWithinDailyCap(userId, goalId?)` + env / per-goal cap |
+| `agentflow-agents/src/services/devices-ws.ts:475` | `task_complete` → `finalizeDeviceTask('done')` |
+| `agentflow-agents/src/services/devices-ws.ts:497` | `task_error` → `finalizeDeviceTask('failed')` |
+| `agentflow-agents/src/services/devices-ws.ts:545` | `finalizeDeviceTask` — UPDATE `device_tasks.status` then run the consumer |
+| `agentflow-agents/src/routes/me-autonomous.ts:344` | `decomposeGoalSync(userId, goalId)` helper shared by the create-handler + explicit `/decompose` route |
+| `agentflow-agents/src/routes/me-autonomous.ts:395` | `POST /me/autonomous/goals` — Date-binding fix + auto-decompose fire-and-forget |
+| `agentflow-agents/migrations/2026-05-24a-autonomous-loop-closure.sql:1` | Migration: `daily_budget_usd` column + extended `device_tasks` CHECK + supporting index |
+| `agentflow-agents/src/services/bootstrap-schema.ts:210` | Idempotent ALTER statements so the column + constraint roll forward on first boot |
+
+## Data flow
+
+```
+┌─────────────┐       ┌─────────────────────────┐       ┌──────────────────┐
+│ POST goals  │──────▶│ autonomous_goals INSERT │──fire▶│ decomposeGoalSync│
+└─────────────┘  201  └─────────────────────────┘  &fgt;│ → milestones INS │
+                                                       └──────────────────┘
+
+WAKE PASS (07:30 MSK ≈ 04 UTC)
+  fetchActiveGoalsWithoutTodaysPlan
+    └─▶ for each goal:
+          llmPlanToday → INSERT autonomous_daily_plans
+          assertWithinDailyCap(userId, goalId)
+            └─▶ over cap?  log budget_cap_hit, skip dispatch
+            └─▶ ok?         INSERT device_tasks (task_ordinal=0)
+
+DAEMON ───── task_complete frame ─────▶ devices-ws.handleClientTaskFrame
+                                          └─▶ finalizeDeviceTask(taskId,'done')
+                                                ├─ UPDATE device_tasks SET status='done'
+                                                └─▶ consumeDeviceTaskOutcome
+                                                      ├─ stamp plan_json.tasks[i].outcome
+                                                      ├─ log autonomous_loop_advanced
+                                                      └─ assertWithinDailyCap → INSERT next ordinal
+```
+
+## DB / Env / API
+
+**Tables**
+
+- `autonomous_goals` — `daily_budget_usd NUMERIC(8,4)` (NULL → env fallback).
+- `autonomous_daily_plans.plan_json.tasks[i].outcome = {status, completed_at, summary}` — stamped by the consumer.
+- `device_tasks.status` CHECK now allows `('queued','dispatched','done','failed')`.
+- `autonomous_budget_ledger` — read by the cap helper for today's SUM.
+
+**Env**
+
+- `AUTONOMOUS_DAILY_CAP_USD` — float USD, default `5.00`. Used when `autonomous_goals.daily_budget_usd` is NULL.
+- `AUTONOMOUS_WAKE_HOUR_UTC` — unchanged, default `4`.
+
+**Routes**
+
+- `POST /me/autonomous/goals` — now auto-decomposes; accepts `deadline_at` as ISO string without 500.
+- `POST /me/autonomous/goals/:id/decompose` — re-uses `decomposeGoalSync`.
+
+**Internal exports**
+
+- `consumeDeviceTaskOutcome(deviceTaskId, 'done'|'failed', summary?)` from `services/autonomous-worker.ts`.
+- `assertWithinDailyCap(userId, goalId?)` from `services/autonomous-budget.ts`.
+- `decomposeGoalSync(userId, goalId)` from `routes/me-autonomous.ts`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Goal stuck — wake pass logs `wake_skipped_no_milestone` daily | `wake_skipped_no_milestone` | `src/services/autonomous-worker.ts:187` — milestones missing; call `POST /goals/:id/decompose` or fix `decomposeGoalSync` |
+| Plan stops after task 0, nothing further dispatched | `autonomous_loop_advanced` count = 1 per plan | `src/services/devices-ws.ts:545` — daemon may not be sending `task_complete` with the queued UUID as `task_id` |
+| Daemon's `task_complete` arrives but next task never inserts | `autonomous_next_skipped_budget_cap` | `src/services/autonomous-budget.ts:1` — raise `AUTONOMOUS_DAILY_CAP_USD` or set per-goal `daily_budget_usd` |
+| `POST /me/autonomous/goals` returns 500 on `deadline_at` | `The "string" argument must be of type string ... Received an instance of Date` | `src/routes/me-autonomous.ts:395` — bind ISO strings, never `new Date()` |
+| `autonomous_goals.daily_budget_usd` ignored | `assertWithinDailyCap` returns env cap | column NULL — set it via `PATCH /me/autonomous/goals/:id` |
+| `device_tasks` rows stay `'dispatched'` forever | none — silent | daemon dropped `task_complete`; consumer expects the daemon to use the row's UUID as `task_id` when draining via `/queued_tasks` |
+
+## Related
+
+- [Desktop daemon: fast task_cancel](/subsystems/desktop-fast-cancel)
+- [Computer-MCP overview](/subsystems/computer-mcp)
+- Migration: `agentflow-agents/migrations/2026-05-24a-autonomous-loop-closure.sql`
+- QA issue: `qa-issues/2026-05-23-autonomous-tab-create-goal-500-deadline-date.md`
