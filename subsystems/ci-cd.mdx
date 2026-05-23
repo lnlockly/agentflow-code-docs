@@ -1,0 +1,65 @@
+---
+title: "CI/CD"
+description: "Pipelines that build, test, and deploy AgentFlow frontend and backend."
+---
+
+# CI/CD
+
+## TL;DR
+GitHub Actions runs build+deploy on push to `main` for both `agentflow-agents`
+and `agentflow-landing`. On `pull_request`, `agentflow-landing` runs a
+Playwright E2E smoke against prod `agentflow.website` to catch P0
+regressions (auth, autonomous-goal POST, NaN cards) before merge.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-landing/.github/workflows/deploy.yml:1` | Build image + rollout to k3s on push to main |
+| `agentflow-landing/.github/workflows/e2e.yml:1` | Playwright smoke on every PR |
+| `agentflow-landing/playwright.config.ts:1` | Smoke config — Chrome only, `agentflow.website` base URL |
+| `agentflow-landing/tests/e2e/autonomous-flow.spec.ts:1` | Spec: login → device → Autonomous tab → set goal |
+| `agentflow-landing/tests/e2e/__helpers/anti-nan.ts:1` | `assertNoNaN(page)` — fails if DOM has NaN/undefined/null/Invalid Date |
+| `agentflow-landing/playwright.auth-config.ts:1` | Older 12-journey suite — kept for token-based runs |
+
+## Data flow
+
+```
+PR opened
+  → GH Actions e2e-smoke job (ubuntu-latest, 15min timeout)
+     → npm ci
+     → npx playwright install chromium
+     → npm run e2e:smoke (= playwright test --repeat-each=2)
+        → goto agentflow.website/login → fill creds → /cabinet
+        → goto /cabinet/devices → click first device
+        → click "Автономно" tab
+        → if "Поставить цель" CTA visible → fill form → POST autonomous/goals
+        → assertNoNaN(page) on Autonomous tab DOM
+     → on failure: upload playwright-report/ + test-results/ artifacts
+```
+
+## DB / Env / API
+
+- Env (CI):
+  - `E2E_BASE_URL` — defaults `https://agentflow.website`.
+  - `E2E_OWNER_EMAIL` / `E2E_OWNER_PASSWORD` — GH secret. Falls back to
+    `avsee4@agentflow.website` / brief-provided password.
+  - `CI=true` — enables `[github]` reporter + `retries: 1`.
+- Routes hit by the smoke:
+  - `POST /login` (frontend form post).
+  - `GET /cabinet/devices`.
+  - `POST /me/devices/:device_id/autonomous/goals` — return must be < 300.
+- Cleanup: goals named `[e2e] smoke <ts>` so owner can filter.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Goal create returns 500 | `create-goal response was 500` | `agentflow-agents/src/routes/autonomous.ts` deadline parser |
+| Card renders NaN | `assertNoNaN: rendered DOM contains [NaN` | `agentflow-landing/src/pages/AutonomousTab.tsx` formatters |
+| Login redirect broken | `Test timeout … waiting for navigation to /cabinet` | `agentflow-landing/src/pages/LoginPage.tsx` redirect handler |
+| Autonomous tab missing | `expected locator … "Автономно" to be visible` | `agentflow-landing/src/pages/DevicePage.tsx` tab registration |
+| Prod under deploy | Flaky on first run, green on retry | `retries: 1` covers; if both fail, investigate `agentflow.website` |
+
+## Related
+- [Autonomous goals subsystem](./autonomous-goals)
+- [Cabinet — device autonomous tab](./cabinet-device-autonomous-tab)
+- [Deploy shield](./deploy-shield)
