@@ -1,0 +1,97 @@
+---
+title: "Device Task Lifecycle"
+description: "How dispatch_task flows from REST → WS → daemon → session accounting, and what fails when."
+---
+
+# Device Task Lifecycle
+
+## TL;DR
+The owner (or an MCP caller) POSTs `dispatch_task` against a registered device. The agentflow-agents backend either sends the task live over the device's WebSocket (when a live `conn` is held on the receiving pod) or persists it as `queued` in `device_tasks` for the daemon to drain on its next `hello` handshake. Daemon runs the LLM loop, publishes `task_action` frames per step, and finishes with `task_complete` (or `task_error`). The terminal frame is what flips `device_sessions.status` and writes `tokens_used` + `cost_usd`.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-devices.ts:632` | `POST /me/devices/:id/dispatch_task` — live-vs-queued router |
+| `agentflow-agents/src/routes/me-devices.ts:489` | `dispatchLiveDeviceTask` — creates session + task row, recordTaskSession, sends WS frame |
+| `agentflow-agents/src/services/devices-ws.ts:415` | `hello` handler — calls `drainAndDispatchQueuedTasks` on (re)connect |
+| `agentflow-agents/src/services/devices-ws.ts:289` | `queuedPayloadToFrame` — converts queue row payload back to `task_dispatch` frame |
+| `agentflow-agents/src/services/devices-ws.ts:561` | `task_complete` ingress — emits event + persistTaskRow + finalizeDeviceTask |
+| `agentflow-agents/src/services/devices-ws.ts:701` | `closeTaskSession` — UPDATE device_sessions tokens_used + cost_usd on `task_complete` |
+| `agentflow-agents/src/services/devices-ws.ts:792` | `resolveTaskSession` — in-memory `taskSessionByTask` map + fallback synthetic session create |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py:1282` | Daemon publishes `task_complete` with `tokens_used=total_tokens_used`, `cost_usd=total_cost_usd` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_client.py` | `drain_queued_tasks` — daemon-side fallback REST poll for queued tasks |
+
+## Data flow
+
+```
+client                backend (multi-pod)        device WS / daemon          DB
+  │                         │                            │                    │
+  │ POST dispatch_task ───→ │                            │                    │
+  │                         │ getConnection(id)?         │                    │
+  │                         │   yes → dispatchLiveDeviceTask                  │
+  │                         │     ├─ INSERT device_sessions (active) ─────→  │
+  │                         │     ├─ INSERT device_tasks (dispatched) ────→  │
+  │                         │     ├─ recordTaskSession(taskId, sessionId)    │
+  │                         │     └─ ws.send({type:'task_dispatch',...}) →  │
+  │ ← 202 { task_id, session_id, queued:false }                              │
+  │                         │   no  → INSERT device_tasks (queued) ──────→  │
+  │ ← 202 { task_id, session_id:null, queued:true }                           │
+  │                         │                            │                   │
+  │                         │ hello frame from daemon ←  │                   │
+  │                         │   drainAndDispatchQueuedTasks                  │
+  │                         │   SELECT WHERE status=queued                   │
+  │                         │   FOR EACH row: ws.send(task_dispatch)   →    │
+  │                         │   UPDATE → status=dispatched ──────────────→  │
+  │                         │                            │                   │
+  │                         │   task_action frames    ← │                   │
+  │                         │   persistTaskRow → resolveTaskSession (cache hit) → INSERT device_action_log
+  │                         │                            │                   │
+  │                         │   task_complete         ← │                   │
+  │                         │   persistTaskRow → insertTaskActionLog (kind=task_complete, tokens_used, cost_usd)
+  │                         │   closeTaskSession → UPDATE device_sessions SET status='completed', tokens_used=N, cost_usd=$
+  │                         │   finalizeDeviceTask → UPDATE device_tasks SET status='done'
+```
+
+## DB / Env / API
+
+**Tables**
+- `device_sessions` — one row per task run. `status ∈ {active, completed, aborted}`. `tokens_used` and `cost_usd` set only on `task_complete` frame.
+- `device_tasks` — one row per dispatch. `status ∈ {queued, dispatched, done, failed}`. Queued rows drained by `drainAndDispatchQueuedTasks` on the next daemon `hello`.
+- `device_action_log` — per-tool-call audit row. `kind` column discriminates `tool_call` / `task_action` / `task_complete` / `task_error`. The full daemon-emitted payload is in `args` JSONB.
+- `user_devices` — registration + `last_seen` heartbeat. `last_seen` drives `shouldQueueForOfflineDevice` (60s trust window).
+
+**Routes**
+- `POST /me/devices/:id/dispatch_task` — body `{ task: string, scope?: object }` → 202 `{ ok, task_id, session_id, queued? }`. `queued:true` means daemon WS was not local to this pod; row sits in `device_tasks` until drained.
+- `POST /me/devices/:id/cancel_task` — body `{ task_id? }` → 202.
+- `GET /me/devices/:id/sessions` — paginated list with tokens + cost.
+- `GET /me/devices/:id/sessions/:sid/log` — per-tool audit trail.
+- `GET /me/devices/:id` — current presence (status, last_seen, scope).
+- `wss://agentflow.website/_agents/_devices/connect` — daemon WS. Auth via `device_id + device_secret`. Handles `hello`, `tool_call_result`, `task_action`, `task_complete`, `task_error`, `subscribe_stream`, `stream_frame`.
+
+**Env**
+- Daemon: `LOOP_MAX_USD` (default 2.0), `LOOP_MAX_STEPS` (default 50), `FF_BOT_AUTO_TEST`, `ANTHROPIC_API_KEY` (east-api-3).
+- Backend: `QUEUE_TRUST_WINDOW_MS=60000` (presence window for queue-vs-409 decision).
+
+**Scope precedence** (daemon-side):
+1. Per-task scope from `dispatch_task` body (highest)
+2. `~/.agentflow/computer-scope.toml` base (loaded once at daemon boot)
+3. Hard-deny paths (`~/.ssh`, `~/.config`, `~/Library/Keychains`, `~/.aws`, `~/.gnupg`) — always enforced
+
+Budget: `max(LOOP_MAX_USD, base_scope.budget_usd)` unless per-task overrides it.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Session ends `completed` but `tokens_used=0, cost_usd=0` | `[devices-ws] close_task_session_failed` or no row update | Pre-PR-770: `closeTaskSession` only set status/ended_at. Fixed by writing tokens/cost from `task_complete` payload. `agentflow-agents/src/services/devices-ws.ts:705` |
+| Dispatch returns `queued:true` even though device looks online | `[device] online user=... device=...` happens on a different pod than the one serving REST | Cross-pod in-memory presence race. Fixed by `drainAndDispatchQueuedTasks` on `hello`. `agentflow-agents/src/services/devices-ws.ts:415` |
+| Task aborts with `cost_cap_exceeded: spent $X >= $0.5` | `cost_cap_exceeded` in `device_action_log.tool='task.cost_cap'` | `LOOP_MAX_USD` default too low. Either set per-task `scope.budget_usd` or lift the toml `budget_usd` (which is now the floor via `loop.py:1426`). |
+| `shell_whitelist is empty; shell.exec disabled` | exact substring in `code_run_command` result | `~/.agentflow/computer-scope.toml` has empty `shell_whitelist`. Either widen the toml or pass scope inline in `dispatch_task`. |
+| `path not in allow_paths: /foo` | exact substring in `code_write_file` result | Same — add path to `allow_paths` (toml or per-task scope). |
+| Multiple terminating pods during rollout — fresh task lands on old code | Pod `STATUS=Terminating` in `kubectl get pods -l app=agentflow-agents` | Daemon WS may still be bound to terminating pod. Force daemon reconnect with `launchctl kickstart -k gui/$(id -u)/com.agentflow.desktop`. |
+| `task.completion_blocked` after a tool error | `completion_blocked_after_tool_error` in session log | New completion guard. Means daemon tried `task_complete` while the last tool returned `ok:false`. Either fix the tool error or have the LLM acknowledge failure in the answer before completing. `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py` |
+| `finalize_device_task_failed` | console.error in agentflow-agents logs | `device_tasks` row UUID malformed or matched 0 rows (already finalised). Idempotent — usually safe to ignore. |
+
+## Related
+- [Multi-Agent Runtime](/subsystems/multi-agent-runtime)
+- [Public LLM Facade](/subsystems/public-llm-facade) — daemon uses `/llm/v1/messages` for Claude calls
