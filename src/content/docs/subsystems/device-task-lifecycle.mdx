@@ -92,6 +92,18 @@ Budget: `max(LOOP_MAX_USD, base_scope.budget_usd)` unless per-task overrides it.
 | `task.completion_blocked` after a tool error | `completion_blocked_after_tool_error` in session log | New completion guard. Means daemon tried `task_complete` while the last tool returned `ok:false`. Either fix the tool error or have the LLM acknowledge failure in the answer before completing. `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py` |
 | `finalize_device_task_failed` | console.error in agentflow-agents logs | `device_tasks` row UUID malformed or matched 0 rows (already finalised). Idempotent — usually safe to ignore. |
 
+## Setup wizard entry point (cabinet UX)
+
+The `/setup-device` route is a standalone linear wizard (auth → API key → install → handshake → done) that owns the cold path from anonymous visitor to a `user_devices` row with `status=online`. It does NOT mint an enrollment token — it provisions a regular API key via `POST /me/api-keys` and the daemon registers itself on first WS connect.
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/pages/SetupDeviceWizard.tsx` | 5-step wizard component |
+| `agentflow-landing/src/pages/Desktop.tsx:872` | CTA "Установить и подключить устройство" |
+| `agentflow-landing/src/main.tsx` (`/setup-device` Route) | Public route (no `RequireAuth` — step 0 handles login inline) |
+
+Polling: `devicesApi.list()` every 3s for up to 5 min in step 3, baseline snapshot of existing device IDs taken at wizard mount so the handshake fires only for the new row. Telemetry: `setup_device_started`, `setup_device_step`, `setup_device_key_created`, `setup_device_connected`, `setup_device_completed`.
+
 ## Related
 - [Multi-Agent Runtime](/subsystems/multi-agent-runtime)
 - [Public LLM Facade](/subsystems/public-llm-facade) — daemon uses `/llm/v1/messages` for Claude calls
