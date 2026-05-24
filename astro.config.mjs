@@ -80,6 +80,7 @@ export default defineConfig({
             { label: 'Cabinet Device — Autonomous Tab', slug: 'subsystems/cabinet-device-autonomous-tab' },
             { label: 'Multi-Agent Runtime (Desktop)', slug: 'subsystems/multi-agent-runtime' },
             { label: 'Mac Menu-Bar App', slug: 'subsystems/mac-menu-bar-app' },
+            { label: 'Recording Jobs', slug: 'subsystems/recording-jobs' },
           ],
         },
         {
@@ -93,6 +94,7 @@ export default defineConfig({
             { label: 'Templates Marketplace', slug: 'flows/templates-marketplace' },
             { label: 'Diploma Outreach + Build', slug: 'flows/diploma-outreach-and-build' },
             { label: 'Graph Execution', slug: 'flows/graph-execution' },
+            { label: 'Tutorial Recording', slug: 'flows/tutorial-recording' },
           ],
         },
         {
