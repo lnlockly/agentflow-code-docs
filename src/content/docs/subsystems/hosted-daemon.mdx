@@ -23,6 +23,9 @@ handshake идёт через тот же `/me/devices/connect`, что и Mac-�
 | `agentflow-agents/src/routes/me-hosted-devices.ts:60` | `HOSTED_DAEMON_ENROLLMENT_TTL_SEC` = 30d, `newRotationSecret`/`rotationSecretMatches` |
 | `agentflow-agents/src/routes/me-hosted-devices.ts:240` | `renderDaemonManifest` — env-блок с `AF_DEVICE_ID`/`AF_ENROLLMENT_TOKEN`/`AF_HOSTED_ROTATION_SECRET`/`AF_API_KEY` |
 | `agentflow-agents/src/routes/me-hosted-devices.ts:475` | POST `/me/hosted-devices` — минт user_devices+api_key+rotation_secret, INSERT hosted_devices, всё в одном `sql.begin` (rollback при любой ошибке) |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:768` | Background void worker — вызывает `wakeTenantVcluster(userId)` перед `kubectl apply` (без этого юзеры с hibernated vcluster получали silent dial-timeout) |
+| `agentflow-agents/src/services/projects.ts:1576` | `wakeTenantVcluster` — cross-service POST → agentflow-api `/internal/users/:id/wake-vcluster` (агенты SA не может patch STS в `af-tenant-*`) |
+| `agentflow-api/src/services/tenant-waker.ts:49` | server-side wake: `kubectl scale sts user-<id> --replicas=1` + `kubectl wait --for=condition=ready pod` (120 s timeout) |
 | `agentflow-agents/src/routes/me-hosted-devices.ts:850` | POST `/me/hosted-devices/:id/reenroll` — exchange rotation_secret → fresh enrollment_token |
 | `agentflow-agents/src/services/bootstrap-schema.ts:347` | ALTER TABLE `hosted_devices` ADD COLUMN kind/user_device_id/rotation_secret_hash |
 | `agentflow-agents/src/services/devices-ws.ts:138` | `performHandshake` — общий путь для Mac и hosted |
@@ -42,6 +45,11 @@ me-hosted-devices.ts
    ├── mint api_keys row        (af_live_*, name=hosted:<base>)
    ├── newRotationSecret        (хэш в hosted_devices.rotation_secret_hash)
    └── INSERT hosted_devices    (kind, user_device_id, rotation_secret_hash)
+   │
+   │ wakeTenantVcluster(userId)
+   │  → agentflow-api POST /internal/users/:id/wake-vcluster
+   │  → kubectl scale sts user-<id> --replicas=1 if hibernated
+   │  → kubectl wait pod ready (120s)
    │
    │ kubectl apply -f <manifest>  (с env-вбросом всех 4 секретов)
    ▼
@@ -112,6 +120,7 @@ Daemon в /cabinet/devices/hosted/:id
 | POST /me/hosted-devices 500 + no rows written | `[hosted-devices] provision tx rolled back` | один из INSERTов внутри `sql.begin` упал — три row (user_devices/api_keys/hosted_devices) откатились вместе; ищи root cause по сообщению после префикса |
 | Chromium падает на старте | `Failed to launch the browser process` в логах daemon | `--no-sandbox` не передан или Xvfb не поднялся — `kubectl logs <pod> -c daemon \| head -50` |
 | Autonomous goal queued таск, daemon online (heartbeat жив), но `task_dispatch` в логах daemon не появляется и `device_sessions` не растёт | `device_tasks` row `status='queued'` или `'dispatched'` без последующего `[device] queued_tasks_dispatched` и без `ws task_dispatch id=<uuid>` на стороне daemon | Backend в `me-autonomous.ts:plan_today` или `autonomous-worker.ts:wake/fan-out` пропустил вызов `dispatchOrQueueDeviceTask` и просто INSERT-нул queued row. Helper в `routes/me-devices.ts:dispatchOrQueueDeviceTask` обязан вызываться для каждого нового device_task — он смотрит `getConnection(deviceId)` и пушит WS frame для уже подключённого daemon. Голый INSERT работает только если daemon переподключится (heartbeat keep-alive это блокирует). |
+| POST /me/hosted-devices succeeds, row сидит в `status='provisioning'` навсегда у юзеров 18 / 164 / 279, при этом юзер 1 всё ок | `[hosted-devices] wake_vcluster_not_ready id=<uuid> user=<id> … detail=wake_http_403` (RBAC) OR `detail=pod_ready_wait_failed:` (vcluster pod scheduling/image-pull fail) | RBAC drift: проверить `kubectl get clusterrolebinding agentflow-api-tenant-admin` — должен существовать (не закоммичен в `agentflow-api/k8s/deployment.yaml`, только в проде). Если ready=false но wake.woken=true → vcluster pod не поднялся в 120 s — смотреть `kubectl -n af-tenant-<id> describe pod -l app=vcluster,release=user-<id>` |
 
 ## Related
 
