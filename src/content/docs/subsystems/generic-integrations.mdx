@@ -42,6 +42,10 @@ specialisation of this generic route and is preserved as an alias.
 | `agentflow-agents/src/routes/me-integrations.ts:475` | `POST /me/integrations/:provider` — generic handler |
 | `agentflow-agents/tests/integrations-generic.test.ts:1` | Unit tests — registry shape + body schemas + financial denylist |
 | `agentflow-agents/src/db/schema.ts:1266` | `project_secrets` table + `(project_id, key)` unique |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/tools/integrations.py:fetch_registry` | Daemon-side registry GET with 5-minute module cache, keyed by API base |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/tools/integrations.py:connect_integration` | Daemon dispatcher — `cookie_export` branch (open, probe, export, POST). `telegram_app` returns `not_implemented` (Track 2b). |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/desktop_tools.py:DESKTOP_TOOLS` | `connect_integration` Anthropic tool descriptor + `ToolExecutor.execute` dispatch wiring real Chrome helpers |
+| `agentflow-computer-mcp/tests/test_connect_integration.py:1` | Daemon-side unit tests — happy path, provider_not_found, not_logged_in, cache TTL, telegram_app stub, backend error passthrough, registry_unavailable |
 
 ## Data flow
 
@@ -98,6 +102,10 @@ For `flow_kind='telegram_app'` the daemon POSTs
 | `/me/integrations` shows `never` after a successful POST | (no log — check `project_secrets` row) | `secret_key` mismatch between registry and the consumer; verify `INTEGRATION_PROVIDERS[*].secret_key` matches what the studio template reads |
 | `connect_integration(telegram_app)` POSTs `{cookies:[]}` | `invalid_body` | Daemon dispatched cookie_export branch for a `flow_kind='telegram_app'` provider — daemon-side bug, route by `flow_kind` |
 | Hub project missing after first onboard | (no log — `SELECT * FROM projects WHERE owner_user_id=X AND kind='integration_hub'`) | `pickOrCreateHubProject` insert failed — check projects-table FK / slug collision |
+| Daemon `connect_integration` returns `not_logged_in` despite signed-in session | `tools/integrations.py:_parse_probe_result` → `{logged: false}` | `logged_probe_js` selector stale; update the row in `integration-providers.ts`. Daemon does not export cookies in this state to avoid burning a backend write. |
+| Daemon returns `provider_not_found` listing only `[kwork]` | (no backend log — daemon-only) | Backend registry response missing the slug; check `GET /integrations/registry` returns the full list and the daemon cache hasn't pinned a stale snapshot (TTL 300 s, restart daemon to flush). |
+| Daemon returns `registry_unavailable` | (daemon stdout) `tools/integrations.py:fetch_registry` raises | Backend down or wrong API base in `~/.agentflow/auth.json`. Daemon falls back to no-op (no Chrome opens). |
+| Daemon returns `encryption_v20_unsupported` | `chrome_cookies.py` Chrome 127+ App-Bound Encryption | Track 2c — daemon-side fallback not written. User must downgrade Chrome or wait on platform-key extraction work. |
 
 ## Related
 
