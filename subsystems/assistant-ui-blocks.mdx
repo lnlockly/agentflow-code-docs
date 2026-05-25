@@ -50,6 +50,7 @@ FloatingGuide  AgentChatPanel (renderUiBlocks=true)
 | Raw `@ui-blocks: [...]` line shown to the user | (silent — visual regression) | Confirm host passes `renderUiBlocks` to `AgentChatPanel` OR (for FloatingGuide) confirm `extractUiBlockNav` strips before render. |
 | `create_project` intent navigates back to dashboard with error toast | `Не удалось создать проект` | Likely `POST /me/projects` 4xx — inspect `agentflow-agents` server logs. |
 | `/assistant` page-level scroll appears, latest message hidden | n/a | The chat host must use `height: calc(100vh - 96px)` + `min-height: 0` on the flex chain — see `src/pages/Assistant.tsx:159`. |
+| Red Стоп click leaves bubble showing `Ошибка: signal is aborted without reason` + a misleading «Повторить» CTA | `signal is aborted without reason` | `AgentChatPanel.tsx:469` outer catch must detect `e.name === 'AbortError'` (or `ctrl.signal.aborted`) and short-circuit so the optimistic `{aborted:true}` flag from `onStop` isn't clobbered. Fix shipped in lnlockly/agentflow-landing#308. |
 
 ## Related
 

@@ -138,9 +138,10 @@ Response (`result.content[0].text` is the JSON-encoded runner envelope):
 | `template_url` rejected | response `{ok:false, error:"template_url_not_supported"}` | Use built-in `composition_id` until PR-2/3 wires arbitrary bundles. |
 | Bundle stuck after tmpfs full | `[remotion-runner] listening` but `/render` hangs on bundle step | Pod restart clears it; bump `ephemeral-storage` limit in manifest. |
 | Agents pod env missing runner URL | MCP tool returns `{ok:false, error:"remotion_runner_not_configured"}` (no HTTP attempted) | Set `REMOTION_RUNNER_URL` on `deploy/agentflow-agents` (k8s/agentflow-agents.yaml). |
-| Runner pod down / Service unreachable | MCP tool returns `{ok:false, error:"remotion_runner_unreachable", details:"..."}` | `kubectl -n franchise-factory get pods -l app=agentflow-remotion-runner`; check restart count / OOMKilled. |
+| Runner pod down / Service unreachable | MCP tool returns `{ok:false, error:"remotion_runner_unreachable", details:"..."}` (text surfaced to user: `Рендер не удался — сервис remotion-runner недоступен (fetch failed)`) | `kubectl -n franchise-factory get pods -l app=agentflow-remotion-runner`; check restart count / OOMKilled. Verified 2026-05-17 16:57Z on prod run #163 — remains failure mode post PR #425. |
 | Render >5 min | MCP tool returns `{ok:false, error:"remotion_runner_timeout"}` (AbortSignal.timeout fires) | Either shorten composition `duration_frames` or split into smaller renders. |
 | Runner replies non-json | MCP tool returns `{ok:false, error:"remotion_runner_bad_response", details:"..."}` | Renderer regression — check pod logs for stack trace. |
+| Preset not in marketplace catalog | `/marketplace/<slug>` resolves but `/marketplace` listing hides the card | Add slug to `PUBLIC_SEED_SLUGS` + `PLATFORM_AUTO_SEED_SLUGS` in `agentflow-agents/src/scripts/bootstrap-marketplace.ts`. Fixed for the 3 video presets 2026-05-17. |
 
 ## Available presets
 
