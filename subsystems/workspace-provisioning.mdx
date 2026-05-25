@@ -19,9 +19,12 @@ and these always recover within ~30-60 s.
 
 | Path | Role |
 |---|---|
-| `agentflow-agents/src/services/projects.ts:1538` | `provisionWorkspaceWithRetry` — the retry helper |
-| `agentflow-agents/src/services/projects.ts:1491` | `WORKSPACE_PROVISION_BACKOFF_SCHEDULE_SEC` constant |
-| `agentflow-agents/src/services/projects.ts:1509` | `WORKSPACE_PROVISION_TERMINAL_ERRORS` set — short-circuits the loop |
+| `agentflow-agents/src/services/projects.ts:1644` | `provisionWorkspaceWithRetry` — the retry helper |
+| `agentflow-agents/src/services/projects.ts:1597` | `WORKSPACE_PROVISION_BACKOFF_SCHEDULE_SEC` constant |
+| `agentflow-agents/src/services/projects.ts:1615` | `WORKSPACE_PROVISION_TERMINAL_ERRORS` set — short-circuits the loop |
+| `agentflow-agents/src/services/projects.ts:1576` | `wakeTenantVcluster` — cross-service call to agentflow-api, scales hibernated STS 0→1 before warmupVcluster |
+| `agentflow-api/src/services/tenant-waker.ts:49` | `wakeTenantVcluster` server-side — patches STS replicas, `kubectl wait` pod ready (120s) |
+| `agentflow-api/src/routes/internal-users.ts:377` | `POST /internal/users/:id/wake-vcluster` — secret-gated endpoint backing the cross-service call |
 | `agentflow-agents/src/mcp-servers/code-exec/index.ts:200` | `create_project` MCP tool — does the actual `kubectl apply` + `wait` |
 | `agentflow-agents/src/services/pingers/approval-retry.ts:1` | 60s pinger that re-fires `runProjectApprovalBackground` for stuck `status='approved'` rows |
 | `agentflow-agents/src/scripts/retry-failed-projects.ts:1` | Bulk script that re-approves projects stuck at `status='failed'` (legacy escape hatch) |
@@ -36,7 +39,11 @@ user clicks Approve
       → provisionWorkspaceWithRetry (loop up to 8 attempts)
           attempt N:
             ├── pingTenantApi  (warm the vcluster apiserver)
-            ├── warmupVcluster (if ping failed)
+            ├── if ping failed:
+            │     ├── wakeTenantVcluster  → POST agentflow-api /internal/users/:id/wake-vcluster
+            │     │     (scales STS 0→1, kubectl wait pod ready up to 120s,
+            │     │      emits project_event kind=log msg=vcluster_wake …)
+            │     └── warmupVcluster      (90s ping budget)
             └── callCodeExecTool('create_project', …)
                   → kubectl apply manifest    (returns apply_failed on calico flap)
                   → kubectl wait --for=ready  (returns pod_not_ready on slow image pull)
@@ -86,6 +93,8 @@ distinguishes:
 | All new projects fail with `quota_exceeded` | `workspace_provision_failed: quota_exceeded` | `services/tenant-quota-verifier.ts` should auto-expand; manual fix via `POST /internal/tenant/:userId/expand-quota` header `x-agentflow-secret` |
 | All new projects fail with `kubeconfig_unavailable` | `workspace_provision_failed: kubeconfig_unavailable` | tenant vcluster missing kubeconfig secret — investigate vcluster syncer pod |
 | FE spinner never ends on failed project | no `workspace_provision_failed_terminal` event | regression — helper must emit terminal kind BEFORE throwing |
+| All apply attempts dial-timeout for a specific user (others fine) | `vcluster_wake ready=false … detail=wake_http_403` OR `wake_transport_error` in project_events `kind=log` | agentflow-api SA lost STS patch perm in `af-tenant-*` — verify `ClusterRoleBinding agentflow-api-tenant-admin` exists (`kubectl get clusterrolebinding agentflow-api-tenant-admin`). Drift between checked-in `agentflow-api/k8s/deployment.yaml` (namespaced RoleBinding only) and prod (cluster-wide). |
+| Hosted-device stuck `status='provisioning'` for tenant that hasn't been used in days | `[hosted-devices] wake_vcluster_not_ready id=… detail=pod_ready_wait_failed:` in agentflow-agents logs | vcluster pod failed readinessProbe within 120s — `kubectl -n af-tenant-<id> describe pod -l app=vcluster,release=user-<id>` to find scheduling/image-pull failure |
 
 ## Related
 
