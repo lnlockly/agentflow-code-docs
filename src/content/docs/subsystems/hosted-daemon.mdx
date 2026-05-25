@@ -90,6 +90,47 @@ Daemon в /cabinet/devices/hosted/:id
   documentary до тех пор пока enforcement не подключён к
   `requireSession`/`devices-ws` (отдельный backlog item)
 
+### Shell whitelist (`AF_SHELL_WHITELIST`)
+
+Hosted-daemon scopes default to `shell_whitelist=[]`. Empty whitelist
+means every `code_run_command` raises `shell_whitelist is empty;
+shell.exec disabled` (`scope.py:51`) → the autonomous loop's session
+terminates with `=== COMPLETION_BLOCKED ===` after the first
+`git fetch` / `pytest` / `npm install`.
+
+`docker/entrypoint.sh` now exports a sensible baseline whenever the env
+var is not set:
+
+```
+ls, cat, head, tail, grep, find, wc, tree, pwd, whoami, env, echo, date, uname, which, file, stat
+git, gh
+node, npm, yarn, pnpm, npx, tsc
+python, python3, pip, pip3, uv, pytest, ruff, black, mypy
+docker, kubectl
+curl, wget, jq
+mkdir, rmdir, rm, cp, mv, touch, chmod, ln
+tar, gzip, gunzip, unzip, zip
+bash, sh, awk, sed
+make, cmake, go, cargo, rustc
+```
+
+Parsing rules (see `config.py:parse_shell_whitelist_env` +
+`tests/test_shell_whitelist_env.py`):
+
+- comma-, newline-, and whitespace-separated all work, in any mix
+- blank lines and `# comments` ignored
+- duplicates collapse, first occurrence wins (stable order across boots)
+- env entries come first; an existing `~/.agentflow/computer-scope.toml`
+  `shell_whitelist` extends the env baseline (env-only entries first,
+  file-only entries appended)
+- per-task scope on the WS `task_dispatch` frame still wins last —
+  owner narrows or widens per dispatch via `POST /me/devices/:id/scope`
+
+Argument-level guard for recursive `rm` lives in
+`scope.py:check_shell` — every shape (`-r`, `-R`, `-rf`, `-fr`, `-rfv`,
+`--recursive`) raises `ScopeDenied("rm with recursive flag is denied")`
+even when `rm` itself is whitelisted.
+
 **Pod env** (только при `kind=daemon`):
 - `AF_DEVICE_ID` — UUID из user_devices
 - `AF_HOSTED_DEVICE_ID` — UUID из hosted_devices (для /reenroll URL)
@@ -100,6 +141,11 @@ Daemon в /cabinet/devices/hosted/:id
 - `AF_API_KEY` — `af_live_<hex>`, scope=`["device:ws","device:reenroll"]`,
   для devices-ws.ts `x-api-key` header
 - `AF_API_URL` — `https://agentflow.website`
+- `AF_SHELL_WHITELIST` — comma/newline/whitespace-separated programs
+  the daemon may pass to `code_run_command`. Default baked into
+  `docker/entrypoint.sh` (see "Shell whitelist" above). Override per-pod
+  by setting this env in the pod manifest renderer
+  (`me-hosted-devices.ts:renderDaemonManifest`).
 
 **Routes:**
 - `POST /me/hosted-devices` (requireSession) — создаёт kind=daemon
