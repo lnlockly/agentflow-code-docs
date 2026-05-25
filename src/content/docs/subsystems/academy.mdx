@@ -98,6 +98,48 @@ GET  /me/courses/:slug/progress    (cookie-auth, returns completed_at[])
 - Frontend routes: `/academy`, `/academy/:slug`, `/academy/:slug/lesson/:id`
 - Iter2 column: `courses.module_slug TEXT NOT NULL DEFAULT 'misc'` — добавлена через `bootstrap-schema.ts` (ADD COLUMN IF NOT EXISTS), сидер выставляет реальный slug при upsert.
 
+## Video lessons (iter3, 2026-05-25)
+
+Уроки типа `video` рендерятся плеером `<video>` в `AcademyLessonPlayerPage.tsx`
+(`if (lesson.type === 'video')`). Источник — `contentJson.video_url`.
+
+### Где хранится файл
+
+`agentflow-landing/public/academy/lesson-videos/*.mp4` — статические assets,
+отдаются landing nginx как `https://agentflow.website/academy/lesson-videos/<file>.mp4`.
+Никакой backend-handler, никакого upload-flow.
+
+### Формат
+
+| Поле | Значение |
+|---|---|
+| Контейнер | MP4 (H.264 video + AAC silent audio) |
+| Размер | 1280×720, 30fps |
+| Длительность | 60-90 секунд |
+| Bitrate | ~50-80 KB/s (~500 KB на 75 секунд) |
+| Audio | Silent AAC track — иначе Telegram считает файл за GIF |
+
+### Как добавить интро-видео в модуль
+
+1. Сгенерируй mp4 по шаблону (см. `/tmp/academy-build/make_video.py` в истории
+   PR `agentflow-agents#828` — Python + PIL + ffmpeg, концат N screenshot-кадров
+   с подписями + title slide + outro slide).
+2. Скопируй файл в `agentflow-landing/public/academy/lesson-videos/<name>.mp4`.
+3. В `seed-academy.ts` вызови `introVideoLesson({ fileName, title, ... })`
+   как первый элемент массива `lessons:` нужного модуля. Хелпер ставит
+   `order: -1`, поэтому видео-урок встанет перед уже существующими лекциями.
+4. PR landing + PR agents → деплой → seeder на старте UPSERT-ит новый урок.
+
+Iter3-видео уже подключены:
+
+| Курс | Модуль | Файл |
+|---|---|---|
+| `start-ai-agent` | `what-is-agent` | `lesson-intro-what-is-agent.mp4` |
+| `marketplace-browse-hire` | `marketplace-hire-flow` | `lesson-intro-marketplace-browse.mp4` |
+| `device-and-integrations-quickstart` | `device-and-integrations-flow` | `lesson-intro-device-setup.mp4` |
+| `platform-navigation-map` | `platform-navigation-map-mod` | `lesson-intro-platform-tour.mp4` |
+| `shorts-from-images` | `shorts-flow` | `lesson-intro-shorts-from-images.mp4` |
+
 ## Как добавить новый курс
 
 1. Открой `agentflow-agents/src/db/seed-academy.ts`.
