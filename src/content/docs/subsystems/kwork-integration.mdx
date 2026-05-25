@@ -1,0 +1,96 @@
+---
+title: "Kwork Integration — daemon → POST /me/integrations/kwork → fork preset"
+description: "Daemon-fed Kwork cookies seal into project_secrets and fork the kwork-account-replier preset as a per-account project owned by the caller."
+---
+
+# Kwork Integration (`POST /me/integrations/kwork`)
+
+## TL;DR
+
+Desktop daemon scrapes Kwork cookies from the operator's logged-in
+browser and POSTs them to AgentFlow. The endpoint validates the cookie
+shape, seals the payload into `project_secrets.KWORK_SESSION_JSON`,
+forks the `kwork-account-replier` preset as a fresh project owned by
+the caller, and provisions an agent on the user's default team. Same
+cookies posted twice return the original project with the secret
+refreshed in place.
+
+This file documents the daemon-fed surface only. The paste-JSON UX
+under `/me/integrations/kwork/connect` is described in
+`me-integrations-kwork.ts` header and is kept on a separate router so a
+regression in one cannot break the other.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-integrations.ts:1` | Module header + spec/RAG cross-refs |
+| `agentflow-agents/src/routes/me-integrations.ts:38` | `PRESET_SLUG`, `SECRET_KEY`, `KWORK_COOKIE_NAME_RE` constants |
+| `agentflow-agents/src/routes/me-integrations.ts:46` | `cookieSchema` + `integrationBodySchema` (zod input) |
+| `agentflow-agents/src/routes/me-integrations.ts:67` | `hashCookies` — deterministic sha256-first-16-hex over sorted cookies |
+| `agentflow-agents/src/routes/me-integrations.ts:135` | `dispatchKworkIntegration` — pure handler with injected deps |
+| `agentflow-agents/src/routes/me-integrations.ts:160` | Idempotent lookup against `user_integrations` |
+| `agentflow-agents/src/routes/me-integrations.ts:218` | Fresh project insert + slug allocator |
+| `agentflow-agents/src/routes/me-integrations.ts:266` | `provisionAgent` call for `kwork-account-replier` |
+| `agentflow-agents/src/routes/me-integrations.ts:298` | Hono wrapper at `POST /me/integrations/kwork` |
+| `agentflow-agents/src/services/bootstrap-schema.ts:372` | `CREATE TABLE IF NOT EXISTS user_integrations` |
+| `agentflow-agents/src/services/seal.ts:67` | `sealString` — AES-256-GCM envelope used for the cookie payload |
+| `agentflow-agents/src/services/agent-provision.ts:226` | `provisionAgent` — preset → live agent row |
+| `agentflow-agents/presets/kwork-account-replier.json:1` | Preset character + required secrets list |
+| `agentflow-agents/tests/integrations-kwork.test.ts:1` | Unit tests (happy path, idempotent, missing cookie, preset gone) |
+
+## Data flow
+
+```
+agentflow-desktop daemon
+   │  scrapes cookies via Playwright storage_state()
+   │  POST /me/integrations/kwork
+   │  body: { cookies: [{name,value,domain,path,...}], project_name? }
+   ▼
+me-integrations.ts: dispatchKworkIntegration(ownerUserId, body)
+   ├── zod parse                              → 400 no_cookies on shape miss
+   ├── any cookie name matches kwork regex?   → 400 no_kwork_session_cookie
+   ├── getPreset('kwork-account-replier')     → 409 preset_missing if gone
+   ├── hashCookies(sorted JSON)               → 16-hex digest
+   │
+   ├── SELECT user_integrations WHERE hash = …
+   │     │  HIT  → UPDATE project_secrets value_encrypted, return 200 created=false
+   │     │  MISS → fall through
+   │
+   ├── INSERT projects (kind='integration_kwork', status='idle')
+   ├── INSERT project_secrets (KWORK_SESSION_JSON, sealed payload)
+   ├── INSERT project_secrets (KWORK_TEAM_ID) IF user has default team
+   ├── provisionAgent({preset character, slugBase='kwork-account-replier'})
+   ├── INSERT team_members (teamId, agentId) IF team known
+   ├── INSERT user_integrations (user_id, 'kwork', project_id, cookie_hash)
+   ▼
+201 { ok, project_id, project_slug, agent_id, secret_key, created:true }
+```
+
+## DB / Env / API
+
+- **Tables:**
+  - `user_integrations` — idempotency anchor `(user_id, kind, cookie_hash)` UNIQUE.
+  - `projects` — fresh row `kind='integration_kwork'`.
+  - `project_secrets` — sealed `KWORK_SESSION_JSON` (load-bearing) + `KWORK_TEAM_ID` (optional).
+  - `agents` + `team_members` — populated by `provisionAgent`; best-effort.
+- **Env:** `AGENTS_MASTER_KEY` (32-byte base64) — fail-loud if absent; required by `sealString`.
+- **Routes:**
+  - `POST /me/integrations/kwork` (this page, daemon-fed)
+  - `POST /me/integrations/kwork/connect` (paste-JSON UX, separate router)
+- **Preset slug:** `kwork-account-replier` (must be `status='active'` in `agent_presets`).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Daemon POST returns 400 on every cookie batch | `no_kwork_session_cookie` | `agentflow-agents/src/routes/me-integrations.ts:147` — extend `KWORK_COOKIE_NAME_RE` if Kwork rotates names |
+| 409 on first call to a freshly seeded cluster | `preset_missing` | Reseed `kwork-account-replier` via `scripts/re-instantiate-presets-from-json.ts` |
+| Same cookies create N projects | (no log — see `user_integrations` row count per user) | Bootstrap migration didn't run; check `CREATE TABLE IF NOT EXISTS user_integrations` in `services/bootstrap-schema.ts:372` |
+| 500 fork_failed with `slug_collision` | `[integrations/kwork] … fork_failed` | Slug entropy is 5 random bytes → 5 retries; if hit, the alphabet at `makeProjectSlug` needs more entropy |
+| 201 but `agent_id: null` in response | `[integrations/kwork] provision_failed user=…` | Inspect Eliza runtime logs in the user's vcluster — provisionAgent failed but secret + project landed; retry by re-POSTing same cookies |
+
+## Related
+
+- [Hosted Daemon](/subsystems/hosted-daemon) — daemon that POSTs here.
+- [Multi-Agent Project Chat](/subsystems/multi-agent-project-chat) — how the forked project surfaces in cabinet.
