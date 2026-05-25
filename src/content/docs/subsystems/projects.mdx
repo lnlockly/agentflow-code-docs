@@ -45,11 +45,12 @@ description: "Brief → GitHub template search → hosted pod git clone → аг
 | `agentflow-agents/src/services/github-template-search.ts:253` | `searchTemplatesForBrief(brief)` → топ-5 кандидатов с кэшем 1ч |
 | `agentflow-agents/src/services/github-template-search.ts:286` | `pickBestTemplateForBrief(brief)` → топ-1 или `FALLBACK_TEMPLATE` (vercel/next.js with-tailwindcss) |
 | `agentflow-agents/src/services/github-template-search.ts:55` | `FALLBACK_TEMPLATE` — используется когда GitHub вернул 0 кандидатов |
-| `agentflow-agents/src/services/bootstrap-schema.ts:522` | ALTER TABLE projects ADD COLUMN template_url / template_repo_full / template_picked_at (Phase A2) |
-| `agentflow-agents/src/routes/projects.ts:762` | `POST /me/projects` — entry point; в новом flow вызывает `pickBestTemplateForBrief` вместо LLM-классификатора kind |
-| `agentflow-agents/src/routes/projects.ts:2725` | `POST /me/projects/:id/approve` — триггерит provision daemon + clone |
-| `agentflow-agents/src/services/projects-pipeline.ts:631` | `approveProject(opts)` — server-side orchestration approve-шага |
-| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/tools/project_setup.py` | MCP-tool `project_setup` (создаётся в Phase A3): `git clone <template_url>` + `npm install` + `npm run dev` на :3000 |
+| `agentflow-agents/src/services/bootstrap-schema.ts:523` | ALTER TABLE projects ADD COLUMN template_url / template_repo_full / template_picked_at (Phase A2) |
+| `agentflow-agents/src/routes/projects.ts:776` | `POST /me/projects` — entry point; вызывает `pickBestTemplateForBrief` синхронно, пишет template_* колонки, возвращает 201 с `kind_classification:'nextjs'` |
+| `agentflow-agents/src/routes/projects.ts:2709` | `POST /me/projects/:id/approve` — template-flow ветка вызывает `triggerProjectClone(projectId)`, отдаёт 202; legacy-флоу падает в `approveProject` |
+| `agentflow-agents/src/services/project-clone.ts:162` | `triggerProjectClone(projectId)` — pick daemon device + dispatch `project_clone_and_setup` task через `dispatchOrQueueDeviceTask`; flip status `→ provisioning` |
+| `agentflow-agents/src/services/projects-pipeline.ts:631` | `approveProject(opts)` — legacy approve-шаг (используется только для строк без `template_repo_full`) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/tools/project_setup.py` | MCP-tool `project_clone_and_setup` (PR #82): `git clone <template_url>` + `npm install` + `npm run dev` на :3000 |
 | `PROJECT_ARCHITECTURE.html` (workspace root) | Source of truth для архитектуры (12 lifecycle steps + 4 роли + 8 open questions, approved 2026-05-25) |
 
 ## Data flow
@@ -141,6 +142,10 @@ description: "Brief → GitHub template search → hosted pod git clone → аг
 | `git clone` падает на private репо | `[project-setup] git_clone_failed exitCode=128` | Public templates only (open question #8). Будущий fix: юзерский GitHub OAuth → `GITHUB_USER_TOKEN` в pod env. |
 | Approve вернул 409 `still_preparing` | `approveProject: project still in preparing` | Background prep ещё не завершился. См. `projects-create-flow.mdx` (instant-create). |
 | `template_url=NULL` на старом проекте | row создан до 2026-05-25 | Legacy row — старый flow по kind classifier. Новых таких не появится; легаси обрабатывается отдельной веткой в `projects-pipeline.ts:631`. |
+| Approve вернул 409 `no_hosted_daemon` | `triggerProjectClone: no_hosted_daemon` | Юзер не создал hosted daemon в `/account/devices`. Создай (`kind=daemon`) и повтори approve. |
+| Approve вернул 409 `device_link_missing` | `triggerProjectClone: device_link_missing` | Daemon ещё не enrolled (pod не подключился). Подожди ~60 c после provision и повтори. |
+| Approve вернул 502 `dispatch_failed` | `triggerProjectClone: dispatch_failed` | WS bridge упал между approve и dispatch. Retry approve. |
+| Approve вернул 502 `template_pick_failed` | `[projects.create] template_pick_failed` | GitHub Search API down или rate-limited без `GITHUB_TOKEN`. Set env, retry. |
 
 ## Open questions (default answers, see PROJECT_ARCHITECTURE.html)
 
