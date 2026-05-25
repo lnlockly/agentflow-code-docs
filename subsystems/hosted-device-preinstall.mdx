@@ -1,0 +1,114 @@
+---
+title: "Hosted Device Preinstall Wizard"
+description: "Per-pod opt-in tool installer threaded from cabinet checkbox → POST body → pod env → entrypoint shell block → progress badges."
+---
+
+# Hosted Device Preinstall Wizard
+
+## TL;DR
+
+Юзер на странице создания облачного устройства выбирает чекбоксами какие
+тулзы предустановить (OpenCode, Codex, Node.js, Python data-science, ffmpeg).
+Список идёт `preinstall: []` в POST body → сохраняется в
+`hosted_devices.preinstall_json` → передаётся пода как env `AF_PREINSTALL` →
+entrypoint при старте крутит по каждой и POST'ит прогресс на
+`/internal/hosted-devices/:id/preinstall-event`. Кабинет рисует per-tool
+бейджи в реальном времени (refetch каждые 6с).
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-hosted-devices.ts:158` | `PREINSTALL_TOOLS` catalog + `createSchema.preinstall` |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:660` | INSERT `preinstall_json` + seed `hosted_device_preinstall_logs` rows |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:336` | Manifest renderer injects `AF_PREINSTALL` + `AF_INTERNAL_SECRET` env |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:880` | GET detail reads `hosted_device_preinstall_logs` → `preinstall_status` |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:1300` | `POST /internal/hosted-devices/:id/preinstall-event` |
+| `agentflow-agents/src/services/bootstrap-schema.ts:370` | DDL: `preinstall_json` column + `hosted_device_preinstall_logs` table |
+| `agentflow-computer-mcp/docker/entrypoint.sh:200` | `run_preinstall_step` + `preinstall_event` shell helpers |
+| `agentflow-landing/src/pages/CabinetHostedDeviceNew.tsx:34` | `PREINSTALL_OPTIONS` + checkbox UI |
+| `agentflow-landing/src/pages/CabinetHostedDeviceDetail.tsx:780` | `PreinstallPanel` component |
+
+## Data flow
+
+```
+User checks ☑ OpenCode + ☑ Node.js in /cabinet/devices/hosted/new
+  │
+  ▼
+POST /me/hosted-devices  {name, size, kind:'daemon', preinstall:['opencode','nodejs']}
+  │
+  ├─► INSERT hosted_devices.preinstall_json = ["opencode","nodejs"]
+  ├─► INSERT hosted_device_preinstall_logs (one 'pending' row per tool)
+  └─► Render StatefulSet manifest with env AF_PREINSTALL="opencode,nodejs"
+        │
+        ▼
+      kubectl apply → pod scheduled in af-tenant-<userId>
+        │
+        ▼
+      entrypoint.sh boots Xvfb → write_hosted_auth → preinstall loop:
+        for tool in opencode, nodejs:
+          preinstall_event(tool, 'installing')   ─► POST /internal/.../preinstall-event
+          <install commands run>
+          preinstall_event(tool, 'installed' | 'failed', detail)
+        │
+        ▼
+      exec agentflow-desktop run
+        │
+        ▼
+Cabinet GET /me/hosted-devices/:id (refetch every 6s)
+  └─► reads hosted_device_preinstall_logs → preinstall_status: {opencode:{status:'installed'},...}
+       │
+       ▼
+     PreinstallPanel renders coloured dot per tool
+```
+
+## DB / Env / API
+
+- Tables:
+  - `hosted_devices.preinstall_json` (JSONB, default `'[]'`)
+  - `hosted_device_preinstall_logs` (PK: `(hosted_device_id, tool)`)
+- Env (pod side):
+  - `AF_PREINSTALL` — comma-separated tool slugs, e.g. `"opencode,nodejs"`
+  - `AF_INTERNAL_SECRET` — same value as agents' `INTERNAL_API_SECRET`,
+    used as `x-agentflow-secret` header on the reporting POST
+  - `AF_HOSTED_DEVICE_ID` — UUID for the `:id` path param
+- Env (server side):
+  - `INTERNAL_API_SECRET` — must be set or the report endpoint returns 500
+- Routes:
+  - `POST /me/hosted-devices` — accepts `preinstall: PreinstallTool[]`
+  - `GET /me/hosted-devices/:id` — returns `preinstall` + `preinstall_status`
+  - `POST /internal/hosted-devices/:id/preinstall-event` — pod → server
+    progress reports (`x-agentflow-secret` auth)
+- Tool slugs (canonical list, must match across all three repos):
+  `opencode`, `codex`, `nodejs`, `python_ds`, `ffmpeg`
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Tool stays at 'pending' forever in cabinet | `[preinstall] <tool> starting` missing from pod logs | Pod env `AF_PREINSTALL` empty → check `me-hosted-devices.ts:660` insert; or entrypoint trapped before loop |
+| Tool reports 'failed' with empty detail | `[preinstall] <tool> failed (rc=...)` in pod stderr | Read pod `kubectl logs`; `tail -c 1800` of install log may have been blank — install command itself was the problem |
+| Progress never reaches server | `curl: (...)` warnings in pod stderr | `AF_INTERNAL_SECRET` mismatch (server `INTERNAL_API_SECRET` rotated, pod env stale) — restart pod to pick up new secret |
+| 500 `internal_secret_not_configured` on /internal/.../preinstall-event | server logs `internal_secret_not_configured` | Set `INTERNAL_API_SECRET` in agents deployment |
+| Unknown slug accepted by server, no-op in pod | server returns 200, pod logs `[preinstall] unknown tool '<x>' — skipping` | New slug added to `PREINSTALL_TOOLS` in backend but not to `case` block in `entrypoint.sh` |
+| Preinstall picked for `kind=plain` device, nothing happens | none — silent drop server-side | Expected: backend ignores `preinstall` when kind≠daemon (`me-hosted-devices.ts:586`) |
+
+## Approximate install times (per tool in a small/medium pod)
+
+| Tool | Cold install | Warm restart (re-run is no-op) |
+|---|---|---|
+| `opencode` | ~45-60 s | <1 s |
+| `codex` | ~30-45 s | <1 s |
+| `nodejs` (apt) | ~90-120 s | ~5 s |
+| `python_ds` (jupyter+pandas+numpy) | ~150-200 s | ~3 s |
+| `ffmpeg` (apt) | ~60-90 s | ~3 s |
+
+Total time when all 5 picked: ~5-6 min on a cold pod. Daemon boots in parallel
+with the install loop only in spirit — the loop is sequential before
+`exec agentflow-desktop run`, so the WS bridge comes up after the last
+install completes. Owner can use the device meanwhile via `/exec` REST.
+
+## Related
+
+- [hosted-device.mdx](/subsystems/hosted-device.mdx)
+- [computer-mcp.mdx](/subsystems/computer-mcp.mdx)
