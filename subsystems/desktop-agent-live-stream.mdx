@@ -1,0 +1,85 @@
+---
+title: "Desktop daemon: live screen stream + cabinet toggle"
+description: "How the MJPEG live screen feed is gated end-to-end — explicit cabinet pause/resume stops mss capture on the daemon, not just the UI img."
+---
+
+# Desktop daemon: live screen stream + cabinet toggle
+
+## TL;DR
+
+Before 2026-05-25 the cabinet «скрыть экран» button only unmounted the
+MJPEG `<img>`. The daemon's `CaptureLoop` kept running at ~20 fps —
+mss capture, Pillow resize, JPEG encode, blake2b dedup all ran for a
+screen nobody was watching. The fix wires the toggle to a new explicit
+endpoint `POST /me/devices/:id/stream` and parks the daemon's capture
+loop on a wake event when no consumer (cabinet subscriber OR local
+viewer) is around.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/state.py:38` | `DriverState.stream_subscribed` event (WS subscriber flag) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/state.py:46` | `DriverState.local_viewer_count` — ref-counted /stream.mjpg consumers |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/state.py:53` | `DriverState.capture_wake` — pulsed when a consumer arrives |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/streamer.py:172` | `CaptureLoop._wait_for_consumer` — blocks on `capture_wake` while gate is closed |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/viewer.py:233` | `_serve_mjpeg` — acquire/release local viewer count around long-poll |
+| `agentflow-computer-mcp/tests/test_streamer_toggle.py:1` | Idle/active gating tests + wake latency tests |
+| `agentflow-agents/src/routes/me-devices.ts:824` | `POST /me/devices/:id/stream` route + `decideStreamToggle` helper |
+| `agentflow-agents/tests/me-devices-stream-toggle.test.ts:1` | Verdict-matrix tests for the new endpoint |
+| `agentflow-landing/src/lib/devicesApi.ts:131` | `devicesApi.setStream(deviceId, enabled)` |
+| `agentflow-landing/src/pages/CabinetDeviceLive.tsx:560` | `syncStreamState` + lastSyncedRef guard |
+
+## Data flow
+
+```
+Cabinet «скрыть экран»          POST /me/devices/:id/stream
+   │                              {enabled: false}
+   ▼                                │
+showFeed=false → setStream(false)   ▼
+                                  conn.send({type: unsubscribe_stream})
+                                    │
+                                    ▼
+                              daemon clears stream_subscribed
+                                    │
+                                    ▼
+                              CaptureLoop waits on capture_wake — zero mss
+
+Cabinet «показать экран»        POST /me/devices/:id/stream
+   │                              {enabled: true}
+   ▼                                │
+showFeed=true → setStream(true)     ▼
+                                  conn.send({type: subscribe_stream})
+                                    │
+                                    ▼
+                              daemon sets stream_subscribed + capture_wake.set()
+                                    │
+                                    ▼
+                              loop resumes within ~50ms → first frame to MJPEG
+```
+
+## DB / Env / API
+
+- Tables: none.
+- Env: none new.
+- Routes:
+  - `POST /me/devices/:id/stream { enabled: boolean }` — explicit toggle, returns 202 `{ok, accepted, enabled}`.
+  - `GET /me/devices/:id/live_stream` — unchanged; still bumps the legacy `acquireStream` counter.
+- WS: `S→C`: `subscribe_stream`, `unsubscribe_stream`. `C→S`: `stream_frame`.
+- LocalStorage: `dlive:showFeed:<deviceId>` — `'0'` off, `'1'` on, missing = default ON.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Cabinet shows frozen frame after hide click | (no log — `<img>` unmounted) | Expected. Re-show pulls a fresh frame. |
+| Daemon never sees set_stream | `ws stream subscribed=` absent in daemon log after POST | Check `getConnection(id)` in `device-registry.ts` — null → 409 device_offline. |
+| Capture loop keeps running after unsubscribe | continuous `[stream] capture err` OR `local_viewer_count > 0` | Stale local /stream.mjpg client on localhost:8765 holding the counter open. |
+| First frame after show takes 1+ s | (no log) | Daemon idle; the 1 s ceiling on `_wait_for_consumer` caught it. `on_stream_subscribe` must call `capture_wake.set()` (see `desktop_cli.py:91`). |
+| Toggle flips locally but daemon never gets the frame | `device_offline` from POST /stream | Daemon offline at click time. Daemon picks up the state via `resyncStreamSubscription` on reconnect. |
+| Cabinet floods POST /stream every render | `[device] POST /stream` flood | `lastSyncedRef` guard missing in `CabinetDeviceLive.tsx`. |
+
+## Related
+
+- [Computer MCP](/subsystems/computer-mcp)
+- [Desktop daemon: fast task_cancel](/subsystems/desktop-fast-cancel)
