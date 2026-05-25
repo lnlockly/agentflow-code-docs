@@ -1,0 +1,115 @@
+---
+title: "Install Wizard (unified local + hosted)"
+description: "Single declarative step list driving both the Tk local installer and the React hosted provisioner. One contract, two surfaces."
+---
+
+# Install Wizard (unified)
+
+## TL;DR
+
+`installer/steps.json` in `agentflow-computer-mcp` is the canonical 12-step
+manifest the user walks through whenever an AgentFlow device gets created —
+local (Mac/Win/Linux via the Tk wizard) or hosted (vcluster pod via the
+cabinet's React wizard). Both surfaces render the same row vocabulary and
+emit progress with the same `STEP <name> <status>` shape so a single cabinet
+view can stream either flow.
+
+Steps with `status: "real"` execute; steps with `status: "planned"` render as
+"скоро" rows linked to the GH issue that unblocks them. This keeps the user
+vision honest (you see the full ambition) without faking work that isn't
+implemented yet.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-computer-mcp/installer/steps.json:1` | The 12-step manifest. Single source of truth. |
+| `agentflow-computer-mcp/installer/steps.py:1` | `Step` dataclass + `StepRunner` + JSON loader. Used by `setup_gui.py` and importable from tests. |
+| `agentflow-computer-mcp/installer/setup_gui.py:516` | Tk `SetupWindow` consumes the runner for its progress UI. |
+| `agentflow-computer-mcp/docker/entrypoint.sh:116` | Hosted entrypoint emits `STEP <name> <status>` to stdout so the cabinet can attribute pod-log lines to row updates. |
+| `agentflow-landing/public/install-wizard-steps.json:1` | Mirror of the canonical manifest. CI diff-check enforces parity. |
+| `agentflow-landing/src/components/InstallWizard.tsx:1` | React wizard, two modes: `local` (token + download .exe + poll for device) and `hosted` (form + provisioner + log stream). |
+| `agentflow-landing/src/components/InstallWizardStepRow.tsx:1` | Single row UI: icon · label · status pill. |
+| `agentflow-landing/src/lib/installWizardSteps.ts:1` | Typed loader. |
+| `agentflow-landing/src/pages/CabinetHostedDeviceNew.tsx:154` | Now thin wrapper around `<InstallWizard mode='hosted' />`. |
+| `agentflow-agents/src/routes/me-devices.ts:7` | `POST /me/devices` — mints `enrollment_token` from `af_live_*`. Unchanged by this work. |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:475` | Hosted provisioner; injects daemon env vars. Unchanged. |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:850` | `POST /me/hosted-devices/:id/reenroll` — rotation. Unchanged. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/opencode_installer.py:163` | `install_opencode` MCP tool the wizard calls in step `install_opencode_cli`. |
+
+## Data flow
+
+```
+                  ┌────────────────────────────┐
+                  │  installer/steps.json      │  ← single source of truth
+                  └────────────┬───────────────┘
+            ┌──────────────────┴──────────────────┐
+            ▼                                     ▼
+  Tk runner (steps.py)                  React runner (installWizard.tsx)
+  imported by setup_gui.py              loads /install-wizard-steps.json
+            │                                     │
+   ┌────────┴────────┐                    ┌──────┴────────┐
+   ▼                 ▼                    ▼               ▼
+ local PC      docker/entrypoint.sh    hosted pod      local mode
+ (exe runs)    (emits STEP lines)      (logs streamed) (token + download)
+            │                                     │
+            └─────────────┬───────────────────────┘
+                          ▼
+              cabinet device detail page
+              shows live row state for both
+```
+
+## Step list (manifest v1)
+
+| # | Name | Label (RU) | Surfaces | Required | Status |
+|---|---|---|---|---|---|
+| 0 | `prepare_workspace` | Готовим папку | win · mac · linux · hosted | yes | real |
+| 1 | `verify_token` | Проверяем токен | win · mac · linux · hosted | yes | real |
+| 2 | `request_permissions` | Спрашиваем разрешения системы | win · mac | no | real (Win Defender exclusion implemented; Mac TCC prompts open Sys Settings via `open x-apple.systempreferences:`) |
+| 3 | `install_daemon_binary` | Ставим демона | win · mac · linux | yes | real |
+| 4 | `write_auth_json` | Сохраняем доступ | win · mac · linux · hosted | yes | real |
+| 5 | `autostart_register` | Включаем автозапуск | win · mac · linux | no | real |
+| 6 | `install_opencode_cli` | Ставим OpenCode | win · mac · linux · hosted | no | real (calls daemon MCP `computer.opencode.install` + `patch_config`; see [opencode-integration](/subsystems/opencode-integration)) |
+| 7 | `install_pencil_mcp` | Ставим Pencil MCP (скоро) | win · mac · linux · hosted | no | planned · [issue](https://github.com/lnlockly/agentflow-agents/issues/TBD-pencil) |
+| 8 | `sync_skill_packs` | Скачиваем навыки (скоро) | win · mac · linux · hosted | no | planned · [issue](https://github.com/lnlockly/agentflow-agents/issues/TBD-skills) |
+| 9 | `register_mcp_servers` | Подключаем MCP-серверы (скоро) | win · mac · linux · hosted | no | planned · [issue](https://github.com/lnlockly/agentflow-agents/issues/TBD-mcp) |
+| 10 | `launch_daemon` | Запускаем демона | win · mac · linux · hosted | yes | real |
+| 11 | `verify_install` | Проверяем что всё работает | win · mac · linux · hosted | yes | real (dispatches hello-world task, waits ≤60s for artifact) |
+
+`hosted` surface skips OS-bound steps (`request_permissions`, `install_daemon_binary`, `autostart_register`) because the image is pre-baked and kube manages lifecycle.
+
+## DB / Env / API
+
+- **Tables:** none new. `user_devices` + `hosted_devices` rows are created by the existing `POST /me/devices` and `POST /me/hosted-devices` endpoints; the wizard surfaces their state, doesn't add columns.
+- **Env (local):** `AF_API_BASE` (default `https://agentflow.website/_agents`), `AF_WS_URL`. Same as legacy installer.
+- **Env (hosted):** `AF_DEVICE_ID`, `AF_HOSTED_DEVICE_ID`, `AF_ENROLLMENT_TOKEN`, `AF_HOSTED_ROTATION_SECRET`, `AF_API_KEY`. Injected by `renderDaemonManifest` (see [hosted-daemon](/subsystems/hosted-daemon)).
+- **Routes consumed:**
+  - `POST /me/api-keys/install-token` — local mode mints the `af_install_*` token shown in the cabinet.
+  - `POST /me/devices` — local: exchanges install token → enrollment_token.
+  - `POST /me/hosted-devices` — hosted: provisions pod.
+  - `POST /me/hosted-devices/:id/reenroll` — hosted entrypoint, rotation.
+  - `POST /me/devices/:id/dispatch_task` — `verify_install` step.
+  - `GET /me/devices/:id/tasks/stream` — SSE for `verify_install` completion.
+  - `GET /me/hosted-devices/:id/events` (or `/logs` fallback) — pod log stream that emits `STEP …` lines.
+- **MCP tools called during install:** `computer.opencode.install`, `computer.opencode.patch_config` (step 6).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Wizard rows out of order vs Tk | `steps.json` schema drift between repos | CI diff-check `agentflow-computer-mcp/installer/steps.json` ↔ `agentflow-landing/public/install-wizard-steps.json` |
+| `STEP verify_install error` | `verify_install: dispatch_task timeout after 60s` | Daemon WS didn't connect — check `auth.json` written, check daemon process running, fall back to manual cabinet check |
+| `install_opencode_cli` step never completes | `[opencode_install] github api rate limit` | Daemon's GitHub API call rate-limited; retry after 1 min or set `OPENCODE_GITHUB_TOKEN` |
+| Tk wizard skips a step silently | `steps.py: skipping <name> (status=planned)` | Expected — planned steps are display-only. Check `steps.json` `status` field. |
+| Hosted log stream stuck on `running` for one row | Pod printed `STEP <name> running` but never printed `ok`/`error` | Step crashed without trap; add `trap "echo STEP $current error trap" ERR` in `entrypoint.sh` |
+| `request_permissions` no-op on Mac | TCC prompt didn't appear | Mac TCC needs `objc` bindings — currently the step just opens Sys Settings, expects user to grant manually |
+| `gh release` download fails on locked-down corporate net | `installer/setup_gui.py: HTTP 403` for `/releases/latest` | Set `AF_INSTALLER_RELEASE_URL` to an internal mirror |
+| Cabinet wizard hangs after submit (hosted) | Pod created but no `STEP` lines appear | `entrypoint.sh` didn't reach the `STEP` emit block — `kubectl -n af-tenant-<userId> logs <pod>` |
+
+## Related
+
+- [Windows installer (legacy)](/subsystems/desktop-installer-wizard) — superseded by this page; kept for back-link continuity.
+- [Hosted daemon](/subsystems/hosted-daemon) — server-side counterpart, env shape, rotation.
+- [OpenCode integration](/subsystems/opencode-integration) — what step 6 actually does.
+- [Device task lifecycle](/subsystems/device-task-lifecycle) — what runs after `launch_daemon` succeeds.
+- Spec: `agentflow/docs/specs/2026-05-25-install-wizard.md` · Plan: `agentflow/docs/plans/2026-05-25-install-wizard.md`.
