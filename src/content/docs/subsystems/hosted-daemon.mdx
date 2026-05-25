@@ -111,6 +111,7 @@ Daemon в /cabinet/devices/hosted/:id
 | Daemon селtест вместо handshake | `[entrypoint] AF_API_KEY missing — running selftest only` | AF_DEVICE_ID не пришёл в env, manifest renderer не сработал — проверь backend logs `[hosted-devices] api_key mint failed` |
 | POST /me/hosted-devices 500 + no rows written | `[hosted-devices] provision tx rolled back` | один из INSERTов внутри `sql.begin` упал — три row (user_devices/api_keys/hosted_devices) откатились вместе; ищи root cause по сообщению после префикса |
 | Chromium падает на старте | `Failed to launch the browser process` в логах daemon | `--no-sandbox` не передан или Xvfb не поднялся — `kubectl logs <pod> -c daemon \| head -50` |
+| Autonomous goal queued таск, daemon online (heartbeat жив), но `task_dispatch` в логах daemon не появляется и `device_sessions` не растёт | `device_tasks` row `status='queued'` или `'dispatched'` без последующего `[device] queued_tasks_dispatched` и без `ws task_dispatch id=<uuid>` на стороне daemon | Backend в `me-autonomous.ts:plan_today` или `autonomous-worker.ts:wake/fan-out` пропустил вызов `dispatchOrQueueDeviceTask` и просто INSERT-нул queued row. Helper в `routes/me-devices.ts:dispatchOrQueueDeviceTask` обязан вызываться для каждого нового device_task — он смотрит `getConnection(deviceId)` и пушит WS frame для уже подключённого daemon. Голый INSERT работает только если daemon переподключится (heartbeat keep-alive это блокирует). |
 
 ## Related
 

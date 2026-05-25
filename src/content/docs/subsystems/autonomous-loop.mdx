@@ -35,7 +35,10 @@ route passes the validated ISO string straight to the tagged template.
 | Path | Role |
 |---|---|
 | `agentflow-agents/src/services/autonomous-worker.ts:175` | `runWakePass` — daily plan generation + initial dispatch (now budget-gated) |
-| `agentflow-agents/src/services/autonomous-worker.ts:402` | `consumeDeviceTaskOutcome(deviceTaskId, status, summary?)` — stamps `plan_json.tasks[i].outcome`, fans out next task |
+| `agentflow-agents/src/services/autonomous-worker.ts:238` | wake-pass dispatch — calls `dispatchOrQueueDeviceTask` so a live daemon WS receives the `task_dispatch` frame immediately |
+| `agentflow-agents/src/services/autonomous-worker.ts:402` | `consumeDeviceTaskOutcome(deviceTaskId, status, summary?)` — stamps `plan_json.tasks[i].outcome`, fans out next task via `dispatchOrQueueDeviceTask` |
+| `agentflow-agents/src/routes/me-devices.ts:570` | `dispatchOrQueueDeviceTask(input)` — shared helper: live WS → `task_dispatch` frame + session row; offline → queued row |
+| `agentflow-agents/src/routes/me-autonomous.ts:756` | `POST /me/autonomous/goals/:id/plan_today` — dispatches first task through the shared helper |
 | `agentflow-agents/src/services/autonomous-budget.ts:1` | `assertWithinDailyCap(userId, goalId?)` + env / per-goal cap |
 | `agentflow-agents/src/services/devices-ws.ts:475` | `task_complete` → `finalizeDeviceTask('done')` |
 | `agentflow-agents/src/services/devices-ws.ts:497` | `task_error` → `finalizeDeviceTask('failed')` |
