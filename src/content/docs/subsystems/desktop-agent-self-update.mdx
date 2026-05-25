@@ -1,0 +1,77 @@
+---
+title: "Desktop daemon self-update"
+description: "Auto-update polling loop plus on-demand «Проверить обновление» button wired through the WS bridge."
+---
+
+# Desktop daemon self-update
+
+## TL;DR
+The frozen `agentflow-desktop.exe` polls `github.com/lnlockly/agentflow-computer-mcp/releases/latest` every 30 minutes (`AF_UPDATE_INTERVAL_MIN`) and self-installs when a newer build appears. Since 2026-05-25 the cabinet `/cabinet/devices/<id>` also exposes a «Проверить обновление» button that triggers the same probe on demand via a `check_update` WS frame and either reports the current version or kicks off the install + restart immediately.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/auto_updater.py:140` | `fetch_latest_release` — un-authenticated `releases/latest` redirect + `SHA256SUMS` asset. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/auto_updater.py:273` | `check_now` — single probe; returns `status: current|available|applied|skipped|error`. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/auto_updater.py:386` | `check_and_apply_once` — on-demand wrapper returning the stable `{ok, applied, restarting, reason}` envelope for the cabinet button. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/auto_updater.py:507` | `start_in_background` — 30-min polling loop with exponential backoff (capped 24h). |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_client.py:200` | `_handle_check_update` — runs the probe on a worker thread + replies with `check_update_result`. |
+| `agentflow-agents/src/services/devices-ws.ts:447` | `check_update_result` route in the WS inbound switch. |
+| `agentflow-agents/src/services/devices-ws.ts:945` | `awaitCheckUpdateResult` + `deliverCheckUpdateResult` — in-memory awaiter registry keyed by correlation id. |
+| `agentflow-agents/src/routes/me-devices.ts:826` | `POST /me/devices/:id/check_update` — Hono route that wires `decideCheckUpdate` to the live WS. |
+| `agentflow-agents/src/routes/me-devices.ts:781` | `decideCheckUpdate` — pure dispatcher (unit-testable) returning the verdict envelope. |
+| `agentflow-landing/src/pages/CabinetDeviceDetail.tsx:298` | «Проверить обновление» button wiring + toast renderer. |
+| `agentflow-landing/src/lib/devicesApi.ts:170` | `devicesApi.checkUpdate` REST client. |
+
+## Data flow
+
+```
+Cabinet button click
+   │ POST /me/devices/:id/check_update
+   ▼
+agentflow-agents (me-devices.ts)
+   │ decideCheckUpdate → randomUUID() → conn.send({type:'check_update', id})
+   │ awaitCheckUpdateResult(id, 25s)
+   ▼
+WS bridge (devices-ws.ts) ─── ws frame ───►  Desktop daemon (ws_client.py)
+                                                  │ _handle_check_update
+                                                  │   → asyncio.to_thread(
+                                                  │       auto_updater.check_and_apply_once)
+                                                  │       → check_now → GitHub
+                                                  │           ├── no newer → status='current'
+                                                  │           └── newer → download + sha256
+                                                  │               ├── Windows → spawn update.bat, sys.exit(0)
+                                                  │               └── Unix → os.replace + os.execv (process re-execs)
+                                                  ▼
+                            ws frame ────────  check_update_result {id, result}
+                            (or socket closes silently on Unix re-exec)
+                            ──────────►  deliverCheckUpdateResult(id, result)
+                                              │ resolves the pending awaiter
+                                              ▼
+                                        Hono returns 200 + envelope
+                                        OR 504 + restarting_inferred:true
+                                              ▼
+                                        Cabinet toast
+```
+
+## DB / Env / API
+- **Tables:** none — request is in-memory only (correlation id map in `devices-ws.ts`).
+- **Env (daemon):** `AF_UPDATE_INTERVAL_MIN` (0 disables polling loop; default 30). On-demand button bypasses this entirely.
+- **Routes:** `POST /me/devices/:id/check_update` → `200 { ok:true, result: CheckUpdateResult }` | `404 not_found` | `409 device_offline` | `502 send_failed` | `504 timeout (restarting_inferred:true)`.
+- **WS frames:** `check_update {id}` (server → client), `check_update_result {id, result}` (client → server).
+- **Reason codes (stable):** `up_to_date`, `applied`, `platform_unsupported`, `major_bump_refused`, `no_sha256`, `download_failed`, `apply_failed`, `probe_crashed`. Cabinet uses these for toast copy.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Probe times out at 25s on Unix even though install succeeded | `auto-update: re-executing` | Expected — `os.execv` drops the WS before ack; cabinet treats 504 + `restarting_inferred:true` as success. |
+| `reason: download_failed` | `auto-update: probe crashed` or `download failed: TimeoutError` | Daemon → GitHub network blocked. Check `~/.agentflow/` reachability; retry. |
+| `reason: no_sha256` | `auto-update: SHA256SUMS unavailable` | Release missing the `SHA256SUMS` asset — upload it to GitHub releases. |
+| `reason: platform_unsupported` | `auto-update: running from source, polling disabled` | Daemon running from `pip install -e .`; update via `git pull` instead. |
+| `reason: major_bump_refused` | `refusing major bump 0.x.x → 1.0.0` | Cross-major upgrades require a human; bump `MAX_MAJOR` in `auto_updater.py`. |
+| Cabinet button greys out forever | `[device] offline … reason=heartbeat_timeout` | Daemon WS dropped; `409 device_offline` returned. Wait for reconnect or restart laptop. |
+
+## Related
+- [Desktop installer wizard](/subsystems/desktop-installer-wizard)
+- [Desktop fast-cancel](/subsystems/desktop-fast-cancel)
+- [Device task lifecycle](/subsystems/device-task-lifecycle)
