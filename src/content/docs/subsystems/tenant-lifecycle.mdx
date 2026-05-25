@@ -1,0 +1,195 @@
+---
+title: "Tenant lifecycle — lazy provisioning + idle hibernation"
+description: "How per-user vclusters scale to zero after 120 min of idle and wake on the next code-exec call. Stop renting compute for tenants nobody is using."
+---
+
+# Tenant lifecycle — lazy provisioning + idle hibernation
+
+## TL;DR
+
+Per-user vclusters used to stay live forever — every signup booked ~250m
+CPU + ~300 MiB RAM on the host scheduler even when the user never came
+back. Now the platform owns four tenant states (`ready` / `dormant` /
+`disabled` / `pending`) and a 15-minute hibernator pinger scales any
+tenant idle for ≥ 120 min down to zero replicas. The next code-exec call
+or chat turn touches `last_tenant_use_at`, which routes through
+`wakeTenant` to scale the StatefulSet back to 1. On a server with 30
+tenants where ~5 are active per day, this frees roughly **9.4 CPU cores
+and 7.5 GiB RAM** during the idle window.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/tenant-lifecycle.ts:1-450` | `touchTenant` / `hibernateTenant` / `wakeTenant` / `touchOrWakeTenant` + dedup maps. |
+| `agentflow-agents/src/services/tenant-lifecycle.ts:104-122` | `findHibernationCandidates` — partial-index-friendly query (last_tenant_use_at < NOW() - interval), oldest first, capped by LIMIT $ {limit}. |
+| `agentflow-agents/src/services/tenant-lifecycle.ts:155-241` | `hibernateTenant` — scales STS to 0 THEN flips status to 'dormant'. Wrong order would let the next wake double-scale. |
+| `agentflow-agents/src/services/tenant-lifecycle.ts:286-393` | `wakeTenant` — three branches: ready (no-op), dormant (scale to 1), disabled/pending/null (nudgeProvision). |
+| `agentflow-agents/src/services/hibernation-kubectl.ts:25-58` | `kubectlScaleStatefulSet` — `kubectl -n af-tenant-<n> scale sts <tenant_id> --replicas=N --timeout=30s`. Treats "not found" + replicas=0 as ok. |
+| `agentflow-agents/src/services/pingers/tenant-hibernator.ts:1-100` | The pinger tick. Feature-flagged via `TENANT_HIBERNATE_ENABLED=1`. |
+| `agentflow-agents/src/services/auto-pinger.ts` (search `isTenantHibernatorEnabled`) | Wires the pinger interval behind the flag — flag-off path skips the setInterval entirely. |
+| `agentflow-agents/src/services/bootstrap-schema.ts` (search `last_tenant_use_at`) | Idempotent migration — adds column, backfills NOW() for every `ready` tenant, creates partial index. |
+| `agentflow-agents/src/services/runtime-router.ts:46-105` | Per-tenant Eliza URL resolver — touches on ready, fires wake on dormant/disabled. Cache TTL 60 s so the post-wake URL refresh lands within one chat turn. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/tenant.ts:34-72` | `loadTenantKubeconfig` — every kubectl path funnels here, fires touchTenant fire-and-forget. |
+| `agentflow-agents/src/services/projects.ts` (search `status === 'disabled' \|\| status === 'dormant'`) | `waitForTenantReady` accepts dormant identically to disabled. |
+
+## Data flow
+
+```
+                       ┌──────────────────────────┐
+                       │   /auth/verify (signup)  │
+                       └────────────┬─────────────┘
+                                    │ ensureTenantForUser (lazy)
+                                    ▼
+                              tenant_status='pending'
+                                    │
+                          vcluster create + seal kubeconfig
+                                    ▼
+                              tenant_status='ready'
+                                    │
+       ┌────────────────────────────┼────────────────────────────────┐
+       │ first code-exec            │ chat turn                      │
+       ▼                            ▼                                ▼
+loadTenantKubeconfig         resolveRuntimeUrl              projectApprove
+  └─ touchTenant() ◄─────────── touchTenant() ─────────────── waitForTenantReady
+                                                                   │
+                                                                   │
+                       ┌───────────── 15 min later ─────────────────┘
+                       ▼  if idle for 120 min
+                tenant-hibernator tick
+                       │
+                       │  findHibernationCandidates(120, 5)
+                       ▼
+                hibernateTenant(user)
+                       │
+                       │  1. kubectl scale sts user-<id> --replicas=0
+                       │  2. UPDATE users SET tenant_status='dormant'
+                       │  3. invalidateRuntimeUrlCache(user)
+                       ▼
+                 tenant_status='dormant'  (≈ 9.4 cores freed)
+                       │
+                       │
+       ┌───────────────┴───────────────┐
+       │ next chat turn / code-exec    │
+       ▼                               ▼
+runtime-router cache miss     loadTenantKubeconfig throws
+       │                       tenant_not_ready:dormant
+       ▼                               ▼
+  wakeTenant()                  projects.waitForTenantReady
+       │                              │
+       │   scale sts --replicas=1     │  flips 'dormant' → 'pending'
+       │   UPDATE status='ready'      │  polls until 'ready'
+       ▼                              ▼
+  tenant_status='ready'          tenant_status='ready'
+```
+
+## DB / Env / API
+
+### Schema
+
+```sql
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_tenant_use_at TIMESTAMPTZ;
+UPDATE users SET last_tenant_use_at = NOW()
+  WHERE tenant_status = 'ready' AND last_tenant_use_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_users_last_tenant_use_at
+  ON users (last_tenant_use_at) WHERE tenant_status = 'ready';
+```
+
+### tenant_status values
+
+| Value | Meaning | Reachable from |
+|---|---|---|
+| `null` | User pre-dates the column | (legacy) |
+| `disabled` | VCLUSTER_ENABLED=0 at signup | wakeTenant → nudgeProvision |
+| `pending` | provisioner running | provisioner only |
+| `provisioning` | (alias of pending in some paths) | provisioner only |
+| `ready` | vcluster + runtime live | hibernate, manual operator action |
+| `dormant` | vcluster STS scaled to 0 | wakeTenant → ready |
+| `failed` | provisioner threw | manual recovery only |
+
+### Env
+
+| Var | Default | Effect |
+|---|---|---|
+| `TENANT_HIBERNATE_ENABLED` | unset | `=1` opts the pinger in. Default-off so we can deploy ahead of rollout. |
+| `TENANT_HIBERNATE_AFTER_MIN` | `120` | Minutes of idle before scale-to-0. |
+| `TENANT_HIBERNATE_TICK_MIN` | `15` | Sweep cadence. |
+| `TENANT_HIBERNATE_MAX_PER_TICK` | `5` | Concurrent shutdowns per tick. |
+| `VCLUSTER_ENABLED` | `0` | Already in prod; flips signup from `disabled` to `pending`. |
+| `INTERNAL_SECRET` + `AGENTFLOW_API_URL` | required | wakeTenant nudge path uses these to call `/internal/users/:id/provision-tenant`. |
+
+### Internal API (no new routes)
+
+The lifecycle module reuses `services/projects.ts:nudgeProvisionTenant` —
+no new routes added on agentflow-api. The only outbound HTTP is the
+existing `POST /internal/users/:id/provision-tenant` with the
+`x-agentflow-secret` header.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Tenant hibernates while user is active | `tenant_hibernated` event with last_tenant_use_at recent | check touchTenant is firing — see `loadTenantKubeconfig` + `resolveRuntimeUrl` |
+| Wake never completes | `wake_scale_failed` | `kubectlScaleStatefulSet` returned non-zero — check vcluster STS exists in `af-tenant-<n>`. |
+| Double-scale race on wake | `tenant_status='dormant'` + STS replicas=1 | hibernateTenant must scale BEFORE flipping status (tested in `tenant-lifecycle.test.ts` #7). |
+| Pinger ticks but no candidates | `tenant-hibernator tick complete scanned=0` | confirm `last_tenant_use_at` column populated — backfill in bootstrap-schema runs once. |
+| Pinger DB query fails | `tenant-hibernator: query_failed` | swallowed; check postgres connection or column existence. |
+| All tenants scaled to 0 on deploy | `tenant_hibernated` for every user within 15 min | backfill UPDATE missed → run `UPDATE users SET last_tenant_use_at = NOW() WHERE tenant_status='ready';` manually. |
+| Dormant tenant can't approve project | `tenant_provision_failed: still dormant after pending-nudge` | waitForTenantReady didn't include `dormant` in the kick clause — verify the IN ('disabled', 'dormant') branch. |
+| Per-tenant Eliza URL serves wrong data after wake | runtime-router cache TTL expired but stale URL still returned | call `invalidateRuntimeUrlCache(userId)` from the wake path (already wired). |
+
+## Operator runbook
+
+### Enable hibernation in prod
+
+```bash
+kubectl -n franchise-factory set env deploy/agentflow-agents \
+  TENANT_HIBERNATE_ENABLED=1 \
+  TENANT_HIBERNATE_AFTER_MIN=120 \
+  TENANT_HIBERNATE_TICK_MIN=15 \
+  TENANT_HIBERNATE_MAX_PER_TICK=5
+kubectl -n franchise-factory rollout status deploy/agentflow-agents
+```
+
+### Force-wake a tenant from a debug shell
+
+```bash
+kubectl -n franchise-factory exec deploy/agentflow-agents -- node -e \
+  'import("./dist/services/tenant-lifecycle.js").then(m => m.wakeTenant(<id>).then(r => console.log(r)))'
+```
+
+### Force-hibernate a tenant
+
+```bash
+kubectl -n franchise-factory exec deploy/agentflow-agents -- node -e \
+  'import("./dist/services/tenant-lifecycle.js").then(m => m.hibernateTenant(<id>).then(r => console.log(r)))'
+```
+
+### Verify column + backfill landed
+
+```bash
+kubectl -n franchise-factory exec agentflow-postgres-97fb67469-69298 -- \
+  psql -U agentflow -d agentflow -c \
+  "SELECT id, tenant_status, last_tenant_use_at FROM users WHERE tenant_status='ready' ORDER BY id LIMIT 20;"
+```
+
+## Estimated savings (single 4-core / 8 GiB host node)
+
+For a server with 30 provisioned tenants:
+
+* If 5 are active per day, 25 hibernate.
+* Per-tenant footprint while running: ~250m CPU + ~300 MiB (vcluster STS) + ~50m + ~512 MiB (runtime) + ~75m + ~256 MiB (pod pool minimum).
+* Freed during idle window: **25 × 375m = 9,375m CPU** and **25 × ~1 GiB ≈ 25 GiB RAM** of *scheduler pressure* (actual memory release depends on kubelet eviction policy + cgroup memory.high).
+* Realistic cluster-wide savings on the current ff-france node (~4 vCPU usable, ~6 GiB RAM): the node stops oscillating between `OutOfCPU` and ready-state.
+
+## Related
+
+- [Postgres tuning](/subsystems/postgres-tuning) — same hot-path DB the
+  hibernator scans.
+- [Runtime supervisor](/subsystems/runtime-supervisor) — peruser pod
+  lifecycle for `kind ∈ {spa, mini_app, landing}` projects. Hibernation
+  scales the vcluster STS, which terminates these peruser pods too.
+- [Multi-agent runtime](/subsystems/multi-agent-runtime) — per-tenant
+  Eliza runtime that materialises after `tenant_status='ready'`. The
+  hibernator scales the parent vcluster, taking the Eliza runtime with
+  it; tenant-bootstrap re-applies the manifests on wake.
