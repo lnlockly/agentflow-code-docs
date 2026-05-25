@@ -1,0 +1,97 @@
+---
+title: "Marketplace → Hosted Deploy"
+description: "Развернуть агента из маркетплейса на облачное устройство одной кнопкой: preset → kind=daemon hosted_devices row → pod с инжектированными prompt/scope/skills."
+---
+
+# Marketplace → Hosted Deploy
+
+## TL;DR
+
+Кнопка «🚀 Развернуть на облачном устройстве» на `/marketplace/<slug>` создаёт hosted-daemon с привязанным `marketplace_preset_slug`. Бекенд читает `agent_presets.character`, инжектит `AF_AGENT_PRESET_NAME`, `AF_AGENT_SYSTEM_PROMPT` (base64), `AF_AGENT_SCOPE` (JSON), `AF_AGENT_SKILLS` (CSV) в манифест пода. Юзер попадает на `/cabinet/devices/hosted/<id>` с заголовком «Облачный агент · <preset.name>» — daemon стартует уже с системным промптом и scope'ом из пресета.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/bootstrap-schema.ts:380` | Migration: `ALTER TABLE hosted_devices ADD COLUMN marketplace_preset_slug TEXT REFERENCES agent_presets(slug) ON DELETE SET NULL` |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:172` | `createSchema` принимает optional `marketplace_preset_slug` |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:325` | `renderDaemonManifest` инжектит preset env-блок (name/prompt-b64/scope/skills) |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:585` | POST `/me/hosted-devices` resolves preset, validates access, persists `marketplace_preset_slug` |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:840` | POST `/me/marketplace/:slug/deploy-to-hosted` — one-shot wrapper, name auto-prefilled |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:202` | `rowToJson` возвращает `marketplace_preset_slug` + `marketplace_preset_name` в API response |
+| `agentflow-landing/src/pages/MarketplaceDetail.tsx:354` | Кнопка «🚀 Развернуть на облачном устройстве» рядом с «Использовать как агента» |
+| `agentflow-landing/src/components/marketplace/DeployToHostedModal.tsx:1` | Модалка: имя устройства + размер + brief preset summary |
+| `agentflow-landing/src/pages/CabinetHostedDeviceDetail.tsx:261` | Header показывает «Облачный агент · <preset.name>» если `marketplace_preset_slug` set |
+| `agentflow-agents/tests/marketplace-hosted-deploy.test.ts:1` | Happy path + permission check (private preset by another user → 403) + invalid slug → 404 |
+
+## Data flow
+
+```
+/marketplace/<slug>
+   │ click «🚀 Развернуть на облачном устройстве»
+   ▼
+DeployToHostedModal
+   │ ввод имени (default <slug>-bot), размер (default medium)
+   │ POST /me/marketplace/<slug>/deploy-to-hosted {device_name, size}
+   ▼
+me-hosted-devices.ts deployFromMarketplaceHandler
+   │ SELECT character FROM agent_presets WHERE slug=<slug>
+   │   AND (source='platform' OR owner_user_id=<userId>)
+   │   AND status='active'
+   │   → 404 if missing, 403 if owned by другим юзером
+   │ extract:
+   │   preset_name        = character.name | slug
+   │   system_prompt_b64  = base64(character.system)
+   │   scope_json         = JSON.stringify(character.settings.scope ?? defaultHostedScope)
+   │   skills_csv         = (character.topics ?? []).join(',')
+   │ INSERT hosted_devices (..., kind='daemon', marketplace_preset_slug=<slug>) — в той же sql.begin
+   │ renderDaemonManifest({..., presetName, systemPromptB64, scopeJson, skillsCsv})
+   │ kubectl apply (background)
+   ▼
+af-tenant-<userId>:<pod>
+   │ env:
+   │   AF_AGENT_PRESET_NAME    = <preset.name>
+   │   AF_AGENT_SYSTEM_PROMPT  = base64(<character.system>)
+   │   AF_AGENT_SCOPE          = {"shell_whitelist":[...], "budget_usd":5, ...}
+   │   AF_AGENT_SKILLS         = "kwork,telegram,reddit"
+   │ entrypoint.sh decodes AF_AGENT_SYSTEM_PROMPT и пишет в
+   │ ~/.agentflow/agent.json — autonomous loop читает на старте
+   ▼
+Cabinet /cabinet/devices/hosted/<id>
+   │ Header: «Облачный агент · <preset.name>»
+   │ DaemonTaskPanel (composer + SSE timeline) — task_dispatch уже знает scope
+```
+
+## DB / Env / API
+
+**Tables:**
+- `hosted_devices.marketplace_preset_slug` — `TEXT REFERENCES agent_presets(slug) ON DELETE SET NULL`. NULL для устройств созданных без preset (старый flow + plain).
+
+**Env (только при kind=daemon AND marketplace_preset_slug IS NOT NULL):**
+- `AF_AGENT_PRESET_NAME` — человекочитаемое имя пресета, рендерится в header кабинета
+- `AF_AGENT_SYSTEM_PROMPT` — base64 от `character.system` (защита от спецсимволов в YAML)
+- `AF_AGENT_SCOPE` — JSON со shell_whitelist / budget_usd / max_actions_per_session
+- `AF_AGENT_SKILLS` — CSV из `character.topics` (опционально, для UI badges)
+
+**Routes:**
+- `POST /me/hosted-devices` (requireSession) — accepts `marketplace_preset_slug` optional. Backward compatible.
+- `POST /me/marketplace/:slug/deploy-to-hosted` (requireSession) — wrapper. Body: `{ device_name?: string, size?: 'small'|'medium'|'large' }`. Returns `{ ok, device: {id, user_device_id, name, size, kind, marketplace_preset_slug, marketplace_preset_name } }`.
+
+**MCP tools:** не задействованы.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| 404 `preset_not_found` при клике «Развернуть» | `[hosted-devices] deploy preset_not_found slug=<slug>` | `agent_presets` row отсутствует / `status='archived'` — пересиди preset из `presets/<slug>.json` через admin, либо проверь FF_AGENT_MARKETPLACE=1 |
+| 403 `preset_forbidden` для приватного пресета | `[hosted-devices] deploy preset_forbidden slug=<slug> owner=<id> caller=<id>` | preset.source='user' с чужим owner_user_id — юзер должен fork-нуть его перед deploy либо попросить владельца опубликовать |
+| Pod встаёт, но autonomous loop игнорит preset prompt | `[entrypoint] AF_AGENT_SYSTEM_PROMPT not set` или `base64 decode failed` | manifest renderer не передал env — проверь что POST handler нашёл preset, либо character.system отсутствует в seed файле |
+| Header кабинета не показывает «Облачный агент · <name>» | API `GET /me/hosted-devices/:id` вернул `marketplace_preset_slug: null` | row создан до миграции (`marketplace_preset_slug IS NULL`) или preset был удалён (ON DELETE SET NULL отработал) |
+| Daemon стартует с пустым shell_whitelist хотя preset был передан | `[scope.py] shell_whitelist is empty; shell.exec disabled` | `character.settings.scope.shell_whitelist` отсутствует в preset JSON — фоллбек в `me-hosted-devices.ts:resolvePresetScope` должен подставить `defaultHostedScope` если preset не указал свой |
+| Migration `ALTER TABLE hosted_devices ADD COLUMN marketplace_preset_slug` упала с `relation "agent_presets" does not exist` | `[bootstrap-schema] ALTER hosted_devices marketplace_preset_slug failed` | bootstrap order: `agent_presets` создаётся раньше `hosted_devices` ALTERs — проверь что seed `presets/*.json` отработал до запуска hosted-devices migration |
+
+## Related
+
+- [Hosted Daemon](/subsystems/hosted-daemon) — общий enrollment / WS flow для kind=daemon
+- [Devices Unified](/subsystems/devices-unified) — `/cabinet/devices/:id` routing
+- [Install Wizard](/subsystems/desktop-installer-wizard) — `/cabinet/devices/new` (альтернативный entry-point)
