@@ -46,6 +46,10 @@ specialisation of this generic route and is preserved as an alias.
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/tools/integrations.py:connect_integration` | Daemon dispatcher — `cookie_export` branch (open, probe, export, POST). `telegram_app` returns `not_implemented` (Track 2b). |
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/desktop_tools.py:DESKTOP_TOOLS` | `connect_integration` Anthropic tool descriptor + `ToolExecutor.execute` dispatch wiring real Chrome helpers |
 | `agentflow-computer-mcp/tests/test_connect_integration.py:1` | Daemon-side unit tests — happy path, provider_not_found, not_logged_in, cache TTL, telegram_app stub, backend error passthrough, registry_unavailable |
+| `agentflow-landing/src/pages/CabinetIntegrations.tsx:135` | Track 3 — provider grid at `/account/integrations`. Reads `/integrations/registry` + `/me/integrations`, dispatches `connect_integration(slug)` to the user's online desktop device, renders live SSE timeline in an overlay |
+| `agentflow-landing/src/lib/agentsApi.ts:5034` | `IntegrationProvider`, `IntegrationStatusRow`, `fetchIntegrationRegistry`, `fetchMyIntegrations` clients |
+| `agentflow-landing/src/main.tsx:712` | Route `/account/integrations` → `CabinetIntegrations` (replaces the static `AccountIntegrations` hub) |
+| `agentflow-landing/src/pages/AccountKworkIntegration.tsx:160` | `MigratedBanner` pointing to `/account/integrations`. Paste-storage_state form kept for backward compat (PR #796) |
 
 ## Data flow
 
@@ -106,6 +110,9 @@ For `flow_kind='telegram_app'` the daemon POSTs
 | Daemon returns `provider_not_found` listing only `[kwork]` | (no backend log — daemon-only) | Backend registry response missing the slug; check `GET /integrations/registry` returns the full list and the daemon cache hasn't pinned a stale snapshot (TTL 300 s, restart daemon to flush). |
 | Daemon returns `registry_unavailable` | (daemon stdout) `tools/integrations.py:fetch_registry` raises | Backend down or wrong API base in `~/.agentflow/auth.json`. Daemon falls back to no-op (no Chrome opens). |
 | Daemon returns `encryption_v20_unsupported` | `chrome_cookies.py` Chrome 127+ App-Bound Encryption | Track 2c — daemon-side fallback not written. User must downgrade Chrome or wait on platform-key extraction work. |
+| Cabinet button disabled with banner «Десктоп-агент не в сети» | `devicesQ.data.items` filtered → no `status === 'online'` row | Install AgentFlow Desktop and run the daemon, then refresh `/account/integrations` |
+| Cabinet overlay stuck on «Ждём первый шаг» | No `action` event on `/me/devices/:id/tasks/stream` within 10s | Daemon connected but task hasn't started — check `dispatch_task` response, daemon process logs |
+| Status badge never flips to `connected` after overlay closes | Daemon `complete` arrived but `/me/integrations/:provider` returned 4xx | Provider config drift between daemon registry cache and backend; restart daemon to flush 5-min cache |
 
 ## Related
 
