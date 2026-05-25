@@ -1,0 +1,142 @@
+---
+title: "DB hot paths"
+description: "Topmost queries on agentflow-postgres, their plans, and the indexes that make them not Seq Scan."
+---
+
+# DB hot paths
+
+## TL;DR
+Профиль на живой `agentflow-postgres` от 2026-05-25 показал три Seq Scan
+запроса по таблицам с десятками тысяч строк: `agent_usage` (billing per-user),
+`agent_events` (UI timeline по агенту), `agents` (`/me/agents` list). Все три
+имеют индекс в drizzle schema, но drizzle migrate не катится через CI (см.
+`memory/feedback_agentflow_migrations.md`), поэтому добавлены через
+`src/services/bootstrap-schema.ts` + `migrations/2026-05-25b-db-hotpath-indexes.sql`.
+PR #760 (postgres tuning) и этот PR не пересекаются — он чинит connection
+hygiene + `project_events`, мы — другие горячие таблицы.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/migrations/2026-05-25b-db-hotpath-indexes.sql` | SQL для документации + manual apply |
+| `agentflow-agents/src/services/bootstrap-schema.ts:392` | Idempotent boot — добавляет шесть индексов через `CREATE INDEX IF NOT EXISTS` |
+| `agentflow-agents/src/db/schema.ts:228` | `agentEvents` drizzle schema (заявляет idx_events_agent_time который раньше не существовал в проде) |
+| `agentflow-agents/src/db/schema.ts:247` | `agentUsage` drizzle schema |
+| `agentflow-agents/src/services/flow-meter.ts:1320` | `agentUsageBreakdown` — джойнит agent_usage + agents + users |
+| `agentflow-agents/src/services/flow-meter.ts:1391` | `userBillingDetail` — `WHERE owner_user_id` запрос который был Seq Scan |
+
+## Top queries (профиль 2026-05-25)
+
+### 1. `agent_usage` filtered by owner
+
+```sql
+SELECT COALESCE(model,'unknown'), COUNT(*), SUM(input_tokens), SUM(output_tokens)
+FROM agent_usage
+WHERE owner_user_id = $1 AND created_at >= $2
+GROUP BY 1
+```
+
+До:
+```
+Sort  (cost=2378.43..2438.24 rows=23925)
+  ->  Seq Scan on agent_usage  (rows=23925)
+        Filter: ((owner_user_id = 1) AND (created_at >= now()-'30 days'))
+        Rows Removed by Filter: 8879
+Execution Time: 28.692 ms
+```
+
+После добавления `idx_usage_owner_time(owner_user_id, created_at DESC)`:
+ожидается Index Scan, цель < 1 мс.
+
+### 2. `agent_events` timeline per agent
+
+```sql
+SELECT * FROM agent_events WHERE agent_id = $1 ORDER BY id DESC LIMIT 50
+```
+
+До:
+```
+Sort Method: quicksort
+  ->  Seq Scan on agent_events  (rows=17107)
+        Filter: (agent_id = 100)
+        Rows Removed by Filter: 17043
+Execution Time: 2.507 ms
+```
+
+После `idx_events_agent_time(agent_id, id DESC)` — Index Range Scan,
+ожидаемое < 0.2 мс. Cleanup cron (`DELETE WHERE created_at < N`) тоже
+получит индекс `idx_events_created_at`.
+
+### 3. `agents` listed by owner
+
+```sql
+SELECT * FROM agents WHERE owner_user_id = $1 ORDER BY created_at DESC LIMIT 100
+```
+
+До:
+```
+Sort Key: created_at DESC
+  ->  Seq Scan on agents  (rows=1063)
+        Filter: (owner_user_id = 1)
+        Rows Removed by Filter: 741
+Execution Time: 1.101 ms
+```
+
+Существующий `agents_owner_category_rating_idx` партиальный
+(`WHERE category IS NOT NULL`) и не покрывает простой фильтр. Новый
+`idx_agents_owner_recent(owner_user_id, created_at DESC)` даёт Index Scan.
+
+### 4. `flow_ledger` paginated transactions
+
+```sql
+SELECT * FROM flow_ledger WHERE user_id = $1 ORDER BY id DESC LIMIT 50
+```
+
+До:
+```
+Index Scan Backward using flow_ledger_pkey  (filter user_id=1, removed 4)
+Execution Time: 0.120 ms
+```
+
+Сейчас работает приемлемо потому что pkey-backward + low cardinality
+фильтра. С ростом таблицы pkey-backward проиграет — composite
+`idx_flow_ledger_user_recent(user_id, id DESC)` даёт точный Range Scan
+и убирает потерю от sequential pkey-scan.
+
+### 5. `agent_usage` settlement scan
+
+`flow-meter.ts` периодически пушит `state='done'` строки в `flow_ledger`
+и обновляет `state='settled'`. Сейчас scanner делает full Seq Scan.
+Новый partial `idx_usage_state(state) WHERE state <> 'settled'` сжимает
+скан до окна актуальных-к-расчёту строк.
+
+## DB / Env / API
+- Tables: `agent_usage`, `agent_events`, `agents`, `flow_ledger`
+- Routes hit by these queries:
+  - `GET /me/billing/usage`, `GET /me/billing/transactions` (`routes/billing-usage.ts`)
+  - `GET /me/agents` (`routes/agents.ts:2151`)
+  - `GET /admin/flow/user/:id` (`routes/admin.ts`)
+  - `GET /me/agents/:id/events` (агентский timeline)
+- Bootstrap: `bootstrapSchema()` вызывается из `src/server.ts` на старте; новые индексы создаются один раз и потом NO-OP через `IF NOT EXISTS`.
+- Postgres pod: `agentflow-postgres-97fb67469-69298` в `franchise-factory` namespace.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `/me/billing/*` отвечает > 200 мс | `[billing] usage-by-model slow` | проверить `EXPLAIN` на `agent_usage WHERE owner_user_id` — должен быть Index Scan, не Seq Scan |
+| Agent timeline пустой / медленный | (no app log, заметно по latency) | `\d agent_events` должен показать `idx_events_agent_time`; иначе restart agentflow-agents pod чтобы `bootstrapSchema` дотянул индекс |
+| Weekly cleanup CronJob `agentflow-postgres-cleanup` отжирает CPU | `DELETE 0` rows но Seq Scan по 1M+ rows на `agent_events` | проверить `idx_events_created_at`; если нет — `CREATE INDEX CONCURRENTLY` руками |
+| `/me/agents` зависает у владельцев с 300+ агентами | (no explicit log) | `EXPLAIN` запроса; индекс `idx_agents_owner_recent` обязан быть |
+
+## Что НЕ делаем (intentionally skipped)
+
+- **`pg_stat_statements`** — нужен restart Postgres с `shared_preload_libraries`. Отложено в follow-up. Сейчас slow-query видимость через `log_min_duration_statement=500` (PR #760).
+- **CREATE INDEX CONCURRENTLY** — не используется потому что postgres-js оборачивает single statement в implicit transaction. На таблицах размера < 100 МБ блокировка ~100 мс приемлема. Если в будущем добавляем индекс на `agent_memories` (102 МБ) — катим вручную через psql.
+- **`agent_memories` / `agent_lessons`** — топ по размеру (102+94 МБ), но уже имеют HNSW + composite индексы. EXPLAIN не показал Seq Scan на горячих запросах.
+- **`project_events`** покрыт PR #760 (`idx_project_events_project_kind_id`, autovacuum 5%/2%).
+
+## Related
+- [Postgres tuning](/subsystems/postgres-tuning) — PR #760 connection hygiene, ConfigMap, cleanup CronJob.
+- [Foundation bridge](/subsystems/foundation-bridge) — основной писатель `agent_runs`.
+- [Autonomous loop](/subsystems/autonomous-loop) — основной писатель `agent_events`.
