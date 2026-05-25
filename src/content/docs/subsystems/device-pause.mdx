@@ -1,0 +1,107 @@
+---
+title: "Device pause / resume toggle"
+description: "Owner toggles a device into idle mode — WS stays connected, dispatch_task is refused, autonomous worker skips it."
+---
+
+# Device pause / resume toggle
+
+## TL;DR
+
+Owner pauses a device when they want to keep the daemon process running
+(heartbeat alive, `status='online'`) but stop the platform from sending
+new work — typical case: testing on the local Mac, don't want the
+autonomous worker grabbing the machine. Backed by a single
+`user_devices.paused_at TIMESTAMPTZ` column. NULL = active; non-NULL =
+paused + audit-trail of when the toggle flipped.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/migrations/2026-05-25c-device-pause.sql` | Adds `paused_at` column |
+| `agentflow-agents/src/services/bootstrap-schema.ts:467` | Idempotent in-process mirror of the migration |
+| `agentflow-agents/src/types/devices.ts:33` | `Device.paused?: boolean` field |
+| `agentflow-agents/packages/shared-types/devices.ts:60` | Same field on the canonical contract |
+| `agentflow-agents/src/routes/me-devices.ts:139` | `rowToDevice()` derives `paused` from `paused_at` |
+| `agentflow-agents/src/routes/me-devices.ts:399` | `POST /me/devices/:id/pause` |
+| `agentflow-agents/src/routes/me-devices.ts:421` | `POST /me/devices/:id/resume` |
+| `agentflow-agents/src/routes/me-devices.ts:910` | 409 `device_paused` gate in `dispatch_task` |
+| `agentflow-agents/src/routes/me-autonomous.ts:613` | `pickPrimaryDevice` adds `AND paused_at IS NULL` |
+| `agentflow-agents/tests/devices-pause.test.ts` | `rowToDevice` derivation contract |
+
+## Data flow
+
+```
+Owner clicks ⏸ in cabinet
+        │
+        ▼
+POST /me/devices/:id/pause
+        │
+        ▼
+UPDATE user_devices
+  SET paused_at = COALESCE(paused_at, NOW())
+  WHERE id=:id AND user_id=session.sub
+        │
+        ▼
+returns Device{ ..., paused: true, status: 'online' }
+        │
+        │  daemon WS keeps heartbeating
+        │  status stays 'online'
+        │
+        ├── Owner-issued POST /dispatch_task
+        │        ▼
+        │   SELECT scope_json, paused_at FROM user_devices
+        │        ▼
+        │   paused_at != null ?
+        │        ▼
+        │   409 { error: 'device_paused',
+        │         message: 'Устройство приостановлено. Возобновите чтобы запустить задачу.' }
+        │
+        └── Autonomous worker tick → pickPrimaryDevice(userId)
+                 ▼
+            SELECT id FROM user_devices
+            WHERE ... AND paused_at IS NULL
+                 ▼
+            returns null when the only device is paused
+                 ▼
+            worker logs no-device and skips this user's tick
+
+Owner clicks ▶ Resume
+        │
+        ▼
+POST /me/devices/:id/resume
+        │
+        ▼
+UPDATE user_devices SET paused_at = NULL
+        │
+        ▼
+dispatch_task accepts work again
+pickPrimaryDevice picks this device again
+already-queued tasks drain via the existing GET /queued_tasks path
+```
+
+## DB / Env / API
+
+- Tables: `user_devices.paused_at TIMESTAMPTZ DEFAULT NULL`
+- Env: none (no flag — feature is always on)
+- Routes:
+  - `POST /me/devices/:id/pause` — idempotent. Re-pausing returns the row unchanged. Returns 404 if the device is not owned or deleted.
+  - `POST /me/devices/:id/resume` — idempotent. Clearing an already-active device is a no-op that still returns the row.
+  - `POST /me/devices/:id/dispatch_task` — returns `409 { error: 'device_paused', message: 'Устройство приостановлено. Возобновите чтобы запустить задачу.' }` while paused.
+  - `GET /me/devices` + `GET /me/devices/:id` — both expose `paused: boolean` (derived).
+- MCP tools: none (the toggle is a cabinet UI gesture, not an agent-callable action).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Cabinet shows device as paused but dispatch_task still goes through | `device_paused` missing from response | `agentflow-agents/src/routes/me-devices.ts:910` — verify the SELECT pulls `paused_at` and the gate runs before `dispatchLiveDeviceTask` |
+| Autonomous worker keeps picking a paused device | (silent — no greppable string yet, look at `[autonomous] dispatching ...` lines and the device_id) | `agentflow-agents/src/routes/me-autonomous.ts:613` — confirm the SQL includes `AND paused_at IS NULL` |
+| Migration didn't run, column missing | `column "paused_at" does not exist` in agents-server startup | Re-deploy `agentflow-agents` so `bootstrapSchema()` runs the `ALTER TABLE ... ADD COLUMN IF NOT EXISTS paused_at` |
+| Resume returns 404 | `not_found` | Device is soft-deleted or not owned — pause/resume require `deleted_at IS NULL AND user_id = session.sub` |
+
+## Related
+
+- [Device task lifecycle](/subsystems/device-task-lifecycle/) — queue/dispatch path that the pause gate sits in front of
+- [Autonomous loop](/subsystems/autonomous-loop/) — `pickPrimaryDevice` consumer
+- [Desktop fast cancel](/subsystems/desktop-fast-cancel/) — different mechanism (per-task `cancel_task`, not device-wide)
