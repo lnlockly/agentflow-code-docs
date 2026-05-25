@@ -52,6 +52,7 @@ export default defineConfig({
         {
           label: 'Subsystems',
           items: [
+            { label: 'Projects (new architecture)', slug: 'subsystems/projects' },
             { label: 'Code Exec MCP', slug: 'subsystems/code-exec-mcp' },
             { label: 'Pod Pre-Warm Pool', slug: 'subsystems/pod-prewarm-pool' },
             { label: 'Caddy Preview', slug: 'subsystems/caddy-preview' },

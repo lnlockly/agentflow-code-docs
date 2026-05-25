@@ -5,6 +5,10 @@ description: "Per-project step that turns a cloned GitHub foundation into a runn
 
 # Foundation Bridge
 
+:::caution[Deprecated — старая архитектура]
+Этот раздел про старую архитектуру с kind-классификатором (`landing` / `spa` / `tg_bot` / etc.). Новый flow создания проектов (brief → GitHub template search → hosted daemon git clone) описан в [`subsystems/projects`](/subsystems/projects/) (approved 2026-05-25). Bridge-механика остаётся релевантной для legacy-проектов на foundation_mode=github_repo.
+:::
+
 ## TL;DR
 
 When a user picks a GitHub repo as their project foundation (`foundation_mode=github_repo`),
