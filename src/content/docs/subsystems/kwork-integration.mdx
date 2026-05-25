@@ -1,82 +1,70 @@
 ---
-title: "Kwork Integration — daemon → POST /me/integrations/kwork → fork preset"
-description: "Daemon-fed Kwork cookies seal into project_secrets and fork the kwork-account-replier preset as a per-account project owned by the caller."
+title: "Kwork Integration — cookie_export specialisation of /me/integrations/:provider"
+description: "Daemon-fed Kwork cookies seal into project_secrets.KWORK_SESSION_JSON in the operator's integration_hub project; the row is read by every studio template's account picker."
 ---
 
 # Kwork Integration (`POST /me/integrations/kwork`)
 
 ## TL;DR
 
-Desktop daemon scrapes Kwork cookies from the operator's logged-in
-browser and POSTs them to AgentFlow. The endpoint validates the cookie
-shape, seals the payload into `project_secrets.KWORK_SESSION_JSON`,
-forks the `kwork-account-replier` preset as a fresh project owned by
-the caller, and provisions an agent on the user's default team. Same
-cookies posted twice return the original project with the secret
-refreshed in place.
+Kwork is one entry (`slug='kwork'`) in the generic integration registry
+at `agentflow-agents/src/services/integration-providers.ts`. The desktop
+daemon scrapes Kwork cookies from the operator's logged-in browser and
+POSTs them to either `/me/integrations/kwork` (compat alias for PR #796
+callers) or the generic `/me/integrations/:provider`. The handler
+repacks cookies into Playwright `storage_state` JSON, seals the payload,
+and writes a row in `project_secrets` keyed `KWORK_SESSION_JSON` inside
+the operator's `integration_hub` sentinel project. Studio templates read
+that row when surfacing account pickers.
 
-This file documents the daemon-fed surface only. The paste-JSON UX
-under `/me/integrations/kwork/connect` is described in
-`me-integrations-kwork.ts` header and is kept on a separate router so a
-regression in one cannot break the other.
+For the generic flow + every other provider, see
+[Generic Integrations](/subsystems/generic-integrations).
 
 ## Files (with line refs)
 
 | Path | Role |
 |---|---|
-| `agentflow-agents/src/routes/me-integrations.ts:1` | Module header + spec/RAG cross-refs |
-| `agentflow-agents/src/routes/me-integrations.ts:38` | `PRESET_SLUG`, `SECRET_KEY`, `KWORK_COOKIE_NAME_RE` constants |
-| `agentflow-agents/src/routes/me-integrations.ts:46` | `cookieSchema` + `integrationBodySchema` (zod input) |
-| `agentflow-agents/src/routes/me-integrations.ts:67` | `hashCookies` — deterministic sha256-first-16-hex over sorted cookies |
-| `agentflow-agents/src/routes/me-integrations.ts:135` | `dispatchKworkIntegration` — pure handler with injected deps |
-| `agentflow-agents/src/routes/me-integrations.ts:160` | Idempotent lookup against `user_integrations` |
-| `agentflow-agents/src/routes/me-integrations.ts:218` | Fresh project insert + slug allocator |
-| `agentflow-agents/src/routes/me-integrations.ts:266` | `provisionAgent` call for `kwork-account-replier` |
-| `agentflow-agents/src/routes/me-integrations.ts:298` | Hono wrapper at `POST /me/integrations/kwork` |
-| `agentflow-agents/src/services/bootstrap-schema.ts:372` | `CREATE TABLE IF NOT EXISTS user_integrations` |
-| `agentflow-agents/src/services/seal.ts:67` | `sealString` — AES-256-GCM envelope used for the cookie payload |
-| `agentflow-agents/src/services/agent-provision.ts:226` | `provisionAgent` — preset → live agent row |
-| `agentflow-agents/presets/kwork-account-replier.json:1` | Preset character + required secrets list |
-| `agentflow-agents/tests/integrations-kwork.test.ts:1` | Unit tests (happy path, idempotent, missing cookie, preset gone) |
+| `agentflow-agents/src/services/integration-providers.ts:116` | `kwork` registry entry (login_url, cookie_domain, required_cookie_names, probe) |
+| `agentflow-agents/src/routes/me-integrations.ts:452` | `POST /me/integrations/kwork` — compat wrapper preserving the `no_kwork_session_cookie` error string |
+| `agentflow-agents/src/routes/me-integrations.ts:475` | `POST /me/integrations/:provider` — generic handler called by the wrapper |
+| `agentflow-agents/src/routes/me-integrations-kwork.ts:1` | Paste-JSON UX (`/me/integrations/kwork/connect`) — separate router |
+| `agentflow-agents/src/services/seal.ts:67` | `sealString` — AES-256-GCM envelope for the cookie payload |
+| `agentflow-agents/presets/kwork-account-replier.json:1` | Preset character + required secrets list (reads `KWORK_SESSION_JSON`) |
+| `agentflow-agents/tests/integrations-kwork.test.ts:1` | Unit tests — cookie / body schemas |
+| `agentflow-agents/tests/integrations-generic.test.ts:1` | Unit tests — registry contract incl. Kwork |
 
 ## Data flow
 
 ```
 agentflow-desktop daemon
-   │  scrapes cookies via Playwright storage_state()
-   │  POST /me/integrations/kwork
-   │  body: { cookies: [{name,value,domain,path,...}], project_name? }
+   │  connect_integration('kwork')
+   │  POST /me/integrations/kwork {cookies: [...]}
    ▼
-me-integrations.ts: dispatchKworkIntegration(ownerUserId, body)
-   ├── zod parse                              → 400 no_cookies on shape miss
-   ├── any cookie name matches kwork regex?   → 400 no_kwork_session_cookie
-   ├── getPreset('kwork-account-replier')     → 409 preset_missing if gone
-   ├── hashCookies(sorted JSON)               → 16-hex digest
-   │
-   ├── SELECT user_integrations WHERE hash = …
-   │     │  HIT  → UPDATE project_secrets value_encrypted, return 200 created=false
-   │     │  MISS → fall through
-   │
-   ├── INSERT projects (kind='integration_kwork', status='idle')
-   ├── INSERT project_secrets (KWORK_SESSION_JSON, sealed payload)
-   ├── INSERT project_secrets (KWORK_TEAM_ID) IF user has default team
-   ├── provisionAgent({preset character, slugBase='kwork-account-replier'})
-   ├── INSERT team_members (teamId, agentId) IF team known
-   ├── INSERT user_integrations (user_id, 'kwork', project_id, cookie_hash)
+me-integrations.ts: compat wrapper at /me/integrations/kwork
+   └── delegates to handleProviderPost(getProvider('kwork'), userId, body)
+        ├── zod parse cookies                      → 400 invalid_body
+        ├── any cookie domain in financial denylist → 403 domain_denied
+        ├── required_cookie_names check             → 400 no_kwork_session_cookie
+        ├── pickOrCreateHubProject(userId)
+        ├── upsertHubSecret(hubId, 'KWORK_SESSION_JSON', 'kwork:storage_state', sealed, why)
    ▼
-201 { ok, project_id, project_slug, agent_id, secret_key, created:true }
+201/200 { ok, project_id, secret_id, secret_created, hub_created,
+          session_cookie_present, csrf_cookie_present, cookie_domains }
 ```
+
+The PR #795 fork-a-preset flow is removed. Cookies no longer create a
+per-account project; one `integration_hub` per user holds the secret
+and every studio template's account picker reads it from there.
 
 ## DB / Env / API
 
 - **Tables:**
-  - `user_integrations` — idempotency anchor `(user_id, kind, cookie_hash)` UNIQUE.
-  - `projects` — fresh row `kind='integration_kwork'`.
-  - `project_secrets` — sealed `KWORK_SESSION_JSON` (load-bearing) + `KWORK_TEAM_ID` (optional).
-  - `agents` + `team_members` — populated by `provisionAgent`; best-effort.
-- **Env:** `AGENTS_MASTER_KEY` (32-byte base64) — fail-loud if absent; required by `sealString`.
+  - `projects` — one `kind='integration_hub'` row per owner.
+  - `project_secrets` — sealed `KWORK_SESSION_JSON` (load-bearing) keyed `(project_id, key)`.
+- **Env:** `AGENTS_MASTER_KEY` (32-byte base64) — fail-loud if absent.
 - **Routes:**
-  - `POST /me/integrations/kwork` (this page, daemon-fed)
+  - `POST /me/integrations/kwork` (compat alias, daemon-fed)
+  - `POST /me/integrations/:provider` (generic — also accepts `kwork`)
   - `POST /me/integrations/kwork/connect` (paste-JSON UX, separate router)
 - **Preset slug:** `kwork-account-replier` (must be `status='active'` in `agent_presets`).
 
@@ -84,13 +72,13 @@ me-integrations.ts: dispatchKworkIntegration(ownerUserId, body)
 
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
-| Daemon POST returns 400 on every cookie batch | `no_kwork_session_cookie` | `agentflow-agents/src/routes/me-integrations.ts:147` — extend `KWORK_COOKIE_NAME_RE` if Kwork rotates names |
-| 409 on first call to a freshly seeded cluster | `preset_missing` | Reseed `kwork-account-replier` via `scripts/re-instantiate-presets-from-json.ts` |
-| Same cookies create N projects | (no log — see `user_integrations` row count per user) | Bootstrap migration didn't run; check `CREATE TABLE IF NOT EXISTS user_integrations` in `services/bootstrap-schema.ts:372` |
-| 500 fork_failed with `slug_collision` | `[integrations/kwork] … fork_failed` | Slug entropy is 5 random bytes → 5 retries; if hit, the alphabet at `makeProjectSlug` needs more entropy |
-| 201 but `agent_id: null` in response | `[integrations/kwork] provision_failed user=…` | Inspect Eliza runtime logs in the user's vcluster — provisionAgent failed but secret + project landed; retry by re-POSTing same cookies |
+| Daemon POST returns 400 on every cookie batch | `no_kwork_session_cookie` | Kwork rotated cookie names → update `required_cookie_names` in the `kwork` registry entry (`integration-providers.ts`) |
+| Daemon POST returns 403 with `domain_denied` | `domain_denied` | Cookie batch contained a banking/exchange domain — daemon-side bug |
+| Same cookies create N hub projects | (no log — `SELECT count(*) FROM projects WHERE owner_user_id=X AND kind='integration_hub'`) | `pickOrCreateHubProject` lookup broke — should return ≤1 |
+| 200/201 but studio account picker is empty | (no log — `SELECT * FROM project_secrets WHERE project_id=<hub> AND key='KWORK_SESSION_JSON'`) | `default-studio-flow-account.ts → listKworkSecretRows` not reading from the hub project |
 
 ## Related
 
-- [Hosted Daemon](/subsystems/hosted-daemon) — daemon that POSTs here.
-- [Multi-Agent Project Chat](/subsystems/multi-agent-project-chat) — how the forked project surfaces in cabinet.
+- [Generic Integrations](/subsystems/generic-integrations) — registry-driven onboarding shared by Kwork, VK, lolzteam, Instagram, LinkedIn, Telegram-app.
+- [Computer-MCP](/subsystems/computer-mcp) — daemon-side `connect_integration` tool.
+- [Multi-Agent Project Chat](/subsystems/multi-agent-project-chat) — how onboarded accounts surface in cabinet.
