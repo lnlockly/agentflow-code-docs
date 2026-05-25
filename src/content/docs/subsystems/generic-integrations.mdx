@@ -1,0 +1,121 @@
+---
+title: "Generic integrations — registry-driven cookie + app onboarding"
+description: "One desktop-agent tool, one backend handler, one frontend grid for every Kwork-like cookie integration and the Telegram-app flow."
+---
+
+# Generic integrations (`/me/integrations/:provider`)
+
+## TL;DR
+
+A single registry of integration providers (Kwork, VK, lolzteam, Instagram,
+LinkedIn, Telegram-app, ...) lives in
+`agentflow-agents/src/services/integration-providers.ts`. The desktop
+daemon's `connect_integration(slug)` tool reads the registry, opens the
+provider's `login_url` in Chrome, runs `logged_probe_js` to confirm the
+operator is signed in, exports cookies, and POSTs them to
+`POST /me/integrations/:provider`. The backend repacks the cookies into
+Playwright `storage_state` JSON, seals the payload, and writes a row to
+`project_secrets` in the operator's `integration_hub` project under the
+registry-defined `secret_key`. Adding a new provider is a single entry in
+the registry plus a one-line `secret_key` consumer in the studio
+template / preset that needs it.
+
+`POST /me/integrations/kwork` (PR #796) is the cookie-export
+specialisation of this generic route and is preserved as an alias.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/integration-providers.ts:1` | Registry + `getProvider` + `isFinancialDomain` + denylist |
+| `agentflow-agents/src/routes/me-integrations.ts:1` | Module header + spec/RAG cross-refs |
+| `agentflow-agents/src/routes/me-integrations.ts:55` | `cookieSchema` + `integrationBodySchema` (zod input) |
+| `agentflow-agents/src/routes/me-integrations.ts:70` | `telegramAppBodySchema` (zod input for `telegram_app`) |
+| `agentflow-agents/src/routes/me-integrations.ts:93` | `packStorageState(cookies, provider?)` — registry-aware repack |
+| `agentflow-agents/src/routes/me-integrations.ts:152` | `pickOrCreateHubProject(ownerUserId)` — sentinel project |
+| `agentflow-agents/src/routes/me-integrations.ts:178` | `upsertHubSecret(projectId, secretKey, masked, payload, why)` |
+| `agentflow-agents/src/routes/me-integrations.ts:226` | `listIntegrationStatus(ownerUserId)` — per-provider status aggregator |
+| `agentflow-agents/src/routes/me-integrations.ts:311` | `GET /integrations/registry` (owner-auth public dump) |
+| `agentflow-agents/src/routes/me-integrations.ts:318` | `GET /me/integrations` |
+| `agentflow-agents/src/routes/me-integrations.ts:329` | `handleProviderPost` — generic body validator + sealer |
+| `agentflow-agents/src/routes/me-integrations.ts:452` | `POST /me/integrations/kwork` — compat wrapper for PR #796 |
+| `agentflow-agents/src/routes/me-integrations.ts:475` | `POST /me/integrations/:provider` — generic handler |
+| `agentflow-agents/tests/integrations-generic.test.ts:1` | Unit tests — registry shape + body schemas + financial denylist |
+| `agentflow-agents/src/db/schema.ts:1266` | `project_secrets` table + `(project_id, key)` unique |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/tools/integrations.py:fetch_registry` | Daemon-side registry GET with 5-minute module cache, keyed by API base |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/tools/integrations.py:connect_integration` | Daemon dispatcher — `cookie_export` branch (open, probe, export, POST). `telegram_app` returns `not_implemented` (Track 2b). |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/desktop_tools.py:DESKTOP_TOOLS` | `connect_integration` Anthropic tool descriptor + `ToolExecutor.execute` dispatch wiring real Chrome helpers |
+| `agentflow-computer-mcp/tests/test_connect_integration.py:1` | Daemon-side unit tests — happy path, provider_not_found, not_logged_in, cache TTL, telegram_app stub, backend error passthrough, registry_unavailable |
+| `agentflow-landing/src/pages/CabinetIntegrations.tsx:135` | Track 3 — provider grid at `/account/integrations`. Reads `/integrations/registry` + `/me/integrations`, dispatches `connect_integration(slug)` to the user's online desktop device, renders live SSE timeline in an overlay |
+| `agentflow-landing/src/lib/agentsApi.ts:5034` | `IntegrationProvider`, `IntegrationStatusRow`, `fetchIntegrationRegistry`, `fetchMyIntegrations` clients |
+| `agentflow-landing/src/main.tsx:712` | Route `/account/integrations` → `CabinetIntegrations` (replaces the static `AccountIntegrations` hub) |
+| `agentflow-landing/src/pages/AccountKworkIntegration.tsx:160` | `MigratedBanner` pointing to `/account/integrations`. Paste-storage_state form kept for backward compat (PR #796) |
+
+## Data flow
+
+```
+desktop daemon
+   │  connect_integration(slug)
+   │  1. GET /integrations/registry         → provider entry
+   │  2. chrome_open_url(login_url)
+   │  3. chrome_eval(logged_probe_js)        → {logged: true}
+   │  4. chrome_export_cookies(cookie_domain)
+   │  5. POST /me/integrations/:provider {cookies:[...]}
+   ▼
+me-integrations.ts: handleProviderPost(provider, ownerUserId, body)
+   ├── zod parse                              → 400 invalid_body
+   ├── any cookie domain in financial denylist → 403 domain_denied
+   ├── packStorageState(cookies, provider)
+   │     └── checks required_cookie_names      → 400 no_session_cookie
+   ├── pickOrCreateHubProject(ownerUserId)     → creates integration_hub
+   ├── upsertHubSecret(hubId, provider.secret_key, masked, sealed_state, why)
+   │     └── unique(project_id, key) → row refreshes, no duplicates
+   ▼
+201/200 { ok, provider, project_id, secret_id, secret_created, hub_created,
+          session_cookie_present, csrf_cookie_present, cookie_domains }
+```
+
+For `flow_kind='telegram_app'` the daemon POSTs
+`{phone, session_string}` instead and the backend seals
+`JSON.stringify({phone, session_string})` under
+`TELEGRAM_SESSION_STRING`. No cookies involved.
+
+## DB / Env / API
+
+- **Tables:**
+  - `projects` — one `kind='integration_hub'` row per owner (sentinel).
+  - `project_secrets` — one row per provider keyed by `(project_id, key)`.
+- **Env:** `AGENTS_MASTER_KEY` (32-byte base64) — required by `sealString`.
+- **Routes:**
+  - `GET  /integrations/registry` — owner-auth registry dump.
+  - `GET  /me/integrations` — per-provider status.
+  - `POST /me/integrations/:provider` — generic onboard.
+  - `POST /me/integrations/kwork` — compat alias.
+  - `POST /me/integrations/kwork/connect` — paste-JSON path (`me-integrations-kwork.ts`).
+- **Registry slugs (current):** `kwork`, `vk`, `lolzteam`, `instagram`, `linkedin`, `telegram_app`.
+- **Secret keys:** `KWORK_SESSION_JSON`, `VK_SESSION_JSON`, `LOLZTEAM_SESSION_JSON`, `INSTAGRAM_SESSION_JSON`, `LINKEDIN_SESSION_JSON`, `TELEGRAM_SESSION_STRING`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Daemon POST returns 404 for new provider | `unknown_provider` | Add the slug to `INTEGRATION_PROVIDERS` in `integration-providers.ts` |
+| Daemon POST returns 400 on every cookie batch | `no_session_cookie` | Update `required_cookie_names` for the provider — site rotated cookie names |
+| Daemon POST returns 400 for kwork specifically | `no_kwork_session_cookie` | Same as above, but the compat wrapper at `me-integrations.ts:400` rewrites the error string |
+| Daemon POST returns 403 with `domain_denied` | `domain_denied` | Cookie batch contained a banking/exchange domain — daemon must not export cookies from financial sites. Tune `FINANCIAL_DOMAIN_DENYLIST` only if a false positive |
+| `/me/integrations` shows `never` after a successful POST | (no log — check `project_secrets` row) | `secret_key` mismatch between registry and the consumer; verify `INTEGRATION_PROVIDERS[*].secret_key` matches what the studio template reads |
+| `connect_integration(telegram_app)` POSTs `{cookies:[]}` | `invalid_body` | Daemon dispatched cookie_export branch for a `flow_kind='telegram_app'` provider — daemon-side bug, route by `flow_kind` |
+| Hub project missing after first onboard | (no log — `SELECT * FROM projects WHERE owner_user_id=X AND kind='integration_hub'`) | `pickOrCreateHubProject` insert failed — check projects-table FK / slug collision |
+| Daemon `connect_integration` returns `not_logged_in` despite signed-in session | `tools/integrations.py:_parse_probe_result` → `{logged: false}` | `logged_probe_js` selector stale; update the row in `integration-providers.ts`. Daemon does not export cookies in this state to avoid burning a backend write. |
+| Daemon returns `provider_not_found` listing only `[kwork]` | (no backend log — daemon-only) | Backend registry response missing the slug; check `GET /integrations/registry` returns the full list and the daemon cache hasn't pinned a stale snapshot (TTL 300 s, restart daemon to flush). |
+| Daemon returns `registry_unavailable` | (daemon stdout) `tools/integrations.py:fetch_registry` raises | Backend down or wrong API base in `~/.agentflow/auth.json`. Daemon falls back to no-op (no Chrome opens). |
+| Daemon returns `encryption_v20_unsupported` | `chrome_cookies.py` Chrome 127+ App-Bound Encryption | Track 2c — daemon-side fallback not written. User must downgrade Chrome or wait on platform-key extraction work. |
+| Cabinet button disabled with banner «Десктоп-агент не в сети» | `devicesQ.data.items` filtered → no `status === 'online'` row | Install AgentFlow Desktop and run the daemon, then refresh `/account/integrations` |
+| Cabinet overlay stuck on «Ждём первый шаг» | No `action` event on `/me/devices/:id/tasks/stream` within 10s | Daemon connected but task hasn't started — check `dispatch_task` response, daemon process logs |
+| Status badge never flips to `connected` after overlay closes | Daemon `complete` arrived but `/me/integrations/:provider` returned 4xx | Provider config drift between daemon registry cache and backend; restart daemon to flush 5-min cache |
+
+## Related
+
+- [Kwork Integration](/subsystems/kwork-integration) — the original cookie-export specialisation (PR #795 → #796), now the kwork row of the registry.
+- [Computer-MCP](/subsystems/computer-mcp) — daemon-side `connect_integration(slug)` tool that drives this router.
+- [Multi-Agent Project Chat](/subsystems/multi-agent-project-chat) — where onboarded accounts surface in cabinet.
