@@ -83,6 +83,13 @@ export default defineConfig({
             { label: 'Multi-Agent Runtime (Desktop)', slug: 'subsystems/multi-agent-runtime' },
             { label: 'Mac Menu-Bar App', slug: 'subsystems/mac-menu-bar-app' },
             { label: 'Recording Jobs', slug: 'subsystems/recording-jobs' },
+            { label: 'Academy', slug: 'subsystems/academy' },
+          ],
+        },
+        {
+          label: 'Academy',
+          items: [
+            { label: 'Curriculum Map', slug: 'academy/curriculum-map' },
           ],
         },
         {
