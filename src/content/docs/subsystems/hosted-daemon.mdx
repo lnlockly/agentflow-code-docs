@@ -22,7 +22,7 @@ handshake идёт через тот же `/me/devices/connect`, что и Mac-�
 | `agentflow-agents/src/routes/me-hosted-devices.ts:36` | `HOSTED_API_KEY_PREFIX` + `generateHostedApiKey`/`hashApiKey` (минт api_key для daemon) |
 | `agentflow-agents/src/routes/me-hosted-devices.ts:60` | `HOSTED_DAEMON_ENROLLMENT_TTL_SEC` = 30d, `newRotationSecret`/`rotationSecretMatches` |
 | `agentflow-agents/src/routes/me-hosted-devices.ts:240` | `renderDaemonManifest` — env-блок с `AF_DEVICE_ID`/`AF_ENROLLMENT_TOKEN`/`AF_HOSTED_ROTATION_SECRET`/`AF_API_KEY` |
-| `agentflow-agents/src/routes/me-hosted-devices.ts:400` | POST `/me/hosted-devices` — минт user_devices+api_key+rotation_secret, INSERT hosted_devices |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:475` | POST `/me/hosted-devices` — минт user_devices+api_key+rotation_secret, INSERT hosted_devices, всё в одном `sql.begin` (rollback при любой ошибке) |
 | `agentflow-agents/src/routes/me-hosted-devices.ts:850` | POST `/me/hosted-devices/:id/reenroll` — exchange rotation_secret → fresh enrollment_token |
 | `agentflow-agents/src/services/bootstrap-schema.ts:347` | ALTER TABLE `hosted_devices` ADD COLUMN kind/user_device_id/rotation_secret_hash |
 | `agentflow-agents/src/services/devices-ws.ts:138` | `performHandshake` — общий путь для Mac и hosted |
@@ -77,7 +77,10 @@ Daemon в /cabinet/devices/hosted/:id
 - `user_devices` — стандартный row, `device_secret_hash` сбрасывается на
   каждом `/reenroll` чтобы старый secret больше не подходил
 - `api_keys` — row с `name='hosted:<base>'` для опознания: при DELETE
-  hosted-device можно revoke этот key точечно (TODO в hosted cleanup)
+  hosted-device можно revoke этот key точечно (TODO в hosted cleanup).
+  `scopes=["device:ws","device:reenroll"]` (вместо `[]` full-owner) —
+  documentary до тех пор пока enforcement не подключён к
+  `requireSession`/`devices-ws` (отдельный backlog item)
 
 **Pod env** (только при `kind=daemon`):
 - `AF_DEVICE_ID` — UUID из user_devices
@@ -86,8 +89,8 @@ Daemon в /cabinet/devices/hosted/:id
   если /reenroll недоступен
 - `AF_HOSTED_ROTATION_SECRET` — long-lived `afh_<hex>`, постоянный весь
   lifetime пода. Эквивалент service-account-token внутри vcluster.
-- `AF_API_KEY` — `af_live_<hex>`, scope=пустой, для devices-ws.ts
-  `x-api-key` header
+- `AF_API_KEY` — `af_live_<hex>`, scope=`["device:ws","device:reenroll"]`,
+  для devices-ws.ts `x-api-key` header
 - `AF_API_URL` — `https://agentflow.website`
 
 **Routes:**
@@ -106,6 +109,7 @@ Daemon в /cabinet/devices/hosted/:id
 | WS handshake `device_not_found` | `[devices-ws] device_not_found` | hosted_devices.user_device_id NULL — backend bug, проверь что INSERT user_devices прошёл в POST handler |
 | Pod OOMKilled через 30s | `Reason: OOMKilled` в `kubectl describe pod` | size='small' для kind=daemon — UI должен был форснуть medium, но кто-то прокликал API напрямую |
 | Daemon селtест вместо handshake | `[entrypoint] AF_API_KEY missing — running selftest only` | AF_DEVICE_ID не пришёл в env, manifest renderer не сработал — проверь backend logs `[hosted-devices] api_key mint failed` |
+| POST /me/hosted-devices 500 + no rows written | `[hosted-devices] provision tx rolled back` | один из INSERTов внутри `sql.begin` упал — три row (user_devices/api_keys/hosted_devices) откатились вместе; ищи root cause по сообщению после префикса |
 | Chromium падает на старте | `Failed to launch the browser process` в логах daemon | `--no-sandbox` не передан или Xvfb не поднялся — `kubectl logs <pod> -c daemon \| head -50` |
 
 ## Related
