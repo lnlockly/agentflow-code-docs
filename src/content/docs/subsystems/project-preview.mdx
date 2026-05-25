@@ -1,0 +1,122 @@
+---
+title: "Project Preview (wildcard subdomain + Caddy + HMR)"
+description: "How <slug>.proj.agentflow.website reaches a dev server inside the user-workspace pod, with WebSocket HMR working end-to-end."
+---
+
+# Project Preview
+
+## TL;DR
+
+Every preview URL of the shape `*.proj.agentflow.website` resolves to the same
+nginx-ingress edge, which terminates TLS using the wildcard cert
+`wildcard-proj-agentflow-tls` and forwards to the multi-tenant
+`user-workspace-1` Caddy sidecar on port 8080. Caddy reads
+`/workspace/<slug>/.runtime/foundation_port` markers and either reverse-proxies
+to `localhost:<port>` (foundation projects with a live dev server) or falls
+back to a `file_server` over `/workspace/<slug>/dist`. WebSocket upgrades pass
+through both nginx-ingress (default) and Caddy `reverse_proxy` (default), so
+Next.js `/_next/webpack-hmr` works in the browser without extra config.
+
+Verified 2026-05-26 on `https://p-1g704j1o.proj.agentflow.website/` (Next.js
+14.2.5 dev server, proj-6x5h2s2m bound to localhost:3001): WS open → initial
+`{"action":"sync","hash":"e929af..."}`; touch `app/(marketing)/page.tsx` →
+within ~1.3s receive `{"action":"building"}` → `{"action":"serverComponentChanges"}`
+→ `{"action":"built","hash":"88fb56d2..."}` (new hash confirms recompile).
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/k8s/user-workspace.yaml:141` | `preview` sidecar — Caddy 2.8-alpine that builds and reloads `/tmp/Caddyfile` on every foundation marker change |
+| `agentflow-agents/k8s/user-workspace.yaml:178` | `discover_foundations()` — scans `/workspace/*/.runtime/foundation_port`, emits `<slug>\t<port>` lines |
+| `agentflow-agents/k8s/user-workspace.yaml:238` | `write_caddyfile()` — emits per-slug `reverse_proxy localhost:<port>` blocks before the static fallback |
+| `agentflow-agents/k8s/user-workspace.yaml:195` | `emit_static_block()` — canonical / digit-safe / expose-public host regexes serving `/workspace/<slug>/dist` |
+| `agentflow-agents/k8s/user-workspace.yaml:422` | Wildcard fallback Ingress `user-workspace-1-preview` (`*.proj.agentflow.website` → user-workspace-1:8080) |
+| `agentflow-agents/src/services/graph-executor/handlers/spa.ts:1210` | Writes the `foundation_port` marker after the project's dev server is up |
+| `agentflow-agents/src/services/peruser-pod.ts` | Mints per-project Ingress + bridge Service from `expose_public` (preferred over the wildcard fallback) |
+| `agentflow-agents/helpers/caddy.ts:412` | Per-project sidecar variant for the one-project-per-pod path (kept in sync with the multi-tenant Caddyfile in `user-workspace.yaml`) |
+
+## Data flow
+
+```
+Browser
+  │  GET https://p-<slug>.proj.agentflow.website/
+  │  Upgrade: websocket  (for /_next/webpack-hmr)
+  ▼
+nginx-ingress (host ns: franchise-factory)
+  │  matches per-project Ingress proj-u1-<slug>  (preferred)
+  │     OR wildcard Ingress user-workspace-1-preview ("*.proj.agentflow.website")
+  │  TLS-terminates with secret wildcard-proj-agentflow-tls
+  │  default WS upgrade pass-through (Upgrade + Connection headers preserved)
+  ▼
+Service (selector-less bridge → user-workspace-1.af-tenant-1:8080)
+  ▼
+Caddy sidecar in user-workspace-1 pod (af-tenant-1 ns)
+  │  header_regexp matches Host against (canonical | digit-prefixed | expose-public)
+  │  IF /workspace/<slug>/.runtime/foundation_port exists →
+  │     reverse_proxy localhost:<port>       (dev server, HMR-capable)
+  │  ELSE → file_server over /workspace/<slug>/dist (static built output)
+  ▼
+Next.js / Vite dev server on localhost:<port> inside the same pod
+  │  serves the app + the /_next/webpack-hmr WebSocket
+  ▼
+Edits to /workspace/<slug>/app/**/*.tsx → dev-server watcher → "building" →
+"built" frame over the WS → React Fast Refresh in the browser
+```
+
+## DB / Env / API
+
+- Tables: none direct. Project rows in `projects` reference the workspace dir
+  by slug (`proj-<slug>`).
+- Env: no extra env. Wildcard cert managed by cert-manager from the existing
+  ClusterIssuer (see `agentflow-code-docs/runbooks/*` and the
+  `wildcard-proj-agentflow-tls` Secret in `franchise-factory`).
+- Ingress resources:
+  - `agentflow-agents/k8s/user-workspace.yaml:422` — wildcard fallback.
+  - Per-project ingresses `proj-u1-<slug>` created by `expose_public` MCP tool
+    via `peruser-pod.ts`. All use the same `wildcard-proj-agentflow-tls`
+    secret + nginx-ingress default WS pass-through.
+- Caddy config: rebuilt + reloaded every 5s by the bash watcher in the
+  sidecar (`user-workspace.yaml:301`). Signature is md5 of the sorted
+  `slug=port` list — only a port-map change triggers `caddy reload`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| 502 from edge, page never loads | `[user-workspace-1] foundation map changed` followed by no `caddy reloaded` line | `agentflow-agents/k8s/user-workspace.yaml:308` — bad Caddyfile, sidecar restarts |
+| WS connects then hangs at `sync` with no `built` after file edit | Dev-server logs `webpack-internal` errors / chokidar `EMFILE` | Inside the project: fs.inotify.max_user_watches or syntax error in the touched file |
+| WS gets 404 from edge | nginx-ingress access log shows `404` for `/_next/webpack-hmr` | Verify the `foundation_port` marker exists and the dev server is actually up on that port; check `discover_foundations` output in sidecar logs |
+| Wrong project rendered under correct hostname | Cookie `__Secure-authjs.callback-url` points to a different slug; `cat /workspace/*/.runtime/foundation_port` shows the same port for ≥2 projects | Port-collision bug — `spa.ts` should mint unique ports per project; rewrite the stale marker or kill the duplicate dev server |
+| TLS handshake error | cert-manager log `wildcard-proj-agentflow-tls` not Ready | Re-issue via cert-manager; see runbook |
+| `*.proj.agentflow.website` Ingress fails to admit | nginx-ingress controller log `invalid wildcard host` | Wildcard host in Ingress must be exactly one DNS label (`*.proj.agentflow.website`, not `*.x.proj.agentflow.website`) |
+
+## Verification commands
+
+```bash
+# 1. Confirm wildcard Ingress + cert
+kubectl -n franchise-factory get ingress user-workspace-1-preview \
+  -o jsonpath='{.spec.tls[0]}'
+
+# 2. List per-project Ingresses
+kubectl -n franchise-factory get ingress -l app.kubernetes.io/managed-by=agentflow-agents
+
+# 3. Inspect live foundation port map inside the pod
+kubectl -n af-tenant-1 exec deploy/user-workspace-1 -c tools -- \
+  bash -lc 'for m in /workspace/*/.runtime/foundation_port; do
+    echo "$(dirname $(dirname $m) | xargs basename)=$(cat $m)"; done'
+
+# 4. HMR end-to-end (browser console)
+const ws = new WebSocket('wss://' + location.host + '/_next/webpack-hmr');
+ws.onmessage = (e) => console.log(e.data);
+# then in the pod:
+kubectl -n af-tenant-1 exec deploy/user-workspace-1 -c tools -- \
+  bash -lc 'echo "// probe $(date +%s)" >> /workspace/proj-<slug>/app/page.tsx'
+# expect: building → built (new hash)
+```
+
+## Related
+
+- [Foundation Bridge](/subsystems/foundation-bridge/)
+- [Hosted Device](/subsystems/hosted-device/)
+- [Projects Create Flow](/subsystems/projects-create-flow/)
