@@ -76,6 +76,7 @@ export default defineConfig({
             { label: 'Matrix Discord Bridge', slug: 'subsystems/mautrix-discord-bridge' },
             { label: 'Social Network', slug: 'subsystems/social-network' },
             { label: 'Autonomous Goals', slug: 'subsystems/autonomous-goals' },
+            { label: 'Install Wizard (unified)', slug: 'subsystems/install-wizard' },
             { label: 'Desktop Auto-Updater', slug: 'subsystems/desktop-auto-updater' },
             { label: 'Desktop Agent LLM', slug: 'subsystems/desktop_agent_llm' },
             { label: 'Cabinet Device — Autonomous Tab', slug: 'subsystems/cabinet-device-autonomous-tab' },
