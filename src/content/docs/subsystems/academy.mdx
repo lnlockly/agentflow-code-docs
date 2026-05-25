@@ -23,15 +23,25 @@ Academy — это полноценный учебный план по AgentFlow
 | Path | Role |
 |---|---|
 | `agentflow-agents/src/db/migrations/0063_academy_phase1.sql:1` | Tables: `courses`, `course_modules`, `course_lessons`, `course_enrollments` |
+| `agentflow-agents/src/db/schema.ts` (courses table) | `moduleSlug TEXT NOT NULL DEFAULT 'misc'` — добавлено в iter2 (2026-05-25) |
+| `agentflow-agents/src/services/bootstrap-schema.ts` | `ALTER TABLE courses ADD COLUMN IF NOT EXISTS module_slug ... DEFAULT 'misc'` — boot-time miграция iter2 |
 | `agentflow-agents/src/db/seed-academy.ts:1` | Idempotent boot-time seed — все курсы платформы |
-| `agentflow-agents/src/db/seed-academy.ts:152` | `COURSE_START` — Запусти первого AI-агента |
-| `agentflow-agents/src/db/seed-academy.ts:374` | `COURSE_FARM` — Подключи ферму контактов |
-| `agentflow-agents/src/db/seed-academy.ts:1768` | `COURSE_MARKETPLACE_BROWSE_HIRE` — Маркетплейс: найми готового агента |
-| `agentflow-agents/src/db/seed-academy.ts:989` | `COURSE_KWORK_FARM` — Kwork: трио агентов на твоём аккаунте |
-| `agentflow-agents/src/db/seed-academy.ts:2224` | `COURSE_TG_FARM_BROADCAST` — TG-рассылка от brief до первого ответа |
-| `agentflow-agents/src/db/seed-academy.ts:1286` | `COURSE_BILLING_TOPUP_USDT` — пополнение USDT через CryptoBot |
-| `agentflow-agents/src/db/seed-academy.ts:1951` | `COURSE_PLATFORM_NAVIGATION_MAP` — карта платформы |
-| `agentflow-agents/src/routes/academy.ts` | REST: `/courses`, `/courses/:slug`, `/lessons/:id` |
+| `agentflow-agents/src/db/seed-academy.ts:171` | `COURSE_START` (start-ai-agent) — модуль `start` |
+| `agentflow-agents/src/db/seed-academy.ts:394` | `COURSE_FARM` (farm-quickstart) — модуль `telegram` |
+| `agentflow-agents/src/db/seed-academy.ts:1796` | `COURSE_MARKETPLACE_BROWSE_HIRE` (marketplace-browse-hire) — модуль `marketplace` |
+| `agentflow-agents/src/db/seed-academy.ts:1012` | `COURSE_KWORK_FARM` (kwork-account-farm-graph) — модуль `kwork` |
+| `agentflow-agents/src/db/seed-academy.ts:2254` | `COURSE_TG_FARM_BROADCAST` (tg-farm-broadcast-launch) — модуль `telegram` |
+| `agentflow-agents/src/db/seed-academy.ts:1311` | `COURSE_BILLING_TOPUP_USDT` (billing-topup-usdt) — модуль `earnings` |
+| `agentflow-agents/src/db/seed-academy.ts:1980` | `COURSE_PLATFORM_NAVIGATION_MAP` (platform-navigation-map) — модуль `start` |
+| `agentflow-agents/src/db/seed-academy.ts:2658` | `COURSE_SOCIAL_NETWORK` (social-network-projects) — модуль `social` |
+| `agentflow-agents/src/db/seed-academy.ts:2802` | `COURSE_QUESTS_REFERRALS` (quests-referrals-earnings) — модуль `earnings` |
+| `agentflow-agents/src/db/seed-academy.ts:2504` | `COURSE_DEVICE_AND_INTEGRATIONS` (device-and-integrations-quickstart) — модуль `start` |
+| `agentflow-agents/src/db/seed-academy.ts:2952` | **iter2** `COURSE_PROJECT_KINDS` (project-kinds-walkthrough) — модуль `marketplace`, 3 урока про landing/spa/tg_bot/mini_app |
+| `agentflow-agents/src/db/seed-academy.ts:3106` | **iter2** `COURSE_TEMPLATES_GALLERY` (templates-gallery-clone) — модуль `marketplace`, клонирование шаблона |
+| `agentflow-agents/src/db/seed-academy.ts:3210` | **iter2** `COURSE_WITHDRAW_USDF` (withdraw-usdf-to-usdt) — модуль `earnings`, вывод на кошелёк |
+| `agentflow-agents/src/db/seed-academy.ts:3318` | **iter2** `COURSE_API_KEYS_LLM_CABINET` (api-keys-and-llm-cabinet) — модуль `start`, API-ключи + кабинет LLM |
+| `agentflow-agents/src/routes/courses.ts` (ACADEMY_MODULES) | **iter2** Статический список 6+1 модулей, отдаётся через `GET /modules` |
+| `agentflow-agents/src/routes/academy.ts` | REST: `/courses`, `/courses/:slug`, `/lessons/:id`, `/modules` (iter2) |
 | `agentflow-agents/src/routes/me-academy.ts` | REST: `/me/courses/:slug/enroll`, `/lessons/:id/complete`, `/progress` |
 | `agentflow-landing/src/pages/academy/AcademyCatalogPage.tsx:1` | Каталог `/academy` |
 | `agentflow-landing/src/pages/academy/AcademyCoursePage.tsx:1` | Курс + модули `/academy/:slug` |
@@ -41,16 +51,19 @@ Academy — это полноценный учебный план по AgentFlow
 
 ## Curriculum map
 
-Шесть модулей покрывают весь жизненный цикл оператора AgentFlow.
+Шесть модулей покрывают весь жизненный цикл пользователя AgentFlow.
 
-| # | Модуль | Цель | Курсы (slug) |
+| # | Модуль (slug) | Цель | Курсы (slug) |
 |---|---|---|---|
-| 1 | Старт | Понять платформу, поставить устройство, запустить первого агента | `start-ai-agent`, `platform-navigation-map`, `concierge-recommend-agent` |
-| 2 | Маркетплейс и проекты | Найти готового агента, нанять, поделиться результатом | `marketplace-browse-hire`, `share-chat-snapshot`, `image-poster`, `researcher-topic`, `shorts-from-images` |
-| 3 | Kwork-автоматизации | Подключить кабинет Kwork, запустить трио (auto-bidder + replier + service-creator) | `kwork-account-farm-graph` |
-| 4 | Telegram-автоматизации | Контакт-ферма, рассылка, прогрев | `farm-quickstart`, `tg-farm-broadcast-launch` |
-| 5 | Соцсеть и расшаривание | Проекты, новости, публичные ссылки на чат | `share-chat-snapshot` (cross-ref) |
-| 6 | Заработок и подписки | Пополнить USDT, купить тариф, понять USDF | `billing-topup-usdt`, `billing-buy-subscription` |
+| 1 | Старт (`start`) | Поставить устройство, понять платформу, поднять свои API-ключи | `start-ai-agent`, `platform-navigation-map`, `concierge-recommend-agent`, `device-and-integrations-quickstart`, `api-keys-and-llm-cabinet` |
+| 2 | Маркетплейс и проекты (`marketplace`) | Найти готового агента, нанять, выбрать kind проекта, склонировать шаблон | `marketplace-browse-hire`, `image-poster`, `researcher-topic`, `shorts-from-images`, `project-kinds-walkthrough`, `templates-gallery-clone` |
+| 3 | Kwork-автоматизации (`kwork`) | Подключить кабинет Kwork, поднять трио (auto-bidder + replier + service-creator) | `kwork-account-farm-graph` |
+| 4 | Telegram (`telegram`) | Контакт-ферма, рассылка, прогрев | `farm-quickstart`, `tg-farm-broadcast-launch` |
+| 5 | Соцсеть (`social`) | Проекты, новости, публичные ссылки на чат | `share-chat-snapshot`, `social-network-projects` |
+| 6 | Заработок (`earnings`) | Пополнить USDT, купить тариф, вывести USDF, квесты + рефералы | `billing-topup-usdt`, `billing-buy-subscription`, `quests-referrals-earnings`, `withdraw-usdf-to-usdt` |
+
+Каждый курс в Postgres `courses.module_slug` хранит slug модуля. Frontend
+`/academy` группирует карточки по модулям через `GET /modules` + `GET /courses`.
 
 Полный mapping модулей → курсов → уроков — в [curriculum-map](/academy/curriculum-map).
 
@@ -80,9 +93,10 @@ GET  /me/courses/:slug/progress    (cookie-auth, returns completed_at[])
 - Tables: `courses`, `course_modules`, `course_lessons`, `course_enrollments`
 - Env (frontend): `VITE_AGENTS_URL` — base для академии (default `https://agents.agentflow.website`)
 - Routes:
-  - Public: `GET /courses`, `GET /courses/:slug`, `GET /lessons/:id`
+  - Public: `GET /courses`, `GET /courses/:slug`, `GET /lessons/:id`, `GET /modules` (iter2)
   - Cookie-auth: `POST /me/courses/:slug/enroll`, `POST /me/courses/:slug/lessons/:id/complete`, `GET /me/courses/:slug/progress`
 - Frontend routes: `/academy`, `/academy/:slug`, `/academy/:slug/lesson/:id`
+- Iter2 column: `courses.module_slug TEXT NOT NULL DEFAULT 'misc'` — добавлена через `bootstrap-schema.ts` (ADD COLUMN IF NOT EXISTS), сидер выставляет реальный slug при upsert.
 
 ## Как добавить новый курс
 
@@ -112,6 +126,8 @@ filler), em-dash как divider, throat-clearing openers, антитезы ви�
 | Симптом | Log signature for grep | Where to fix |
 |---|---|---|
 | Курс не появляется на `/academy` после деплоя | `seed academy: skipped` или нет `seed academy: courses=N` в логах | `agentflow-agents/src/server.ts` — проверь вызов `seedAcademyPilotCourse()` |
+| Курс попадает в секцию "Без модуля" | `module_slug = 'misc'` в БД | `seed-academy.ts` — у `CourseSeed` нет поля `moduleSlug` или указан несуществующий slug |
+| `/academy` не группирует, рендерит одной кучей | `GET /modules` → 404 | старый backend без iter2 — фронт падает на `ACADEMY_MODULES_FALLBACK`, проверь деплой agentflow-agents |
 | Урок открывается без контента | response `/lessons/:id` = `null` | `seed-academy.ts` — у урока пустой `contentJson` |
 | `/me/courses/.../enroll` возвращает `null` | `[academy] enroll: no session` | пользователь не залогинен — фронт должен редиректить на `/login` |
 | Прогресс не сохраняется | `[academy] mark-complete: lesson not in course` | `markComplete` шлёт `lessonId` из чужого курса — проверить `slug` параметр |

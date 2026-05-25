@@ -39,9 +39,12 @@ Module 5 (Соцсеть)
 | `start-ai-agent` (Запусти первого AI-агента) | Зачем тебе AI-агент → Глянь как работает → Запусти первого агента → Проверь себя | 90 мин |
 | `platform-navigation-map` (Карта платформы) | Что есть на платформе → Когда что использовать → Концепции | 45 мин |
 | `concierge-recommend-agent` (Спроси у /assistant) | Зачем нужен концьерж → Пошагово: спроси и найми → Тонкости | 30 мин |
+| `device-and-integrations-quickstart` (Устройство + интеграции) | Выбор типа устройства → визард установки → cookies для kwork/vk/etc | 30 мин |
+| `api-keys-and-llm-cabinet` (iter2) | Где взять API-ключ → как подцепить свою OpenAI/Claude/локальную модель в кабинете LLM | 25 мин |
 
-Cabinet surfaces проверяются: `/cabinet/devices/new` (визард установки),
-`/cabinet/devices` (список устройств), `/assistant` (концьерж-чат), `/marketplace`.
+Cabinet surfaces: `/cabinet/devices/new` (визард установки),
+`/cabinet/devices`, `/assistant`, `/marketplace`, `/account/api-keys`,
+`/cabinet/llm`.
 
 ## Module 2 — Маркетплейс и проекты
 
@@ -54,10 +57,11 @@ Cabinet surfaces проверяются: `/cabinet/devices/new` (визард у
 | `researcher-topic` | как Researcher собирает данные по теме и возвращает структурированный ответ | 30 мин |
 | `image-poster` | Image Maker для постера мероприятия с итеративной правкой | 25 мин |
 | `shorts-from-images` | рекламный шортс из своих картинок (Remotion-flow) | 35 мин |
-| `share-chat-snapshot` | публичная ссылка на чат с агентом — пуш в портфолио | 20 мин |
+| `project-kinds-walkthrough` (iter2) | какой kind выбрать — landing / spa / tg_bot / mini_app — на конкретных задачах | 25 мин |
+| `templates-gallery-clone` (iter2) | клонирование готового шаблона из галереи за 30 сек | 15 мин |
 
 Cabinet surfaces: `/marketplace`, `/marketplace/:slug`, `/projects/:id`,
-`/projects/:id/workspace`, `/shared/:token`.
+`/projects/:id/workspace`, `/projects/new`, `/templates`, `/shared/:token`.
 
 ## Module 3 — Kwork-автоматизации
 
@@ -98,15 +102,11 @@ Cabinet surfaces: `/account/integrations/telegram`, `/farm`,
 
 | Курс | Что осваиваешь | Время |
 |---|---|---|
-| `share-chat-snapshot` (cross-ref из Module 2) | публичные ссылки на чаты — снапшот для портфолио | 20 мин |
+| `share-chat-snapshot` | публичные ссылки на чаты — снапшот для портфолио | 20 мин |
+| `social-network-projects` | соцсеть AgentFlow: проекты, новости, лента, профиль | 25 мин |
 
-Дополнительно (без отдельного курса, опирается на cabinet UX):
-- `/projects/:id` — публикация project news post,
-- `/projects/:id/news/:nid` — детальная страница новости,
-- `/feed` — лента проектов сообщества,
-- `/u/:username` — публичный профиль.
-
-Cabinet surfaces: `/projects/:id`, `/feed`, `/shared/:token`, `/u/:username`.
+Cabinet surfaces: `/projects/:id`, `/projects/:id/news/:nid`, `/feed`,
+`/shared/:token`, `/u/:username`.
 
 ## Module 6 — Заработок и подписки
 
@@ -117,14 +117,11 @@ Cabinet surfaces: `/projects/:id`, `/feed`, `/shared/:token`, `/u/:username`.
 |---|---|---|
 | `billing-topup-usdt` | invoice → QR → оплата → баланс USDF | 25 мин |
 | `billing-buy-subscription` | start/pro/business → активация → edge cases | 30 мин |
-
-Дополнительно (без отдельного курса, прямо в cabinet):
-- `/quests` — задания за USDF (см. [Onboarding Quests](/subsystems/onboarding-quests)),
-- `/earnings` — общий заработок и реферальные ссылки,
-- `/account/subscription` — управление подпиской.
+| `quests-referrals-earnings` | квесты, рефералы, первые $50 в USDF на платформе | 25 мин |
+| `withdraw-usdf-to-usdt` (iter2) | вывод USDF на внешний кошелёк (USDT) — лимиты, комиссия, статусы | 15 мин |
 
 Cabinet surfaces: `/account/billing`, `/account/subscription`, `/quests`,
-`/earnings`.
+`/earnings`, `/account/withdraw`.
 
 ## Что покрывает каждая поверхность кабинета
 
