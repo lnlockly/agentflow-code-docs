@@ -84,6 +84,7 @@ export default defineConfig({
             { label: 'Mac Menu-Bar App', slug: 'subsystems/mac-menu-bar-app' },
             { label: 'Recording Jobs', slug: 'subsystems/recording-jobs' },
             { label: 'Academy', slug: 'subsystems/academy' },
+            { label: 'Showcase Kits', slug: 'subsystems/showcase-kits' },
           ],
         },
         {
