@@ -1,0 +1,115 @@
+---
+title: "Hosted Daemon — AI-агент в облаке (kind=daemon)"
+description: "End-to-end auth flow для kind=daemon: user_devices row, rotation_secret, /reenroll, ws-handshake. Парная страница к hosted-device.mdx."
+---
+
+# Hosted Daemon (kind=daemon)
+
+## TL;DR
+
+`kind=daemon` запускает полноценный AgentFlow Desktop runtime
+(`ghcr.io/lnlockly/agentflow-daemon:latest` — Xvfb + Chromium +
+Playwright + computer-use tools) внутри vcluster пользователя. WS
+handshake идёт через тот же `/me/devices/connect`, что и Mac-демон, —
+оба авторизуются как rows в `user_devices`. Cabinet `/cabinet/devices/hosted/:id`
+показывает task composer для kind=daemon (та же поверхность что
+`CabinetDeviceLive` для Mac, без MJPEG-стрима).
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-hosted-devices.ts:36` | `HOSTED_API_KEY_PREFIX` + `generateHostedApiKey`/`hashApiKey` (минт api_key для daemon) |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:60` | `HOSTED_DAEMON_ENROLLMENT_TTL_SEC` = 30d, `newRotationSecret`/`rotationSecretMatches` |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:240` | `renderDaemonManifest` — env-блок с `AF_DEVICE_ID`/`AF_ENROLLMENT_TOKEN`/`AF_HOSTED_ROTATION_SECRET`/`AF_API_KEY` |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:400` | POST `/me/hosted-devices` — минт user_devices+api_key+rotation_secret, INSERT hosted_devices |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:850` | POST `/me/hosted-devices/:id/reenroll` — exchange rotation_secret → fresh enrollment_token |
+| `agentflow-agents/src/services/bootstrap-schema.ts:347` | ALTER TABLE `hosted_devices` ADD COLUMN kind/user_device_id/rotation_secret_hash |
+| `agentflow-agents/src/services/devices-ws.ts:138` | `performHandshake` — общий путь для Mac и hosted |
+| `agentflow-computer-mcp/docker/entrypoint.sh:95` | `write_hosted_auth()` — /reenroll → `~/.agentflow/auth.json` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/auth.py:30` | `build_connect_headers` — `x-api-key`/`x-device-id`/`x-enrollment-token` |
+| `agentflow-landing/src/pages/CabinetHostedDeviceNew.tsx:60` | radio Тип (plain/daemon), force size=medium для daemon |
+| `agentflow-landing/src/pages/CabinetHostedDeviceDetail.tsx:200` | `DaemonTaskPanel` — composer + SSE timeline |
+
+## Data flow
+
+```
+Cabinet «Создать»
+   │ POST /me/hosted-devices {kind=daemon, size, name}
+   ▼
+me-hosted-devices.ts
+   ├── mint user_devices row    (enrollment_token, TTL 30d)
+   ├── mint api_keys row        (af_live_*, name=hosted:<base>)
+   ├── newRotationSecret        (хэш в hosted_devices.rotation_secret_hash)
+   └── INSERT hosted_devices    (kind, user_device_id, rotation_secret_hash)
+   │
+   │ kubectl apply -f <manifest>  (с env-вбросом всех 4 секретов)
+   ▼
+af-tenant-<userId>:<pod>  (daemon container)
+   │ entrypoint.sh
+   │  ├── Xvfb (always)
+   │  ├── (опц.) fluxbox+x11vnc+novnc если AF_ENABLE_SCREEN=1
+   │  └── write_hosted_auth():
+   │        ├── POST /me/hosted-devices/<HOSTED_ID>/reenroll
+   │        │       {rotation_secret: AF_HOSTED_ROTATION_SECRET}
+   │        │      → {enrollment_token, device_id, ttl_sec}
+   │        └── ~/.agentflow/auth.json (mode 0600)
+   ▼
+agentflow-desktop run --headless
+   │ ws connect wss://agentflow.website/_agents/_devices/connect
+   │ headers: x-api-key, x-device-id, x-enrollment-token
+   ▼
+devices-ws.ts performHandshake
+   │ enrollment_token path → user_devices.status='online'
+   │ + freshSecret в hello_ack
+   ▼
+Daemon в /cabinet/devices/hosted/:id
+   │ DaemonTaskPanel
+   │ POST /me/devices/<user_device_id>/dispatch_task {task}
+   │ SSE /me/devices/<user_device_id>/tasks/stream
+```
+
+## DB / Env / API
+
+**Tables:**
+- `hosted_devices` — `id`, `user_id`, `kind` ('plain'|'daemon'), `user_device_id`
+  FK → user_devices(id), `rotation_secret_hash` (SHA-256 hex)
+- `user_devices` — стандартный row, `device_secret_hash` сбрасывается на
+  каждом `/reenroll` чтобы старый secret больше не подходил
+- `api_keys` — row с `name='hosted:<base>'` для опознания: при DELETE
+  hosted-device можно revoke этот key точечно (TODO в hosted cleanup)
+
+**Pod env** (только при `kind=daemon`):
+- `AF_DEVICE_ID` — UUID из user_devices
+- `AF_HOSTED_DEVICE_ID` — UUID из hosted_devices (для /reenroll URL)
+- `AF_ENROLLMENT_TOKEN` — initial one-time token (30d TTL), используется
+  если /reenroll недоступен
+- `AF_HOSTED_ROTATION_SECRET` — long-lived `afh_<hex>`, постоянный весь
+  lifetime пода. Эквивалент service-account-token внутри vcluster.
+- `AF_API_KEY` — `af_live_<hex>`, scope=пустой, для devices-ws.ts
+  `x-api-key` header
+- `AF_API_URL` — `https://agentflow.website`
+
+**Routes:**
+- `POST /me/hosted-devices` (requireSession) — создаёт kind=daemon
+- `POST /me/hosted-devices/:id/reenroll` (NO auth — rotation_secret IS the auth)
+- `DELETE /me/hosted-devices/:id` (requireSession) — soft-deletes paired user_devices
+
+**MCP tools:** не задействуются — flow проходит через REST.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Daemon контейнер в CrashLoopBackOff с "no_credential" в логах | `[entrypoint] no enrollment_token available` | проверь что AF_ENROLLMENT_TOKEN либо AF_HOSTED_ROTATION_SECRET в env пода (`kubectl describe pod`) |
+| `/reenroll` 401 при старте | `[entrypoint] /reenroll failed` | hosted_devices.rotation_secret_hash NULL — это старый row (до миграции), пересоздай hosted device |
+| WS handshake `device_not_found` | `[devices-ws] device_not_found` | hosted_devices.user_device_id NULL — backend bug, проверь что INSERT user_devices прошёл в POST handler |
+| Pod OOMKilled через 30s | `Reason: OOMKilled` в `kubectl describe pod` | size='small' для kind=daemon — UI должен был форснуть medium, но кто-то прокликал API напрямую |
+| Daemon селtест вместо handshake | `[entrypoint] AF_API_KEY missing — running selftest only` | AF_DEVICE_ID не пришёл в env, manifest renderer не сработал — проверь backend logs `[hosted-devices] api_key mint failed` |
+| Chromium падает на старте | `Failed to launch the browser process` в логах daemon | `--no-sandbox` не передан или Xvfb не поднялся — `kubectl logs <pod> -c daemon \| head -50` |
+
+## Related
+
+- [Hosted Device (общее)](/subsystems/hosted-device) — REST API, kubectl exec, /logs SSE, /power
+- [Desktop / Computer-MCP](/subsystems/desktop-skills) — Mac-демон с тем же handshake
+- [Devices WS Handshake](/flows/device-enrollment) — общий path для Mac и hosted
