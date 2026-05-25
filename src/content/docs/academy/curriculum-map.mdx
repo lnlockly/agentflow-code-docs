@@ -1,0 +1,171 @@
+---
+title: "Curriculum Map — модули и уроки"
+description: "Шесть модулей AgentFlow Academy с прогрессивными зависимостями. Маппинг модуль → курсы → уроки → ссылки на cabinet-поверхности."
+---
+
+# Curriculum Map
+
+Шесть модулей. От первого подключения устройства до автономной работы агента
+на маркетплейсе, в kwork-кабинете и в Telegram.
+
+## Граф прохождения
+
+```
+Module 1 (Старт)
+   │
+   ├─────────────────────────────┬───────────────┐
+   ▼                             ▼               ▼
+Module 2 (Маркетплейс)    Module 4 (TG)    Module 6 (Заработок)
+   │                             │
+   ▼                             │
+Module 3 (Kwork) ◄────────────────┘
+   │
+   ▼
+Module 5 (Соцсеть)
+```
+
+Зависимости:
+- Module 2, 4, 6 разблокированы после Module 1.
+- Module 3 (Kwork) требует Module 1 (нужно устройство с Chrome).
+- Module 5 (Соцсеть) — финальный, опирается на готовые проекты из 2 и 4.
+
+## Module 1 — Старт
+
+**Цель:** понять, что такое AgentFlow, поставить устройство и запустить первого
+агента за один сеанс.
+
+| Курс | Уроки | Время |
+|---|---|---|
+| `start-ai-agent` (Запусти первого AI-агента) | Зачем тебе AI-агент → Глянь как работает → Запусти первого агента → Проверь себя | 90 мин |
+| `platform-navigation-map` (Карта платформы) | Что есть на платформе → Когда что использовать → Концепции | 45 мин |
+| `concierge-recommend-agent` (Спроси у /assistant) | Зачем нужен концьерж → Пошагово: спроси и найми → Тонкости | 30 мин |
+
+Cabinet surfaces проверяются: `/cabinet/devices/new` (визард установки),
+`/cabinet/devices` (список устройств), `/assistant` (концьерж-чат), `/marketplace`.
+
+## Module 2 — Маркетплейс и проекты
+
+**Цель:** найти готового агента под задачу, нанять в один клик, получить
+результат и поделиться.
+
+| Курс | Что осваиваешь | Время |
+|---|---|---|
+| `marketplace-browse-hire` | каталог → детальная карточка → POST hire → готовый агент в `/projects` | 35 мин |
+| `researcher-topic` | как Researcher собирает данные по теме и возвращает структурированный ответ | 30 мин |
+| `image-poster` | Image Maker для постера мероприятия с итеративной правкой | 25 мин |
+| `shorts-from-images` | рекламный шортс из своих картинок (Remotion-flow) | 35 мин |
+| `share-chat-snapshot` | публичная ссылка на чат с агентом — пуш в портфолио | 20 мин |
+
+Cabinet surfaces: `/marketplace`, `/marketplace/:slug`, `/projects/:id`,
+`/projects/:id/workspace`, `/shared/:token`.
+
+## Module 3 — Kwork-автоматизации
+
+**Цель:** подключить cookies kwork.ru, поднять трио агентов (auto-bidder, replier,
+service-creator), чтобы заказы прилетали в твой Inbox автоматически.
+
+| Курс | Что осваиваешь | Время |
+|---|---|---|
+| `kwork-account-farm-graph` | трио агентов через team-maestro, секреты, ограничения | 60 мин |
+
+Дополнительный материал из других модулей:
+- из Module 1 — установка устройства (нужен Chrome для экспорта cookies),
+- из Module 2 — навигация по проектам (где смотреть Inbox).
+
+Cabinet surfaces: `/account/integrations`, `/account/integrations/kwork`,
+`/projects/:id/inbox`, `/projects/:id/workspace`.
+
+Связанный RAG: [Generic Integrations](/subsystems/generic-integrations),
+[Kwork Integration](/subsystems/kwork-integration).
+
+## Module 4 — Telegram-автоматизации
+
+**Цель:** подключить TG-аккаунт, запустить ферму контактов и рассылку по списку
+с jitter, throttling и прогревом.
+
+| Курс | Что осваиваешь | Время |
+|---|---|---|
+| `farm-quickstart` (Подключи ферму контактов) | что такое ферма → подключение TG → пиши свою историю | 45 мин |
+| `tg-farm-broadcast-launch` | от brief до первого ответа: leads.csv → throttled_send → /farm | 60 мин |
+
+Cabinet surfaces: `/account/integrations/telegram`, `/farm`,
+`/projects/:id/inbox`, `/cabinet/whispers`.
+
+## Module 5 — Соцсеть и шаринг
+
+**Цель:** опубликовать новость о проекте, расшарить чат публичной ссылкой,
+собрать первых подписчиков.
+
+| Курс | Что осваиваешь | Время |
+|---|---|---|
+| `share-chat-snapshot` (cross-ref из Module 2) | публичные ссылки на чаты — снапшот для портфолио | 20 мин |
+
+Дополнительно (без отдельного курса, опирается на cabinet UX):
+- `/projects/:id` — публикация project news post,
+- `/projects/:id/news/:nid` — детальная страница новости,
+- `/feed` — лента проектов сообщества,
+- `/u/:username` — публичный профиль.
+
+Cabinet surfaces: `/projects/:id`, `/feed`, `/shared/:token`, `/u/:username`.
+
+## Module 6 — Заработок и подписки
+
+**Цель:** пополнить баланс USDT через CryptoBot, понять тариф и USDF,
+прокачать квесты, привести рефералов.
+
+| Курс | Что осваиваешь | Время |
+|---|---|---|
+| `billing-topup-usdt` | invoice → QR → оплата → баланс USDF | 25 мин |
+| `billing-buy-subscription` | start/pro/business → активация → edge cases | 30 мин |
+
+Дополнительно (без отдельного курса, прямо в cabinet):
+- `/quests` — задания за USDF (см. [Onboarding Quests](/subsystems/onboarding-quests)),
+- `/earnings` — общий заработок и реферальные ссылки,
+- `/account/subscription` — управление подпиской.
+
+Cabinet surfaces: `/account/billing`, `/account/subscription`, `/quests`,
+`/earnings`.
+
+## Что покрывает каждая поверхность кабинета
+
+| URL | Курс / урок | Модуль |
+|---|---|---|
+| `/cabinet/devices/new` | `start-ai-agent` → `launch-first-agent` | 1 |
+| `/cabinet/devices` | `platform-navigation-map` → `all-surfaces` | 1 |
+| `/cabinet/devices/:id` | `start-ai-agent` → `launch-first-agent` | 1 |
+| `/marketplace` | `marketplace-browse-hire` → `marketplace-overview` | 2 |
+| `/marketplace/:slug` | `marketplace-browse-hire` → `step-by-step-hire` | 2 |
+| `/projects` | `platform-navigation-map` → `when-to-use-what` | 1 |
+| `/projects/:id` | `share-chat-snapshot` → `share-overview` | 2 / 5 |
+| `/projects/:id/workspace` | `kwork-account-farm-graph` → `step-by-step-clone` | 3 |
+| `/projects/:id/inbox` | `tg-farm-broadcast-launch` → `launch-broadcast-step-by-step` | 4 |
+| `/account/integrations` | `kwork-account-farm-graph` → `where-secrets-come-from` | 3 |
+| `/account/integrations/kwork` | `kwork-account-farm-graph` → `kwork-trio-overview` | 3 |
+| `/account/integrations/telegram` | `farm-quickstart` → `connect-telegram` | 4 |
+| `/account/billing` | `billing-topup-usdt` → `step-by-step-topup` | 6 |
+| `/account/subscription` | `billing-buy-subscription` → `step-by-step-buy` | 6 |
+| `/farm` | `tg-farm-broadcast-launch` → `launch-broadcast-step-by-step` | 4 |
+| `/quests` | (см. RAG [onboarding-quests](/subsystems/onboarding-quests)) | 6 |
+| `/earnings` | (см. RAG [earnings-dashboard](/subsystems/earnings-dashboard)) | 6 |
+| `/assistant` | `concierge-recommend-agent` → `step-by-step-ask` | 1 |
+| `/shared/:token` | `share-chat-snapshot` → `step-by-step-share` | 2 / 5 |
+| `/feed` | (см. RAG social-network) | 5 |
+
+## Источники правды
+
+- DB-данные: `courses`, `course_modules`, `course_lessons` (Postgres `agentflow`).
+- Сидер: `agentflow-agents/src/db/seed-academy.ts:1`.
+- Каноническая RAG-страница академии: [`subsystems/academy`](/subsystems/academy).
+- Стиль текстов: правило копирайтинга 2026-05-15 в `seed-academy.ts:8-12`.
+
+## Как этот документ обновляется
+
+Один раз за PR, который меняет состав курсов:
+
+1. Открываешь `seed-academy.ts`, добавляешь / меняешь `CourseSeed`.
+2. Открываешь этот файл, правишь соответствующую таблицу модуля.
+3. Правишь `subsystems/academy.mdx` (таблица Files, секция Curriculum map).
+4. PR описанием: «Adds course X → Module Y, doc refs updated».
+
+Если этот документ расходится с DB — DB прав. Открой issue в
+`agentflow-code-docs` с label `rag-stale`.
