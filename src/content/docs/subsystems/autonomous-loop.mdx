@@ -91,6 +91,14 @@ DAEMON ───── task_complete frame ─────▶ devices-ws.handleC
 
 - `POST /me/autonomous/goals` — now auto-decomposes; accepts `deadline_at` as ISO string without 500.
 - `POST /me/autonomous/goals/:id/decompose` — re-uses `decomposeGoalSync`.
+- `POST /internal/autonomous/wake-now` — manual trigger, gated by `INTERNAL_API_SECRET` (header `x-agentflow-secret`). Body: `{"pass": "wake" | "reflect" | "both"}` (default `wake`). Returns `{ok, pass, wake?: {generated, dispatched}, reflect?: {reflected}, duration_ms}`. Runs in the calling pod's process — prefer the workers pod so the loops don't share LLM tokens with API traffic:
+  ```bash
+  kubectl -n franchise-factory exec deploy/agentflow-workers -- \
+    curl -sS -X POST localhost:3000/internal/autonomous/wake-now \
+      -H "x-agentflow-secret: $INTERNAL_API_SECRET" \
+      -H 'content-type: application/json' \
+      -d '{"pass":"wake"}'
+  ```
 
 **Internal exports**
 
