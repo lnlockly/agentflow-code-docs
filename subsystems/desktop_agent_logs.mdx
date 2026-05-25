@@ -1,0 +1,123 @@
+---
+title: "Desktop daemon: file logs + WS log ship"
+description: "Where daemon logs land on each platform and how the cabinet pulls them without asking the user to open PowerShell."
+---
+
+# Desktop daemon: file logs + WS log ship
+
+## TL;DR
+
+Before 2026-05-25 the daemon called `logging.basicConfig(stderr)` from
+three CLI entry points and nothing else. On Windows the schtasks-
+launched daemon discards stderr, so the user had to open a PowerShell
+window and re-run the daemon by hand to capture a stack trace —
+a blocker for diagnostics. The fix adds a rotating file handler in a
+per-platform directory plus a `WsLogHandler` that ships WARN/ERROR/
+CRITICAL records to the backend over the existing WS as `device_log`
+frames. The cabinet reads them via `GET /me/devices/:id/logs`.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/logging_setup.py:36` | `log_dir()` — per-platform directory resolution |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/logging_setup.py:73` | `init_logging()` — stderr + RotatingFileHandler, tolerates mkdir failure |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_log_uploader.py:48` | `WsLogHandler.emit` — bounded queue, drop-oldest |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_log_uploader.py:77` | `set_publisher` — flushes the backlog on attach |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/desktop_cli.py:133` | `cmd_run` wires `init_logging` + WS handler |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_client.py:155` | `_connect_once` binds the publisher post-hello, drops it on disconnect |
+| `agentflow-agents/src/db/migrations/0071_device_logs.sql:1` | `device_logs` table + `idx_device_logs_device_time` |
+| `agentflow-agents/src/services/devices-ws.ts:478` | `device_log` frame → `persistDeviceLog` → INSERT |
+| `agentflow-agents/src/services/devices-ws.ts:880` | `normaliseDeviceLog` — level whitelist + 4 KB truncate |
+| `agentflow-agents/src/routes/me-devices.ts:1132` | `GET /me/devices/:id/logs` |
+| `agentflow-agents/tests/me-devices-logs.test.ts:1` | Pure-helper tests (parse + normalise) |
+| `agentflow-computer-mcp/tests/test_logging_setup.py:1` | log_dir + rotation + mkdir-failure tests |
+| `agentflow-computer-mcp/tests/test_ws_log_uploader.py:1` | Drop-oldest + drain-on-attach + truncation tests |
+
+## Log file locations
+
+| Platform | Path |
+|---|---|
+| Windows | `%LOCALAPPDATA%\AgentFlow\logs\daemon.log` (fallback `%APPDATA%\AgentFlow\logs\daemon.log`) |
+| macOS | `~/Library/Logs/AgentFlow/daemon.log` |
+| Linux | `$XDG_STATE_HOME/agentflow/logs/daemon.log` or `~/.local/state/agentflow/logs/daemon.log` |
+
+Rotation: 5 MB per file, 5 backups (`daemon.log`, `daemon.log.1`, …).
+Disk ceiling per device: 30 MB.
+
+## Data flow
+
+```
+daemon code calls log.error("…")
+   │
+   ▼
+root logger fan-out
+   │
+   ├──► StreamHandler(stderr)        ── dev console
+   │
+   ├──► RotatingFileHandler          ── per-platform daemon.log
+   │
+   └──► WsLogHandler                 ── bounded queue (500)
+              │
+              ▼
+        publisher set?
+        ├─ no  → keep in queue, retry on next set_publisher()
+        └─ yes → ws_client.publish({type: device_log, …})
+                                 │
+                                 ▼
+                    backend devices-ws.persistDeviceLog
+                                 │
+                                 ▼
+                    INSERT INTO device_logs (…)
+                                 │
+                                 ▼
+   cabinet GET /me/devices/:id/logs?level=ERROR&limit=50
+                                 │
+                                 ▼
+   {ok, items: [{level, ts, logger_name, message, exc_info_text}…]}
+```
+
+## DB / Env / API
+
+- Tables: `device_logs (id bigserial, device_id uuid, level text, ts timestamptz, logger_name text, message text, exc_info_text text)`. Indexes `idx_device_logs_device_time (device_id, ts DESC)` and `idx_device_logs_level_time (level, ts DESC)`.
+- Env: none new. The daemon's existing log dir resolution honours `LOCALAPPDATA` / `APPDATA` / `XDG_STATE_HOME` when present.
+- Routes:
+  - `GET /me/devices/:id/logs?level=&since=&limit=` → `200 {ok, items: [...]}`. Defaults: `limit=100`, no level filter, no since filter. Limit bounded `[1, 500]`. Levels accepted: `WARNING|WARN|ERROR|CRITICAL|FATAL` (aliases collapse to canonical).
+  - Auth via `requireSession`; ownership check via `loadOwnedDeviceId` (404 when foreign).
+- WS frame:
+  - `C→S`: `{type: "device_log", level, ts, logger_name, message, exc_info_text?}`.
+- Truncate ceilings: `message` and `exc_info_text` capped at 4 KB per row server-side; `logger_name` capped at 200 chars.
+- Level filter: backend rejects `INFO`/`DEBUG`/anything outside the whitelist so the table does not turn into a firehose.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Daemon crashed and there is no file | `agentflow-desktop: log file unavailable at` (stderr only) | `logging_setup.py:115` — mkdir blew up. Check write perms on `%LOCALAPPDATA%\AgentFlow\logs\` (Windows) or `~/Library/Logs/AgentFlow/` (macOS). |
+| Disk full — rotation did not save us | (no log) | `daemon.log` + 5 backups cap at ~30 MB. If the volume is full anyway, the OS denies the write and the file handler stays quiet (stderr keeps going). User has to free space on the host. |
+| WS blocking on log upload | (would be `[stream] capture err` cascading) | `ws_log_uploader.py:_drain` — bounded queue (500) + drop-oldest means the emitting thread never blocks. If queue keeps draining slowly, look at `dropped_count()` via `get_handler()`. |
+| Cabinet shows zero logs even after a crash | `persist_device_log_failed` | `devices-ws.ts:persistDeviceLog` — INSERT failed (FK / connection blip). Re-check `device_logs` table exists; verify migration `0071_device_logs.sql` ran (see `_app_migrations`). |
+| Backlog never flushes after reconnect | `set_publisher` never called | `ws_client.py:_connect_once` — handler is bound right after hello. If WS reconnects but `set_publisher` is not hit, hello was never sent. |
+| INFO records flooding the table | `level = 'INFO'` in `SELECT level, count(*) FROM device_logs GROUP BY level` | `WsLogHandler.__init__` default `min_level=logging.WARNING` was overridden somewhere. Backend also rejects via `normaliseDeviceLog`. |
+| Log ts is in 2099 | `level = 'ERROR' AND ts > now()` | Clock skew on the daemon host. `normaliseDeviceLog` clamps ±24 h skew; further drift falls back to server `now()`. |
+
+## How a user reads logs
+
+1. **Locally (PowerShell on Windows):**
+   ```powershell
+   Get-Content -Tail 100 -Wait "$env:LOCALAPPDATA\AgentFlow\logs\daemon.log"
+   ```
+2. **Locally (macOS):**
+   ```sh
+   tail -f ~/Library/Logs/AgentFlow/daemon.log
+   ```
+3. **From the cabinet (any platform, no terminal needed):**
+   `GET https://agentflow.website/_agents/me/devices/:id/logs?level=ERROR&limit=50`
+   — returns the last 50 ERROR records. The cabinet renders this in the
+   device detail page's "недавние ошибки" pane.
+
+## Related
+
+- [Desktop daemon: live screen stream + cabinet toggle](/subsystems/desktop-agent-live-stream)
+- [Desktop auto-updater](/subsystems/desktop-auto-updater)
+- [Computer MCP overview](/subsystems/computer-mcp)
