@@ -1,0 +1,134 @@
+---
+title: "Project clone pipeline (approve → daemon → running)"
+description: "How project approval fans out to the owner's hosted daemon pod, clones the template repo, spawns the dev server, and flips status."
+---
+
+# Project clone pipeline
+
+> **Status: SHIPPED in agentflow-agents PR (this PR) + agentflow-computer-mcp PR #82.** Part of the Phase A refactor (A1 desktop tool, A2 template-based create flow, A3 dispatch + status callback).
+
+## TL;DR
+
+After `POST /me/projects/:id/approve` succeeds, the agents service picks the owner's primary daemon `hosted_device`, dispatches a `project_clone_and_setup` task over the persistent WS (or queues it in `device_tasks` for drain on next connect), flips `projects.status` to `provisioning`, and waits. The daemon pod clones the template repo, runs install + spawns the dev server, and POSTs back to `POST /internal/projects/:id/clone-status` with `{ ok, port, pid, … }`. The agents service then flips status to `running` (success) or `failed` (error) and stamps `preview_url=http://127.0.0.1:<port>` for the first success only.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/project-clone.ts:162` | `triggerProjectClone(projectId)` — the single fan-out helper A2's `/approve` calls. |
+| `agentflow-agents/src/services/project-clone.ts:80` | `looksLikeSafeSlug` — mirrors daemon-side `^[A-Za-z0-9_-]{1,64}$` so invalid slugs fail fast pre-dispatch. |
+| `agentflow-agents/src/services/project-clone.ts:92` | `pickDaemonDevice(ownerUserId)` — `hosted_devices kind='daemon' deleted_at IS NULL`, prefers `status='running'`. |
+| `agentflow-agents/src/services/project-clone.ts:116` | `loadProject(id)` — defensive raw SQL with `information_schema.columns` probe for `template_repo_full` (column lands with A2). |
+| `agentflow-agents/src/routes/internal.ts:674` | `POST /internal/projects/:id/clone-status` route. Raw SQL on purpose — drizzle's typed select crashes against any DB missing newer schema columns. |
+| `agentflow-agents/src/routes/me-devices.ts:680` | `dispatchOrQueueDeviceTask({deviceId,userId,task,scope?,extraPayload?})` — live WS dispatch or queue insert into `device_tasks`. |
+| `agentflow-agents/src/services/projects.ts` | `appendProjectEvent(id, kind, payload)` — `project_events` writer. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/tools/project_setup.py` | `PROJECT_CLONE_AND_SETUP_DESCRIPTOR` + handler. Clones the repo, installs, spawns dev server, POSTs `clone-status`. |
+| `agentflow-agents/tests/project-clone-setup.test.ts` | DB-gated tests for helper + route (9 cases — auto-skip when local DB lacks `hosted_devices` table). |
+
+## Data flow
+
+```
+owner clicks Approve
+        │
+        ▼
+POST /me/projects/:id/approve   (A2's refactored route)
+        │
+        ▼
+triggerProjectClone(projectId)              ◄── this PR (A3)
+        │
+        ├─→ loadProject(id)
+        │     └─ raw SQL, defensive `template_repo_full` column probe
+        │
+        ├─→ looksLikeSafeSlug(slug)         → invalid_slug
+        ├─→ pickDaemonDevice(owner)         → no_hosted_daemon
+        ├─→ device.user_device_id           → device_link_missing
+        │
+        ├─→ dispatchOrQueueDeviceTask({
+        │     deviceId, userId,
+        │     task: 'project_clone_and_setup',
+        │     scope: {template_repo_full, slug, project_id},
+        │     extraPayload: {source:'project_approve', ...}
+        │   })
+        │     └─ live WS push OR insert into device_tasks (drained on reconnect)
+        │
+        ├─→ UPDATE projects SET status='provisioning'  (only if re-kickable)
+        └─→ INSERT project_events kind='clone_dispatched' {task_id, queued, ...}
+
+  daemon pod (computer-mcp PR #82):
+        receives task → git clone → install → spawn dev server
+        │
+        ▼
+POST /internal/projects/:id/clone-status     ◄── this PR (A3 route)
+   header x-agentflow-secret: <AF_INTERNAL_API_SECRET>
+   body  { ok, port_reachable, port, dev_pid, repo_url, package_manager,
+           project_dir, error?, detail? }
+        │
+        ▼
+   SELECT status, preview_url FROM projects WHERE id=… (raw SQL)
+        │
+        ├─→ if status='provisioning' → next = ok ? 'running' : 'failed'
+        │   else                     → keep status (don't downgrade live URL)
+        │
+        ├─→ first success + port_reachable
+        │     → stamp preview_url='http://127.0.0.1:<port>'
+        │
+        ├─→ UPDATE projects (status / preview_url, NOW())
+        └─→ INSERT project_events kind='clone_status' (full daemon payload)
+```
+
+## DB / Env / API
+
+- Tables:
+  - `projects` (`status`, `preview_url`, `updated_at`, `template_repo_full` [A2]).
+  - `hosted_devices` (`kind`, `user_device_id`, `status`, `deleted_at`).
+  - `user_devices` (`id` uuid — the daemon's WS identity).
+  - `device_tasks` (queue rows for offline drain).
+  - `project_events` (`kind` ∈ {`clone_dispatched`, `clone_status`}).
+- Env:
+  - `INTERNAL_API_SECRET` — agents service; gates `/internal/*`.
+  - `AF_INTERNAL_API_SECRET` — read by daemon when POSTing `clone-status`.
+- Routes:
+  - `POST /me/projects/:id/approve` (owner-facing — A2's PR).
+  - `POST /internal/projects/:id/clone-status` (daemon callback — this PR).
+- MCP tools:
+  - `project_clone_and_setup` (computer-mcp PR #82) — the daemon-side tool dispatched here.
+
+## Status lifecycle
+
+```
+draft  ─┐
+        ├──► awaiting_approval ──► approved ──► provisioning ──► running
+        │                                            │
+        │                                            └─ ok=false → failed ──┐
+        │                                                                    │
+        └────────────────────── operator re-approve ──────────────────────────┘
+```
+
+Re-kickable statuses (helper flips → `provisioning` and re-dispatches):
+`approved`, `awaiting_approval`, `draft`, `failed`, `cancelled`.
+
+Non-downgrade rule: `clone-status` only mutates `status` when the project was `provisioning`. A stale daemon report against a `running` project leaves status untouched (event row still written).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Approve returns `error:'no_hosted_daemon'` | `pickDaemonDevice` row count = 0 | Owner has no hosted-device daemon pod. Provision one via `POST /me/hosted-devices`. |
+| Approve returns `error:'template_repo_full_missing'` | `template_repo_full — Phase A2 must run first` | Project predates the template flow. Re-trigger A2's template picker. |
+| Approve returns `error:'invalid_slug'` | `is not filesystem-safe` | Project slug has spaces/unicode/length > 64. Rename pre-approve. |
+| Approve returns `error:'device_link_missing'` | `daemon never enrolled` | `hosted_devices.user_device_id` is NULL. Daemon never opened WS. Inspect pod logs for `hello` failure. |
+| Approve returns `error:'dispatch_failed'` | first 300 chars of dispatch error in `detail` | WS push or `device_tasks` insert threw. Read `detail` — usually DB / WS state. |
+| Project stuck in `provisioning` for >5 min | no `clone_status` event row | Daemon never POSTed back. Check pod is alive (`hosted_devices.status='running'`), inspect daemon stderr, verify `AF_INTERNAL_API_SECRET` matches. |
+| `/internal/projects/:id/clone-status` returns 401 | `unauthenticated` in agents log | Daemon's `AF_INTERNAL_API_SECRET` mismatch vs agents' `INTERNAL_API_SECRET`. See **Env-var alias** below. |
+| `/internal/projects/:id/clone-status` returns 404 | `not_found` | Project id doesn't exist. Daemon was dispatched against a project that was since deleted — leave it. |
+| `clone-status` returns 500 with `column does not exist` | postgres `errorMissingColumn` | Local DB lagging master. Route uses raw SQL to dodge this; if you see it, drizzle drift snuck back in — check the handler isn't using `db.select().from(projects)`. |
+
+## Env-var alias (known mismatch)
+
+The daemon currently reads `AF_INTERNAL_API_SECRET` from its pod env, but the hosted-device manifest at `agentflow-agents/src/routes/me-hosted-devices.ts` sets `AF_INTERNAL_SECRET`. Until one side is renamed, the daemon should fall back to either name, OR the manifest must set both. Track: surface in next ops review.
+
+## Related
+
+- [Hosted-device preinstall](/subsystems/hosted-device-preinstall) — how the daemon pod is provisioned per owner.
+- [Computer MCP](/subsystems/computer-mcp) — the MCP server inside the daemon pod that owns the `project_clone_and_setup` tool.
+- [Template clone (generic inputs → project)](/subsystems/template-clone) — different system: preset-driven inputs form, not template-repo clone.
