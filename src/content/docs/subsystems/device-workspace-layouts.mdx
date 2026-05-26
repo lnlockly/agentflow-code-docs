@@ -1,0 +1,86 @@
+---
+title: "Device workspace layouts"
+description: "Universal /devices/:id/live workspace with three presets and per-slot widget overrides"
+---
+
+# Device workspace layouts
+
+## TL;DR
+A device's `/cabinet/devices/:id/live` page renders a CSS-grid workspace with three named slots (`main` / `side` / `bottom`). Owners pick a preset (`developer` / `simple` / `universal`) and optionally swap individual slot widgets. The preset id + per-slot overrides persist on `user_devices.layout_preset` / `user_devices.layout_config`. Pages without a preset render the legacy MJPEG+composer grid (zero-regression default).
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/components/workspace/presets.ts` | `PRESETS`, `parseSlot`, `mergeLayoutConfig` |
+| `agentflow-landing/src/components/workspace/UniversalWorkspace.tsx` | CSS-grid renderer; mobile single-pane tabs |
+| `agentflow-landing/src/components/workspace/LayoutPicker.tsx` | Header pill + per-slot swap submenu |
+| `agentflow-landing/src/components/workspace/widgets/index.ts` | Widget id → React component registry |
+| `agentflow-landing/src/components/workspace/widgets/*.tsx` | 8 widgets (preview-iframe, xvfb-stream, code-editor, file-tree, terminal, chat, artefact, events) |
+| `agentflow-landing/src/hooks/useDeviceLayout.ts` | Reads device row + optimistic PATCH helper |
+| `agentflow-landing/src/store/deviceWorkspaceStore.ts` | Cross-widget activeFile handle (Zustand) |
+| `agentflow-landing/src/pages/CabinetDeviceLive.tsx` | Page shell: legacy view + opt-in universal workspace |
+| `agentflow-landing/src/lib/devicesApi.ts` | `patchLayout` + `workspaceTree`/`workspaceReadFile`/`workspaceWriteFile`/`terminalWsUrl` |
+
+## Data flow
+
+```
+              ┌──────────────────────────┐
+GET /me       │ device.layout_preset      │
+/devices/:id  │ device.layout_config      │
+   ──────────►│ → mergeLayoutConfig() →   │
+              │   ResolvedLayout          │
+              └──────────┬───────────────┘
+                         ▼
+              ┌──────────────────────────┐
+              │ UniversalWorkspace        │
+              │ grid:                     │
+              │   "main side"             │
+              │   "bottom bottom"         │
+              └──────────┬───────────────┘
+                         ▼
+              ┌──────────────────────────┐
+              │ WIDGET_REGISTRY[id]       │
+              │ → React.lazy component    │
+              └──────────────────────────┘
+
+PATCH /me/devices/:id { layout_preset, layout_config }
+   from LayoutPicker → optimistic cache update
+   → react-query invalidate on success
+```
+
+Mobile (<768px) collapses the grid to a sticky-tab single-pane view; non-active slots stay mounted via `display:none` so terminal scrollback / editor content / chat history survive tab switches.
+
+## DB / Env / API
+
+- Tables: `user_devices.layout_preset TEXT`, `user_devices.layout_config JSONB`
+- Routes:
+  - `PATCH /me/devices/:id` body `{ layout_preset?, layout_config? }`
+  - `GET /me/devices/:id/workspace/tree?root=&depth=`
+  - `GET /me/devices/:id/workspace/file?path=`
+  - `PUT /me/devices/:id/workspace/file?path=` body `{ content, encoding? }`
+  - `WS /me/devices/:id/terminal` envelope `{ type: 'data'|'resize'|'exit', ... }`
+- Allowlisted roots: `/workspace`, `/home/agent`, `/tmp`
+
+## Presets
+
+```ts
+PRESETS.developer  = { main: 'preview-iframe', side: 'stack:[file-tree,code-editor]', bottom: 'terminal' }
+PRESETS.simple     = { main: 'preview-iframe', side: 'chat',                          bottom: null }
+PRESETS.universal  = { main: 'xvfb-stream',    side: 'stack:[artefact,chat]',         bottom: 'tabs:[terminal,file-tree,events]' }
+```
+
+Slot specs: bare widget id, `stack:[w1,w2]`, `tabs:[w1,w2,w3]`, or `null` (hidden).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Unknown widget rendered as text | `Неизвестный виджет:` | `widgets/index.ts` registry — add id |
+| File save 404 / 403 | `path not allowed` (server) | check `/workspace` allowlist |
+| Editor blank on mobile | `Редактор кода доступен на десктопе` | by design — open on desktop |
+| Terminal "оборвано" repeatedly | `terminal ws close code=` | check `WS /me/devices/:id/terminal` backend |
+
+## Related
+- [Device pause](/subsystems/device-pause)
+- [Device task lifecycle](/subsystems/device-task-lifecycle)
+- [Desktop agent live stream](/subsystems/desktop-agent-live-stream)
