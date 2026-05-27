@@ -1,13 +1,37 @@
 ---
-title: "Project kinds"
-description: "landing / spa / tg_bot / mini_app / tg_profile_bundle / tg_farm — что куда роутится."
+title: "Project kinds → runtime_class"
+description: "7-value kind enum collapsed into the 3-value runtime_class (web / tg_bot / workspace)."
 ---
 
-# Project kinds
+# Project kinds → `runtime_class`
 
 :::caution[Deprecated — старая архитектура]
-Этот раздел про старую архитектуру с kind-классификатором (`landing` / `spa` / `tg_bot` / `mini_app` / `tg_profile_bundle` / `tg_farm`). Новый flow создания проектов — один тип `nextjs` + GitHub template search + hosted daemon git clone — описан в [`subsystems/projects`](/subsystems/projects/) (approved 2026-05-25). Колонки `projects.kind` и `projects.kind_classification` остаются для backward-compat.
+Этот раздел про старую архитектуру с kind-классификатором (`landing` / `spa` / `tg_bot` / `mini_app` / `tg_profile_bundle` / `tg_farm`). Новый flow создания проектов — один тип `nextjs` + GitHub template search + hosted daemon git clone — описан в [`subsystems/projects`](/subsystems/projects/) (approved 2026-05-25). Колонки `projects.kind` и `projects.kind_classification` остаются для backward-compat одного релиза.
 :::
+
+## TL;DR — runtime_class (post-refactor)
+
+Owner directive 2026-05-28: «я не помню зачем мне кинды теперь». The 7-value `kind` enum collapsed into a 3-value `runtime_class` driven by the only distinctions the rest of the code actually cared about: does the project bind an HTTP dev port? Is there a runtime probe at all?
+
+| `runtime_class` | What it means | Watcher | Live URL shape | Maps from `kind` |
+|---|---|---|---|---|
+| `web` | Binds an HTTP dev port. Preview iframe. | Heartbeat (daemon push) + preview-reconciler/watchdog (curl probe). | `https://p-<slug>.proj.agentflow.website/` | `landing`, `spa`, `nextjs`, `mini_app`, `tg_profile_bundle` |
+| `tg_bot` | Telegram bot, no port. | `getMe` (BotFather token) — preview-reconciler skips. | `https://t.me/<bot_username>` | `tg_bot` |
+| `workspace` | Code-only, no runtime probe. | — | (no live URL) | `code_only` |
+
+Migration: `src/db/migrations/0075_runtime_class.sql` adds the column + `CHECK` constraint + index. Drizzle schema: `agentflow-agents/src/db/schema.ts:608` (`runtimeClass: text('runtime_class').notNull().default('web')`).
+
+Mapper helper: [`agentflow-agents/src/services/runtime-class.ts`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/runtime-class.ts) — `runtimeClassForKind(kind)` is the bridge every consumer should use during the deprecation window.
+
+Where it's wired:
+- `routes/projects.ts:1093` — persists both `kind` and `runtimeClass` on `POST /me/projects`.
+- `routes/projects.ts:1252,1439,1726` — every `kind` field in API responses now ships `runtime_class` alongside.
+- `services/pingers/preview-reconciler.ts` — `loadProvisioningCandidates` SQL filters `runtime_class = 'web'`; watchdog SELECT same. Per-runtime-class cool-down map: `web` 240s, `tg_bot` 30s, `workspace` 0.
+- Frontend `agentflow-landing/src/lib/agentsApi.ts:570` — `ProjectSummary.runtime_class?: 'web' | 'tg_bot' | 'workspace'`. UI branches that used `kind === 'tg_bot'` for live-URL shape (`src/pages/WorkspaceV2.tsx:560`) now prefer `runtime_class === 'tg_bot'`.
+
+Deprecation window: `kind` column + every legacy alias (`PREVIEW_WATCHDOG_COOLDOWN_BY_KIND`, `previewWatchdogCooldownMsForKind`, `STATIC_PREVIEW_KINDS`) kept for one release so external scripts + source-pin tests don't break. Next PR drops them.
+
+## Old architecture (historical) ↓
 
 > **TODO** — заполнить researcher-агентом. Стартовый skeleton.
 
