@@ -20,7 +20,7 @@ hosted pod.
 
 | Path | Role |
 |---|---|
-| `agentflow-agents/src/services/tg-bot-creator.ts` | NEW. Orchestrator. `createBotViaBotFather` runs the 6-step BotFather convo via tg-mcp (`mcpDirect.callTool('telegram', …)`), retries on username collision, returns `{botToken, botUsername}` or typed error. |
+| `agentflow-agents/src/services/tg-bot-creator.ts` | NEW. Orchestrator. `createBotViaBotFather` runs the 6-step BotFather convo via tg-mcp (`mcpDirect.callTool('telegram', …)`), retries on username collision, rotates across the owner's active TG accounts on `flood_wait` / `botfather_no_reply` with a process-local 1h cooldown map (`accountCooldownUntil`, key `<ownerUserId>:<accountId>`). Terminal errors (`username_unavailable`, `token_parse_failed`, `mcp_error`) do NOT rotate. Returns `{botToken, botUsername}` or typed error. |
 | `agentflow-agents/src/services/project-clone.ts` | Extended. When `kind='tg_bot'`, call `createBotViaBotFather` BEFORE the daemon dispatch. On success seal+store `BOT_TOKEN` in `project_secrets` + thread it into the agent_dev_brief `scope`. On `no_tg_account`, write a `tg_account_required` event and short-circuit. |
 | `agentflow-agents/src/routes/projects.ts` | Adds `POST /me/projects/:id/connect-telegram` for retry after the owner links their TG account. |
 | `agentflow-agents/src/services/builtin-templates.ts` | Already returns `tg-bot-aiogram → lnlockly/agentflow-tg-bot-starter` for the classifier; we just verify the repo exists. |
@@ -84,6 +84,7 @@ project.kind === 'tg_bot' ?
 | Approve returns 502 + `botfather_no_reply` | `[tg-bot-creator] poll timeout waiting for BotFather` | tg-mcp down / account banned. Check `TG_MCP_URL` + `list_accounts`. |
 | Approve returns 502 + `username_unavailable` | `[tg-bot-creator] giving up on username after 5 retries` | All collision attempts taken — owner brief implies a generic name. Retry creates new candidates. |
 | Approve returns 502 + `botfather_flood_wait` | `[tg-bot-creator] flood_wait, sleeping` | Telegram rate-limited the owner account; we sleep+retry 2x then give up. |
+| All TG accounts FloodWait/silent → final `flood_wait` | `[tg-bot-creator] account <N> for owner <M> hit flood_wait; cooling for 60min and rotating` | Owner has multiple linked TG accounts; orchestrator rotates per call and parks failing accounts in an in-process cooldown map (`accountCooldownUntil`, key `<ownerUserId>:<accountId>`, TTL 1h). If every account is cooling, surface a friendly retry-later. See `tg-bot-creator.ts:50-90`. |
 | Bot created but `python bot.py` never starts | `pgrep -f 'python bot.py'` empty in pod | Daemon brief amendment not deployed; verify computer-mcp PR landed. |
 | Re-running connect-telegram on a project that already has BOT_TOKEN | (none — idempotent no-op) | Returns existing `bot_username`. |
 
