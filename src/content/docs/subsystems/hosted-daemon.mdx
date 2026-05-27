@@ -15,6 +15,25 @@ handshake идёт через тот же `/me/devices/connect`, что и Mac-�
 показывает task composer для kind=daemon (та же поверхность что
 `CabinetDeviceLive` для Mac, без MJPEG-стрима).
 
+### Image graph (after PR `feat/daemon-image-split`)
+
+Single fat image was split into one base + three variants so the cabinet
+can pick the cheapest runtime per use case:
+
+| Tag | Built from | Adds on top of base | ≈ Size |
+|---|---|---|---|
+| `ghcr.io/lnlockly/agentflow-daemon-base:<sha>` | `agentflow-computer-mcp/docker/Dockerfile.base` | python 3.12-slim + tini + curl + daemon install | ~120 MB |
+| `ghcr.io/lnlockly/agentflow-daemon-assistant:<sha>` | `docker/Dockerfile.assistant` | nothing — minimal preview+chat surface | ~120 MB |
+| `ghcr.io/lnlockly/agentflow-daemon-coder:<sha>` | `docker/Dockerfile.coder` | Node 22 (NodeSource), pnpm 10, yarn, opencode-ai, git, jq, ttyd | ~350 MB |
+| `ghcr.io/lnlockly/agentflow-daemon-universal:<sha>` | `docker/Dockerfile.universal` | xvfb, fluxbox, chromium+driver, x11vnc, novnc, websockify, ffmpeg, playwright | ~1.4 GB |
+
+Legacy tag `ghcr.io/lnlockly/agentflow-daemon:<sha>` is aliased to
+`-universal` in `.github/workflows/docker-image.yml` so existing
+manifests in `agentflow-agents/src/routes/me-hosted-devices.ts:240`
+`renderDaemonManifest` keep pulling without coordination. The cabinet
+selector + manifest rewrite to per-variant tags lands in the
+DB+UI / resolver follow-up PRs.
+
 ## Files (with line refs)
 
 | Path | Role |
