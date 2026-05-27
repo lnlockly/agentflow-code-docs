@@ -107,7 +107,7 @@ return result
 **Env:**
 - `ANTHROPIC_LARGE_MODEL` — default model for `legacy-callwithfallback` provider when caller doesn't pin one. Live flip lever for TEXT_LARGE — set to `claude-opus-4-7` (2026-05-14) or any other model the upstream proxy serves.
 - `ANTHROPIC_SMALL_MODEL` — same idea for TEXT_SMALL (currently `claude-sonnet-4-6` — haiku-4-5 is broken on the proxy per `claudecodeapi.ts:54`).
-- `ANTHROPIC_API_KEY` + `ANTHROPIC_BASE_URL` — proxy creds. Production uses east-api-3.org (NOT real api.anthropic.com — the prefix `sk-ant-03-*` is proxy-format).
+- `EAST_API_3_KEY` (canonical) / `ANTHROPIC_API_KEY` (DEPRECATED alias — one release of back-compat) + `ANTHROPIC_BASE_URL` — proxy creds. Production uses east-api-3.org (NOT real api.anthropic.com — the prefix `sk-ant-03-*` is proxy-format). The env var was renamed 2026-05-27 because every new contributor pasted a real Anthropic key into `ANTHROPIC_API_KEY` and watched every request return 401; `EAST_API_3_KEY` makes the upstream obvious. `env.ts:eastApi3Key()` reads new name first, falls back to old. Migration `2026-05-27d-rename-east-api-3-key.sql` flips `llm_provider_configs.api_key_env` from `ANTHROPIC_API_KEY` → `EAST_API_3_KEY` for east-api-3 rows.
 - `XAI_API_KEY` — opt-in registration for xAI provider в bootstrap.
 - `OPENROUTER_API_KEY` — legacy fallback (ai-router/bootstrap.ts:21).
 - `LLM_DB_REFRESH_MS` — cadence для refreshDbProviders.
