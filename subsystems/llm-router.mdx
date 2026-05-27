@@ -5,6 +5,15 @@ description: "Mini-registry с приоритетом, owner-scoped провай
 
 # LLM router
 
+## Post-refactor canonical (2026-05-28)
+
+PR #913 consolidated ~50 hard-coded model strings (`gpt-5.3-codex`, `claude-*`) across `env.ts`, `character.ts`, `project-daemon.ts`, `tenant-bootstrap.ts`, `agent-importer.ts` onto a single alias: **`flow`**. The `ANTHROPIC_TO_ANY_ALIAS` const that used to live alongside `pickFlowUpstream` was deleted; its six rows now live in `llm_model_aliases` and `pickFlowUpstream` consults the DB first.
+
+What this means for callers:
+- Don't pass a model string. Pass `model: 'flow'` (or omit it and inherit the default).
+- The alias resolves through `llm_model_aliases` → `FLOW_PREFERENCE_ORDER` → upstream pick.
+- DB row for `flow` is now reachable; if you see fall-through to `legacy-callwithfallback` despite priority-50 DB rows, check the auth key on the matching `llm_provider_configs` row (the lazy fall-through is the silent-401 failure mode).
+
 ## TL;DR
 
 Все LLM-вызовы внутри agentflow-agents идут через `invokeAI()` → mini-registry, которая выбирает провайдера по `ModelType` (`TEXT_SMALL`/`TEXT_BIG`/`EMBEDDING_*` и т.п.), приоритету (desc) и owner_user_id-скоупу. Перед вызовом — budget gate (`assertUserBudget`), затем exact-match response cache (опц. `LLM_CACHE_ENABLED=1`), после — запись в `agent_usage`. DB-таблица `llm_provider_configs` позволяет добавлять providers (anthropic-compat или openai-compat) без деплоя — `refreshDbProviders` тикает каждые N секунд и подкидывает новые handlers в registry.
@@ -139,3 +148,7 @@ return result
 
 - [Architecture overview](/architecture/overview)
 - [Auth & access](/subsystems/auth-and-access)
+
+---
+
+Last updated 2026-05-28 (post-refactor — PR #913 consolidated model strings → `flow`; `ANTHROPIC_TO_ANY_ALIAS` deleted).

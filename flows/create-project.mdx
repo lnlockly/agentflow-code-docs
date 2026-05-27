@@ -5,8 +5,12 @@ description: "POST /me/projects → kind classify → Maestro propose → user a
 
 # Create project flow
 
-:::caution[Deprecated — старая архитектура]
-Этот flow про старую архитектуру: kind-классификатор (`landing` / `spa` / `tg_bot` / etc.) → Maestro propose → kind-specific provision (auto-scrape / auto-bot / scaffold). Новый flow (brief → GitHub template search → hosted daemon git clone → агент-разработчик в pod'е) описан в [`subsystems/projects`](/subsystems/projects/) (approved 2026-05-25).
+:::danger[Deleted — 2026-05-28]
+This entire flow (kind-classifier → Maestro propose → approveProject → kind-specific provision: auto-scrape / auto-bot / scaffold) was **removed in PR #917**. `kind-classifier.ts`, `approveProject`, and `runProjectApprovalBackground` no longer exist. `POST /me/projects` now resolves a template (builtin shortlist + AI ranker), fires `triggerProjectClone`, and the project pod's opencode does the rest. Rows arriving without a resolvable `templateRepoFull` return HTTP 400 `project_missing_template_repo`.
+
+For the current flow see [Project lifecycle](/flows/project-lifecycle). For the template scorer see [Template clone](/subsystems/template-clone).
+
+The content below is preserved for archival reasons only.
 :::
 
 ## TL;DR
@@ -186,3 +190,7 @@ For full frontend behaviour and the `ProjectCard` kind-accent, see
 - [Auto-bot assign](/flows/auto-bot-assign)
 - [Project lifecycle](/flows/project-lifecycle)
 - [Preview deploy](/flows/preview-deploy)
+
+---
+
+Last updated 2026-05-28 (deprecated — entire kind-classifier / approveProject pipeline removed in PR #917).

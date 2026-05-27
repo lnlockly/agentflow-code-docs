@@ -9,6 +9,22 @@ description: "Per-pod Caddy sidecar для preview URL: static / proxy / stub mo
 
 Каждый project-pod несёт Caddy sidecar на порту 8080. Читает `/workspace/.runtime/plan.json` и сам выбирает режим: **static** (раздаёт `dist/` или `pick_root` подкаталог), **proxy** (forward в backend на `127.0.0.1:PORT`), **stub** (HTML «Workspace ready — deploying...»). Stub-страница умышленно sha256-hashed в `placeholder-hashes.json`, чтобы preview-gate не финализировал проект, пока coder реально не запустил приложение.
 
+## preview-reconciler tuning (2026-05-28, PR #914)
+
+The watchdog that demotes a `done` project back to `running` on 5xx now uses **per-kind cool-down** with a **3-consecutive-failure** requirement, reset on every successful promote:
+
+| Kind | Cool-down after promote |
+|---|---|
+| `nextjs` | 240s |
+| `spa` | 240s |
+| `landing` | 60s |
+| `tg_bot` | 30s |
+| default | 180s |
+
+A single 5xx no longer demotes; the watcher needs three consecutive failures during a tick window, and a fresh promote zeroes the counter. Combined with the cool-down this kills the flap that hit every nextjs project >1500 before the PR.
+
+Phase 3 replaces this polling watcher with **daemon-push heartbeat**: the daemon POSTs `/internal/projects/:id/preview-alive` every 30s after first 200, the watcher just checks `preview_alive_at > now() - 90s`, `probePublicUrl` + cool-down go away.
+
 ## Files
 
 | Repo / path | Что делает |
@@ -116,3 +132,7 @@ describes the old per-host model — patch it if you touch that doc next.
 - [Runtime supervisor](/subsystems/runtime-supervisor)
 - [code-exec MCP](/subsystems/code-exec-mcp)
 - [Preview deploy flow](/flows/preview-deploy)
+
+---
+
+Last updated 2026-05-28 (post-refactor — PR #914 added per-kind cool-down + 3-consecutive-failure demote).
