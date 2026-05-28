@@ -73,7 +73,7 @@ handleKnowledgeMcp (knowledge.ts)
 - `INTERNAL_API_SECRET` — shared secret the mount validates via constant-time compare.
 
 **Routes:**
-- `POST /internal/mcp/knowledge/?agent=<slug>&token=<secret>` — JSON-RPC MCP transport. `agent` is required, missing → 400 `missing_agent_query`. Token mismatch → 401 `unauthorized`.
+- `POST /internal/mcp/knowledge/?agent=<slug>` with `x-mcp-auth: <secret>` header — JSON-RPC MCP transport. `agent` is required, missing → 400 `missing_agent_query`. Token mismatch → 401 `unauthorized`. Legacy `?token=<secret>` query is accepted for one release (Eliza plugin-mcp baked URLs); DEPRECATED, slated for removal after 2026-06-01 — see `routes/internal-mcp.ts:readToken()`.
 
 **MCP tools:**
 - `search({ query: string (2-1000 chars), top_k?: integer (1-20, default 5) })` →
