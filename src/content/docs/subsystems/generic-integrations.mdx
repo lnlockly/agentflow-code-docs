@@ -23,6 +23,19 @@ template / preset that needs it.
 `POST /me/integrations/kwork` (PR #796) is the cookie-export
 specialisation of this generic route and is preserved as an alias.
 
+### Direct-tool dispatch (no LLM in the loop)
+
+The connect button now dispatches `connect_integration` via the daemon's
+direct-tool short-circuit (PR #89), not via the LLM agent loop. The
+cabinet sends `POST /me/devices/:id/dispatch_task` with
+`{task, scope:{provider:<slug>}, tool:'connect_integration'}`; the
+daemon's `_handle_direct_tool` runs the MCP tool with `scope` as args
+and emits `task_complete` / `task_error` synchronously. Earlier flow
+shipped a natural-language `KWORK_TASK` string and let the model pick
+the tool — on hosted Linux pods the model often chose `screen_capture`
+first, which crashes with `libxcb` missing and surfaced raw Python
+tracebacks to the cabinet (root cause for the owner's P0 on 2026-05-28).
+
 ## Files (with line refs)
 
 | Path | Role |
@@ -46,20 +59,39 @@ specialisation of this generic route and is preserved as an alias.
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/tools/integrations.py:connect_integration` | Daemon dispatcher — `cookie_export` branch (open, probe, export, POST). `telegram_app` returns `not_implemented` (Track 2b). |
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/desktop_tools.py:DESKTOP_TOOLS` | `connect_integration` Anthropic tool descriptor + `ToolExecutor.execute` dispatch wiring real Chrome helpers |
 | `agentflow-computer-mcp/tests/test_connect_integration.py:1` | Daemon-side unit tests — happy path, provider_not_found, not_logged_in, cache TTL, telegram_app stub, backend error passthrough, registry_unavailable |
-| `agentflow-landing/src/pages/CabinetIntegrations.tsx:135` | Track 3 — provider grid at `/account/integrations`. Reads `/integrations/registry` + `/me/integrations`, dispatches `connect_integration(slug)` to the user's online desktop device, renders live SSE timeline in an overlay |
-| `agentflow-landing/src/lib/agentsApi.ts:5034` | `IntegrationProvider`, `IntegrationStatusRow`, `fetchIntegrationRegistry`, `fetchMyIntegrations` clients |
-| `agentflow-landing/src/main.tsx:712` | Route `/account/integrations` → `CabinetIntegrations` (replaces the static `AccountIntegrations` hub) |
-| `agentflow-landing/src/pages/AccountKworkIntegration.tsx:160` | `MigratedBanner` pointing to `/account/integrations`. Paste-storage_state form kept for backward compat (PR #796) |
+| `agentflow-landing/src/pages/CabinetIntegrations.tsx:1` | Provider grid at `/account/integrations`. Reads `/integrations/registry` + `/me/integrations`, picks the active device via `useDesktopDevices`, hands off to `IntegrationConnectModal` for the dispatch + SSE timeline |
+| `agentflow-landing/src/components/integrations/IntegrationConnectModal.tsx:1` | Generic connect overlay. Builds dispatch body `{task, scope:{provider}, tool:'connect_integration'}` (PR #89 direct-tool path), renders timeline / success / error / paste-fallback |
+| `agentflow-landing/src/hooks/useDesktopDevices.ts:1` | Hook + `isDesktopAgent` predicate. Filters hosted-pod daemons (`hd-*` / `cloud` / `облако`) so dispatch never lands on a Linux pod without Chrome |
+| `agentflow-landing/src/pages/CabinetIntegration.tsx:1` | Standalone connect page at `/account/integrations/:provider/connect`. Replaces the deleted kwork-only `CabinetIntegrationsKwork.tsx`; per-provider paste pages above keep their own routes |
+| `agentflow-landing/src/lib/devicesApi.ts:212` | `dispatchTask({task, scope?, tool?})` — `tool` carries the direct-tool name to the backend |
+| `agentflow-landing/src/lib/agentsApi.ts:5217` | `IntegrationProvider`, `IntegrationStatusRow`, `fetchIntegrationRegistry`, `fetchMyIntegrations` clients |
+| `agentflow-landing/src/main.tsx:344` | Route `/account/integrations` → `CabinetIntegrations`; `/account/integrations/:provider/connect` → `CabinetIntegration`; `/cabinet/integrations/kwork` redirects into the generic path |
+| `agentflow-landing/src/pages/AccountKworkIntegration.tsx:1` | `MigratedBanner` pointing to `/account/integrations`. Paste-storage_state form kept for backward compat (PR #796) |
+| `agentflow-agents/src/routes/me-devices.ts:799` | `dispatchTaskSchema` now accepts `tool: /^[a-z][a-z0-9_]*$/` so the route forwards the direct-tool field to `dispatchLiveDeviceTask({tool})` |
+| `agentflow-agents/src/routes/me-integrations-kwork.ts:1` | Kwork-specific connect/disconnect + `connects`/`budget` business-rule endpoints. Connect/status routes coexist with the generic path (PR #796 compat); `connects` got a `/budget` alias for naming clarity |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_client.py:260` | `_handle_task_dispatch` + `_handle_direct_tool` — runs `tool` from the dispatch frame straight against the MCP handler, emits `task_complete` / `task_error` with no LLM iterations |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/chrome_cookies.py:474` | `export_cookies(domain, profile)` — Chrome SQLite + macOS Keychain / Windows DPAPI. Playwright-compatible `storage_state.cookies` shape. No headless / playwright / screenshots involved |
 
 ## Data flow
 
 ```
-desktop daemon
-   │  connect_integration(slug)
+cabinet (CabinetIntegrations / CabinetIntegration)
+   │  user clicks «Подключить через моё устройство»
+   │  POST /me/devices/:id/dispatch_task
+   │       { task: "connect_integration(slug) — …",
+   │         scope: { provider: <slug> },
+   │         tool: 'connect_integration' }
+   ▼
+me-devices.ts → dispatchLiveDeviceTask({tool})
+   │  WS frame {type:'task_dispatch', id, task, scope, tool}
+   ▼
+desktop daemon (ws_client._handle_direct_tool)
+   │  tool != '' → skip LLM loop, run MCP tool with scope as args:
+   │  connect_integration(provider=<slug>)
    │  1. GET /integrations/registry         → provider entry
    │  2. chrome_open_url(login_url)
    │  3. chrome_eval(logged_probe_js)        → {logged: true}
-   │  4. chrome_export_cookies(cookie_domain)
+   │  4. chrome_export_cookies(cookie_domain) (SQLite + Keychain — no playwright)
    │  5. POST /me/integrations/:provider {cookies:[...]}
    ▼
 me-integrations.ts: handleProviderPost(provider, ownerUserId, body)
@@ -93,7 +125,12 @@ For `flow_kind='telegram_app'` the daemon POSTs
   - `POST /me/integrations/kwork` — compat alias.
   - `POST /me/integrations/kwork/connect` — paste-JSON path (`me-integrations-kwork.ts`).
 - **Registry slugs (current):** `kwork`, `vk`, `lolzteam`, `instagram`, `linkedin`, `telegram_app`.
-- **Secret keys:** `KWORK_SESSION_JSON`, `VK_SESSION_JSON`, `LOLZTEAM_SESSION_JSON`, `INSTAGRAM_SESSION_JSON`, `LINKEDIN_SESSION_JSON`, `TELEGRAM_SESSION_STRING`.
+- **Secret keys:** `KWORK_SESSION_JSON`, `VK_SESSION_JSON`, `LOLZTEAM_SESSION_JSON`, `INSTAGRAM_SESSION_JSON`, `LINKEDIN_SESSION_JSON`, `TELEGRAM_SESSION_STRING`. Per-provider naming is kept legacy on purpose — owner approved keeping `KWORK_SESSION_JSON` rather than renaming to `<PROVIDER>_SESSION_JSON` and breaking shipped users.
+- **Kwork-specific business endpoints (not auth):**
+  - `GET/POST /me/integrations/kwork/connects` — daily/weekly Connects-quota budget (legacy name).
+  - `GET/POST /me/integrations/kwork/budget` — semantic alias of the above, preferred for new callers.
+  - `DELETE /me/integrations/kwork/disconnect` — soft-disable; payload kept.
+- **Direct-tool dispatch:** `POST /me/devices/:id/dispatch_task` accepts optional `tool: /^[a-z][a-z0-9_]*$/` (≤64 chars). When set, daemon's `_handle_direct_tool` runs the MCP tool with `scope` as args, bypassing the LLM agent loop. Used by `/account/integrations` to call `connect_integration` directly.
 
 ## Failure modes
 
@@ -113,6 +150,10 @@ For `flow_kind='telegram_app'` the daemon POSTs
 | Cabinet button disabled with banner «Десктоп-агент не в сети» | `devicesQ.data.items` filtered → no `status === 'online'` row | Install AgentFlow Desktop and run the daemon, then refresh `/account/integrations` |
 | Cabinet overlay stuck on «Ждём первый шаг» | No `action` event on `/me/devices/:id/tasks/stream` within 10s | Daemon connected but task hasn't started — check `dispatch_task` response, daemon process logs |
 | Status badge never flips to `connected` after overlay closes | Daemon `complete` arrived but `/me/integrations/:provider` returned 4xx | Provider config drift between daemon registry cache and backend; restart daemon to flush 5-min cache |
+| Cabinet modal headline = `ScreenShotError: Library libxcb.so not found` | Raw `screen_capture` traceback from Linux pod daemon | Fixed by direct-tool dispatch (`IntegrationConnectModal` sends `tool:'connect_integration'`); legacy `KWORK_TASK` natural-language string is gone. If it recurs, confirm `dispatch_task` body contains the `tool` field |
+| Daemon picks `screen_capture` over `chrome_export_cookies` | LLM agent loop chose the wrong tool from the freeform task | Same as above — cabinet now bypasses the LLM via direct-tool dispatch. Verify `dispatchTaskSchema.tool` is wired in `me-devices.ts:799` |
+| `POST /me/devices/:id/dispatch_task` 400 with `tool` field present | `dispatchTaskSchema` rejected uppercase / dashes in tool name | Tool names must match `^[a-z][a-z0-9_]*$` (matches daemon MCP registry); fix the caller, not the regex |
+| `/cabinet/integrations/kwork` 404 after refactor | Legacy `CabinetIntegrationsKwork.tsx` deleted alongside the LLM-in-loop flow | Route still resolves — it `Navigate`s to `/account/integrations/kwork/connect` |
 
 ## Related
 
