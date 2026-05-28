@@ -11,7 +11,7 @@ Owner brief 2026-05-28 retired the subscription model. New model: user pays USDT
 ## Files (with line refs)
 | Path | Role |
 |---|---|
-| `agentflow-agents/src/db/migrations/0076_usdt_balance_referral_payouts.sql` | Adds `flow_balances.usdt_balance` + `referral_payouts` table |
+| `agentflow-agents/src/db/migrations/0077_usdt_balance_referral_payouts.sql` | Adds `flow_balances.usdt_balance` + `referral_payouts` table |
 | `agentflow-agents/src/services/referral-payouts.ts:36` | `LEVEL_BP` constant — basis-point schedule |
 | `agentflow-agents/src/services/referral-payouts.ts:99` | `walkAndPay(tx, …)` — chain walker, admin overflow |
 | `agentflow-agents/src/services/cryptobot-billing.ts:679` | `applyTopupInvoicePaid` — credits `usdf_balance`, calls walker in same TX |
@@ -104,7 +104,7 @@ user clicks "Pay $X USDT"
 
 ## Migration sequence
 
-1. `0076_usdt_balance_referral_payouts.sql` — additive. Apply BEFORE the agents deploy that calls `walkAndPay` (otherwise `applyTopupInvoicePaid` throws `relation referral_payouts does not exist`).
+1. `0077_usdt_balance_referral_payouts.sql` — additive. Apply BEFORE the agents deploy that calls `walkAndPay` (otherwise `applyTopupInvoicePaid` throws `relation referral_payouts does not exist`).
 2. After 1, deploy the agents image with PRs #936 + #937.
 3. After 2, deploy landing PR for `/account/referrals` + $10 floor.
 4. (Phase 2, deferred) Archive `subscriptions` once the last `cryptobot_subscriptions.expires_at` passes. Owner policy 2026-05-28: existing subs keep running, no new sales.
