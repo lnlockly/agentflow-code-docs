@@ -1,0 +1,119 @@
+---
+title: "AgentFlow MCP server (platform extension)"
+description: "Node MCP extension exposing the /me REST surface as 31 tools (11 project/workspace/template + 20 af_*) over stdio and streamable-http; the Goose extension that carries platform tools when Goose replaces the computer-mcp daemon."
+---
+
+# AgentFlow MCP server (platform extension)
+
+## TL;DR
+
+`agentflow-mcp-server` is a Node/TypeScript MCP server that wraps the AgentFlow
+public `/me/*` REST surface as MCP tools. It exposes **31 tools**: the original
+11 project/workspace/template tools plus the **20 `af_*` platform tools** that
+mirror the desktop daemon's `AFClient` (`af_client.py`). It runs over **stdio**
+(default) or **streamable-http** (`--http`), so a Goose runtime loads it with
+`--with-extension` or `--with-streamable-http-extension`. This is how platform
+tools (projects, devices, agents, telegram, matrix, memory, spawn) survive the
+master-plan-v3 move from the `agentflow-computer-mcp` daemon to Goose: instead
+of being baked into the daemon's LLM loop, they are a Goose MCP extension.
+
+Auth is `x-api-key: af_live_*` from `AGENTFLOW_API_KEY` (env only; never
+hardcoded). Default base is `https://agentflow.website/_agents` — the same
+owner-key host the daemon uses (NOT `api.agentflow.website`, which rejects
+these keys).
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-mcp-server/src/index.ts:1` | Entry. Loads env config, builds `McpServer`, registers all tools, runs stdio or `--http` streamable transport. |
+| `agentflow-mcp-server/src/index.ts:133` | `buildServer()` — registers the 11 base tools + loops `AF_TOOLS` to register the 20 `af_*` tools. |
+| `agentflow-mcp-server/src/index.ts:196` | `runHttp()` — `node:http` server, per-session `StreamableHTTPServerTransport`, keyed by `mcp-session-id`. |
+| `agentflow-mcp-server/src/client.ts:113` | `AgentFlowClient` — fetch wrapper, `x-api-key`, injectable `fetchImpl` for tests, typed methods per endpoint + `requestRaw()`. |
+| `agentflow-mcp-server/src/client.ts:15` | `AgentFlowError(message,status,endpoint,body)` thrown on non-2xx. |
+| `agentflow-mcp-server/src/error.ts:32` | `explainError()` maps 401/403/404/409/422/5xx to friendly tool text; tools never throw to the transport. |
+| `agentflow-mcp-server/src/tools/af-platform.ts:1` | All 20 `af_*` tools as `{name,config,handler}`; exported as `AF_TOOLS`. |
+| `agentflow-mcp-server/src/tools/*.ts` | The 9 project/workspace tools + `list-templates`/`clone-template`. |
+| `agentflow-mcp-server/test/client.test.js` | 14 client tests (mocked fetch — path/header/body/error mapping). |
+| `agentflow-mcp-server/test/af-tools.test.js` | 10 af-tool tests (arg mapping, device-id fallback, spawn flow, error result). |
+| `.github/workflows/agentflow-mcp-server-ci.yml` | CI on `[self-hosted, ff-france]`: typecheck + build + `npm test`. |
+
+## Data flow
+
+```
+Goose (or Claude Desktop / Cursor)
+  │  stdio  OR  POST http://host:8788/mcp  (streamable-http, mcp-session-id)
+  ▼
+agentflow-mcp-server (McpServer, 31 tools)
+  │  tool handler → AgentFlowClient.<method>()
+  │  fetch(baseUrl + /me/...), header x-api-key: af_live_*
+  ▼
+agentflow-agents pod  (requireSession accepts x-api-key)
+  ▼  Postgres / TG-MCP / Matrix bridge
+```
+
+## DB / Env / API
+
+- **Env:** `AGENTFLOW_API_KEY` (required, `af_live_*`), `AGENTFLOW_BASE_URL`
+  (default `https://agentflow.website/_agents`), `AGENTFLOW_DEVICE_ID`
+  (default device for `af_remember`/`af_recall`), `AGENTFLOW_HTTP_PORT`
+  (default 8788).
+- **Routes consumed** (verified in `agentflow-agents/src/routes`):
+  `GET/POST /me/projects`, `/me/projects/:id`, `/me/projects/:id/approve`,
+  `/me/projects/:id/events`, `/me/projects/:id/messages`,
+  `/me/projects/:id/files[/content]`, `GET /me/devices[/:id]`,
+  `GET /me/agents`, `POST /me/agents/:slug/invoke` (agents-runs.ts:46),
+  `POST /me/telegram/send` + `GET dialogs|messages|search|whoami` +
+  `POST /me/telegram/react` (me-telegram.ts:470-511), `POST /me/matrix/send`
+  (me-matrix.ts:192), `POST|GET /me/devices/:id/memories`
+  (me-devices-memories.ts:98,130), `GET /me/templates`,
+  `POST /me/templates/:slug/clone`.
+- **MCP tools (31):** base `list_projects get_project create_project
+  approve_project send_message get_events list_files read_file get_preview
+  list_templates clone_template`; platform `af_list_projects af_get_project
+  af_create_project af_approve_project af_list_project_events
+  af_get_project_events af_spawn_subagent af_list_devices af_get_device
+  af_list_agents af_send_agent_message af_send_telegram_message
+  af_telegram_dialogs af_telegram_messages af_telegram_search af_telegram_react
+  af_telegram_whoami af_post_matrix_room af_remember af_recall`.
+
+## Loading into Goose
+
+```bash
+# stdio
+AGENTFLOW_API_KEY=af_live_… \
+goose session --with-extension "node /ABS/dist/index.js"
+
+# streamable-http (server holds the key; never in Goose config)
+AGENTFLOW_API_KEY=af_live_… node /ABS/dist/index.js --http --port 8788
+goose session --with-streamable-http-extension "http://127.0.0.1:8788/mcp"
+```
+
+`~/.config/goose/config.yaml` stanza: `type: stdio` (cmd/args/envs) or
+`type: streamable_http` (uri/headers). Full examples in the package README.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Server exits at boot | `AGENTFLOW_API_KEY env var is required` | set the env in the Goose extension / host config |
+| Server refuses key | `does not look like an af_live_* token` | use an `af_live_*` owner key |
+| `af_remember`/`af_recall` returns an error result | `No device_id. Pass one, or set AGENTFLOW_DEVICE_ID` | pass `device_id` or set `AGENTFLOW_DEVICE_ID` |
+| Tool returns "Invalid AgentFlow API key" | 401/403 path in `explainError` (`error.ts:34`) | rotate the key, or check base url is `_agents` not `api.` (status === 401 at error.ts:34) |
+| HTTP mode 404 on every request | `streamable-http listening on … /mcp` but client posts other path | match `--path` / use `/mcp` |
+
+## Notes / gotchas
+
+- `af_send_agent_message` maps to `POST /me/agents/:slug/invoke` with
+  `{ input: text }`. The daemon's `af_client.py` used a `/me/agents/{id}/message`
+  path that is NOT public; the MCP tool addresses agents by **slug** (agents in
+  `GET /me/agents` are keyed by slug).
+- stdout is reserved for JSON-RPC; all logs go to stderr.
+- `dist/` and `node_modules/` are gitignored; CI builds `dist` from `src`.
+
+## Related
+
+- [Computer MCP](/subsystems/computer-mcp) — the daemon whose `af_*` surface this mirrors.
+- [Template clone](/subsystems/template-clone) — backs `list_templates`/`clone_template`.
+- [TG MCP](/subsystems/tg-mcp) — the Telethon pool the `/me/telegram/*` routes call through.
+- Master plan v3 §4 (`agentflow/plans/master-plan-v3-goose-replaces-computer.md`).
