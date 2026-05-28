@@ -33,7 +33,7 @@ so a Telegram-bot brief doesn't see a landing card first.
 |---|---|---|---|---|
 | `landing-static` | landing | `lnlockly/agentflow-static-starter` | tiny | single `index.html` + `npx serve` |
 | `landing-nextjs` | landing | `lnlockly/agentflow-static-starter` | tiny | placeholder until we ship a dedicated Next.js landing starter |
-| `tg-bot-aiogram` | tg_bot | `wakaree/aiogram_bot_template` | 172 KB | aiogram 3 + SQLAlchemy, runnable with `docker compose up` |
+| `tg-bot-aiogram` | tg_bot | `lnlockly/agentflow-tg-bot-starter` | tiny | aiogram 3 + Procfile, NO pyproject.toml (avoids broken pip install -e fork from wakaree) |
 | `spa-vite-react` | spa | `dan5py/react-vite-shadcn-ui` | 70 KB | Vite + React + Tailwind + shadcn |
 | `api-fastify` | api | `matschik/fastify-typescript-starter` | 1.4 MB | Fastify + TS, real starter (not the framework monorepo) |
 | `mini-app-telegram` | mini_app | `Telegram-Mini-Apps/reactjs-template` | 852 KB | tma.js + React + Vite, official template |
@@ -43,8 +43,12 @@ so a Telegram-bot brief doesn't see a landing card first.
 The previous registry had four broken/suboptimal entries that this revision
 fixed (PR `feat/complex-projects-e2e`):
 
-- `lnlockly/agentflow-tg-bot-starter` → **404 not found** upstream (the repo
-  was never created). Swapped to `wakaree/aiogram_bot_template`.
+- `lnlockly/agentflow-tg-bot-starter` → was 404 not found upstream in 2026-05-26.
+  Created and populated 2026-05-27 (aiogram 3 + Procfile). 2026-05-28: switched
+  back to our starter and away from `wakaree/aiogram_bot_template` because
+  the wakaree pyproject.toml has `project.authors[0]` as a string, not an
+  object — the LLM dep-installer runs `pip install -e .` and crashes before
+  aiogram boots. Bot @yogabook2_bot (project 1564) was the live repro.
 - `vitejs/vite` → the Vite framework monorepo (~30 MB checkout), not a
   scaffold. Daemons OOM during install. Swapped to a 70 KB single-stack
   starter.
