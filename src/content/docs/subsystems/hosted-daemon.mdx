@@ -24,7 +24,7 @@ can pick the cheapest runtime per use case:
 |---|---|---|---|
 | `ghcr.io/lnlockly/agentflow-daemon-base:<sha>` | `agentflow-computer-mcp/docker/Dockerfile.base` | python 3.12-slim + tini + curl + daemon install | ~120 MB |
 | `ghcr.io/lnlockly/agentflow-daemon-assistant:<sha>` | `docker/Dockerfile.assistant` | nothing — minimal preview+chat surface | ~120 MB |
-| `ghcr.io/lnlockly/agentflow-daemon-coder:<sha>` | `docker/Dockerfile.coder` | Node 22 (NodeSource), pnpm 10, yarn, opencode-ai, git, jq, ttyd | ~350 MB |
+| `ghcr.io/lnlockly/agentflow-daemon-coder:<sha>` | `docker/Dockerfile.coder` | Node 22 (NodeSource), pnpm 10, yarn, serve, aider (replaced opencode-ai 2026-05-28), git, jq, ttyd | ~400 MB |
 | `ghcr.io/lnlockly/agentflow-daemon-universal:<sha>` | `docker/Dockerfile.universal` | xvfb, fluxbox, chromium+driver, x11vnc, novnc, websockify, ffmpeg, playwright | ~1.4 GB |
 
 Legacy tag `ghcr.io/lnlockly/agentflow-daemon:<sha>` is aliased to
