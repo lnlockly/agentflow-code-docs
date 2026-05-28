@@ -1,0 +1,83 @@
+---
+title: "Activepieces marketplace (Track B)"
+description: "Self-hosted Activepieces as the no-code automation marketplace, bridged to AgentFlow MCP + SSO."
+---
+
+# Activepieces marketplace
+
+## TL;DR
+Activepieces (MIT, self-hosted, 4 pods in `franchise-factory`) replaces the
+hand-written marketplace. Users build no-code flows from a 280+ piece catalog.
+A standalone `kwork-rest-bridge` pod exposes AgentFlow's MCP servers (Kwork +
+Telegram MTProto) to AP flows over plain HTTP. `POST /me/flows/sso` provisions
+an AP user per AgentFlow owner and returns a JWT for the cabinet iframe.
+Integration level = Level 1 (SSO + iframe), not a fork.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-flows.ts:1` | `POST /me/flows/sso` + `GET /me/flows/whoami` |
+| `agentflow-agents/src/services/activepieces-sso.ts:1` | AP user provisioning (invite→accept→sign-up) + re-sign-in |
+| `agentflow-agents/src/db/schema.ts` (`apUserLinks`) | `ap_user_links` table mapping |
+| `agentflow-agents/migrations/2026-05-29a-ap-user-links.sql` | table DDL (apply via psql — CI doesn't migrate) |
+| `agentflow-agents/src/services/env.ts` (`ffActivepiecesEnabled`, `apBaseUrl`, `apPublicUrl`, `apPlatformId`, `apAdminJwt`) | AP config |
+| `activepieces-spike/kwork-rest-bridge/server.mjs` | REST→MCP bridge (kwork + `/tg/*`); `Bearer af_live_*` auth |
+| `activepieces-spike/kwork-rest-bridge/k8s.yaml` | bridge Deployment + Service |
+| `plans/autonomous/_activepieces-phase1.md` | Phase 1 live verification log |
+
+## Data flow
+
+```
+cabinet/flows
+   │  POST /me/flows/sso   (requireSession; af_live_* | bearer | cookie)
+   ▼
+agentflow-agents → activepieces-sso.provisionApUser(ownerUserId)
+   │  first call:  AP invite → accept → sign-up   (AP REST, invite-only)
+   │  later calls: AP sign-in (sealed password)
+   │  → ap_user_links { owner_user_id → ap_user_id, ap_project_id, sealed pw }
+   ▼
+{ jwt, apProjectId, publicUrl }  → <iframe src="{publicUrl}/embed?jwt=…&projectId=…">
+
+flow run (AP worker pod)
+   │  HTTP piece → kwork-rest-bridge
+   │    auth: x-bridge-secret + (Bearer af_live_* | body.ownerUserId)
+   ▼
+   ├─ /kwork/*  → MCP /internal/mcp/kwork-inbox  (x-mcp-auth: INTERNAL_API_SECRET)
+   └─ /tg/*     → MCP agentflow-tg-mcp:4500/mcp  (x-mcp-auth: MCP_AUTH_SECRET)
+                    → Telethon MTProto → real Telegram
+```
+
+`Bearer af_live_*` → ownerUserId resolution: the bridge calls
+`GET /me/flows/whoami` with the key in `x-api-key` (cached). No HMAC secret is
+duplicated into the bridge.
+
+## DB / Env / API
+- Tables: `ap_user_links` (owner_user_id PK, ap_user_id, ap_project_id, ap_email, ap_password_sealed).
+- Env (agentflow-agents): `FF_ACTIVEPIECES_ENABLED`, `AP_BASE_URL`, `AP_PUBLIC_URL`, `AP_PLATFORM_ID`, `AP_ADMIN_JWT`, `AGENTS_MASTER_KEY` (seals the AP password).
+- Env (bridge pod): `INTERNAL_API_SECRET`, `AP_BRIDGE_SECRET`, `TG_MCP_URL`, `TG_MCP_AUTH_SECRET` (from `agentflow-tg-mcp-env.MCP_AUTH_SECRET`).
+- Routes: `POST /me/flows/sso`, `GET /me/flows/whoami`.
+- Bridge routes: `POST /kwork/{scan-dialogs,scan-projects,send-message,respond-to-project}`, `POST /tg/{send-message,list-dialogs,get-user}`, `GET /health`.
+- AP cluster: pods `activepieces`, `activepieces-worker` (2Gi), `activepieces-postgres-0`, `activepieces-redis`, `kwork-rest-bridge`. UI/API `https://flows.proj.agentflow.website` (v0.83.0). Internal `http://activepieces.franchise-factory.svc:80`.
+
+## Building flows programmatically
+Hand-built `UPDATE_TRIGGER`/`ADD_ACTION` envelopes fail AP's strict validator
+(`body/ Invalid input`). Use **`IMPORT_FLOW`** (`POST /api/v1/flows/{id}`
+`{type:'IMPORT_FLOW', request:{displayName, trigger:{…nextAction chain…}}}`) —
+the server decomposes it into validated ops. Then `LOCK_AND_PUBLISH` +
+`CHANGE_STATUS{status:'ENABLED'}`. Trigger `type` is the enum **value**
+`PIECE_TRIGGER`; action `type` is `PIECE`.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Flow run `INTERNAL_ERROR`, no steps | `Error: Authentication type is required` | HTTP piece `authType` must be `'NONE'` (uppercase); webhook trigger `authType` `'none'` |
+| Webhook 200 but no run created | (worker `EXECUTE_WEBHOOK` then nothing) | webhook trigger `input` missing `{authType:'none'}` |
+| Run stuck `RUNNING` then worker restart | `OOMKilled` on `activepieces-worker` | worker memory limit raised to 2Gi |
+| Approval step `FAILED` | `Bad Request: unsupported parse_mode` | `request_approval_message` `parse_mode` must be `'None'` (plain text) |
+| Bridge `Bearer` path 502 | `api_key_resolve_failed_404` | `/me/flows/whoami` not deployed yet (deploy agents) |
+| SSO 503 | `activepieces_disabled` / `ap_admin_jwt_not_configured` | set `FF_ACTIVEPIECES_ENABLED=1` + `AP_ADMIN_JWT` |
+
+## Related
+- [tg-mcp](/subsystems/tg-mcp)
+- [marketplace](/subsystems/marketplace) (legacy, being replaced)
+- Plans: `plans/master-plan-v2-fix-lovable.md` §4, `plans/activepieces/*`
