@@ -1,0 +1,98 @@
+---
+title: "coder-shim — Goose device-bridge"
+description: "Thin WS bridge that speaks AgentFlow's devices-ws protocol and drives `goose run` instead of the opencode/aider coder subprocess."
+---
+
+# coder-shim — Goose device-bridge
+
+## TL;DR
+Master-plan v3 replaces the daemon's opencode/aider coder subprocess with
+**Goose** (`block/goose`, forked as `lnlockly/agentflow-goose`). `coder-shim` is the
+thin device-bridge that speaks AgentFlow's existing devices-ws protocol on one side
+and runs `goose run` on the other, so the backend (`devices-ws.ts`) and ~20 cabinet
+pages stay unchanged. Phase-0 spike verified: goose builds brief-derived files,
+serves over HTTP, ~111 MiB peak RSS (`plans/autonomous/_goose-spike.md`). Opt-in via
+`FF_DAEMON_IMAGE` — when unset the resolver keeps the coder image (reversible).
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/coder-shim/protocol.ts:68` | `buildHello`/`buildHeartbeat`/`buildTaskComplete`/`buildTaskError`/`parseFrame` mirror `WsMessage` |
+| `agentflow-agents/src/coder-shim/protocol.ts:117` | `isCoderDispatch` — only `task_dispatch` with `tool='agent_dev_brief'` + id |
+| `agentflow-agents/src/coder-shim/scope.ts:49` | `validateScope` — required-field + slug + template-ref (argv-injection) guards |
+| `agentflow-agents/src/coder-shim/goose-runner.ts:27` | `buildGooseConfig` — openai provider → platform gateway, model alias `flow` |
+| `agentflow-agents/src/coder-shim/goose-runner.ts:54` | `buildGooseArgs` — `run --with-builtin developer --no-session --max-turns N -t <brief>`; never a concrete model id |
+| `agentflow-agents/src/coder-shim/goose-runner.ts:89` | `runGoose` — spawn + tail capture + wall-clock timeout |
+| `agentflow-agents/src/coder-shim/pipeline.ts:31` | `buildReport` (pure) — goose exit + probe → CloneStatusReport |
+| `agentflow-agents/src/coder-shim/pipeline.ts:114` | `runCoderTask` — clone → goose config → `runGoose` → probe → report |
+| `agentflow-agents/src/coder-shim/clone-status.ts:29` | `buildCloneStatusBody` — matches `internal.ts` `cloneStatusSchema`; secret in header only |
+| `agentflow-agents/src/coder-shim/bridge.ts:53` | `CoderShimBridge` — connect, hello, hello_ack secret rotation, heartbeat 15s, task routing |
+| `agentflow-agents/src/coder-shim/main.ts:24` | entrypoint — env → bridge |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:120` | `resolveDaemonImage` — `FF_DAEMON_IMAGE=goose` → coder-shim image; else coder (hotfix) |
+| `agentflow-agents/coder-shim-image/Dockerfile:1` | image: node 22 + bridge + goose from the fork |
+| `agentflow-agents/coder-shim-image/entrypoint.sh:1` | env check + `node dist/coder-shim/main.js` |
+| `agentflow-agents/.github/workflows/build-coder-shim.yml:1` | self-hosted build → `ghcr.io/<owner>/agentflow-coder-shim` |
+| `agentflow-agents/tests/coder-shim.test.ts:1` | 28 unit tests (protocol/scope/runner/clone-status/report/resolver) |
+
+## Data flow
+```
+backend project-clone.ts
+  dispatchOrQueueDeviceTask({ tool:'agent_dev_brief', scope:{template_repo_full,
+    slug, project_id, brief, port, kind, bot_token?} })
+   │ WS task_dispatch   (devices-ws protocol — UNCHANGED)
+   ▼
+coder-shim bridge.handleCoderDispatch
+   │  validateScope → runCoderTask:
+   │    git clone --depth 1 -- <repo> /workspace/<slug>
+   │    write ~/.config/goose/config.yaml (provider=openai, model=$GOOSE_MODEL,
+   │       OPENAI_HOST=$AF_API_URL, OPENAI_BASE_PATH=_agents/llm/v1/chat/completions)
+   │    goose run --with-builtin developer --no-session --max-turns N -t <brief>
+   │    probe 127.0.0.1:<port>  (HTTP kinds; skipped for tg_bot)
+   │  POST /internal/projects/:id/clone-status {ok, port, port_reachable, ...}
+   ▼  WS task_complete  (or task_error)
+backend internal.ts clone-status → flips status, wires Service/Ingress, preview_url
+```
+
+## DB / Env / API
+- Tables: none new. Consumes `projects` via `/internal/projects/:id/clone-status`.
+- Env (pod side, all already on the daemon pod): `AF_API_KEY`, `AF_API_URL`
+  (default `https://agentflow.website`), `AF_DEVICE_ID`, `AF_DEVICE_TOKEN`,
+  `AF_ENROLLMENT_TOKEN`, `AF_INTERNAL_API_SECRET`, `GOOSE_MODEL` (default `flow`),
+  `GOOSE_MAX_TURNS`, `GOOSE_TIMEOUT_MS`, `GOOSE_DISABLE_KEYRING=1`, `WORKSPACE_ROOT`.
+- Env (server side): `FF_DAEMON_IMAGE` — `goose` → coder-shim image; full ref →
+  verbatim; unset → coder (2026-05-28 hotfix path).
+- WS: connects to `wss://<AF_API_URL host>/_devices/connect` with `x-api-key` /
+  `x-device-id` / `x-device-secret` (or `x-enrollment-token` on first run).
+- LLM: routes through the platform gateway `flow`→codex.sale; model is the alias
+  `flow`, never a concrete id (gateway `pickFlowUpstream` resolves it).
+- Goose source: forked at `lnlockly/agentflow-goose`. Image bundles goose via the
+  Dockerfile `GOOSE_DOWNLOAD_BASE`/`GOOSE_RELEASE_TAG` build-args (defaults to
+  upstream `stable` until the fork cuts a release).
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Coder pod never connects | `[coder-shim] FATAL: missing required env` | entrypoint env check — `AF_API_KEY`/`AF_DEVICE_ID` unset on the pod |
+| goose binary missing | `[coder-shim] FATAL: goose binary not on PATH` | image build — goose download step failed |
+| clone-status never posts | `internal_secret_unset` returned by `postCloneStatus` | `AF_INTERNAL_API_SECRET` not on the pod |
+| Project stuck provisioning, goose ran | `clone-status posted ... ok=true http=...` then no promote | `port_reachable:false` — dev-server not up in the probe window; preview-reconciler promotes later |
+| task_error `goose_failed` | `coder task ... crashed` / report `error:'goose_failed'` | read the report `detail` (goose tail) — model/gateway/scaffold issue |
+| task_error `template_repo_full_missing` for a real repo | none (synchronous) | template ref failed `TEMPLATE_RE` (flag-shaped or non `owner/repo`/https) |
+
+## Relationship to the in-daemon goose backend
+There are two ways to run goose for the coder, and they coexist:
+- **In-place (`CODE_AGENT_BACKEND=goose`)** — flips the engine inside the
+  existing Python daemon's `agent_dev_brief`, no new image. See
+  [Code-agent backend registry](/subsystems/code-agents-backend). Smallest change.
+- **coder-shim (this page)** — a standalone Node bridge + image that drops the
+  Python daemon for the coder slice entirely. The master-plan v3 target, sourced
+  from the `lnlockly/agentflow-goose` fork.
+
+Both speak the same `agent_dev_brief` dispatch contract and the same
+`/internal/projects/:id/clone-status` callback, so the backend does not care
+which one a given pod runs.
+
+## Related
+- [Code-agent backend registry](/subsystems/code-agents-backend) — the in-daemon `CODE_AGENT_BACKEND=goose` path
+- [hosted-daemon](/subsystems/hosted-daemon) — pod image graph, daemon variants
+- [daemon-image-reconciler](/subsystems/daemon-image-reconciler) — how `resolveDaemonImage` output reaches pods
