@@ -91,6 +91,7 @@ omitted. Empty user list returns `{ block: "" }`.
 | `POST /reorder` updates only some rows | rows belong to a different `user_id` — the `WHERE s.user_id = ${userId}` clause filters silently | confirm the cabinet only sends ids it owns; check `device_intent_skills_user_cat_pos` index covers the lookup |
 | `invalid_body` from POST | zod rejected the input — usually empty `when_phrases` or `then_instruction > 2000 chars` | inspect `.detail` array in response; mirror CHECK constraints in the form |
 | Skill survives device deletion | `device_id` is nullable so device-scoped rows are GC'd via `ON DELETE CASCADE`; global (`device_id IS NULL`) rows stay alive — intentional | no fix needed; document this UX expectation in the cabinet copy |
+| Cloud device loops on `screen_capture` for project chat | `ScreenShotError: Library libxcb.so not found` in daemon logs, task text starts with `[PROJECT CONTEXT]` | `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py:1005-1046` — `run_task` now strips `screen_capture / screen_region / list_windows / activate_app / chrome_* / browser_* / keyboard_* / mouse_*` from the descriptor list AND skips the initial `jpeg_b64_full()` frame when the task body contains `[PROJECT CONTEXT]` or `project_id:` / `project_dir:`. Soft prompt directives don't bind tool choice; the LLM can't call what it can't see. Shipped in computer-mcp PR #121 (2026-05-28). |
 
 ## Related
 
