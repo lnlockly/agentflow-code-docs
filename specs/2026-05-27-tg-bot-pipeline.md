@@ -83,6 +83,7 @@ project.kind === 'tg_bot' ?
 | Approve returns 409 + `no_tg_account` | `[tg-bot-creator] no active tg account for owner` | Owner needs to link TG via `/cabinet/integrations/telegram`, then POST `/me/projects/:id/connect-telegram`. |
 | Approve returns 502 + `botfather_no_reply` | `[tg-bot-creator] poll timeout waiting for BotFather` | tg-mcp down / account banned. Check `TG_MCP_URL` + `list_accounts`. |
 | Approve returns 502 + `username_unavailable` | `[tg-bot-creator] giving up on username after 5 retries` | All collision attempts taken — owner brief implies a generic name. Retry creates new candidates. |
+| Bot username is a long transliterated sentence (e.g. `bot_dlya_zapisi_na_strizhku_bot`) | LLM `validateProposedUsername` returns null → fallback to `af_<slug>_bot` | LLM router ignored the prompt cap. The validator now rejects stems >16 chars or >1 underscore (`tg-bot-creator.ts:135-170`). Tighten the prompt examples if a vertical keeps falling through. |
 | Approve returns 502 + `botfather_flood_wait` | `[tg-bot-creator] flood_wait, sleeping` | Telegram rate-limited the owner account; we sleep+retry 2x then give up. |
 | Bot created but `python bot.py` never starts | `pgrep -f 'python bot.py'` empty in pod | Daemon brief amendment not deployed; verify computer-mcp PR landed. |
 | Re-running connect-telegram on a project that already has BOT_TOKEN | (none — idempotent no-op) | Returns existing `bot_username`. |
