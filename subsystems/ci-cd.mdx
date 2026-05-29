@@ -16,6 +16,10 @@ regressions (auth, autonomous-goal POST, NaN cards) before merge.
 ## Files (with line refs)
 | Path | Role |
 |---|---|
+| `agentflow-agents/.github/workflows/deploy.yml:1` | `Build & Deploy Agents` — build image + rollout `agentflow-agents`/`agentflow-workers` to k3s on push to main (self-hosted runner = deploy host) |
+| `agentflow-agents/.github/workflows/deploy.yml:363` | `Apply manifest + rollout` step — `kubectl apply` + `set image` + `rollout status --timeout=6m` for both deploys |
+| `agentflow-agents/k8s/agentflow-agents.yaml:139` | `agentflow-agents` Deployment — rollout strategy `maxSurge:0 / maxUnavailable:1` (drain-then-create) |
+| `agentflow-agents/k8s/agentflow-agents.yaml:451` | `agentflow-workers` Deployment — same drain-then-create strategy |
 | `agentflow-landing/.github/workflows/deploy.yml:1` | Build image + rollout to k3s on push to main |
 | `agentflow-landing/.github/workflows/e2e.yml:1` | Playwright smoke on every PR |
 | `agentflow-landing/playwright.config.ts:1` | Smoke config — Chrome only, `agentflow.website` base URL |
@@ -48,6 +52,29 @@ graph-executor tests, preview-gate logic drift); the job stays non-blocking unti
 they're triaged.
 
 ## Data flow
+
+### agentflow-agents deploy (push to main)
+
+```
+push main → "Build & Deploy Agents" (self-hosted runner ON ff-france)
+  build-runtime-image (only if runtime-image/** changed)
+  build-deploy:
+    → npm audit --omit=dev --audit-level=high   (blocking gate)
+    → docker build & push ghcr.io/lnlockly/agentflow-agents:{sha,latest}
+    → Trivy scan (continue-on-error)
+    → kubectl apply k8s/agentflow-agents.yaml + user-workspace.yaml
+    → kubectl set image deploy/agentflow-agents + agentflow-workers :{sha}
+    → kubectl rollout status (both, --timeout=6m, parallel)   ← the gate that fails
+    → idempotent seed scripts (continue-on-error)
+```
+
+There is NO `npm test` gate in the deploy workflow — build + typecheck happen
+inside the Docker build; the `npm test` suite gates only on `pr-check.yml`
+(continue-on-error). A red deploy is therefore a rollout failure, not a test
+failure. Migrations run in-app on boot (`src/services/migrations-runner.ts`),
+not in CI.
+
+### agentflow-landing deploy (push to main) + PR smoke
 
 ```
 PR opened
@@ -84,6 +111,7 @@ PR opened
 | Login redirect broken | `Test timeout … waiting for navigation to /cabinet` | `agentflow-landing/src/pages/LoginPage.tsx` redirect handler |
 | Autonomous tab missing | `expected locator … "Автономно" to be visible` | `agentflow-landing/src/pages/DevicePage.tsx` tab registration |
 | Prod under deploy | Flaky on first run, green on retry | `retries: 1` covers; if both fail, investigate `agentflow.website` |
+| Agents deploy red at `Apply manifest + rollout`, live image stuck on old SHA | `error: timed out waiting for the condition` (after `Waiting for deployment "agentflow-agents" rollout to finish: 1 out of 2 new replicas`) + pod event `FailedScheduling … Insufficient cpu` | Node (8 CPU) is ~99% on CPU *requests* from accumulated `af-tenant-*` pods. A `maxSurge:1` rollout needs a schedulable surge pod and can't get one. Fixed 2026-05-29: strategy → `maxSurge:0 / maxUnavailable:1` in `k8s/agentflow-agents.yaml:139,451` (drain-then-create frees the old pod's 100m first) + `rollout status --timeout` 3m→6m in `deploy.yml:399` (preStop drain runs up to 280s). Longer-term: trim tenant-pod sprawl (MEMORY `feedback_agentflow_pod_quota`, keep `af-tenant-1` ≤ ~30 pods). |
 
 ## Related
 - [Autonomous goals subsystem](./autonomous-goals)
