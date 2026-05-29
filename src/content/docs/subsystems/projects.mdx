@@ -121,7 +121,7 @@ description: "Brief → GitHub template search → hosted pod git clone → аг
 - `POST /me/projects/:id/approve` — `{}` → 200 `{ok:true, hosted_device_id}` (см. `projects.ts:2725`).
 - `POST /me/projects/:id/message` — `{text}` → INSERT `project_tasks` row, daemon подхватит.
 - `GET /me/projects/:id` — `{status, tasks, preview_url, template_url, last_commit}`.
-- Auth: `requireSession` (cookie или `x-api-key`). Owner key user 1: `af_live_723ad0a0e766c34f6c713e53e677626120468497a21fb84ffd68798c564c4367`.
+- Auth: `requireSession` (cookie или `x-api-key`). Owner key user 1: in the `agentflow-agents-env` k8s secret (`NIGHTLY_E2E_OWNER_KEY`) — never inline it in docs (the prior literal was committed, now redacted, and must be ROTATED).
 
 **MCP tools (agentflow-computer-mcp)**
 - `project_setup(template_url, slug)` — git clone + npm install + npm run dev (A3 будет создавать в `driver/tools/project_setup.py`).
