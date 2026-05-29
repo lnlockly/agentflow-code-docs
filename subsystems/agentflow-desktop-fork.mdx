@@ -41,6 +41,9 @@ unchanged on purpose.
 | `agentflow-goose/ui/desktop/src/device-bridge/extensionsSetup.ts` | merge `computercontroller` (builtin) + af_* MCP (`@agentflow/mcp-server`) into `~/.config/goose/config.yaml` — add-if-absent, never clobbers user entries |
 | `agentflow-goose/ui/desktop/src/main.ts` (`ensureDeviceBridge`) | starts the bridge after goosed; gated `FF_DEVICE_BRIDGE=1` |
 | `agentflow-goose/ui/desktop/src/main.ts` (goosed env merge) | injects the flow-gateway env into the spawned goosed; gated `FF_FLOW_LLM=1` |
+| `agentflow-goose/ui/desktop/resources/agentflow-mcp/server.cjs` | vendored single-file af_* MCP bundle (esbuild of `@agentflow/mcp-server`, SDK+zod inlined, ~792KB) shipped as a forge extraResource |
+| `agentflow-goose/ui/desktop/scripts/bundle-af-mcp.mjs` | regenerates the af_* bundle from the sibling repo |
+| `agentflow-goose/ui/desktop/forge.config.ts` (extraResource) | ships `resources/agentflow-mcp` so af_* loads on a stock install (no `AGENTFLOW_MCP_PATH`) |
 
 ## Data flow
 ```
@@ -110,12 +113,15 @@ real cabinet dispatch needs a packaged build (matrix b3/b4/b6) — that is the n
 verification step once P1 lands and a signed/packaged artifact exists.
 
 ## Not yet done (tracked follow-ups)
-- **af_* MCP bundling (P4):** `extensionsSetup` enables `computercontroller`
-  (builtin, always) and wires the af_* MCP **only when its server entrypoint
-  resolves** (`AGENTFLOW_MCP_PATH` env or the packaged
-  `<resourcesPath>/agentflow-mcp-server/dist/index.js`). The desktop does not yet
-  bundle `@agentflow/mcp-server` as an extraResource, so af_* is skipped on a
-  stock launch until P4 packaging adds it; computercontroller is unaffected.
+- **Packaged live verify (P4):** with af_* now bundled, the remaining step is a
+  packaged Mode-A (standalone chat builds code + drives the machine on `flow`) +
+  Mode-B (cabinet dispatch → same goosed) run on a real built artifact — matrix
+  b3/b4/b6. Needs a packaged (ideally signed/notarized) build + a real device +
+  the gateway; owner/infra-gated.
+- **Code-signing / notarization** certs (Apple + Windows EV) — infra/owner.
+- **af_* bundle refresh:** `resources/agentflow-mcp/server.cjs` is a vendored
+  esbuild artifact — re-run `scripts/bundle-af-mcp.mjs` when `@agentflow/mcp-server`
+  changes (or publish it to a registry + depend on it instead of vendoring).
 - **Live-screen stream (b6 "watch live"):** `subscribe_stream`/`unsubscribe_stream`
   are routed to an `onStreamSubscribe` hook, but the screen-capture publisher
   (port of computer-mcp `CaptureLoop`) is not yet wired — flag for P3/P4.
