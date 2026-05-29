@@ -112,7 +112,7 @@ real build-burst ceiling.
 | hosted-device `small` | `agentflow-agents/src/routes/me-hosted-devices.ts:607` | `100m` (was 250m) | `1` | idle daemon+Chromium ~1-8m; burst bounded by limit |
 | hosted-device `medium` / `large` | same | `500m` / `1` | `2` / `4` | realistic build floors — unchanged |
 | warm hosted-pool (idle, af-pool) | `agentflow-agents/src/services/hosted-pool/manifest.ts:111` | `100m` (was 250m) | `1` | selftest-idle until claim recycle re-applies user manifest |
-| code-exec warm pod | `agentflow-agents/src/mcp-servers/code-exec/helpers/pod-pool.ts:175` | `15m` (was 25m) | `500m` | ~32 cluster-wide; idle 0-1m; claim spike bounded by limit |
+| code-exec warm pod | `agentflow-agents/src/mcp-servers/code-exec/helpers/pod-pool.ts:175` | `15m` (was 25m) | `500m` | idle 0-1m; claim spike bounded by limit. **Per-pod sizing alone wasn't enough** — also cut the COUNT: per-tenant default 3→1 + cluster-wide cap `POD_POOL_GLOBAL_MAX=8` (was ~32 pods). See [Pod Pre-Warm Pool](/subsystems/pod-prewarm-pool). |
 | per-project pod | `code-exec/constants` / manifest | `25m` + 5m sidecar | (limit governs build) | already minimal — left as-is |
 | vcluster syncer (`user-N-0`) | vcluster Helm chart (NOT this repo) | 50m / 200m | — | out of repo scope; uses 20-74m |
 

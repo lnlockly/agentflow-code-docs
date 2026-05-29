@@ -24,6 +24,7 @@ regressions (auth, autonomous-goal POST, NaN cards) before merge.
 | `agentflow-landing/playwright.auth-config.ts:1` | Older 12-journey suite — kept for token-based runs |
 | `agentflow-agents/.github/workflows/pr-check.yml:67` | `test` job — runs `npm test` over all of `tests/` (non-blocking) |
 | `agentflow-agents/package.json:18` | `test` script — `node --import tsx --test "tests/*.test.ts" "tests/**/*.test.ts"` |
+| `agentflow-agents/.github/workflows/deploy.yml:363` | `Apply manifest + rollout` step — `kubectl apply` + `set image` both deploys, then `rollout status … --timeout=8m` (raised from 3m, 2026-05-29) under `set -e` |
 
 ## agentflow-agents test glob (the `**` quirk)
 
@@ -84,6 +85,7 @@ PR opened
 | Login redirect broken | `Test timeout … waiting for navigation to /cabinet` | `agentflow-landing/src/pages/LoginPage.tsx` redirect handler |
 | Autonomous tab missing | `expected locator … "Автономно" to be visible` | `agentflow-landing/src/pages/DevicePage.tsx` tab registration |
 | Prod under deploy | Flaky on first run, green on retry | `retries: 1` covers; if both fail, investigate `agentflow.website` |
+| agentflow-agents deploy goes RED but the image still rolled (pods healthy 2/2) | `error: timed out waiting for the condition` on the `Apply manifest + rollout` step | `agentflow-agents/.github/workflows/deploy.yml:363` — `set image` already happened before the wait, so the deploy DID land; the `rollout status` wait timed out because a surge pod couldn't SCHEDULE fast on the CPU-tight node. Timeout raised 3m→8m (2026-05-29). Do NOT `\|\| true` it — a genuine never-completing rollout must still fail. Root capacity fix: reduce warm-pool count (see [workspace-provisioning](./workspace-provisioning) Pod CPU-request sizing). |
 
 ## Related
 - [Autonomous goals subsystem](./autonomous-goals)
