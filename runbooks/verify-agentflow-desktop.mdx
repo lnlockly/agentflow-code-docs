@@ -1,0 +1,76 @@
+---
+title: "Verify AgentFlow Desktop (packaged, Mode A + Mode B)"
+description: "One-pass packaged verification of the forked AgentFlow Desktop — build, enrol, then confirm standalone + platform-driven runs on the flow LLM."
+---
+
+# Verify AgentFlow Desktop (packaged)
+
+## TL;DR
+After the feature PRs land (rebrand → device-bridge → flow engine →
+computercontroller/af_* → af_* bundle), this is the one-shot acceptance pass on
+a real built artifact. Everything below the build step is owner/infra: it needs
+a packaged (ideally signed) app, a real machine, and the live gateway. The CI
+gate already proves the app typechecks + packages on every PR — this proves it
+actually *runs* both modes.
+
+## 0. Build the artifact
+```bash
+cd agentflow-goose/ui/desktop
+pnpm install
+pnpm run package          # unsigned app bundle under out/
+# or: pnpm run make       # installers (dmg/deb/rpm/zip) — signing needs APPLE_TEAM_ID / WINDOWS_CERTIFICATE_FILE
+```
+Output: `out/AgentFlow Desktop-<platform>-<arch>/`. Launch that binary.
+
+## 1. Enrol the device (for Mode B)
+The bridge reads `~/.agentflow/auth.json` — same format the retired daemon used,
+so an already-provisioned device just works. To enrol fresh, add a device in
+`/cabinet` (or write auth.json) with:
+```json
+{ "api_key": "af_live_…", "device_id": "<uuid>",
+  "enrollment_token": "<token>", "ws_url": "wss://agentflow.website/_agents/_devices/connect" }
+```
+Launch with both flags on (opt-in until this pass signs off):
+```bash
+FF_DEVICE_BRIDGE=1 FF_FLOW_LLM=1 "out/AgentFlow Desktop-darwin-arm64/AgentFlow Desktop.app/Contents/MacOS/AgentFlow Desktop"
+```
+On macOS grant Screen Recording + Accessibility when prompted (computercontroller needs them).
+
+## 2. Confirm engine wiring
+- `~/.config/goose/config.yaml` now has `extensions.computercontroller` (+ `agentflow` if the bundle resolved) and the app log shows `[engine] routing goosed through the AgentFlow flow gateway` + `[engine] enabled goose extensions: …`.
+- Grep the app log for `[device-bridge]` to confirm the WS connected (look for the absence of `device bridge skipped: … not enrolled`).
+
+## 3. Mode A — standalone (matrix b3)
+In the app chat, give a build + control task ("create a small Next.js page and
+take a screenshot of it in the browser"). PASS when:
+- goose makes `developer` write/editor tool calls that put real files on disk, AND
+- a `computercontroller` call screenshots/drives the machine,
+- all on the `flow` model (no other provider key needed; the gateway sees the af key).
+
+## 4. Mode B — platform-driven (matrix b4)
+From `/cabinet` (device online), dispatch a task to the device. PASS when a
+`task_complete` arrives with a **real, content-specific answer** (not a
+placeholder). Pull the artifact server-side (the public device API hides result
+text):
+```bash
+ssh ff-france 'kubectl -n franchise-factory exec agentflow-postgres-97fb67469-69298 -- \
+  psql -U agentflow -d agentflow -c "SELECT kind, created_at, LEFT(payload::text,250) \
+  FROM device_action_log WHERE device_id=<ID> ORDER BY id DESC LIMIT 10;"'
+```
+Look for `task.task_complete` with `answer` describing the real screen/result +
+non-zero `tokens_used`/`cost_usd`. Also verify drain-on-reconnect: dispatch while
+the app is closed, reopen → the queued task runs (`draining N queued task(s)` in the log).
+
+## 5. Live screen (matrix b6) — partial
+`subscribe_stream` is routed but the capture-frame publisher is not yet ported
+(see the fork page follow-ups). Cabinet "watch live" will not show frames until
+that lands — expected; do not fail the pass on b6 yet.
+
+## Pass criteria
+- b3: Mode A produced real files + a real screenshot on `flow`.
+- b4: Mode B `task_complete` with a content-specific answer artifact + usage; queued-drain works.
+- One install, both modes, same goosed.
+
+## Related
+- [AgentFlow Desktop (Goose fork)](/subsystems/agentflow-desktop-fork)
+- Plan: `agentflow/plans/goose-desktop-fork.md`
