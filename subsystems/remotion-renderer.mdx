@@ -32,7 +32,7 @@ preset that uses the tool.
 | `agentflow-agents/.github/workflows/build-remotion-runner.yml` | Builds + pushes `ghcr.io/lnlockly/agentflow-remotion-runner` on `remotion-runner/**` changes. |
 | `agentflow-agents/src/mcp-servers/video/index.ts` | `@agentflow-video` MCP server. Exposes `remotion.render` — POSTs to `${REMOTION_RUNNER_URL}/render`, 5-min timeout, passes runner envelope through. |
 | `agentflow-agents/src/mcp-servers/video/index.test.ts` | Unit tests — registry shape, missing-url branch, happy path, runner 4xx, empty `composition_id`, non-json reply. |
-| `agentflow-agents/src/routes/internal-mcp.ts:VIDEO_PATHS` | Owner-pinned mount at `/internal/mcp/video/?token=…&owner=<uid>`. |
+| `agentflow-agents/src/routes/internal-mcp.ts:VIDEO_PATHS` | Owner-pinned mount at `/internal/mcp/video/?owner=<uid>` with the `x-mcp-auth` header (secret is header-only, SECURITY.md M-3). |
 | `agentflow-agents/src/services/internal-mcp-resolver.ts:INTERNAL_MCPS` | `'video'` whitelisted for `${AGENTFLOW_INTERNAL}` placeholder substitution. |
 | `agentflow-agents/src/services/env.ts:remotionRunnerUrl` | Reads `REMOTION_RUNNER_URL`; defaults to empty so the tool refuses with `remotion_runner_not_configured` instead of hung fetch. |
 | `agentflow-agents/k8s/agentflow-agents.yaml:REMOTION_RUNNER_URL` | `http://agentflow-remotion-runner:4200` on the api Deployment. Workers don't call the MCP. |
@@ -74,7 +74,7 @@ agentflow-agents pod  ──POST /render──►  agentflow-remotion-runner pod
   - `GET  /health` → `{ok:true, service:'remotion-runner'}`
   - `POST /render` → `{ok, mp4_url, composition_id, duration_sec, size_bytes, render_ms}` or `{ok:false, error, details?}`
 - **Routes (agents pod):**
-  - `POST /internal/mcp/video/?token=<INTERNAL_API_SECRET>&owner=<uid>` — JSON-RPC streamable-http MCP. `initialize`, `tools/list`, `tools/call`. Owner-pinned.
+  - `POST /internal/mcp/video/?owner=<uid>` with the `x-mcp-auth: <INTERNAL_API_SECRET>` header — JSON-RPC streamable-http MCP. `initialize`, `tools/list`, `tools/call`. Owner-pinned. The secret is HEADER-ONLY (legacy `?token=` query no longer accepted, SECURITY.md M-3).
 - **MCP tools (PR-2 shipped):**
   - `remotion.render({ composition_id, props?, fps?, duration_frames? })` — agentflow-agents proxies the POST to the runner Service and returns the runner envelope unchanged.
 
