@@ -33,6 +33,9 @@ in the Phase-A2 create-project flow (see [projects](/subsystems/projects/)).
 | `agentflow-agents/src/services/github-template-search.ts:543` | `extendedEnabled` — `FF_TEMPLATE_EXTENDED_SEARCH` gate (default ON). |
 | `agentflow-agents/src/services/github-template-search.ts:330` | `FRAMEWORK_SOURCE_BLOCKLIST` — only true framework source; structural hard-reject covers the rest. |
 | `agentflow-agents/src/services/github-template-search.ts:350` | `INSTALL_HOSTILE_REPOS` + `isInstallHostile` + `pickCleanCuratedLead` — yarn-only / external-backend repos that brick in-pod install; skipped as fallback lead AND filtered from search hits. |
+| `agentflow-agents/src/services/github-template-search.ts:375` | `EXTERNAL_AUTH_SAAS_REPOS` + `isExternalAuthSaas` — curated repos that hard-need Clerk/Supabase (500 on boot without keys we don't provision); `pickCleanCuratedLead` skips them so a complex brief lands on a self-contained starter. |
+| `agentflow-agents/src/services/github-template-search.ts:1025` | `BOOT_BLOCKING_AUTH_DEP_RX` / `SOFT_EXTERNAL_SAAS_DEP_RX` + `externalAuthSaasPenalty` — deprioritize a GitHub-Search finalist whose package.json hard-depends on external auth/data SaaS (applied in `refineByFileTree`). |
+| `agentflow-agents/src/services/github-template-search.ts:773` | `parseRankerArray` (tolerant fence/prose JSON extraction) + `heuristicRankFallback` — capability-aware fallback when the AI ranker errors; drops vertical-conflicting candidates (no ecom storefront for a non-commerce brief). |
 | `agentflow-agents/src/services/foundation-structural-filter.ts:445` | `detectVertical` (incl. `STOREFRONT_CORE_RX` dashboard-over-ecom guard) + `pickCuratedBypassList` + `deriveStructuralSignals` / `decideHardReject` / `structuralBias` — reused for vertical routing + file-tree hard-reject. |
 | `agentflow-agents/src/routes/projects.ts:912` | the only prod caller — honours an explicit `selected_foundation` (mode=`github_repo`) over the scorer; otherwise `pickBestTemplateForBrief(brief, resolvedKindForPicker)`. |
 
@@ -50,9 +53,15 @@ POST /me/projects { brief }
            Promise.allSettled(runGithubQuery × N) → merge+dedupe by stars
            (no GITHUB_TOKEN → log github_search_unauthenticated, 1 query only)
       → rankByBrief (1 LLM call, 0-10)
+           parseRankerArray (tolerant) — on ANY ranker error (parse/timeout/
+           empty) → heuristicRankFallback: capability-aware, drops vertical-
+           conflicting candidates (no ecom storefront for a non-commerce brief).
+           Old code took a blind top-3-by-stars slice here → handed a dashboard
+           brief the highest-star ecom storefront.
       → refineByFileTree (token + extended only):
            fetch package.json + root tree → decideHardReject (drop monorepo/
-           framework/desktop) → +structuralBias +capabilityFileTreeBonus → re-sort
+           framework/desktop) → +structuralBias +capabilityFileTreeBonus
+           −externalAuthSaasPenalty (Clerk/Auth0/Supabase) → re-sort
       → if empty → pickFallbackForBrief (capability-aware curated boilerplate)
 ```
 
@@ -79,16 +88,22 @@ POST /me/projects { brief }
 | Project dies at `install` before coder/DB/route-gate run (yarn-only / external-backend repo) | picked repo in `INSTALL_HOSTILE_REPOS` (e.g. `medusajs/nextjs-starter-medusa`, `packageManager: yarn@4`) | Add the repo to `INSTALL_HOSTILE_REPOS` (`github-template-search.ts:350`); it's then skipped as fallback lead and filtered from search hits. |
 | Dashboard/admin/CRUD brief lands on the ecom medusa storefront (`reasoning=capability_fallback_ecom_marketplace`) | `capability_fallback_ecom_marketplace` for an operator brief | `detectVertical` dashboard-over-ecom guard (`foundation-structural-filter.ts`): dashboard wins when no `STOREFRONT_CORE_RX` match. |
 | Caller's explicit `selected_foundation` ignored, scorer pick stored instead | stored `templateRepoFull` ≠ posted `selected_foundation.repo_full_name` | `projects.ts:912` — explicit `mode=github_repo` foundation now wins; `mode=scratch`/absent falls through to the scorer. |
+| AI ranker errors → a dashboard/non-commerce brief picked a high-star ecom storefront | `[github-template-search] ai_ranker_failed err=` (then `stars-based fallback (AI ranking failed)` in old reasoning) | `rankByBrief` now logs the real error + calls `heuristicRankFallback` (capability-aware, drops vertical-conflicting candidates). `github-template-search.ts:773`. |
+| Generated dashboard app 500s on every route: `@clerk/nextjs: Missing publishableKey` | picked repo in `EXTERNAL_AUTH_SAAS_REPOS` (e.g. `kiranism/next-shadcn-dashboard-starter`) or finalist logs `external_auth_saas reason=external_auth_saas_boot_blocking` | Curated dashboard lead is the self-contained `arhamkhnz/next-shadcn-admin-dashboard`; Clerk/Supabase repos skipped by `pickCleanCuratedLead` + penalized in `refineByFileTree`. We don't provision external-SaaS keys (own-infra). |
 
 ## Capability-aware fallback tiers
 
 `pickFallbackForBrief(brief, kind)` order:
 
 1. **Kind fallback** — `tg_bot`/`api`/`spa`/`mini_app` → in-house kind starter.
-2. **Complex (DB/auth/dashboard/commerce)** → **first install-clean** curated repo
-   for the brief's vertical via `pickCleanCuratedLead` (`kiranism/next-shadcn-dashboard-starter`
-   for dashboard, `vercel/commerce` for ecom — `medusajs/nextjs-starter-medusa`
-   is skipped as yarn-only/external-backend). `reasoning: capability_fallback_<vertical>`.
+2. **Complex (DB/auth/dashboard/commerce)** → **first install-clean AND
+   self-contained** curated repo for the brief's vertical via
+   `pickCleanCuratedLead` (`arhamkhnz/next-shadcn-admin-dashboard` for dashboard
+   — built-in mock auth, no Clerk/Supabase; `vercel/commerce` for ecom).
+   `medusajs/nextjs-starter-medusa` is skipped as yarn-only/external-backend;
+   `kiranism/next-shadcn-dashboard-starter` (Clerk) and
+   `horizon-ui/shadcn-nextjs-boilerplate` (Supabase) are skipped as external-
+   auth-SaaS. `reasoning: capability_fallback_<vertical>`.
 3. **App keyword** → install-clean vertical lead (`reasoning: vertical_fallback_<vertical>`).
 4. **Static-keyword brief** → `agentflow-static-starter`.
 5. **Ambiguous** → static, unless kind is web (then install-clean vertical lead).
@@ -108,6 +123,34 @@ POST /me/projects { brief }
   корзина/cart/checkout/…) resolves to `dashboard_saas`, not `ecom_marketplace`.
   A real online store that merely mentions «админка» still resolves to ecom.
 
+### AI-ranker-error capability fallback + external-auth-SaaS avoidance (route-gate 2026-05-30)
+
+Two last-mile robustness fixes, found by route-gate's dashboard E2E on the live
+image:
+
+- **AI-ranker error → capability-aware, not stars-based.** `rankByBrief` used to
+  take a blind top-3-by-stars slice when the LLM reply failed to parse, so an
+  un-pinned dashboard-CRUD brief picked `saleor/storefront` (a high-star ecom
+  repo) with `reasoning: stars-based fallback (AI ranking failed)`. Now the
+  ranker reply is parsed by `parseRankerArray` (strips fences, extracts the
+  `[ … ]` block from prose) and ANY error logs `ai_ranker_failed err=…` then
+  routes to `heuristicRankFallback`. The heuristic keys off the brief's vertical
+  + capabilities, **drops vertical-conflicting candidates** (an ecom storefront
+  for a non-commerce brief), and returns `[]` (→ capability-aware curated
+  fallback) when nothing compatible survives. Ecom briefs still keep ecom.
+- **Self-contained over external-auth-SaaS.** A generated app that hard-needs an
+  external auth/data SaaS (Clerk, Supabase) is dead-on-arrival — every route
+  500s on a missing key, and we don't provision those (own-infra: PGlite not
+  Neon). The curated dashboard lead is now `arhamkhnz/next-shadcn-admin-dashboard`
+  (built-in mock auth, no `.env`, runs on `next dev`/`next start`).
+  `pickCleanCuratedLead` skips `EXTERNAL_AUTH_SAAS_REPOS`
+  (`kiranism/next-shadcn-dashboard-starter` Clerk,
+  `horizon-ui/shadcn-nextjs-boilerplate` Supabase, `satnaing/shadcn-admin`
+  Clerk), and `refineByFileTree` applies `externalAuthSaasPenalty` to any
+  GitHub-Search finalist whose package.json carries `@clerk/*` / `@auth0/*`
+  (boot-blocking, −6) or `next-auth` / `@supabase/*` / `firebase` (soft, −3),
+  logging `external_auth_saas reason=…`.
+
 ### Explicit `selected_foundation` wins over the scorer
 
 `POST /me/projects` with `selected_foundation: { mode: 'github_repo',
@@ -116,13 +159,24 @@ caller's repo as `templateRepoFull` / `foundationRepoFullName` (`ref` honoured,
 default `main`). `mode: 'scratch'` and an absent foundation fall through to
 `pickBestTemplateForBrief`. (`projects.ts:912`.)
 
-## Verification (2026-05-29)
+## Verification (2026-05-30)
 
-Local `gh` token, 3 complex briefs (token never committed):
-`saas-admin-with-billing` → `satnaing/shadcn-admin` (+5 capability-verified,
-beat `ant-design-pro` ★38k); `services-marketplace-with-chat` →
-`saleor/storefront` (+3); `crypto-portfolio-tracker` → `satnaing/shadcn-admin`.
-30/19/30 real candidates merged per brief — none an in-house bare starter.
+Local `gh` token, real GitHub Search, AI-ranker-error path simulated (token
+never committed):
+
+- **Dashboard-CRUD (the bug):** real candidates included `Kiranism/next-shadcn-dashboard-starter`
+  (Clerk), `satnaing/shadcn-admin` (Clerk) and `saleor/storefront` (ecom).
+  Ranker-error fallback picked `ant-design/ant-design-pro` (self-contained admin,
+  auth deps NONE-CLEAN) — **not** the ecom storefront. Capability curated
+  fallback = `arhamkhnz/next-shadcn-admin-dashboard` (self-contained, not Clerk).
+- **Blog:** ranker-error fallback + curated fallback both → `timlrx/tailwind-nextjs-starter-blog`
+  (NONE-CLEAN).
+- **Ecom (control):** ranker-error fallback kept ecom (`vuestorefront/storefront-ui`);
+  curated fallback = `vercel/commerce`. Vertical respected — ecom stays ecom.
+
+Earlier run (2026-05-29): `saas-admin-with-billing` → `satnaing/shadcn-admin`
+(+5 capability-verified, beat `ant-design-pro` ★38k) — note that pick is now
+deprioritized by `externalAuthSaasPenalty` (Clerk).
 
 ## Related
 
