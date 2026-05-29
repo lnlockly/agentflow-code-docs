@@ -33,7 +33,7 @@ description: "Brief → GitHub template search → hosted pod git clone → аг
 | Роль | Кто | Что делает |
 |---|---|---|
 | 🧑 Юзер | Человек | Пишет бриф, смотрит preview, чатится с агентом, принимает «готово». НЕ знает про код, git, cluster. |
-| 🤖 Project Picker | server-side AI в `github-template-search.ts` | На `POST /me/projects` достаёт keywords из брифа → GitHub Search API → AI скорит топ-5 → возвращает топ-1 (fallback `vercel/next.js with-tailwindcss`) |
+| 🤖 Project Picker | server-side AI в `github-template-search.ts` | На `POST /me/projects` достаёт keywords из брифа → GitHub Search API → AI скорит топ-5 → возвращает топ-1. No-match fallback (app-shaped brief) = `lnlockly/agentflow-nextjs-starter` (clean Next.js 14, no auth/DB, serves 200 at `/`). Was `steven-tey/precedent` until 2026-05-29 — Clerk in its root layout 500'd `/` without `CLERK_*` keys. |
 | ⚙️ Hosted Daemon | Pod в `af-tenant-<userId>` (`kind=daemon`) | Реальный разработчик: OpenCode CLI + Claude/GPT. Читает бриф, пишет код, гоняет `npm run dev`, коммитит. Использует `AF_SHELL_WHITELIST` (git, npm, node, curl, jq, grep, sed; НЕ `rm -r`) |
 | 📦 Caddy + ws-tunnel | Edge proxy | Auto-route `<slug>.proj.agentflow.website` → WS-tunnel к port 3000 pod'а. HMR работает as-is через Next.js dev server |
 
@@ -41,12 +41,13 @@ description: "Brief → GitHub template search → hosted pod git clone → аг
 
 | Path | Role |
 |---|---|
-| `agentflow-agents/src/services/github-template-search.ts:67` | `GithubTemplate` interface — фигурирует во всём flow (repo_full, url, stars, relevance_score) |
-| `agentflow-agents/src/services/github-template-search.ts:148` | `searchGithub` — обёртка над GitHub Code Search REST (`/search/repositories?q=...`) |
-| `agentflow-agents/src/services/github-template-search.ts:181` | `rankByBrief` — AI-ранжирование через `useModel(ModelType.TEXT_LARGE)` (читает description + topics) |
-| `agentflow-agents/src/services/github-template-search.ts:253` | `searchTemplatesForBrief(brief)` → топ-5 кандидатов с кэшем 1ч |
-| `agentflow-agents/src/services/github-template-search.ts:286` | `pickBestTemplateForBrief(brief)` → топ-1 или `FALLBACK_TEMPLATE` (vercel/next.js with-tailwindcss) |
-| `agentflow-agents/src/services/github-template-search.ts:55` | `FALLBACK_TEMPLATE` — используется когда GitHub вернул 0 кандидатов |
+| `agentflow-agents/src/services/github-template-search.ts:210` | `GithubTemplate` interface — фигурирует во всём flow (repo_full, url, stars, relevance_score) |
+| `agentflow-agents/src/services/github-template-search.ts:335` | `searchGithub` — обёртка над GitHub Code Search REST (`/search/repositories?q=...`) |
+| `agentflow-agents/src/services/github-template-search.ts:395` | `rankByBrief` — AI-ранжирование через `useModel(ModelType.TEXT_LARGE)` (читает description + topics) |
+| `agentflow-agents/src/services/github-template-search.ts:500` | `searchTemplatesForBrief(brief)` → топ-5 кандидатов с кэшем 1ч |
+| `agentflow-agents/src/services/github-template-search.ts:539` | `pickBestTemplateForBrief(brief)` → топ-1 или `FALLBACK_TEMPLATE` (clean Next.js / static / kind-fallback via `pickFallbackForBrief`) |
+| `agentflow-agents/src/services/github-template-search.ts:45` | `FALLBACK_TEMPLATE` = `lnlockly/agentflow-nextjs-starter` — app-shaped brief, GitHub returned 0 candidates. Clean Next.js 14 + Tailwind, no auth/DB → 200 at `/`. (Was `steven-tey/precedent` → 500 via Clerk before 2026-05-29.) |
+| `agentflow-agents/src/services/github-template-search.ts:178` | `pickFallbackForBrief(brief, kind)` — routes no-match briefs: `KIND_FALLBACKS[kind]` first, else `APP_BRIEF_KEYWORDS` → `FALLBACK_TEMPLATE`, else `STATIC_FALLBACK`. |
 | `agentflow-agents/src/services/bootstrap-schema.ts:522` | ALTER TABLE projects ADD COLUMN template_url / template_repo_full / template_picked_at (Phase A2) |
 | `agentflow-agents/src/routes/projects.ts:843` | `POST /me/projects` — entry point; вызывает `pickBestTemplateForBrief` вместо LLM-классификатора kind |
 | `agentflow-agents/src/routes/projects.ts:875` | tg_bot intent resolution — `analyzeBrief(brief).kind_inferred==='tg_bot'` (or explicit `kind:'tg_bot'`) → `isTgBotIntent` → `resolvedKind='tg_bot'`. Explicit non-tg web kind suppresses auto-promotion. |
@@ -138,7 +139,7 @@ description: "Brief → GitHub template search → hosted pod git clone → аг
 
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
-| Все проекты получают `vercel/next.js` fallback | `[github-template-search] github_rate_limit_exhausted` | Set `GITHUB_TOKEN` env в agents pod (5000 req/h вместо 60). См. `github-template-search.ts:148`. |
+| Все проекты получают одинаковый fallback (`agentflow-nextjs-starter` / `agentflow-static-starter`) | `github_search_failed status=403` / `[github-template-search]` | GitHub Search rate-limit. Set `GITHUB_TOKEN` env в agents pod (5000 req/h вместо 60). См. `github-template-search.ts:335`. |
 | `pickBestTemplateForBrief` вернул fallback хотя бриф осмысленный | `[github-template-search] ranked_zero_candidates brief=` | AI-ранкер не нашёл совпадений → расширь keywords в `extractKeywords` (`github-template-search.ts:112`). |
 | Project stuck в `provisioning` > 5 мин | `[hosted-devices] apply failed id=` | kubectl apply фейлится на vcluster apiserver — см. `marketplace-hosted-deploy.mdx` failure modes. |
 | Daemon pod up но `npm install` падает | `[project-setup] npm_install_failed exitCode=` | Шаблон требует Node > 20 или yarn/pnpm. Daemon базовый image — Node 20 + npm. Проверь `package.json#engines` в выбранном шаблоне. |
@@ -149,6 +150,7 @@ description: "Brief → GitHub template search → hosted pod git clone → аг
 | Approve вернул 409 `still_preparing` | `approveProject: project still in preparing` | Background prep ещё не завершился. См. `projects-create-flow.mdx` (instant-create). |
 | `template_url=NULL` на старом проекте | row создан до 2026-05-25 | Legacy row — старый flow по kind classifier. Новых таких не появится; легаси обрабатывается отдельной веткой в `projects-pipeline.ts:631`. |
 | Bot brief shipped a marketing landing (`kind=nextjs`, `bot_username=null`, invented @handle) | grep `kind_fallback_tg_bot` absent for a bot brief; row has `kind='nextjs'` | Pre-PR-#964 bug — `POST /me/projects` only honoured explicit `kind:'tg_bot'`. Fixed: `analyzeBrief` infers tg_bot from the brief (`routes/projects.ts:875`). Repro: project 1586. |
+| Fallback Next.js project edits + serves but `/` returns HTTP 500, never promotes to `running` | `throwMissingPublishableKeyError` / `Missing publishableKey` in the project pod dev log; `template.reasoning='fallback'` with `repo_full='steven-tey/precedent'` | Pre-2026-05-29 bug — `FALLBACK_TEMPLATE` was `steven-tey/precedent`, which wires `ClerkProvider` into `app/layout.tsx` + `clerkMiddleware` into `app/middleware.ts`; without `CLERK_*` env keys `/` 500s and preview-reconciler can't promote. Fixed: fallback is now `lnlockly/agentflow-nextjs-starter` (no auth/DB, 200 at `/`). `github-template-search.ts:45`. |
 
 ## Open questions (default answers, see PROJECT_ARCHITECTURE.html)
 
