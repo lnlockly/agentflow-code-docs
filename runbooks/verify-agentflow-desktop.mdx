@@ -71,6 +71,26 @@ that lands — expected; do not fail the pass on b6 yet.
 - b4: Mode B `task_complete` with a content-specific answer artifact + usage; queued-drain works.
 - One install, both modes, same goosed.
 
+## Verified 2026-05-30 (unsigned, headless engine path)
+Ran without packaging the Electron shell — built goosed (debug) from the fork
+and drove the engine directly, which is the same code path the app uses:
+- **b3 PASS** — goosed on `flow`, `POST /reply` "build a React TODO app" →
+  developer tool wrote 4 real files (`package.json`, `index.html`,
+  `src/App.jsx` with real useState/add/toggle/delete, `src/main.jsx`).
+- **b4 PASS** — device-bridge run standalone against prod
+  `wss://…/_agents/_devices/connect` with the real `auth.json` → device
+  **online** in `/me/devices` → `POST /me/devices/:id/dispatch_task` (202) →
+  bridge ran it on the local goosed → `hello.txt` written with the exact
+  dispatched content → `task_complete` row in `device_action_log`.
+- **b6** not run (capture publisher pending); computercontroller GUI needs
+  interactive TCC grants — a headless agent can't approve them, so the
+  machine-control half of b3 + b6 is owner-interactive only.
+
+**Gotcha found + fixed (PR #8):** goosed `/reply` returns "Provider not set"
+unless the session calls `POST /agent/update_provider {session_id, provider,
+model}` after `/agent/start` — env vars alone are not enough. The dispatch
+path now does this.
+
 ## Related
 - [AgentFlow Desktop (Goose fork)](/subsystems/agentflow-desktop-fork)
 - Plan: `agentflow/plans/goose-desktop-fork.md`

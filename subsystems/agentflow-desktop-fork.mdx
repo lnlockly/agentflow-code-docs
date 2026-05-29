@@ -101,6 +101,7 @@ unchanged on purpose.
 | Bridge connects then drops repeatedly | `[device-bridge] heartbeat timeout — closing` | network / server WS keepalive |
 | Dispatched task fails | `[device-bridge] task … cancelled` or `task_error: task_failed:` frame | `ui/desktop/src/device-bridge/goosedDispatch.ts` |
 | Queued tasks not replayed | `queued-task drain failed` | `ui/desktop/src/device-bridge/queuedTasks.ts` |
+| Dispatched task fails immediately | goosed `Provider not set` | `goosedDispatch.ts` must `POST /agent/update_provider` after `/agent/start` (PR #8) |
 
 ## Device-bridge verification status
 The bridge module is unit-verified — 29 vitest tests (auth round-trip + header
