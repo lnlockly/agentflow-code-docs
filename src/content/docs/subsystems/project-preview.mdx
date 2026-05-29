@@ -35,6 +35,8 @@ within ~1.3s receive `{"action":"building"}` → `{"action":"serverComponentChan
 | `agentflow-agents/src/services/graph-executor/handlers/spa.ts:1210` | Writes the `foundation_port` marker after the project's dev server is up |
 | `agentflow-agents/src/services/peruser-pod.ts` | Mints per-project Ingress + bridge Service from `expose_public` (preferred over the wildcard fallback) |
 | `agentflow-agents/helpers/caddy.ts:412` | Per-project sidecar variant for the one-project-per-pod path (kept in sync with the multi-tenant Caddyfile in `user-workspace.yaml`) |
+| `agentflow-agents/src/services/pool-worker/post-build.ts:1511` | `detectAndRepointPreview()` — writes the bridge Endpoints with the resolved pod's **raw IP** (selector-less, no owner-pod lifecycle binding) |
+| `agentflow-agents/src/services/pingers/preview-bleed-guard.ts:1` | Bleed-guard sweep — every 90s clears any repointed bridge whose pinned IP is no longer held by a pod in the owner's own `af-tenant-<owner>` ns |
 
 ## Data flow
 
@@ -79,6 +81,13 @@ Edits to /workspace/<slug>/app/**/*.tsx → dev-server watcher → "building" �
 - Caddy config: rebuilt + reloaded every 5s by the bash watcher in the
   sidecar (`user-workspace.yaml:301`). Signature is md5 of the sorted
   `slug=port` list — only a port-map change triggers `caddy reload`.
+- Bridge Endpoints isolation: `detectAndRepointPreview` stamps repointed
+  Service/Endpoints with `agentflow.io/owner=u<id>`,
+  `agentflow.io/repointed-by=detectAndRepointPreview`, and
+  `agentflow.io/target-ns=af-tenant-<id>`. `preview-bleed-guard` (90s cadence)
+  lists those Endpoints, resolves each owner's tenant pod-IP set, and clears
+  any pin whose IP the owner does not own — fail-safe (a kube list error skips
+  the owner, never clears live bridges).
 
 ## Failure modes
 
@@ -88,6 +97,7 @@ Edits to /workspace/<slug>/app/**/*.tsx → dev-server watcher → "building" �
 | WS connects then hangs at `sync` with no `built` after file edit | Dev-server logs `webpack-internal` errors / chokidar `EMFILE` | Inside the project: fs.inotify.max_user_watches or syntax error in the touched file |
 | WS gets 404 from edge | nginx-ingress access log shows `404` for `/_next/webpack-hmr` | Verify the `foundation_port` marker exists and the dev server is actually up on that port; check `discover_foundations` output in sidecar logs |
 | Wrong project rendered under correct hostname | Cookie `__Secure-authjs.callback-url` points to a different slug; `cat /workspace/*/.runtime/foundation_port` shows the same port for ≥2 projects | Port-collision bug — `spa.ts` should mint unique ports per project; rewrite the stale marker or kill the duplicate dev server |
+| **Cross-tenant content bleed** — user A's preview URL serves user B's app. Multiple distinct `proj-uA-*` bridges return byte-identical content from a foreign tenant's pod | `preview-bleed-guard: cleared cross-tenant bleeding bridge` (after fix). Diagnose: bridge `Endpoints proj-uA-<slug>` IP is held by a pod in `af-tenant-B`, not `af-tenant-A` (`kubectl get pods -A -o wide \| grep <ip>`) | Root cause: `detectAndRepointPreview` pins a **raw pod IP** into a selector-less Endpoints; when A's pod dies the calico IP is recycled to a B pod and the stale pin silently follows. Fix: `preview-bleed-guard.ts` revalidates IP ↔ owner-tenant membership and clears foreign pins (→ 503). Repoint machinery restores a fresh IP when A's pod returns |
 | TLS handshake error | cert-manager log `wildcard-proj-agentflow-tls` not Ready | Re-issue via cert-manager; see runbook |
 | `*.proj.agentflow.website` Ingress fails to admit | nginx-ingress controller log `invalid wildcard host` | Wildcard host in Ingress must be exactly one DNS label (`*.proj.agentflow.website`, not `*.x.proj.agentflow.website`) |
 
