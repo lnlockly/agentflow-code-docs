@@ -47,9 +47,11 @@ Two paired additions to AgentFlow Desktop:
 | `agentflow-agents/src/routes/me-devices-memories.ts:1` | REST handlers under `/me/devices/:id/memories` |
 | `agentflow-agents/src/routes/me-devices-memories.ts:78` | `parseTagsParam(raw)` — `,`-split, trim, lowercase |
 | `agentflow-agents/src/routes/me-devices-memories.ts:62` | `rowToMemory` — postgres-js row → DTO with kind-fallback |
+| `agentflow-agents/src/routes/me-devices-memories.ts:92` | `isUuid(value)` — guards `:id` before the SQL so a non-uuid id can't crash the `uuid` column |
+| `agentflow-agents/src/routes/me-devices-memories.ts:97` | `ownsDevice` returns `false` for a non-uuid id → existing `device_not_found` 404 |
 | `agentflow-agents/src/db/schema.ts:3590` | `deviceMemories` Drizzle model |
 | `agentflow-agents/src/server.ts:104` | `meDevicesMemoriesApp` mounted BEFORE `meDevicesApp` so `/memories` is not shadowed by `:id` |
-| `agentflow-agents/tests/me-devices-memories.test.ts:1` | 9 pure tests (parseTagsParam, rowToMemory) |
+| `agentflow-agents/tests/me-devices-memories.test.ts:1` | pure helper tests (parseTagsParam, rowToMemory, isUuid) + DB-backed HTTP tests (non-uuid / unowned / owned) |
 
 ## Data flow
 
@@ -111,6 +113,7 @@ INSERT INTO device_memories ... RETURNING *
 | Daemon errors `firefox profile not found` on first `firefox_open` | `firefox profile not found` | set `AGENTFLOW_FIREFOX_PROFILE` to absolute path; `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/firefox.py:103` |
 | `af_remember` returns `{ok: false, error: "no device_id ..."}` | `no device_id (set in auth.json` | enroll device or set `AGENTFLOW_DEVICE_ID`; `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/af_client.py:430` |
 | `POST /me/devices/:id/memories` 404 with `device_not_found` | `device_not_found` | device id mismatch or device was soft-deleted; check `user_devices.deleted_at` |
+| `GET`/`POST /me/devices/:id/memories` returns HTTP 500 for a malformed `:id` (e.g. `default`) | `invalid input syntax for type uuid` / `GET /me/devices/default/memories -> HTTP 500` | `user_devices.id` is a `uuid` column; the daemon sentinel `default` crashed the SELECT. Fixed by the `isUuid` guard in `ownsDevice`; `agentflow-agents/src/routes/me-devices-memories.ts:97`. Sibling routes still unguarded: `me-devices-skills.ts` (POST), `me-devices-workspace.ts` (`resolveDeviceOwnership`) |
 | Tag filter returns nothing despite recent inserts | (no log) | tags are lowercased at write time — pass lowercase tags in `?tags=`; `agentflow-agents/src/routes/me-devices-memories.ts:108` |
 | `launch_persistent_context` hangs on launch | hangs without log | another Firefox process owns the same profile; quit the user's Firefox or use a copied profile dir |
 
