@@ -39,8 +39,9 @@ injection boundary.
 | `agentflow-agents/src/coder-shim/recipes.ts:115` | `validateRecipeDispatch` — recipe-id allowlist + param-key whitelist + cron guard |
 | `agentflow-agents/src/coder-shim/recipes.ts:161` | `buildRecipeRunArgs` — `run --no-session --max-turns N --recipe <file> --params k=v ...` (array) |
 | `agentflow-agents/src/coder-shim/recipes.ts:192` | `buildScheduleArgs` — `schedule add --schedule-id … --cron … --recipe-source <file>` |
-| `agentflow-agents/src/coder-shim/goose-runner.ts:27` | `buildGooseConfig` — openai provider → platform gateway, model alias `flow` |
-| `agentflow-agents/src/coder-shim/goose-runner.ts:54` | `buildGooseArgs` — `run --with-builtin developer --no-session --max-turns N -t <brief>`; never a concrete model id |
+| `agentflow-agents/src/coder-shim/goose-runner.ts:27` | `buildGooseConfig` — openai provider → platform gateway, model alias `flow`, `GOOSE_MODE: auto` (headless tool auto-apply) |
+| `agentflow-agents/src/coder-shim/goose-runner.ts:66` | `buildCoderPrompt` — frames the raw brief as an "edit the cloned files at CWD" directive; branches on `kind` (HTTP vs tg_bot), never a slug |
+| `agentflow-agents/src/coder-shim/goose-runner.ts:95` | `buildGooseArgs` — `run --with-builtin developer --no-session --max-turns N -t <framed-prompt>`; `-t` is `buildCoderPrompt`, not the bare brief; never a concrete model id |
 | `agentflow-agents/src/coder-shim/goose-runner.ts:103` | `runGooseArgv` — array-argv spawn (one process path for coder + recipe + schedule) |
 | `agentflow-agents/src/coder-shim/pipeline.ts:31` | `buildReport` (pure) — goose exit + probe → CloneStatusReport |
 | `agentflow-agents/src/coder-shim/pipeline.ts:114` | `runCoderTask` — clone → goose config → `runGoose` → probe → report |
@@ -71,8 +72,11 @@ coder-shim bridge.handleCoderDispatch
    │  validateScope → runCoderTask:
    │    git clone --depth 1 -- <repo> /workspace/<slug>
    │    write ~/.config/goose/config.yaml (provider=openai, model=$GOOSE_MODEL,
-   │       OPENAI_HOST=$AF_API_URL, OPENAI_BASE_PATH=_agents/llm/v1/chat/completions)
-   │    goose run --with-builtin developer --no-session --max-turns N -t <brief>
+   │       OPENAI_HOST=$AF_API_URL, OPENAI_BASE_PATH=_agents/llm/v1/chat/completions,
+   │       GOOSE_MODE=auto)
+   │    goose run --with-builtin developer --no-session --max-turns N -t <framed-prompt>
+   │      (framed-prompt = buildCoderPrompt(brief,kind,port): "edit the cloned files
+   │       at CWD to implement this brief"; the bare brief alone reads as a chat turn)
    │    probe 127.0.0.1:<port>  (HTTP kinds; skipped for tg_bot)
    │  POST /internal/projects/:id/clone-status {ok, port, port_reachable, ...}
    ▼  WS task_complete  (or task_error)
@@ -151,6 +155,8 @@ charset-validated before reaching the scheduler.
 | task_error `recipe_run_failed` | report `recipe_run_failed: <goose tail>` | goose non-zero on `goose run --recipe` — read the tail (model/gateway/recipe issue) |
 | task_error `recipe_schedule_failed` | report `recipe_schedule_failed: <tail>` | `goose schedule add` non-zero — read the tail (cron/scheduler issue) |
 | Goose device never connects, ws-200 loop | `ws error: Unexpected server response: 200` then `ws closed; reconnecting in 4.0s` | `main.ts` built `wsUrl` without the `/_agents` ingress prefix — the bare path hit the landing proxy (HTTP 200, no upgrade). Fixed: `wsUrl = ${wsHost}/_agents/_devices/connect`. |
+| Coder build exits 0 but workspace untouched (placeholder still served) | goose cli log `Session completed ... message_count":2` with `tool_calls":0` | `goose-runner.ts:66` — `buildGooseArgs` fed the bare brief as `-t`; the model replied conversationally with no developer tool call. Fixed: `buildCoderPrompt` frames it as an edit-the-CWD directive + `GOOSE_MODE: auto`. |
+| Coder build runs tools but writes nothing / picks `apps__create_app` | goose cli log `Tool call started ... apps__create_app` (not `developer__text_editor`) | tool-selection drift from extension bloat (8 extensions/17 tools enabled vs goose's 5/50 recommendation). The framed prompt + `GOOSE_MODE: auto` steer it back to the developer editor tools. |
 | Goose device create rejected | `goose_canary_disabled` (HTTP 403) | `FF_GOOSE_CANARY` not set on agentflow-agents — set it to provision the canary |
 | Goose device row INSERT fails | `hosted_devices_template_check` violation | migration `0077_hosted_device_template_goose.sql` not applied to the postgres pod |
 
