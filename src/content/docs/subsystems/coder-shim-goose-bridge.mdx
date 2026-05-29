@@ -54,7 +54,7 @@ injection boundary.
 | `agentflow-agents/src/routes/me-hosted-devices.ts:142` | `resolveDaemonImage` — `template==='goose'` → coder-shim FIRST (deterministic, isolated); else `FF_DAEMON_IMAGE` override; else coder (hotfix) |
 | `agentflow-agents/src/routes/me-hosted-devices.ts:427` | `isGooseCanaryEnabled` — `FF_GOOSE_CANARY` gate; create path 403s `goose_canary_disabled` unless set |
 | `agentflow-agents/src/routes/me-hosted-devices.ts:418` | `createSchema.template` enum now includes `'goose'`; warm-pool claim skipped for goose (pool pods are coder-baked) |
-| `agentflow-agents/src/db/migrations/0077_hosted_device_template_goose.sql:1` | widens `hosted_devices_template_check` to allow `'goose'` |
+| `agentflow-agents/src/db/migrations/0078_hosted_device_template_goose.sql:1` | widens `hosted_devices_template_check` to allow `'goose'` |
 | `agentflow-agents/coder-shim-image/Dockerfile:1` | image: node 22 + bridge + goose from the fork |
 | `agentflow-agents/coder-shim-image/entrypoint.sh:1` | env check + `node dist/coder-shim/main.js` |
 | `agentflow-agents/.github/workflows/build-coder-shim.yml:1` | self-hosted build → `ghcr.io/<owner>/agentflow-coder-shim` |
@@ -144,7 +144,7 @@ charset-validated before reaching the scheduler.
 | task_error `recipe_run_failed` | report `recipe_run_failed: <goose tail>` | goose non-zero on `goose run --recipe` — read the tail (model/gateway/recipe issue) |
 | task_error `recipe_schedule_failed` | report `recipe_schedule_failed: <tail>` | `goose schedule add` non-zero — read the tail (cron/scheduler issue) |
 | Goose device create rejected | `goose_canary_disabled` (HTTP 403) | `FF_GOOSE_CANARY` not set on agentflow-agents — set it to provision the canary |
-| Goose device row INSERT fails | `hosted_devices_template_check` violation | migration `0077_hosted_device_template_goose.sql` not applied to the postgres pod |
+| Goose device row INSERT fails | `hosted_devices_template_check` violation | migration `0078_hosted_device_template_goose.sql` not applied to the postgres pod |
 
 ## Relationship to the in-daemon goose backend
 There are two ways to run goose for the coder, and they coexist:
