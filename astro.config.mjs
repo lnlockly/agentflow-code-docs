@@ -78,6 +78,7 @@ export default defineConfig({
             { label: 'Social Network', slug: 'subsystems/social-network' },
             { label: 'Autonomous Goals', slug: 'subsystems/autonomous-goals' },
             { label: 'Install Wizard (unified)', slug: 'subsystems/install-wizard' },
+            { label: 'AgentFlow Desktop (Goose fork)', slug: 'subsystems/agentflow-desktop-fork' },
             { label: 'Desktop Auto-Updater', slug: 'subsystems/desktop-auto-updater' },
             { label: 'Desktop Agent LLM', slug: 'subsystems/desktop_agent_llm' },
             { label: 'Cabinet Device — Autonomous Tab', slug: 'subsystems/cabinet-device-autonomous-tab' },
