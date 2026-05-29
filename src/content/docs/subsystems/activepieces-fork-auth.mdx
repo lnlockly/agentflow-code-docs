@@ -93,5 +93,5 @@ the route 404s and upstream CE behaviour is byte-identical.
 - [activepieces marketplace (hosted deploy)](/subsystems/marketplace-hosted-deploy)
 - [auth session rotation](/subsystems/auth-session-rotation)
 - Rebase map + full security review: `plans/autonomous/_ap-fork-auth.md`
-- Billing/quota patch (next): worker/engine pre-run balance check + real-time
-  debit + hard-stop at zero, behind `AP_AGENTFLOW_BILLING_ENABLED` (not yet built).
+- [activepieces fork — engine-level billing/quota hook](/subsystems/activepieces-fork-billing)
+  — pre-run balance gate + per-run debit, behind `AP_AGENTFLOW_BILLING_ENABLED`.
