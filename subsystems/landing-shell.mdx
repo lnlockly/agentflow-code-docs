@@ -7,17 +7,23 @@ description: "AppShellV2 sidebar/topbar, admin section split, design tokens used
 
 ## TL;DR
 
-All v2 pages (`/studio`, `/projects`, `/marketplace`, `/my/agents`, `/inbox`, `/triggers`, `/account/usage`, `/account/billing`, `/account/settings`, `/admin/hub`, `/status`) wrap their bodies in `AppShellV2`. The shell renders a 240px sidebar + 70px topbar with a single set of design tokens defined in `dark-tokens.css`. Two sidebar variants exist: the regular WORKSPACE + INSIGHTS nav for everyday browsing, and an ADMIN nav that activates only when the user is on `/admin/*` AND `user.is_admin === true`. Admin entries never bleed into the regular workspace shell.
+All v2 pages (`/studio`, `/projects`, `/marketplace`, `/my/agents`, `/inbox`, `/triggers`, `/account/usage`, `/account/billing`, `/account/settings`, `/admin/hub`, `/status`) wrap their bodies in `AppShellV2`. The shell renders a 240px sidebar + 70px topbar with a single set of design tokens defined in `dark-tokens.css`. Two sidebar variants exist: the regular nav for everyday browsing and an ADMIN nav that activates only when the user is on `/admin/*` AND `user.is_admin === true`. Admin entries never bleed into the regular workspace shell.
+
+**Apps-cleanup 2026-05-29 (UX overhaul §3):** the regular nav is now grouped by outcome, not one flat list. `WORKSPACE_SECTIONS` renders «Создать» (`CREATE_NAV`: Кабинет/Проекты/Устройства/Навыки) then «Работа» (`WORK_NAV`: Мои агенты/Маркетплейс/Приложения); `INSIGHTS_NAV` is the «Кабинет» group (Биллинг/Партнёрка/Настройки). Removed from the sidebar: **Singularity** (`/singularity` — static duplicate hub, no own backend) and **Квесты** (`/start` — gamification stub). The `/apps` launcher dropped its **Души** (`/workspace/souls`) tile — graph-executor was unwired (PR #917), souls is tombstoned. All three routes still resolve by direct URL (archive-not-break; souls `/me/souls` still answers 200 pre-Phase-3). Audit + per-item evidence: `plans/autonomous/_apps-cleanup-audit.md`. i18n keys `app.shell.section.{create,work,cabinet}` in ru/en/zh.
 
 ## Files
 
 | Path | Role |
 |---|---|
-| `agentflow-landing/src/components/layout/AppShellV2.tsx:54` | `WORKSPACE_NAV` — Studio, Projects, Marketplace, My Agents, Triggers, Inbox |
-| `agentflow-landing/src/components/layout/AppShellV2.tsx:63` | `INSIGHTS_NAV` — Activity, Billing & usage, Buy Credits, Settings |
-| `agentflow-landing/src/components/layout/AppShellV2.tsx:74` | `ADMIN_NAV` — Hub, All projects, Campaigns, Ads, FLOW emission, Billing config, Platform workspace |
-| `agentflow-landing/src/components/layout/AppShellV2.tsx:87` | `isAdminPath(pathname)` — matches `/admin/*` and `/account/admin/*` |
-| `agentflow-landing/src/components/layout/AppShellV2.tsx:194` | `onAdminRoute && user?.is_admin` swap that picks WORKSPACE+INSIGHTS vs ADMIN |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:103` | `CREATE_NAV` — «Создать» group: Кабинет, Проекты, Устройства, Навыки |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:112` | `WORK_NAV` — «Работа» group: Мои агенты, Маркетплейс, Приложения |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:118` | `WORKSPACE_SECTIONS` — ordered `{titleKey, items}` groups the sidebar maps over |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:126` | `INSIGHTS_NAV` — «Кабинет» group: Биллинг, Партнёрка, Настройки |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:139` | `ADMIN_NAV` — Hub, All projects, Campaigns, Ads, FLOW emission, Billing config, Platform workspace |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:151` | `isAdminPath(pathname)` — matches `/admin/*`, `/account/admin/*`, `/workspace/admin/*` |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:345` | `onAdminRoute && isAdmin` swap that picks WORKSPACE_SECTIONS+INSIGHTS vs ADMIN |
+| `agentflow-landing/src/pages/AppsLauncher.tsx:83` | `/apps` `SECTIONS` — iOS-style tile grid for secondary surfaces |
+| `agentflow-landing/src/components/layout/Sidebar.tsx:73` | Legacy team-shell `DISCOVER_NAV` (used by old `AppShell`: TeamHub/TeamsList/MyTasks/invites) |
 | `agentflow-landing/src/components/account/AccountHeader.tsx:32` | Legacy header for `/account`, `/hub` — no longer carries an admin pill |
 | `agentflow-landing/src/styles/dark-tokens.css:17` | All design tokens — surfaces, borders, text, accent, fonts |
 
