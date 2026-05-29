@@ -50,6 +50,9 @@ injection boundary.
 | `agentflow-agents/src/coder-shim/bridge.ts:82` | `getManifest` — cache the allowlist; fail-closed (null → reject) if the bundle is missing/malformed |
 | `agentflow-agents/src/coder-shim/bridge.ts:239` | `handleRecipeDispatch` — validate → run-once (`runGooseArgv`) or schedule → task_complete/error |
 | `agentflow-agents/src/coder-shim/main.ts:24` | entrypoint — env → bridge (`recipesDir`=`RECIPES_DIR` ?? `/app/recipes/devices`) |
+| `agentflow-agents/src/coder-shim/queued.ts:39` | `queuedRowToFrame` / `parseQueuedTasksResponse` / `buildQueuedTasksUrl` — cross-replica queued-task drain (BUG A) |
+| `agentflow-agents/src/coder-shim/bridge.ts:213` | `startQueuedPoll` / `drainQueuedTasks` — poll `GET /me/devices/:id/queued_tasks` every 10s, route through live handlers; `inFlight` guard de-dupes a live frame + a polled row |
+| `agentflow-agents/src/coder-shim/health.ts:31` | `startHealthServer` — serves `/api/health` on `:8765` so the STS readiness probe passes |
 | `agentflow-agents/coder-shim-image/recipes/devices/manifest.json:1` | vendored allowlist (from fork `lnlockly/agentflow-goose`); COPYed to `/app/recipes/devices` |
 | `agentflow-agents/src/routes/me-hosted-devices.ts:93` | `DeviceTemplate` — `'coder'\|'assistant'\|'universal'\|'goose'` (goose = per-device canary) |
 | `agentflow-agents/src/routes/me-hosted-devices.ts:142` | `resolveDaemonImage` — `template==='goose'` → coder-shim FIRST (deterministic, isolated); else `FF_DAEMON_IMAGE` override; else coder (hotfix) |
@@ -159,6 +162,9 @@ charset-validated before reaching the scheduler.
 | Coder build runs tools but writes nothing / picks `apps__create_app` | goose cli log `Tool call started ... apps__create_app` (not `developer__text_editor`) | tool-selection drift from extension bloat (8 extensions/17 tools enabled vs goose's 5/50 recommendation). The framed prompt + `GOOSE_MODE: auto` steer it back to the developer editor tools. |
 | Goose device create rejected | `goose_canary_disabled` (HTTP 403) | `FF_GOOSE_CANARY` not set on agentflow-agents — set it to provision the canary |
 | Goose device row INSERT fails | `hosted_devices_template_check` violation | migration `0077_hosted_device_template_goose.sql` not applied to the postgres pod |
+| Task dispatched (`clone_dispatched`, `queued:true`) but goose never runs; pod `0/1`; `device_tasks.status='queued'` forever | server `clone_dispatched ... queued=true`; pod log stops after `device_secret rotated` — no `coder task` line | cross-replica race: WS pins to one of 2 agentflow-agents replicas, the `/approve` dispatch lands on the other so `getConnection` returns null → task queued, never pushed; the stable WS never reconnects so `drainAndDispatchQueuedTasks` (hello-only) never re-fires. Fixed: `bridge.ts` polls `GET /me/devices/:id/queued_tasks` every 10s (`queued.ts:queuedRowToFrame`) and routes rows through the live handlers. |
+| Goose pod stays `0/1` NotReady though WS is connected | `kubectl get pod` READY `0/1`; readiness probe `GET /api/health:8765` → connection refused | coder-shim ran only the WS bridge — nothing served `:8765`, so the STS readiness probe never passed. Fixed: `health.ts:startHealthServer` serves `/api/health` on 8765, started from `main.ts`. |
+| Goose pod restart → WS 401, device bricked | `[coder-shim] ws error: Unexpected server response: 401` on a pod that previously connected | the one-time `AF_ENROLLMENT_TOKEN` was consumed on the first connect (server NULLs it) and the rotated `device_secret` lives only in memory; a stateless pod restart reconnects with a stale credential. Fixed: `coder-shim-image/entrypoint.sh` trades `AF_HOSTED_ROTATION_SECRET` for a fresh enrollment_token via `POST /me/hosted-devices/:id/reenroll` on every boot (mirrors the legacy daemon). |
 
 ## Relationship to the in-daemon goose backend
 There are two ways to run goose for the coder, and they coexist:
