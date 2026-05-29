@@ -7,7 +7,9 @@ description: "Brief → GitHub template search → hosted pod git clone → аг
 
 ## TL;DR
 
-Новый flow создания проектов (approved 2026-05-25, см. `PROJECT_ARCHITECTURE.html` в корне workspace). Юзер пишет бриф → AI ищет подходящий Next.js шаблон через GitHub Code Search → hosted daemon в vcluster юзера делает `git clone` шаблона → внутри pod'а работает агент-разработчик (OpenCode CLI + Claude/GPT-5.3-codex), который читает бриф, пишет код, запускает `npm run dev`, чинит ошибки, коммитит. Юзер видит live preview на `<slug>.proj.agentflow.website` через Caddy + ws-tunnel и общается с агентом через кабинет. Старый LLM-классификатор `kind=landing/spa/tg_bot` уходит в depreciated — у всех новых проектов один путь: Next.js + git clone.
+Новый flow создания проектов (approved 2026-05-25, см. `PROJECT_ARCHITECTURE.html` в корне workspace). Юзер пишет бриф → AI ищет подходящий Next.js шаблон через GitHub Code Search → hosted daemon в vcluster юзера делает `git clone` шаблона → внутри pod'а работает агент-разработчик (OpenCode CLI + Claude/GPT-5.3-codex), который читает бриф, пишет код, запускает `npm run dev`, чинит ошибки, коммитит. Юзер видит live preview на `<slug>.proj.agentflow.website` через Caddy + ws-tunnel и общается с агентом через кабинет. Старый LLM-классификатор `kind=landing/spa/tg_bot` уходит в depreciated.
+
+**Один путь, два runtime'а.** Almost every brief resolves to `kind=nextjs` / `runtime_class=web`. The one fork is Telegram-bot intent: `POST /me/projects` runs the deterministic regex classifier `analyzeBrief(brief)` and, when it returns `kind_inferred==='tg_bot'` (or the client posted an explicit `kind:'tg_bot'`), the project is created with `kind='tg_bot'` / `runtime_class='tg_bot'`. That single value steers the template picker to the aiogram starter (`KIND_FALLBACKS.tg_bot` → `lnlockly/agentflow-tg-bot-starter`, ships `bot.py` `cmd_start` with `<!-- SLOT:brief.start_greeting -->`) and fires the BotFather token pipeline in `project-clone.ts` instead of a Next.js dev server. An explicit non-tg web kind (`landing` / `spa` / `nextjs`) is respected and is NOT auto-promoted even if the copy mentions a bot. Added 2026-05-29 (PR #964) — before it, a bot brief without an explicit kind resolved to nextjs and shipped a marketing landing about a bot (`bot_username=null`, invented @handle in copy) instead of a runnable bot (live repro: project 1586).
 
 ## 12 lifecycle steps
 
@@ -46,7 +48,11 @@ description: "Brief → GitHub template search → hosted pod git clone → аг
 | `agentflow-agents/src/services/github-template-search.ts:286` | `pickBestTemplateForBrief(brief)` → топ-1 или `FALLBACK_TEMPLATE` (vercel/next.js with-tailwindcss) |
 | `agentflow-agents/src/services/github-template-search.ts:55` | `FALLBACK_TEMPLATE` — используется когда GitHub вернул 0 кандидатов |
 | `agentflow-agents/src/services/bootstrap-schema.ts:522` | ALTER TABLE projects ADD COLUMN template_url / template_repo_full / template_picked_at (Phase A2) |
-| `agentflow-agents/src/routes/projects.ts:762` | `POST /me/projects` — entry point; в новом flow вызывает `pickBestTemplateForBrief` вместо LLM-классификатора kind |
+| `agentflow-agents/src/routes/projects.ts:843` | `POST /me/projects` — entry point; вызывает `pickBestTemplateForBrief` вместо LLM-классификатора kind |
+| `agentflow-agents/src/routes/projects.ts:875` | tg_bot intent resolution — `analyzeBrief(brief).kind_inferred==='tg_bot'` (or explicit `kind:'tg_bot'`) → `isTgBotIntent` → `resolvedKind='tg_bot'`. Explicit non-tg web kind suppresses auto-promotion. |
+| `agentflow-agents/src/services/brief-analyzer.ts:98` | `KIND_RULES` tg_bot regex (telegram-bot / aiogram / телеграм-бот / тг-бот / чат-бот) + low-precedence Russian `бот` fallback (line 135). No LLM. |
+| `agentflow-agents/src/services/github-template-search.ts:106` | `KIND_FALLBACKS.tg_bot` → `lnlockly/agentflow-tg-bot-starter` (aiogram). Honoured first in `pickFallbackForBrief` when `kind==='tg_bot'`. |
+| `agentflow-agents/src/services/project-clone.ts:382` | `if (project.kind === 'tg_bot')` → `ensureBotTokenForProject` (BotFather-auto or owner-pasted token) + `bot_username` + `.env` BOT_TOKEN. |
 | `agentflow-agents/src/routes/projects.ts:2725` | `POST /me/projects/:id/approve` — триггерит provision daemon + clone |
 | `agentflow-agents/src/services/projects-pipeline.ts:631` | `approveProject(opts)` — server-side orchestration approve-шага |
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/tools/project_setup.py` | MCP-tool `project_setup` (создаётся в Phase A3): `git clone <template_url>` + `npm install` + `npm run dev` на :3000 |
@@ -142,6 +148,7 @@ description: "Brief → GitHub template search → hosted pod git clone → аг
 | `git clone` падает на private репо | `[project-setup] git_clone_failed exitCode=128` | Public templates only (open question #8). Будущий fix: юзерский GitHub OAuth → `GITHUB_USER_TOKEN` в pod env. |
 | Approve вернул 409 `still_preparing` | `approveProject: project still in preparing` | Background prep ещё не завершился. См. `projects-create-flow.mdx` (instant-create). |
 | `template_url=NULL` на старом проекте | row создан до 2026-05-25 | Legacy row — старый flow по kind classifier. Новых таких не появится; легаси обрабатывается отдельной веткой в `projects-pipeline.ts:631`. |
+| Bot brief shipped a marketing landing (`kind=nextjs`, `bot_username=null`, invented @handle) | grep `kind_fallback_tg_bot` absent for a bot brief; row has `kind='nextjs'` | Pre-PR-#964 bug — `POST /me/projects` only honoured explicit `kind:'tg_bot'`. Fixed: `analyzeBrief` infers tg_bot from the brief (`routes/projects.ts:875`). Repro: project 1586. |
 
 ## Open questions (default answers, see PROJECT_ARCHITECTURE.html)
 
@@ -150,7 +157,7 @@ description: "Brief → GitHub template search → hosted pod git clone → аг
 3. **Zero candidates**: fallback на `vercel/next.js` + warning юзеру.
 4. **Hibernation**: после 120 мин простоя scale-to-0; возврат 30-60с.
 5. **Storage**: PVC 5Gi per project (git history + node_modules + .next cache).
-6. **TG-bots**: ищется Next.js шаблон с TG Mini App (например `nextjs-telegram-miniapp`), потом юзер даёт BotFather token.
+6. **TG-bots**: bot-intent брифы (`analyzeBrief → tg_bot`) больше НЕ идут в Next.js — `kind='tg_bot'` / `runtime_class='tg_bot'`, клонируется aiogram-стартер (`lnlockly/agentflow-tg-bot-starter`), coder заполняет `bot.py` SLOT из брифа. Токен минтится автоматически через BotFather (owner с привязанным TG) или вставляется owner'ом (`bot_token` в create-payload). Mini App — отдельный kind (`mini_app`, TWA-стартер).
 7. **Billing**: pod биллится из USDF баланса по `tg_action_pricing`; hibernate = 0 ₽/час, active small = ~0.5 ₽/час.
 8. **Private GitHub**: public only пока; future — юзерский OAuth.
 
