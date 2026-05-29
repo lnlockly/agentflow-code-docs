@@ -25,6 +25,7 @@ Hosted Device — это StatefulSet в персональном vcluster пол
 | `agentflow-agents/src/routes/me-hosted-devices.ts:1` | весь REST + manifest renderers |
 | `agentflow-agents/src/routes/me-hosted-devices.ts:71` | Zod-схема `createSchema` (size + kind) |
 | `agentflow-agents/src/routes/me-hosted-devices.ts:104` | `renderStsManifest` — диспетчер plain/daemon |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:451` | `resolveCreateKind` — named template ⇒ `kind:'daemon'` (фикс footgun: `{template:'goose'}` без kind → больше не python-заглушка) |
 | `agentflow-agents/src/routes/me-hosted-devices.ts:200` | `renderDaemonManifest` — образ daemon |
 | `agentflow-agents/src/services/bootstrap-schema.ts` | таблица `hosted_devices` |
 | `agentflow-landing/src/pages/CabinetHostedDeviceNew.tsx` | форма создания (имя, размер) |
@@ -87,6 +88,15 @@ DELETE /me/hosted-devices/:id      →  kubectl delete sts + soft delete
 | `/exec` возвращает `exit_code=126` | stdout пустой, stderr `command not found` | пользователь команды на `sh -c` (не bash builtin) |
 | SSE `/logs` мгновенно `end` | stderr из kubectl `pod not found` | подождать readiness или перезапустить через `/power restart` |
 | `/power restart` 500 | stderr `forbidden: cannot patch sts` | sealed kc выписан без `apps/statefulsets/patch` (старые юзеры) |
+| `{template:'goose'}` (или любой template) даёт python-заглушку, recipe-dispatch молча no-op | pod `image: python:3.11-slim` + `name: runtime`, в логах нет `[coder-shim] connecting`; create-ответ `kind:"plain","template":"coder"` | `resolveCreateKind` в `me-hosted-devices.ts` — template без явного `kind` теперь форсит `kind:'daemon'` (PR #980). До фикса: всегда слать `kind:'daemon'` вместе с template |
+
+> **Footgun (исправлено, PR #980):** `template` выбирает ТОЛЬКО daemon-образ
+> и бессмысленен для `plain`. Раньше `POST { template:'goose' }` без `kind`
+> проходил canary-gate, но падал в `kind:'plain'`, где handler сбрасывал
+> template обратно в `'coder'` и рендерил python-заглушку — «online»
+> устройство без daemon, без devices-ws bridge, молча игнорирующее каждый
+> `agent_run_recipe`. `resolveCreateKind(body, kind, template)` теперь
+> коэрсит `kind→'daemon'` когда указан template и `kind` не задан явно.
 
 ## kind=plain vs kind=daemon
 
