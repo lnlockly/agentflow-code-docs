@@ -14,25 +14,41 @@ pages stay unchanged. Phase-0 spike verified: goose builds brief-derived files,
 serves over HTTP, ~111 MiB peak RSS (`plans/autonomous/_goose-spike.md`). Opt-in via
 `FF_DAEMON_IMAGE` — when unset the resolver keeps the coder image (reversible).
 
+The shim exposes **two** direct-tools: `agent_dev_brief` (project coder) and
+`agent_run_recipe` (device use-cases — the cabinet "what should this device do?"
+picker). `agent_run_recipe` runs a bundled Goose recipe (`recipes/devices/<id>.yaml`)
+immediately, or registers it with Goose's scheduler when a `cron` is supplied
+(cloud recipes like C2 morning-digest). The recipe manifest is the allowlist + the
+injection boundary.
+
 ## Files (with line refs)
 | Path | Role |
 |---|---|
 | `agentflow-agents/src/coder-shim/protocol.ts:68` | `buildHello`/`buildHeartbeat`/`buildTaskComplete`/`buildTaskError`/`parseFrame` mirror `WsMessage` |
-| `agentflow-agents/src/coder-shim/protocol.ts:117` | `isCoderDispatch` — only `task_dispatch` with `tool='agent_dev_brief'` + id |
+| `agentflow-agents/src/coder-shim/protocol.ts:66` | `RECIPE_TOOL='agent_run_recipe'`; `CODER_SHIM_TOOLS` advertises both tools |
+| `agentflow-agents/src/coder-shim/protocol.ts:137` | `isRecipeDispatch` — `task_dispatch` with `tool='agent_run_recipe'` + id |
 | `agentflow-agents/src/coder-shim/scope.ts:49` | `validateScope` — required-field + slug + template-ref (argv-injection) guards |
+| `agentflow-agents/src/coder-shim/recipes.ts:78` | `loadManifest` — read+cache the bundled `manifest.json` allowlist |
+| `agentflow-agents/src/coder-shim/recipes.ts:94` | `normalizeCron` — 5/6-field cron only; normalize 5→6 for Goose; reject illegal |
+| `agentflow-agents/src/coder-shim/recipes.ts:115` | `validateRecipeDispatch` — recipe-id allowlist + param-key whitelist + cron guard |
+| `agentflow-agents/src/coder-shim/recipes.ts:161` | `buildRecipeRunArgs` — `run --no-session --max-turns N --recipe <file> --params k=v ...` (array) |
+| `agentflow-agents/src/coder-shim/recipes.ts:192` | `buildScheduleArgs` — `schedule add --schedule-id … --cron … --recipe-source <file>` |
 | `agentflow-agents/src/coder-shim/goose-runner.ts:27` | `buildGooseConfig` — openai provider → platform gateway, model alias `flow` |
 | `agentflow-agents/src/coder-shim/goose-runner.ts:54` | `buildGooseArgs` — `run --with-builtin developer --no-session --max-turns N -t <brief>`; never a concrete model id |
-| `agentflow-agents/src/coder-shim/goose-runner.ts:89` | `runGoose` — spawn + tail capture + wall-clock timeout |
+| `agentflow-agents/src/coder-shim/goose-runner.ts:103` | `runGooseArgv` — array-argv spawn (one process path for coder + recipe + schedule) |
 | `agentflow-agents/src/coder-shim/pipeline.ts:31` | `buildReport` (pure) — goose exit + probe → CloneStatusReport |
 | `agentflow-agents/src/coder-shim/pipeline.ts:114` | `runCoderTask` — clone → goose config → `runGoose` → probe → report |
 | `agentflow-agents/src/coder-shim/clone-status.ts:29` | `buildCloneStatusBody` — matches `internal.ts` `cloneStatusSchema`; secret in header only |
 | `agentflow-agents/src/coder-shim/bridge.ts:53` | `CoderShimBridge` — connect, hello, hello_ack secret rotation, heartbeat 15s, task routing |
-| `agentflow-agents/src/coder-shim/main.ts:24` | entrypoint — env → bridge |
+| `agentflow-agents/src/coder-shim/bridge.ts:82` | `getManifest` — cache the allowlist; fail-closed (null → reject) if the bundle is missing/malformed |
+| `agentflow-agents/src/coder-shim/bridge.ts:239` | `handleRecipeDispatch` — validate → run-once (`runGooseArgv`) or schedule → task_complete/error |
+| `agentflow-agents/src/coder-shim/main.ts:24` | entrypoint — env → bridge (`recipesDir`=`RECIPES_DIR` ?? `/app/recipes/devices`) |
+| `agentflow-agents/coder-shim-image/recipes/devices/manifest.json:1` | vendored allowlist (from fork `lnlockly/agentflow-goose`); COPYed to `/app/recipes/devices` |
 | `agentflow-agents/src/routes/me-hosted-devices.ts:120` | `resolveDaemonImage` — `FF_DAEMON_IMAGE=goose` → coder-shim image; else coder (hotfix) |
 | `agentflow-agents/coder-shim-image/Dockerfile:1` | image: node 22 + bridge + goose from the fork |
 | `agentflow-agents/coder-shim-image/entrypoint.sh:1` | env check + `node dist/coder-shim/main.js` |
 | `agentflow-agents/.github/workflows/build-coder-shim.yml:1` | self-hosted build → `ghcr.io/<owner>/agentflow-coder-shim` |
-| `agentflow-agents/tests/coder-shim.test.ts:1` | 28 unit tests (protocol/scope/runner/clone-status/report/resolver) |
+| `agentflow-agents/tests/coder-shim.test.ts:1` | 44 unit tests (protocol/scope/runner/clone-status/report/resolver + recipe allowlist/argv/cron) |
 
 ## Data flow
 ```
@@ -53,12 +69,37 @@ coder-shim bridge.handleCoderDispatch
 backend internal.ts clone-status → flips status, wires Service/Ingress, preview_url
 ```
 
+### agent_run_recipe (device use-cases)
+```
+cabinet picker (PR #543) → POST /me/devices/:id/dispatch_task
+  { tool:'agent_run_recipe', scope:{ recipe:<id>, params:{k:v}, cron? } }
+   │ WS task_dispatch  (devices-ws, UNCHANGED)
+   ▼
+coder-shim bridge.handleRecipeDispatch
+   │  loadManifest(/app/recipes/devices) → validateRecipeDispatch:
+   │    recipe ∈ manifest allowlist + path-safe id?
+   │    params ∩ recipe's declared param keys (drop the rest)?
+   │    cron valid (5/6 fields, digits + */,- only) → normalize 5→6?
+   │  ensureGooseConfig (provider=openai, model=$GOOSE_MODEL=flow)
+   │  cron set?
+   │    YES → goose schedule add --schedule-id <dev>-<id> --cron <6f> --recipe-source <file>
+   │          → task_complete "scheduled: <id> (<schedule-id>)"
+   │    NO  → goose run --no-session --max-turns N --recipe <file> --params k=v ...
+   │          → task_complete (tail) / task_error
+   ▼  WS task_complete / task_error  (no clone-status — a recipe is not a build)
+```
+Injection boundary: the recipe id is the only thing that becomes a file path
+(`recipes/devices/<id>.yaml`, id matched `^[a-z0-9-]+$` AND found in the manifest);
+params ride as single argv elements (`--params k=v`), never a shell string; cron is
+charset-validated before reaching the scheduler.
+
 ## DB / Env / API
 - Tables: none new. Consumes `projects` via `/internal/projects/:id/clone-status`.
 - Env (pod side, all already on the daemon pod): `AF_API_KEY`, `AF_API_URL`
   (default `https://agentflow.website`), `AF_DEVICE_ID`, `AF_DEVICE_TOKEN`,
   `AF_ENROLLMENT_TOKEN`, `AF_INTERNAL_API_SECRET`, `GOOSE_MODEL` (default `flow`),
-  `GOOSE_MAX_TURNS`, `GOOSE_TIMEOUT_MS`, `GOOSE_DISABLE_KEYRING=1`, `WORKSPACE_ROOT`.
+  `GOOSE_MAX_TURNS`, `GOOSE_TIMEOUT_MS`, `GOOSE_DISABLE_KEYRING=1`, `WORKSPACE_ROOT`,
+  `RECIPES_DIR` (default `/app/recipes/devices` — the bundled manifest + recipe yaml).
 - Env (server side): `FF_DAEMON_IMAGE` — `goose` → coder-shim image; full ref →
   verbatim; unset → coder (2026-05-28 hotfix path).
 - WS: connects to `wss://<AF_API_URL host>/_devices/connect` with `x-api-key` /
@@ -78,6 +119,11 @@ backend internal.ts clone-status → flips status, wires Service/Ingress, previe
 | Project stuck provisioning, goose ran | `clone-status posted ... ok=true http=...` then no promote | `port_reachable:false` — dev-server not up in the probe window; preview-reconciler promotes later |
 | task_error `goose_failed` | `coder task ... crashed` / report `error:'goose_failed'` | read the report `detail` (goose tail) — model/gateway/scaffold issue |
 | task_error `template_repo_full_missing` for a real repo | none (synchronous) | template ref failed `TEMPLATE_RE` (flag-shaped or non `owner/repo`/https) |
+| Recipe dispatch rejected | `recipe dispatch ... rejected: recipe_not_allowed` | unknown / path-shaped recipe id — not in `manifest.json` allowlist |
+| Recipe dispatch rejected (bad cron) | `recipe dispatch ... rejected: invalid_cron` | `scope.cron` not 5/6 cron fields of `[0-9*/,-]` — `normalizeCron` returned null |
+| Recipe never runs, all rejected | `recipe manifest load failed` | `/app/recipes/devices/manifest.json` missing/malformed in the image → fail-closed |
+| task_error `recipe_run_failed` | report `recipe_run_failed: <goose tail>` | goose non-zero on `goose run --recipe` — read the tail (model/gateway/recipe issue) |
+| task_error `recipe_schedule_failed` | report `recipe_schedule_failed: <tail>` | `goose schedule add` non-zero — read the tail (cron/scheduler issue) |
 
 ## Relationship to the in-daemon goose backend
 There are two ways to run goose for the coder, and they coexist:
