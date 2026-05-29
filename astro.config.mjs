@@ -87,6 +87,7 @@ export default defineConfig({
             { label: 'Academy', slug: 'subsystems/academy' },
             { label: 'Showcase Kits', slug: 'subsystems/showcase-kits' },
             { label: 'Owner Alerts Worker', slug: 'subsystems/owner-alerts' },
+            { label: 'Activepieces Marketplace', slug: 'subsystems/activepieces-marketplace' },
           ],
         },
         {
