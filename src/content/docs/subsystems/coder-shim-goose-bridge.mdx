@@ -121,8 +121,14 @@ charset-validated before reaching the scheduler.
   if the flag is later unset.
 - API: `POST /me/hosted-devices {kind:'daemon', template:'goose'}` → goose device
   (canary-gated). All other create-path behaviour is unchanged.
-- WS: connects to `wss://<AF_API_URL host>/_devices/connect` with `x-api-key` /
-  `x-device-id` / `x-device-secret` (or `x-enrollment-token` on first run).
+- WS: connects to `wss://<AF_API_URL host>/_agents/_devices/connect` with
+  `x-api-key` / `x-device-id` / `x-device-secret` (or `x-enrollment-token` on
+  first run). The `/_agents` prefix is mandatory — the central ingress routes
+  `/_agents(/|$)(.*)` to the agentflow-agents service and strips the prefix, so
+  the server's mount at `/_devices/connect` (`devices-ws.ts:228`) only sees a
+  prefixed public URL. A bare `wss://.../_devices/connect` falls through to the
+  landing proxy, which answers the upgrade with HTTP 200 and no `101` — the shim
+  loops `reconnecting in 4.0s` and the device stays `offline`.
 - LLM: routes through the platform gateway `flow`→codex.sale; model is the alias
   `flow`, never a concrete id (gateway `pickFlowUpstream` resolves it).
 - Goose source: forked at `lnlockly/agentflow-goose`. Image bundles goose via the
@@ -144,6 +150,7 @@ charset-validated before reaching the scheduler.
 | goose device pod `ImagePullBackOff` | `failed to fetch anonymous token ... 401 Unauthorized` for `lnlockly/agentflow-coder-shim` | the coder-shim image is PRIVATE; the daemon STS must carry `imagePullSecrets: [{name: ghcr-pull}]` (added in `me-hosted-devices.ts` `renderDaemonManifest`, PR #956). The secret is applied per-tenant by `tenant-bootstrap.ts` `apply_ghcr_pull`. Legacy `agentflow-daemon-*` images are public so this only bit goose devices / fresh nodes without a cached image. |
 | task_error `recipe_run_failed` | report `recipe_run_failed: <goose tail>` | goose non-zero on `goose run --recipe` — read the tail (model/gateway/recipe issue) |
 | task_error `recipe_schedule_failed` | report `recipe_schedule_failed: <tail>` | `goose schedule add` non-zero — read the tail (cron/scheduler issue) |
+| Goose device never connects, ws-200 loop | `ws error: Unexpected server response: 200` then `ws closed; reconnecting in 4.0s` | `main.ts` built `wsUrl` without the `/_agents` ingress prefix — the bare path hit the landing proxy (HTTP 200, no upgrade). Fixed: `wsUrl = ${wsHost}/_agents/_devices/connect`. |
 | Goose device create rejected | `goose_canary_disabled` (HTTP 403) | `FF_GOOSE_CANARY` not set on agentflow-agents — set it to provision the canary |
 | Goose device row INSERT fails | `hosted_devices_template_check` violation | migration `0077_hosted_device_template_goose.sql` not applied to the postgres pod |
 
