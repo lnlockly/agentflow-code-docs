@@ -14,6 +14,12 @@ pages stay unchanged. Phase-0 spike verified: goose builds brief-derived files,
 serves over HTTP, ~111 MiB peak RSS (`plans/autonomous/_goose-spike.md`). Opt-in via
 `FF_DAEMON_IMAGE` — when unset the resolver keeps the coder image (reversible).
 
+Rollout is **per-device**, not global. A device created with `template:'goose'`
+runs the coder-shim image deterministically (the resolver checks the template
+before the `FF_DAEMON_IMAGE` override), so one isolated canary can be verified
+without flipping the global default for live users. Other templates are
+untouched; delete the goose device → the runtime is gone.
+
 The shim exposes **two** direct-tools: `agent_dev_brief` (project coder) and
 `agent_run_recipe` (device use-cases — the cabinet "what should this device do?"
 picker). `agent_run_recipe` runs a bundled Goose recipe (`recipes/devices/<id>.yaml`)
@@ -44,7 +50,11 @@ injection boundary.
 | `agentflow-agents/src/coder-shim/bridge.ts:239` | `handleRecipeDispatch` — validate → run-once (`runGooseArgv`) or schedule → task_complete/error |
 | `agentflow-agents/src/coder-shim/main.ts:24` | entrypoint — env → bridge (`recipesDir`=`RECIPES_DIR` ?? `/app/recipes/devices`) |
 | `agentflow-agents/coder-shim-image/recipes/devices/manifest.json:1` | vendored allowlist (from fork `lnlockly/agentflow-goose`); COPYed to `/app/recipes/devices` |
-| `agentflow-agents/src/routes/me-hosted-devices.ts:120` | `resolveDaemonImage` — `FF_DAEMON_IMAGE=goose` → coder-shim image; else coder (hotfix) |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:93` | `DeviceTemplate` — `'coder'\|'assistant'\|'universal'\|'goose'` (goose = per-device canary) |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:142` | `resolveDaemonImage` — `template==='goose'` → coder-shim FIRST (deterministic, isolated); else `FF_DAEMON_IMAGE` override; else coder (hotfix) |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:427` | `isGooseCanaryEnabled` — `FF_GOOSE_CANARY` gate; create path 403s `goose_canary_disabled` unless set |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:418` | `createSchema.template` enum now includes `'goose'`; warm-pool claim skipped for goose (pool pods are coder-baked) |
+| `agentflow-agents/src/db/migrations/0077_hosted_device_template_goose.sql:1` | widens `hosted_devices_template_check` to allow `'goose'` |
 | `agentflow-agents/coder-shim-image/Dockerfile:1` | image: node 22 + bridge + goose from the fork |
 | `agentflow-agents/coder-shim-image/entrypoint.sh:1` | env check + `node dist/coder-shim/main.js` |
 | `agentflow-agents/.github/workflows/build-coder-shim.yml:1` | self-hosted build → `ghcr.io/<owner>/agentflow-coder-shim` |
@@ -101,7 +111,16 @@ charset-validated before reaching the scheduler.
   `GOOSE_MAX_TURNS`, `GOOSE_TIMEOUT_MS`, `GOOSE_DISABLE_KEYRING=1`, `WORKSPACE_ROOT`,
   `RECIPES_DIR` (default `/app/recipes/devices` — the bundled manifest + recipe yaml).
 - Env (server side): `FF_DAEMON_IMAGE` — `goose` → coder-shim image; full ref →
-  verbatim; unset → coder (2026-05-28 hotfix path).
+  verbatim; unset → coder (2026-05-28 hotfix path). **GLOBAL — do not flip in prod
+  until the matrix is green.**
+- Env (server side): `FF_GOOSE_CANARY` — `1`/`true`/`yes` enables provisioning
+  `template:'goose'` hosted devices (the isolated per-device canary). When unset,
+  `POST /me/hosted-devices {template:'goose'}` returns 403 `goose_canary_disabled`.
+  This gate only controls *creating new* goose devices; `resolveDaemonImage` keys
+  off the stored row, so an already-provisioned goose device keeps its image even
+  if the flag is later unset.
+- API: `POST /me/hosted-devices {kind:'daemon', template:'goose'}` → goose device
+  (canary-gated). All other create-path behaviour is unchanged.
 - WS: connects to `wss://<AF_API_URL host>/_devices/connect` with `x-api-key` /
   `x-device-id` / `x-device-secret` (or `x-enrollment-token` on first run).
 - LLM: routes through the platform gateway `flow`→codex.sale; model is the alias
@@ -124,6 +143,8 @@ charset-validated before reaching the scheduler.
 | Recipe never runs, all rejected | `recipe manifest load failed` | `/app/recipes/devices/manifest.json` missing/malformed in the image → fail-closed |
 | task_error `recipe_run_failed` | report `recipe_run_failed: <goose tail>` | goose non-zero on `goose run --recipe` — read the tail (model/gateway/recipe issue) |
 | task_error `recipe_schedule_failed` | report `recipe_schedule_failed: <tail>` | `goose schedule add` non-zero — read the tail (cron/scheduler issue) |
+| Goose device create rejected | `goose_canary_disabled` (HTTP 403) | `FF_GOOSE_CANARY` not set on agentflow-agents — set it to provision the canary |
+| Goose device row INSERT fails | `hosted_devices_template_check` violation | migration `0077_hosted_device_template_goose.sql` not applied to the postgres pod |
 
 ## Relationship to the in-daemon goose backend
 There are two ways to run goose for the coder, and they coexist:
