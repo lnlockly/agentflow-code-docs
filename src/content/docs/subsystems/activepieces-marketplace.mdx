@@ -20,8 +20,27 @@ cabinet `/flows` launcher calls `/me/flows/sso`, then redirects the browser to
 page (`flows-sso-handoff`) persists the token to `localStorage` (`token` +
 `projectId`) and redirects to `/`; the AP SPA's `AllowOnlyLoggedInUserOnlyGuard`
 sees a valid token and lands the user authenticated. Integration level =
-Level 1 (SSO + redirect), not a fork (the fork patches live on branches in
-`lnlockly/agentflow-flows` but the live CE pods still run upstream 0.83.0).
+Level 1 (SSO + redirect).
+
+**SEAM 2b (2026-05-29):** the live `activepieces` Deployment (ns
+`franchise-factory`) now runs the **fork** image
+`ghcr.io/lnlockly/agentflow-flows:<sha>` (built by the `AgentFlow Flows CI`
+workflow on the self-hosted ff-france runner), NOT upstream
+`activepieces/activepieces:0.83.0`. The fork carries the rebrand (CE
+`defaultTheme` → websiteName `AgentFlow`, primary `#0a0a0a`, self-hosted
+`/agentflow-{favicon,full-logo}.svg`; tab title `AgentFlow · Автоматизации`;
+sidebar `← Кабинет` link → `https://agentflow.website/cabinet`) plus the
+flag-gated auth + billing patches. Deploy env (note the `AP_` prefix AP adds to
+every system prop): `AP_AGENTFLOW_AUTH_ENABLED=true` (registers managed-authn
+in CE — `/api/v1/managed-authn/external-token` returns 401 on a bad token, was
+404 on upstream), `AP_AGENTFLOW_AGENTS_URL=https://agents.agentflow.website`
+(public host — the billing client's `safeHttp` rejects private/loopback IPs),
+`AP_AGENTFLOW_INTERNAL_SECRET` from `secret/agentflow-flows-internal` (copy of
+agents `INTERNAL_API_SECRET`). Billing stays OFF
+(`AP_AGENTFLOW_BILLING_ENABLED` unset). The existing sign-up/sign-in SSO in
+`activepieces-sso.ts` is image-agnostic and unaffected. Tracked manifest:
+`agentflow-flows/deploy/agentflow-subdomain/activepieces-deployment.yaml`
+(uses `imagePullSecrets: ghcr-pull` — the fork image is private).
 
 ## Files (with line refs)
 | Path | Role |
