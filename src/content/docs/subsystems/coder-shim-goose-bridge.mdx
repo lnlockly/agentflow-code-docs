@@ -201,6 +201,41 @@ charset-validated before reaching the scheduler.
 | Task dispatched (`clone_dispatched`, `queued:true`) but goose never runs; pod `0/1`; `device_tasks.status='queued'` forever | server `clone_dispatched ... queued=true`; pod log stops after `device_secret rotated` — no `coder task` line | cross-replica race: WS pins to one of 2 agentflow-agents replicas, the `/approve` dispatch lands on the other so `getConnection` returns null → task queued, never pushed; the stable WS never reconnects so `drainAndDispatchQueuedTasks` (hello-only) never re-fires. Fixed: `bridge.ts` polls `GET /me/devices/:id/queued_tasks` every 10s (`queued.ts:queuedRowToFrame`) and routes rows through the live handlers. |
 | Goose pod stays `0/1` NotReady though WS is connected | `kubectl get pod` READY `0/1`; readiness probe `GET /api/health:8765` → connection refused | coder-shim ran only the WS bridge — nothing served `:8765`, so the STS readiness probe never passed. Fixed: `health.ts:startHealthServer` serves `/api/health` on 8765, started from `main.ts`. |
 | Goose pod restart → WS 401, device bricked | `[coder-shim] ws error: Unexpected server response: 401` on a pod that previously connected | the one-time `AF_ENROLLMENT_TOKEN` was consumed on the first connect (server NULLs it) and the rotated `device_secret` lives only in memory; a stateless pod restart reconnects with a stale credential. Fixed: `coder-shim-image/entrypoint.sh` trades `AF_HOSTED_ROTATION_SECRET` for a fresh enrollment_token via `POST /me/hosted-devices/:id/reenroll` on every boot (mirrors the legacy daemon). |
+| Chat edit on a goose project does nothing / `workspace_not_ready` | `POST /me/projects/:id/daemon-chat` SSE `event: error {"text":"workspace_not_ready"}`; `projects.workspace_project_name` is NULL | the legacy code-exec edit loop (`project-daemon.ts` `runProjectDaemonTurn`) needs `workspace_project_name`, which the goose clone flow never sets. Fixed: when a project has `home_device_id` (goose-bound), the turn routes to `runGooseEditTurn` which re-dispatches the edit as a goose run (see Edit channel below) instead of the Claude/code-exec loop. |
+| Edit applied but the preview still shows the pre-edit page | served page unchanged after a daemon-chat edit; pod `.coder-shim-dev.log` shows a 2nd `next start` failing `EADDRINUSE` | the prior dev server still holds the port, so the rebuilt app can't rebind. Fixed: `pipeline.ts` edit mode calls `killProjectDevServer(projectDir)` (kills only PIDs whose `/proc/<pid>/cwd` is this project) before restarting. |
+| Edit dispatched but workspace gone | clone-status `{ok:false, error:'workspace_missing_for_edit'}` | the pod was recycled between build and edit, so `/workspace/<slug>` no longer exists. The pipeline fails visibly rather than silently re-cloning a blank template over the user's work — re-approve to rebuild from the brief first. |
+
+## Edit channel (goose projects)
+Goose-built projects are iterated from the cabinet chat (`POST /me/projects/:id/daemon-chat`). For a goose project (one with `home_device_id` set) the turn does NOT run the legacy Claude + code-exec loop — it re-dispatches the edit as another goose run in the SAME workspace:
+
+```
+POST /me/projects/:id/daemon-chat { text: "<edit instruction>" }
+  → runProjectDaemonTurn → (home_device_id set) → runGooseEditTurn
+      triggerProjectClone(id, { editText })   // reuses the dispatch machinery
+        scope { slug, project_id, brief: editText, port, kind, edit:true }
+        flips project running → provisioning (so completion is detectable)
+       │ WS task_dispatch agent_dev_brief (edit:true)
+       ▼
+   coder-shim runCoderTask (edit branch)
+        SKIP clone (workspace exists) — edits are incremental over prior state
+        goose run -t <editText>  (developer editor, same --system guardrail)
+        restore PROTECTED_CONFIG_FILES, install, build-validate + self-heal
+        killProjectDevServer(projectDir)  → startDevServer (next start)
+       │ clone-status { ok, port_reachable } → re-promote running/failed
+       ▼
+   runGooseEditTurn polls projects.status until ≠ provisioning, streams
+     progress + the refreshed preview_url over SSE.
+```
+
+Each edit accumulates over the last (same `/workspace/<slug>`), so a sequence
+"change the headline → add a reviews block → add pricing → change colours"
+keeps prior changes. A failed edit (`build_failed`) leaves the previous working
+preview up (the dev server is only killed AFTER the build gate passes).
+
+Files: `agentflow-agents/src/services/project-daemon.ts` `runGooseEditTurn`;
+`agentflow-agents/src/services/project-clone.ts` `triggerProjectClone({editText})`;
+`agentflow-agents/src/coder-shim/pipeline.ts` edit branch;
+`agentflow-agents/src/coder-shim/dev-server.ts` `killProjectDevServer`.
 
 ## Relationship to the in-daemon goose backend
 There are two ways to run goose for the coder, and they coexist:
