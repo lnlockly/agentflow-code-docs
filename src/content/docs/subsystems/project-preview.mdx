@@ -82,12 +82,17 @@ Edits to /workspace/<slug>/app/**/*.tsx → dev-server watcher → "building" �
   sidecar (`user-workspace.yaml:301`). Signature is md5 of the sorted
   `slug=port` list — only a port-map change triggers `caddy reload`.
 - Bridge Endpoints isolation: `detectAndRepointPreview` stamps repointed
-  Service/Endpoints with `agentflow.io/owner=u<id>`,
-  `agentflow.io/repointed-by=detectAndRepointPreview`, and
-  `agentflow.io/target-ns=af-tenant-<id>`. `preview-bleed-guard` (90s cadence)
-  lists those Endpoints, resolves each owner's tenant pod-IP set, and clears
-  any pin whose IP the owner does not own — fail-safe (a kube list error skips
-  the owner, never clears live bridges).
+  Service/Endpoints with labels `agentflow.io/owner=u<id>`,
+  `agentflow.io/repointed-by=detectAndRepointPreview`,
+  `agentflow.io/target-ns=af-tenant-<id>` and annotations
+  `agentflow.io/target-pod` + `agentflow.io/target-pod-ip` (which pod the pin
+  was resolved to). `preview-bleed-guard` runs once ~20s after boot AND every
+  90s: it lists those Endpoints, resolves each owner's tenant pod-IP set
+  (across all pod phases, so a Pending/Terminating pod during a rollout is not
+  treated as gone), and clears any pin whose IP the owner does not own —
+  fail-safe (a kube list error skips the owner, never clears live bridges).
+  The boot run means an autodeploy self-remediates already-stale bridges with
+  no manual kubectl.
 
 ## Failure modes
 
