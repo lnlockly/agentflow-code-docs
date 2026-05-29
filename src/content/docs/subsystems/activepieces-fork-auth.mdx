@@ -1,0 +1,97 @@
+---
+title: "activepieces fork — native AgentFlow auth"
+description: "The lnlockly/agentflow-flows fork trusts an AgentFlow-minted RS256 identity natively via activepieces' own managed-authn route, flag-gated in Community edition. Replaces the shadow-user dance."
+---
+
+# activepieces fork — native AgentFlow auth
+
+## TL;DR
+
+We forked activepieces to `lnlockly/agentflow-flows` for engine-level control of
+auth (and, next, billing). The auth patch enables activepieces' **own** EE
+`managed-authn` external-token route inside the Community edition, behind the env
+flag `AP_AGENTFLOW_AUTH_ENABLED` (default off). AgentFlow mints a short-lived
+RS256 JWT signed with its private key; activepieces verifies it against a seeded
+`signing_key` public-key row and returns a native AP USER token. This replaces
+the `#944` shadow-user dance (invite → accept → sign-up → sealed password →
+re-sign-in) with cryptographic identity. The diff is 19 additive lines, no
+upstream auth logic edited — fully rebaseable.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-flows/packages/server/api/src/app/helper/system/system-props.ts:10` | New env-flag enum member `AGENTFLOW_AUTH_ENABLED` → reads `AP_AGENTFLOW_AUTH_ENABLED` |
+| `agentflow-flows/packages/server/api/src/app/helper/system/system.ts:23` | Fail-closed default `AGENTFLOW_AUTH_ENABLED='false'` |
+| `agentflow-flows/packages/server/api/src/app/app.ts:318` | `if (system.getBoolean(AGENTFLOW_AUTH_ENABLED)) app.register(managedAuthnModule)` in the `COMMUNITY` switch case |
+| `agentflow-flows/packages/server/api/src/app/ee/managed-authn/managed-authn-controller.ts:15` | Upstream route `POST /v1/managed-authn/external-token` (reused, unmodified) |
+| `agentflow-flows/packages/server/api/src/app/ee/managed-authn/lib/external-token-extractor.ts:10` | Upstream RS256 verify against `signing_key` by JWT `kid` (reused, unmodified) |
+| `agentflow-flows/packages/server/api/src/app/ee/managed-authn/managed-authn-service.ts:27` | Upstream get-or-create AP user + project from `externalUserId`/`externalProjectId` (reused) |
+| `agentflow-flows/.github/workflows/agentflow-flows-ci.yml:1` | Build the fork as `ghcr.io/lnlockly/agentflow-flows:<sha>` on the `ff-france` self-hosted runner |
+| `agentflow-agents/src/services/activepieces-sso.ts:195` | Today's shadow-user `provisionApUser` — to be replaced by the RS256 mint once the fork image is live |
+
+## Data flow
+
+```
+AgentFlow cabinet "open flows"
+   │  POST /me/flows/sso  (agentflow-agents)
+   ▼
+agentflow-agents mints RS256 JWT
+   header { alg:RS256, kid:<signing_key id> }
+   payload { externalUserId:"af-<uid>", externalProjectId:"af-<uid>",
+             firstName, lastName, role:"EDITOR" }   signed w/ AF private key
+   │  POST {AP}/api/v1/managed-authn/external-token { externalAccessToken }
+   ▼
+agentflow-flows (CE, AP_AGENTFLOW_AUTH_ENABLED=true)
+   externalTokenExtractor → decodeAndVerify(RS256, signing_key.publicKey by kid)
+   managedAuthnService → get-or-create AP user (email = sha256("managed_<plat>_<extUid>"))
+                       → get-or-create AP project (externalId = externalProjectId)
+                       → mint native AP USER JWT
+   │  { token, projectId, ... }
+   ▼
+cabinet iframe uses the AP token (same shape as today's shadow-user token)
+```
+
+When the flag is **off** (default), `managedAuthnModule` is not registered in CE;
+the route 404s and upstream CE behaviour is byte-identical.
+
+## DB / Env / API
+
+- **Tables:** `signing_key` (seed AgentFlow's RS256 public key, one row per
+  platform; the row `id` is the JWT `kid`), `user` / `user_identity` / `project`
+  / `project_member` / `project_role` (all upstream, all in CE `getEntities()`).
+- **Env:** `AP_AGENTFLOW_AUTH_ENABLED` (`true`/unset; default off). Existing AP
+  env unchanged (`AP_JWT_SECRET`, `AP_ENCRYPTION_KEY`, `AP_EDITION=ce`).
+- **Routes:** `POST /api/v1/managed-authn/external-token` (public, signature-gated).
+- **MCP tools:** none (server-to-server REST).
+- **CI image:** `ghcr.io/lnlockly/agentflow-flows:<sha>` + `:latest`, built on the
+  dedicated `ff-france` self-hosted runner (`ff-france-flows`, systemd unit
+  `actions.runner.lnlockly-agentflow-flows.ff-france-flows`).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| External-token route returns 404 with flag intended on | `Activepieces Edition` then no managed-authn register | env `AP_AGENTFLOW_AUTH_ENABLED` not `true` on the CE pod |
+| Token rejected | `Failed to extract external token` | `external-token-extractor.ts:57` — wrong `kid`, no seeded `signing_key`, bad signature, or wrong alg |
+| Missing kid | `signing key id is not found in the header` | AgentFlow must set `kid` in the JWT header |
+| Unknown kid | `signing key not found signingKeyId=` | seed the public key as a `signing_key` row for the platform |
+| Role resolve fails | `project_role` `Project Role by name and platformId not found` | the `role` claim must be a seeded `DefaultProjectRole` (e.g. `EDITOR`) |
+
+## Security notes
+
+- Fail-closed both when the flag is off (route not registered) and on bad tokens
+  (RS256 verify error → `INVALID_BEARER_TOKEN`, never falls through to a
+  principal). No shared-secret/header bypass — trust is asymmetric crypto only.
+- Created AP user is `PlatformRole.MEMBER` / project role `EDITOR`, scoped to its
+  own external project; AP per-project authz still applies on every later request.
+- Key rotation: insert a new `signing_key` row, switch AgentFlow's `kid`, delete
+  the old row. Already-minted AP tokens stay valid until expiry (no forced logout).
+
+## Related
+
+- [activepieces marketplace (hosted deploy)](/subsystems/marketplace-hosted-deploy)
+- [auth session rotation](/subsystems/auth-session-rotation)
+- Rebase map + full security review: `plans/autonomous/_ap-fork-auth.md`
+- Billing/quota patch (next): worker/engine pre-run balance check + real-time
+  debit + hard-stop at zero, behind `AP_AGENTFLOW_BILLING_ENABLED` (not yet built).
