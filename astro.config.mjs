@@ -120,6 +120,7 @@ export default defineConfig({
             { label: 'Canonical Templates', slug: 'runbooks/canonical-templates' },
             { label: 'Scaffold Hardening', slug: 'runbooks/scaffold-hardening' },
             { label: 'Chat-stack Smoke (Playwright)', slug: 'runbooks/chat-smoke-e2e' },
+            { label: 'Verify AgentFlow Desktop', slug: 'runbooks/verify-agentflow-desktop' },
             { label: 'Update the RAG', slug: 'runbooks/update-rag-docs' },
             { label: 'Revolution Doctrine', slug: 'runbooks/revolution-doctrine' },
           ],
