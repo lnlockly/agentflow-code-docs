@@ -22,6 +22,13 @@ hardcoded). Default base is `https://agentflow.website/_agents` — the same
 owner-key host the daemon uses (NOT `api.agentflow.website`, which rejects
 these keys).
 
+**Repo:** standalone at `lnlockly/agentflow-mcp-server` (package at repo root).
+It was moved out of `FranchiseFactoryStudio/franshise-studio` so its CI runs on
+the `ff-france` self-hosted runner (that org's runners are not reachable from
+this user account; GitHub-hosted runners are billing-blocked). The dedicated
+runner is `ff-france-mcp-server` (systemd
+`actions.runner.lnlockly-agentflow-mcp-server.ff-france-mcp-server`).
+
 ## Files (with line refs)
 
 | Path | Role |
@@ -36,7 +43,7 @@ these keys).
 | `agentflow-mcp-server/src/tools/*.ts` | The 9 project/workspace tools + `list-templates`/`clone-template`. |
 | `agentflow-mcp-server/test/client.test.js` | 14 client tests (mocked fetch — path/header/body/error mapping). |
 | `agentflow-mcp-server/test/af-tools.test.js` | 10 af-tool tests (arg mapping, device-id fallback, spawn flow, error result). |
-| `.github/workflows/agentflow-mcp-server-ci.yml` | CI on `[self-hosted, ff-france]`: typecheck + build + `npm test`. |
+| `.github/workflows/ci.yml` | CI on `[self-hosted, ff-france]`: `npm ci`/`npm install` → typecheck → build → `node --test`. |
 
 ## Data flow
 
@@ -99,6 +106,7 @@ goose session --with-streamable-http-extension "http://127.0.0.1:8788/mcp"
 | Server exits at boot | `AGENTFLOW_API_KEY env var is required` | set the env in the Goose extension / host config |
 | Server refuses key | `does not look like an af_live_* token` | use an `af_live_*` owner key |
 | `af_remember`/`af_recall` returns an error result | `No device_id. Pass one, or set AGENTFLOW_DEVICE_ID` | pass `device_id` or set `AGENTFLOW_DEVICE_ID` |
+| `af_remember`/`af_recall` returns HTTP 500 for `device_id="default"` | `AgentFlow GET /me/devices/default/memories -> HTTP 500` (or `POST .../memories`) | **Backend, not the extension.** The extension never sends the literal `"default"`: `af-platform.ts:446,480` resolves `args.device_id \|\| ctx.defaultDeviceId` (env `AGENTFLOW_DEVICE_ID`) and errors out if neither is a real id. `client.ts:290,302` URL-encode whatever id they get. The 500 happens when a **real UUID is not supplied** and the caller passes the placeholder string `default`: `agentflow-agents` route `me-devices-memories.ts` looks up the device row, finds none, and 500s instead of 404. Fix belongs in the agents route (return 404/422 for unknown device, or require a registered device). The extension's contract is already correct — set `AGENTFLOW_DEVICE_ID` to a real device UUID (from `af_list_devices`). |
 | Tool returns "Invalid AgentFlow API key" | 401/403 path in `explainError` (`error.ts:34`) | rotate the key, or check base url is `_agents` not `api.` (status === 401 at error.ts:34) |
 | HTTP mode 404 on every request | `streamable-http listening on … /mcp` but client posts other path | match `--path` / use `/mcp` |
 
