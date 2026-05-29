@@ -36,8 +36,10 @@ unchanged on purpose.
 | `agentflow-goose/ui/desktop/src/device-bridge/wsBridge.ts` | WS reverse-tunnel: hello/hello_ack secret rotation, heartbeat, task_dispatch/cancel, reconnect backoff (port of `ws_client.py`) |
 | `agentflow-goose/ui/desktop/src/device-bridge/goosedDispatch.ts` | drives local goosed `POST /agent/start`→`/reply` SSE; accumulates answer + token usage |
 | `agentflow-goose/ui/desktop/src/device-bridge/queuedTasks.ts` | drains `/me/devices/:id/queued_tasks` on reconnect |
-| `agentflow-goose/ui/desktop/src/device-bridge/index.ts` | `startDeviceBridge()` wiring + `ws` connect-header adapter |
+| `agentflow-goose/ui/desktop/src/device-bridge/index.ts` | `startDeviceBridge()` wiring + `ws` connect-header adapter + `flowGatewayEnvFromAuth()` |
+| `agentflow-goose/ui/desktop/src/device-bridge/engineConfig.ts` | flow-gateway env builder (`buildFlowGatewayEnv`) + extensions config (`buildExtensionsConfig`), ported from coder-shim `goose-runner.ts` |
 | `agentflow-goose/ui/desktop/src/main.ts` (`ensureDeviceBridge`) | starts the bridge after goosed; gated `FF_DEVICE_BRIDGE=1` |
+| `agentflow-goose/ui/desktop/src/main.ts` (goosed env merge) | injects the flow-gateway env into the spawned goosed; gated `FF_FLOW_LLM=1` |
 
 ## Data flow
 ```
@@ -64,6 +66,13 @@ unchanged on purpose.
 - Device-bridge env: `FF_DEVICE_BRIDGE=1` (opt-in until packaged-verified),
   `AGENTFLOW_DIR` (auth dir override), `AF_API_URL` (REST base, default
   `https://agentflow.website` → `/_agents`).
+- Engine LLM env (P3, gated `FF_FLOW_LLM=1`): `GOOSE_PROVIDER=openai`,
+  `GOOSE_MODEL=flow` (alias only — gateway's `pickFlowUpstream` resolves it),
+  `OPENAI_HOST=https://agentflow.website`,
+  `OPENAI_BASE_PATH=_agents/llm/v1/chat/completions`, `OPENAI_API_KEY=<af key
+  from auth.json>`, `GOOSE_DISABLE_KEYRING=true`. `GOOSE_MODE` is NOT set so
+  interactive Mode A keeps its tool-approval UX. The gateway requires an
+  `af_live_*` key, so a keyless standalone launch keeps the user's own provider.
 - WS frames (device→server): `hello`, `heartbeat`, `task_progress`,
   `task_complete`, `task_error`; (server→device): `hello_ack` (rotates
   `device_secret`), `task_dispatch`, `task_cancel`, `subscribe_stream`/`unsubscribe_stream`.
@@ -95,6 +104,11 @@ real cabinet dispatch needs a packaged build (matrix b3/b4/b6) — that is the n
 verification step once P1 lands and a signed/packaged artifact exists.
 
 ## Not yet done (tracked follow-ups)
+- **Extension enablement (P3.5):** `engineConfig.buildExtensionsConfig()` is the
+  canonical builder for the `developer` + `computercontroller` builtins + af_*
+  MCP, but it is not yet applied to the desktop's goose config (developer is on
+  by default; computercontroller + af_* need a config merge through the desktop's
+  extension system — held back to avoid clobbering a user's `config.yaml`).
 - **Live-screen stream (b6 "watch live"):** `subscribe_stream`/`unsubscribe_stream`
   are routed to an `onStreamSubscribe` hook, but the screen-capture publisher
   (port of computer-mcp `CaptureLoop`) is not yet wired — flag for P3/P4.
