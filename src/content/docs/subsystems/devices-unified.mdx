@@ -95,6 +95,8 @@ GET /me/devices/:id  (backend resolver)
 | Live page stuck on legacy URL after click | (none — useEffect skipped) | `agentflow-landing/src/pages/CabinetDeviceLive.tsx:494` — verify `device.id !== id` branch |
 | `GET /me/devices/:hostedId` returns 404 for plain hosted pod | `not_found` | Expected — plain pods have no user_devices row. Use `/me/hosted-devices/:id` |
 | Hosted sub-section never appears on Live page | response missing `kind: 'hosted'` | Check backend JOIN — `hosted_devices.user_device_id` may be NULL on older rows |
+| Non-uuid `:id` (e.g. daemon sentinel `default`) returns HTTP 500 | `invalid input syntax for type uuid` | `user_devices.id` / `hosted_devices.id` / `device_intent_skills.device_id` are uuid columns. Guard with `isUuid()` before the query: memories `agentflow-agents/src/routes/me-devices-memories.ts:97` → 404 `device_not_found`; skills `agentflow-agents/src/routes/me-devices-skills.ts:138`,`:316` → 400 `invalid_device_id`; workspace `agentflow-agents/src/routes/me-devices-workspace.ts:128` (`resolveDeviceOwnership` returns null) → 404 |
+| Device route test returns 500 `jwt_not_configured` instead of running the route | `jwt_not_configured` | `env.jwtSecret` was an eager capture of `process.env.AUTH_JWT_SECRET` at module-load; ESM import hoisting froze it as `''` before a no-DB test set the var. Fixed by making it a getter in `agentflow-agents/src/services/env.ts:48` (reads live env at verify time) |
 
 ## Related
 
