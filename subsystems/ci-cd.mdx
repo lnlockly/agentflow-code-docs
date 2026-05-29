@@ -43,10 +43,31 @@ Fix: quote BOTH patterns so the shell passes them literally to node, whose
 ```
 
 `pr-check.yml` `detect_tests` counts with `find tests -name '*.test.ts'` for the
-same reason. ~53 real failures are now visible (DB-integration tests needing a
-migrated Postgres in CI, missing `k8s/mautrix-discord*.yaml` on main, dead
-graph-executor tests, preview-gate logic drift); the job stays non-blocking until
-they're triaged.
+same reason.
+
+### Remaining failure buckets (2026-05-29, after dead-test cleanup)
+
+The 4 dead graph-executor test files were deleted (they only exercised the
+unwired executor — registry coverage of seeded boilerplate node ids, deterministic
+handler retry contracts, coder-delegate brief envelopes, `substituteTemplates`):
+`tests/unit/graph-executor/handlers/{coder-delegate,deterministic,registry-coverage}.test.ts`
+and `tests/unit/graph-executor/templates.test.ts`. The graph-executor SOURCE stays
+(still referenced by `src/services/projects.ts` + `src/routes/me-graph-prompts.ts`);
+removal is Phase 3 / P8.
+
+Full local run (no migrated DB): 4448 tests, 30 fail, 125 skip. Buckets:
+
+| Bucket | Files | Fix path |
+|---|---|---|
+| DB-integration (need migrated Postgres in CI) | `courses` (2), `self-mcp` (2), `teams` (1), `teams-recurring` (1), `usage` (1), `character.snapshot` (1) | provision + migrate a Postgres service in the `test` job |
+| missing committed artifact | `mautrix-discord-config` (10) | commit `k8s/mautrix-discord-config.yaml` + `k8s/mautrix-discord.yaml` to main |
+| preview-gate / reconciler logic drift | `services/pool-worker/preview-gate` (8), `unit/pingers/preview-reconciler-watchdog` (1) | separate audit of `checkPreviewGate` strict/healthPath/backend-health branches + cool-down skip window |
+| known / expected | `unit/request-platform-resources` (2) | `FF_PLATFORM_AGENT_DRIVEN` / `FF_PLATFORM_RESOURCES` guards |
+| flaky under concurrency | `unit/graph-executor/walker` (1) | `parallel roots fan-in` passes in isolation, fails under full-suite timing |
+
+The `test` job stays non-blocking until the DB-in-CI item lands. Once the only
+reds left are DB-integration + the 2 known `request-platform-resources`, flip
+`continue-on-error: true` to blocking.
 
 ## Data flow
 
