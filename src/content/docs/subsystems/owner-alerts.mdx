@@ -1,0 +1,110 @@
+---
+title: "Owner alerts worker"
+description: "Flag-gated background worker that pipes five platform-health signals to the owner-notify Telegram bot with per-key throttling."
+---
+
+# Owner alerts worker
+
+## TL;DR
+
+A single generic background worker (`owner-alerts-worker.ts`) evaluates five
+platform-health signals on one 2-minute tick and posts a concise message to
+the existing owner-notify Telegram bot. It reuses the same bot token / chat-id
+resolution as the rest of the codebase (`OWNER_NOTIFY_BOT_TOKEN` secret, owner
+chat `1361064246`) — no second sender. Flag-gated **OFF** by default
+(`FF_OWNER_ALERTS=1` to enable); when off the tick early-returns so the worker
+is inert and merging is safe. Throttling is a per-key state machine: a message
+goes out only on `ok→firing`, on a cooldown re-arm while still firing, or once
+on `firing→ok` (recovery). This prevents chat flooding while a condition
+persists.
+
+Monitored signals:
+
+- **(a) 5xx / error rate** — delta of the in-process prom registry series
+  `llm_request_duration_seconds{status="5xx"}` plus `recordusage_failures_total`
+  since the last tick (rate, not lifetime total).
+- **(b) pod restart / crashloop** — `kubectl get pods -n franchise-factory`,
+  sum of container `restartCount` + `CrashLoopBackOff` waiting reasons.
+- **(c) platform LLM budget (flow balance)** — daily `flow_ledger` debit sum
+  (same `LLM_DEBIT_KINDS` as the burn alerter) vs `LLM_DAILY_CAP_USD`. Spend
+  near the cap = platform LLM budget near exhaustion.
+- **(d) TLS cert expiry** — TLS socket connect to the public host, reads the
+  peer cert `valid_to`.
+- **(e) deploy / rollout failure** — `kubectl rollout status deployment/agentflow-agents`
+  with a short deadline; a stuck rollout exits non-zero.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/owner-alerts-worker.ts:56` | `isOwnerAlertsEnabled()` — reads `FF_OWNER_ALERTS === '1'` |
+| `agentflow-agents/src/services/owner-alerts-worker.ts:119` | `decideAlerts()` — pure throttle state machine (ok→firing / cooldown / recovery) |
+| `agentflow-agents/src/services/owner-alerts-worker.ts:165` | `buildAlertMessage()` — pure TG body builder, returns null when empty |
+| `agentflow-agents/src/services/owner-alerts-worker.ts:215` | `probeErrorRate()` — prom-registry 5xx + recordUsage-failure delta |
+| `agentflow-agents/src/services/owner-alerts-worker.ts:268` | `probePodRestarts()` — kubectl pod restart / crashloop scan |
+| `agentflow-agents/src/services/owner-alerts-worker.ts:320` | `probeFlowBalance()` — daily flow_ledger spend vs cap |
+| `agentflow-agents/src/services/owner-alerts-worker.ts:389` | `probeTlsExpiry()` — TLS socket peer-cert `valid_to` check |
+| `agentflow-agents/src/services/owner-alerts-worker.ts:411` | `probeRollout()` — kubectl rollout status of the deployment |
+| `agentflow-agents/src/services/owner-alerts-worker.ts:439` | `sendOwnerAlert()` — POST to api.telegram.org (`text` field, not `message`) |
+| `agentflow-agents/src/services/owner-alerts-worker.ts:481` | `runOwnerAlertsTick()` — orchestrator: probes → decide → send |
+| `agentflow-agents/src/services/auto-pinger.ts:322` | flag-gated `setInterval(runOwnerAlertsTick, OWNER_ALERTS_TICK_MS)` registration |
+| `agentflow-agents/tests/unit/owner-alerts-worker.test.ts:1` | unit tests for the pure pieces (15 cases) |
+
+## Data flow
+
+```
+runOwnerAlertsTick (every 2min, only if FF_OWNER_ALERTS=1)
+  ├─ probeErrorRate    ← matrixMetricsRegistry.getMetricsAsJSON()
+  ├─ probePodRestarts  ← kubectl get pods -n franchise-factory -o json
+  ├─ probeFlowBalance  ← SELECT SUM(-amount) FROM flow_ledger (today, debit kinds)
+  ├─ probeTlsExpiry    ← tls.connect(agentflow.website:443) → peer cert valid_to
+  └─ probeRollout      ← kubectl rollout status deployment/agentflow-agents
+        ↓ Alert[]
+  decideAlerts(alerts, prevState, now, cooldown)  ── per-key throttle
+        ↓ toSend[]
+  buildAlertMessage(toSend) → text
+        ↓
+  sendOwnerAlert(text) → POST api.telegram.org/bot<OWNER_NOTIFY_BOT_TOKEN>/sendMessage
+```
+
+Per-process `alertState` map carries `{firing, lastSentAt}` per key across
+ticks. A pod restart resets it (re-arms each alert as fresh) — a persisting
+condition re-fires once after restart, then throttles.
+
+## DB / Env / API
+
+- Tables: `flow_ledger` (read-only — daily debit sum for the budget signal).
+- Env / flags:
+  - `FF_OWNER_ALERTS` — master flag, `1` to enable (default off).
+  - `OWNER_NOTIFY_BOT_TOKEN` — owner-notify bot token (k8s secret `agentflow-agents-env`).
+  - `OWNER_ALERTS_CHAT_ID` — override chat id (default owner `1361064246`).
+  - `OWNER_ALERTS_COOLDOWN_MS` — re-arm window while firing (default 3600000).
+  - `OWNER_ALERTS_NAMESPACE` — kube namespace to scan (default `franchise-factory`).
+  - `OWNER_ALERTS_DEPLOYMENT` — deployment for rollout check (default `agentflow-agents`).
+  - `OWNER_ALERTS_5XX_PER_TICK` — 5xx+billing-error threshold per tick (default 20).
+  - `OWNER_ALERTS_RESTART_THRESHOLD` — container restart count threshold (default 5).
+  - `OWNER_ALERTS_FLOW_PCT` — fraction of `LLM_DAILY_CAP_USD` that fires (default 0.85).
+  - `LLM_DAILY_CAP_USD` — daily cap the budget signal compares against (default 50).
+  - `OWNER_ALERTS_TLS_HOST` — host to probe (default `agentflow.website`).
+  - `OWNER_ALERTS_TLS_WARN_DAYS` — days-to-expiry threshold (default 14).
+- Routes / MCP tools: none — internal worker only.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Worker never fires while enabled | `owner-alerts tick failed` | `services/auto-pinger.ts:325` |
+| prom registry read throws (5xx probe degrades to ok) | `owner_alerts_metrics_read_failed` | `services/owner-alerts-worker.ts:238` |
+| flow_ledger query fails (budget probe degrades to ok) | `owner_alerts_flow_query_failed` | `services/owner-alerts-worker.ts:335` |
+| TG send rejected / network down | `owner_alerts_send_failed` | `services/owner-alerts-worker.ts:439` |
+| Alert fired (audit which keys) | `owner_alerts_firing` | `services/owner-alerts-worker.ts:509` |
+| TG silently drops message (wrong field) | n/a — sender uses `text`, asserted in test | `tests/unit/owner-alerts-worker.test.ts` |
+
+Each probe degrades to a non-firing `Alert` on its own infra failure
+(kubectl unavailable, ledger down, cert unreachable) so one broken signal
+never blocks the others and never produces a false alarm.
+
+## Related
+
+- [Matrix monitoring](/subsystems/matrix-monitoring) — the prom registry the 5xx probe reads.
+- [Autonomous loop](/subsystems/autonomous-loop) — sibling owner-notify sender (`autonomous-auto-pause.ts`).
