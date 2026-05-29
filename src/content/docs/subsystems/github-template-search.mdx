@@ -178,6 +178,51 @@ Earlier run (2026-05-29): `saas-admin-with-billing` → `satnaing/shadcn-admin`
 (+5 capability-verified, beat `ant-design-pro` ★38k) — note that pick is now
 deprioritized by `externalAuthSaasPenalty` (Clerk).
 
+## Extended-mode comparison (ranked shortlist + justification)
+
+Owner direction (`plans/complex-app-extended-mode.md`): a complex brief must NOT
+get a silent top-1. Two product modes:
+
+- **default** (simple landing / bot) → fast single-pick; callers take
+  `pickBestTemplateForBrief` / `comparison.lead_repo_full`.
+- **extended** (dashboards / SaaS / multi-feature) → the cabinet shows a RANKED
+  SHORTLIST with per-candidate justification so the user chooses;
+  `selected_foundation` (#992) is the channel for that choice.
+
+`compareTemplatesForBrief(brief, kind, opts)` reuses `searchTemplatesForBrief`
+(so reliability + self-contained + capability-aware ranking apply underneath),
+then enriches the top `COMPARE_LIMIT` (5) via a package.json probe:
+
+```
+TemplateComparison {
+  brief_vertical, complex, mode,            # mode = resolveScorerMode (opts.mode || complex→extended)
+  lead_repo_full,                            # == candidates[0].repo_full (default-mode fast pick)
+  candidates: TemplateComparisonCandidate[]  # each:
+    summary                 # "TypeScript · dashboard_saas · MUI · несёт: дашборд/таблицы/графики"
+    ships {db,auth,dashboard,commerce,ui_kit}  # real deps (CAP_DEP_SIGNALS) or topics fallback
+    install_clean           # !isInstallHostile
+    self_contained          # !isExternalAuthSaas && no boot-blocking @clerk/@auth0 dep
+    pros[] / cons[]         # FOR THIS BRIEF (covers caps? install-clean? self-contained?)
+    recommended             # index 0 = reasoned default
+    recommendation_reason   # the WHY, not just a score
+}
+```
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/github-template-search.ts` `compareTemplatesForBrief` | extended-mode entry — ranked shortlist + per-candidate justification. |
+| `…` `describeCandidate` (pure) | builds one justified entry: ships + install_clean/self_contained + pros/cons + reason. |
+| `…` `detectShips` / `detectUiKit` | capability + UI-kit fingerprint from package.json deps (topics fallback). |
+| `…` `resolveScorerMode` + `SearchOpts.mode` | default vs extended (explicit toggle wins; else `complex`). |
+
+Verified (local `gh` token, real GitHub Search + package.json probes) — dashboard
+brief shortlist: `devias-io/material-kit-react` (★ recommended; MUI; ships
+dashboard; install-clean + self-contained), `vercel/nextjs-postgres-nextauth-
+tailwindcss-template` (ships db+auth, shadcn), `ant-design/ant-design-pro` (Ant
+Design) — all install-clean + self-contained, none Clerk; each with pros/cons +
+reason. (The PLANNER step + cabinet plan/compare UI are separate work per the
+spec — this PR ships only the scorer's comparison output.)
+
 ## Related
 
 - [projects](/subsystems/projects/) — Phase-A2 create-project flow that calls the scorer.
