@@ -85,14 +85,18 @@ Edits to /workspace/<slug>/app/**/*.tsx → dev-server watcher → "building" �
   Service/Endpoints with labels `agentflow.io/owner=u<id>`,
   `agentflow.io/repointed-by=detectAndRepointPreview`,
   `agentflow.io/target-ns=af-tenant-<id>` and annotations
-  `agentflow.io/target-pod` + `agentflow.io/target-pod-ip` (which pod the pin
-  was resolved to). `preview-bleed-guard` runs once ~20s after boot AND every
-  90s: it lists those Endpoints, resolves each owner's tenant pod-IP set
-  (across all pod phases, so a Pending/Terminating pod during a rollout is not
-  treated as gone), and clears any pin whose IP the owner does not own —
-  fail-safe (a kube list error skips the owner, never clears live bridges).
-  The boot run means an autodeploy self-remediates already-stale bridges with
-  no manual kubectl.
+  `agentflow.io/target-pod` + `agentflow.io/target-pod-ip` (what the pin was
+  resolved to). `preview-bleed-guard` runs once ~20s after boot AND every 90s:
+  it lists those Endpoints and resolves each owner's **held-IP set = pod IPs
+  (192.168.x, all phases) ∪ Service ClusterIPs (10.43.x)** in
+  `af-tenant-<owner>`. `detectAndRepointPreview` pins EITHER kind — the
+  preferred branch pins the per-project / user-workspace Service ClusterIP, the
+  legacy/headless branch pins a pod IP — so both must count as owner-held or a
+  healthy ClusterIP-pinned bridge is falsely cleared. Any pin whose IP is in
+  neither set is foreign → cleared to 503. Fail-safe: if EITHER the pod or svc
+  list errors the owner is skipped (never clears a live bridge). The boot run
+  means an autodeploy self-remediates already-stale bridges with no manual
+  kubectl.
 
 ## Failure modes
 
