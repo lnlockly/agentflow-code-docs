@@ -1,0 +1,103 @@
+---
+title: "GitHub template search (scorer)"
+description: "Brief → similar real GitHub repo. Extended multi-query search + capability-aware fallback + file-tree-verified ranking that the project-create flow uses to pick a foundation."
+---
+
+# GitHub template search (scorer)
+
+## TL;DR
+
+`pickBestTemplateForBrief(brief, kind)` finds a real GitHub repo that already
+looks like the user's brief, so the coder adapts a feature-complete app instead
+of filling one page of an empty starter. It runs an **extended multi-query
+GitHub Search**, AI-ranks the merged candidates, then **verifies capability
+against each finalist's file tree** (package.json + root layout). When search is
+unauthenticated or empty, a **capability-aware fallback** routes a DB+auth+
+dashboard brief to a real boilerplate — never the bare no-DB starter.
+
+This replaced the legacy per-kind graph walkers + the [Foundation Scout](/subsystems/foundation-scout/)
+in the Phase-A2 create-project flow (see [projects](/subsystems/projects/)).
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/github-template-search.ts:960` | `searchTemplatesForBrief` — main entry. Cache → keywords → multi-query search → AI rank → file-tree refine → fallback. |
+| `agentflow-agents/src/services/github-template-search.ts:1009` | `pickBestTemplateForBrief` — top-1 wrapper called by the create-project route. |
+| `agentflow-agents/src/services/github-template-search.ts:162` | `analyzeBriefCapabilities` — pure regex read of DB/auth/dashboard/commerce + vertical + `complex` flag (RU+EN). |
+| `agentflow-agents/src/services/github-template-search.ts:558` | `buildSearchQueries` — extended fan-out: base + capability + vertical queries. |
+| `agentflow-agents/src/services/github-template-search.ts:617` | `searchGithub` — runs the queries (Promise.allSettled), merges + dedupes by stars; logs `github_search_unauthenticated` with no token. |
+| `agentflow-agents/src/services/github-template-search.ts:899` | `refineByFileTree` — fetch package.json + root tree, hard-reject monorepo/framework/desktop, boost real capability deps. |
+| `agentflow-agents/src/services/github-template-search.ts:282` | `pickFallbackForBrief` — capability-aware fallback tiers (kind → complex-curated → app → static). |
+| `agentflow-agents/src/services/github-template-search.ts:385` | `KIND_RECIPES` — per-kind search filters (language gate, stars, `size:<…`). |
+| `agentflow-agents/src/services/github-template-search.ts:543` | `extendedEnabled` — `FF_TEMPLATE_EXTENDED_SEARCH` gate (default ON). |
+| `agentflow-agents/src/services/github-template-search.ts:330` | `FRAMEWORK_SOURCE_BLOCKLIST` — only true framework source; structural hard-reject covers the rest. |
+| `agentflow-agents/src/services/foundation-structural-filter.ts:445` | `detectVertical` + `pickCuratedBypassList` + `deriveStructuralSignals` / `decideHardReject` / `structuralBias` — reused for vertical routing + file-tree hard-reject. |
+| `agentflow-agents/src/routes/projects.ts:920` | the only prod caller — `template = await pickBestTemplateForBrief(brief, resolvedKindForPicker)`. |
+
+## Data flow
+
+```
+POST /me/projects { brief }
+  → resolvedKind = tg_bot | nextjs   (projects.ts)
+  → pickBestTemplateForBrief(brief, kind)
+      → cache hit? return
+      → analyzeBriefCapabilities(brief)         # db/auth/dashboard/commerce + vertical + complex
+      → extractKeywords (1 LLM call)
+      → searchGithub:
+           buildSearchQueries → [ base, capability(if complex), vertical ]
+           Promise.allSettled(runGithubQuery × N) → merge+dedupe by stars
+           (no GITHUB_TOKEN → log github_search_unauthenticated, 1 query only)
+      → rankByBrief (1 LLM call, 0-10)
+      → refineByFileTree (token + extended only):
+           fetch package.json + root tree → decideHardReject (drop monorepo/
+           framework/desktop) → +structuralBias +capabilityFileTreeBonus → re-sort
+      → if empty → pickFallbackForBrief (capability-aware curated boilerplate)
+```
+
+## DB / Env / API
+
+- Tables: none (Redis-cached only via `template-search-cache`).
+- Env:
+  - `GITHUB_TOKEN` — **required for the feature**. Read-only PAT in
+    `agentflow-agents-env`. Unauthenticated GitHub Search = 10 req/min + 403s →
+    degraded single-query mode + capability fallback. Owner-provided.
+  - `FF_TEMPLATE_EXTENDED_SEARCH` — set `0` to force the legacy single-query
+    path. Default: extended ON.
+- Routes: consumed by `POST /me/projects` (create-project flow).
+- MCP tools: none.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Every complex brief picks the bare `agentflow-nextjs-starter` (score 0) | `github_search_unauthenticated` | Set `GITHUB_TOKEN` in `agentflow-agents-env`; code at `github-template-search.ts:630`. |
+| All search queries fail (rate-limit / 403) | `github_search_failed status=` | `github-template-search.ts` `runGithubQuery`; caller falls to capability fallback. |
+| A monorepo / framework-source finalist gets dropped | `[github-template-search] hard_reject reason=monorepo` | Intended — `refineByFileTree` + `decideHardReject`. Loosen the structural filter only if a real app template is mis-rejected. |
+| Template pick returns 400 with no fallback | `project_missing_template_repo` | `projects.ts` — brief had no `templateRepoFull` and no scorer match. |
+
+## Capability-aware fallback tiers
+
+`pickFallbackForBrief(brief, kind)` order:
+
+1. **Kind fallback** — `tg_bot`/`api`/`spa`/`mini_app` → in-house kind starter.
+2. **Complex (DB/auth/dashboard/commerce)** → lead curated repo for the brief's
+   vertical (`kiranism/next-shadcn-dashboard-starter`,
+   `medusajs/nextjs-starter-medusa`, …). `reasoning: capability_fallback_<vertical>`.
+3. **App keyword** → vertical lead (`reasoning: vertical_fallback_<vertical>`).
+4. **Static-keyword brief** → `agentflow-static-starter`.
+5. **Ambiguous** → static, unless kind is web (then vertical lead).
+
+## Verification (2026-05-29)
+
+Local `gh` token, 3 complex briefs (token never committed):
+`saas-admin-with-billing` → `satnaing/shadcn-admin` (+5 capability-verified,
+beat `ant-design-pro` ★38k); `services-marketplace-with-chat` →
+`saleor/storefront` (+3); `crypto-portfolio-tracker` → `satnaing/shadcn-admin`.
+30/19/30 real candidates merged per brief — none an in-house bare starter.
+
+## Related
+
+- [projects](/subsystems/projects/) — Phase-A2 create-project flow that calls the scorer.
+- [Foundation Scout](/subsystems/foundation-scout/) — legacy vertical-routing path (deprecated); its vertical buckets are reused here.
+- [Builtin templates registry](/subsystems/builtin-templates/) — curated starters surfaced above scorer candidates in the modal.
