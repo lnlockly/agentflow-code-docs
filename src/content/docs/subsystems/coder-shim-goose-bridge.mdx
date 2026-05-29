@@ -141,6 +141,7 @@ charset-validated before reaching the scheduler.
 | Recipe dispatch rejected | `recipe dispatch ... rejected: recipe_not_allowed` | unknown / path-shaped recipe id — not in `manifest.json` allowlist |
 | Recipe dispatch rejected (bad cron) | `recipe dispatch ... rejected: invalid_cron` | `scope.cron` not 5/6 cron fields of `[0-9*/,-]` — `normalizeCron` returned null |
 | Recipe never runs, all rejected | `recipe manifest load failed` | `/app/recipes/devices/manifest.json` missing/malformed in the image → fail-closed |
+| goose device pod `ImagePullBackOff` | `failed to fetch anonymous token ... 401 Unauthorized` for `lnlockly/agentflow-coder-shim` | the coder-shim image is PRIVATE; the daemon STS must carry `imagePullSecrets: [{name: ghcr-pull}]` (added in `me-hosted-devices.ts` `renderDaemonManifest`, PR #956). The secret is applied per-tenant by `tenant-bootstrap.ts` `apply_ghcr_pull`. Legacy `agentflow-daemon-*` images are public so this only bit goose devices / fresh nodes without a cached image. |
 | task_error `recipe_run_failed` | report `recipe_run_failed: <goose tail>` | goose non-zero on `goose run --recipe` — read the tail (model/gateway/recipe issue) |
 | task_error `recipe_schedule_failed` | report `recipe_schedule_failed: <tail>` | `goose schedule add` non-zero — read the tail (cron/scheduler issue) |
 | Goose device create rejected | `goose_canary_disabled` (HTTP 403) | `FF_GOOSE_CANARY` not set on agentflow-agents — set it to provision the canary |
