@@ -35,8 +35,9 @@ in the Phase-A2 create-project flow (see [projects](/subsystems/projects/)).
 | `agentflow-agents/src/services/github-template-search.ts:350` | `INSTALL_HOSTILE_REPOS` + `isInstallHostile` + `pickCleanCuratedLead` — yarn-only / external-backend repos that brick in-pod install; skipped as fallback lead AND filtered from search hits. |
 | `agentflow-agents/src/services/github-template-search.ts:375` | `EXTERNAL_AUTH_SAAS_REPOS` + `isExternalAuthSaas` — curated repos that hard-need Clerk/Supabase (500 on boot without keys we don't provision); `pickCleanCuratedLead` skips them so a complex brief lands on a self-contained starter. |
 | `agentflow-agents/src/services/github-template-search.ts:1025` | `BOOT_BLOCKING_AUTH_DEP_RX` / `SOFT_EXTERNAL_SAAS_DEP_RX` + `externalAuthSaasPenalty` — deprioritize a GitHub-Search finalist whose package.json hard-depends on external auth/data SaaS (applied in `refineByFileTree`). |
-| `agentflow-agents/src/services/github-template-search.ts:773` | `parseRankerArray` (tolerant fence/prose JSON extraction) + `heuristicRankFallback` — capability-aware fallback when the AI ranker errors; drops vertical-conflicting candidates (no ecom storefront for a non-commerce brief). |
-| `agentflow-agents/src/services/foundation-structural-filter.ts:445` | `detectVertical` (incl. `STOREFRONT_CORE_RX` dashboard-over-ecom guard) + `pickCuratedBypassList` + `deriveStructuralSignals` / `decideHardReject` / `structuralBias` — reused for vertical routing + file-tree hard-reject. |
+| `agentflow-agents/src/services/github-template-search.ts:773` | `parseRankerArray` (tolerant fence/prose JSON extraction) + `heuristicRankFallback` — capability-aware fallback when the AI ranker errors; drops vertical-conflicting + external-auth-SaaS candidates, and **leads with the self-contained curated repo for a complex brief** (optional `brief` arg). |
+| `agentflow-agents/src/services/github-template-search.ts` `textFromModelResult` | reads `content[].text` from a `TextGenerationResult` — replaces `String(raw)` (which produced `"[object Object]"` → 100% AI-ranker + keyword-extractor failure). |
+| `agentflow-agents/src/services/foundation-structural-filter.ts:445` | `detectVertical` — operator detection via `VERTICAL_RX.dashboard_saas` ∪ `ADMIN_OPERATOR_RX` ∪ record-CRUD, gated by `STOREFRONT_CORE_RX` (dashboard-over-ecom). + `pickCuratedBypassList` / `deriveStructuralSignals` / `decideHardReject` / `structuralBias`. |
 | `agentflow-agents/src/routes/projects.ts:912` | the only prod caller — honours an explicit `selected_foundation` (mode=`github_repo`) over the scorer; otherwise `pickBestTemplateForBrief(brief, resolvedKindForPicker)`. |
 
 ## Data flow
@@ -89,6 +90,8 @@ POST /me/projects { brief }
 | Dashboard/admin/CRUD brief lands on the ecom medusa storefront (`reasoning=capability_fallback_ecom_marketplace`) | `capability_fallback_ecom_marketplace` for an operator brief | `detectVertical` dashboard-over-ecom guard (`foundation-structural-filter.ts`): dashboard wins when no `STOREFRONT_CORE_RX` match. |
 | Caller's explicit `selected_foundation` ignored, scorer pick stored instead | stored `templateRepoFull` ≠ posted `selected_foundation.repo_full_name` | `projects.ts:912` — explicit `mode=github_repo` foundation now wins; `mode=scratch`/absent falls through to the scorer. |
 | AI ranker errors → a dashboard/non-commerce brief picked a high-star ecom storefront | `[github-template-search] ai_ranker_failed err=` (then `stars-based fallback (AI ranking failed)` in old reasoning) | `rankByBrief` now logs the real error + calls `heuristicRankFallback` (capability-aware, drops vertical-conflicting candidates). `github-template-search.ts:773`. |
+| **AI ranker fails on EVERY call** → heuristic fallback always runs (`reasoning: capability-aware heuristic fallback (AI ranking failed; vertical=…)` on 100% of picks); keyword extraction also returns junk | `ai_ranker_failed err=ranker_output_not_a_json_array` every time — root cause: `useModel(TEXT_SMALL)` returns a `TextGenerationResult` **object**, old code did `String(raw)` → literal `"[object Object]"` | `textFromModelResult(raw)` reads `content[].text` instead of `String(raw)`. Fixed in `rankByBrief` + `extractKeywords` (`github-template-search.ts`). |
+| Operator/admin/CRM brief WITHOUT the literal "dashboard/админка" word lands on ecom | `caps.vertical=ecom_marketplace` for a back-office brief (e.g. "список клиентов / добавить-удалить") | `detectVertical` operator detection widened via `ADMIN_OPERATOR_RX` + record-CRUD (add+remove+record-noun) in `foundation-structural-filter.ts`. |
 | Generated dashboard app 500s on every route: `@clerk/nextjs: Missing publishableKey` | picked repo in `EXTERNAL_AUTH_SAAS_REPOS` (e.g. `kiranism/next-shadcn-dashboard-starter`) or finalist logs `external_auth_saas reason=external_auth_saas_boot_blocking` | Curated dashboard lead is the self-contained `arhamkhnz/next-shadcn-admin-dashboard`; Clerk/Supabase repos skipped by `pickCleanCuratedLead` + penalized in `refineByFileTree`. We don't provision external-SaaS keys (own-infra). |
 
 ## Capability-aware fallback tiers
@@ -151,6 +154,57 @@ image:
   (boot-blocking, −6) or `next-auth` / `@supabase/*` / `firebase` (soft, −3),
   logging `external_auth_saas reason=…`.
 
+### AI-ranker 100% failure + classifier + heuristic-floor fix (route-gate 2026-05-30, live #994)
+
+Found live on the fully-deployed #994 image: a clients-admin dashboard brief
+auto-picked an ECOM template, and EVERY run logged `capability-aware heuristic
+fallback (AI ranking failed; vertical=…)` — the AI ranker never succeeded.
+
+- **Root cause — AI ranker failed on every call.** `useModel(ModelType.TEXT_SMALL)`
+  resolves to a `TextGenerationResult` **object** (`{ content: [{type:'text',
+  text}], … }`), not a string. `rankByBrief` + `extractKeywords` did
+  `String(raw ?? '').trim()` → the literal `"[object Object]"`, so
+  `parseRankerArray` threw `ranker_output_not_a_json_array` 100% of the time and
+  keyword extraction emitted the junk token `objectobject`. Fix:
+  `textFromModelResult(raw)` reads `content[].text` (defensive: a bare string is
+  returned verbatim). The ranker (and GitHub keyword search) now actually works;
+  the heuristic is a true fallback, not the default path.
+- **Classifier — operator intent widened.** The dashboard-over-ecom guard keyed
+  only off `VERTICAL_RX.dashboard_saas`, so a back-office brief whose operative
+  words were management verbs ("управление клиентами", "список клиентов /
+  добавить-удалить") and no literal "dashboard/админка" fell to ecom on an
+  incidental commerce word. `detectVertical` now treats a brief as operator when
+  it matches `VERTICAL_RX.dashboard_saas` **OR** `ADMIN_OPERATOR_RX`
+  (admin\*/back-office/internal-tool/CRM/ERP/CRUD/«панель управления»/«управление|
+  список|реестр|база ‹records›»/«клиентская база|админка|кабинет») **OR** a
+  record-CRUD pair (add-verb + remove-verb + record-noun). Operator + no
+  `STOREFRONT_CORE_RX` → `dashboard_saas`. **Ecom is reserved for real
+  storefronts** (cart/checkout/shop/корзина); an admin panel FOR a real store
+  still resolves to ecom because the storefront core gates it.
+- **Heuristic floor — self-contained curated lead.** Because the AI ranker may
+  stay flaky, `heuristicRankFallback` (when given the `brief`) now LEADS a
+  complex brief with the capability-aware self-contained curated repo
+  (`pickFallbackForBrief` → `arhamkhnz/next-shadcn-admin-dashboard` for
+  dashboard, `vercel/commerce` for ecom) and lists the keyword-ranked GitHub
+  repos as alternatives. It also drops `EXTERNAL_AUTH_SAAS_REPOS` candidates
+  (Clerk/Supabase 500-on-boot). The legacy 3-arg signature (no `brief`) keeps
+  the pure-candidate behavior, so an empty conflict-filtered set still returns
+  `[]` for the caller's `pickFallbackForBrief`.
+
+Verified (API-only, real regexes; AI-ranker-down path simulated with an
+ecom-skewed candidate set):
+
+- `клиентская админка / список клиентов / добавить-удалить / дашборд метрик`
+  → `vertical=dashboard_saas`; heuristic(AI-down) lead =
+  `arhamkhnz/next-shadcn-admin-dashboard`; Clerk + ecom candidates dropped.
+- `Внутренний инструмент: список клиентов, добавить/удалить клиента, статистика`
+  (no literal "dashboard" word) → `dashboard_saas` → arhamkhnz.
+- `client-admin dashboard, clients list, add and remove clients, back-office`
+  → `dashboard_saas` → arhamkhnz.
+- `Интернет-магазин обуви: каталог товаров, корзина, оформление заказа`
+  → `ecom_marketplace`; heuristic lead = `vercel/commerce` (medusa skipped);
+  ecom alternatives kept.
+
 ### Explicit `selected_foundation` wins over the scorer
 
 `POST /me/projects` with `selected_foundation: { mode: 'github_repo',
@@ -177,6 +231,51 @@ never committed):
 Earlier run (2026-05-29): `saas-admin-with-billing` → `satnaing/shadcn-admin`
 (+5 capability-verified, beat `ant-design-pro` ★38k) — note that pick is now
 deprioritized by `externalAuthSaasPenalty` (Clerk).
+
+## Extended-mode comparison (ranked shortlist + justification)
+
+Owner direction (`plans/complex-app-extended-mode.md`): a complex brief must NOT
+get a silent top-1. Two product modes:
+
+- **default** (simple landing / bot) → fast single-pick; callers take
+  `pickBestTemplateForBrief` / `comparison.lead_repo_full`.
+- **extended** (dashboards / SaaS / multi-feature) → the cabinet shows a RANKED
+  SHORTLIST with per-candidate justification so the user chooses;
+  `selected_foundation` (#992) is the channel for that choice.
+
+`compareTemplatesForBrief(brief, kind, opts)` reuses `searchTemplatesForBrief`
+(so reliability + self-contained + capability-aware ranking apply underneath),
+then enriches the top `COMPARE_LIMIT` (5) via a package.json probe:
+
+```
+TemplateComparison {
+  brief_vertical, complex, mode,            # mode = resolveScorerMode (opts.mode || complex→extended)
+  lead_repo_full,                            # == candidates[0].repo_full (default-mode fast pick)
+  candidates: TemplateComparisonCandidate[]  # each:
+    summary                 # "TypeScript · dashboard_saas · MUI · несёт: дашборд/таблицы/графики"
+    ships {db,auth,dashboard,commerce,ui_kit}  # real deps (CAP_DEP_SIGNALS) or topics fallback
+    install_clean           # !isInstallHostile
+    self_contained          # !isExternalAuthSaas && no boot-blocking @clerk/@auth0 dep
+    pros[] / cons[]         # FOR THIS BRIEF (covers caps? install-clean? self-contained?)
+    recommended             # index 0 = reasoned default
+    recommendation_reason   # the WHY, not just a score
+}
+```
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/github-template-search.ts` `compareTemplatesForBrief` | extended-mode entry — ranked shortlist + per-candidate justification. |
+| `…` `describeCandidate` (pure) | builds one justified entry: ships + install_clean/self_contained + pros/cons + reason. |
+| `…` `detectShips` / `detectUiKit` | capability + UI-kit fingerprint from package.json deps (topics fallback). |
+| `…` `resolveScorerMode` + `SearchOpts.mode` | default vs extended (explicit toggle wins; else `complex`). |
+
+Verified (local `gh` token, real GitHub Search + package.json probes) — dashboard
+brief shortlist: `devias-io/material-kit-react` (★ recommended; MUI; ships
+dashboard; install-clean + self-contained), `vercel/nextjs-postgres-nextauth-
+tailwindcss-template` (ships db+auth, shadcn), `ant-design/ant-design-pro` (Ant
+Design) — all install-clean + self-contained, none Clerk; each with pros/cons +
+reason. (The PLANNER step + cabinet plan/compare UI are separate work per the
+spec — this PR ships only the scorer's comparison output.)
 
 ## Related
 
