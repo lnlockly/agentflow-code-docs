@@ -10,6 +10,8 @@ GitHub Actions runs build+deploy on push to `main` for both `agentflow-agents`
 and `agentflow-landing`. On `pull_request`, `agentflow-landing` runs a
 Playwright E2E smoke against prod `agentflow.website` to catch P0
 regressions (auth, autonomous-goal POST, NaN cards) before merge.
+`agentflow-agents` PRs run `typecheck` + `build` (blocking) and a
+`node --test` job over `tests/` (non-blocking, `continue-on-error: true`).
 
 ## Files (with line refs)
 | Path | Role |
@@ -20,6 +22,30 @@ regressions (auth, autonomous-goal POST, NaN cards) before merge.
 | `agentflow-landing/tests/e2e/autonomous-flow.spec.ts:1` | Spec: login → device → Autonomous tab → set goal |
 | `agentflow-landing/tests/e2e/__helpers/anti-nan.ts:1` | `assertNoNaN(page)` — fails if DOM has NaN/undefined/null/Invalid Date |
 | `agentflow-landing/playwright.auth-config.ts:1` | Older 12-journey suite — kept for token-based runs |
+| `agentflow-agents/.github/workflows/pr-check.yml:67` | `test` job — runs `npm test` over all of `tests/` (non-blocking) |
+| `agentflow-agents/package.json:18` | `test` script — `node --import tsx --test "tests/*.test.ts" "tests/**/*.test.ts"` |
+
+## agentflow-agents test glob (the `**` quirk)
+
+`npm test` runs via `sh -c`, where `sh` has no `globstar`, so an unquoted
+`tests/**/*.test.ts` collapses `**` to a single `*` — it matches nested
+`tests/<dir>/*.test.ts` but silently DROPS top-level `tests/*.test.ts`. For a
+long time ~109 top-level suites never ran in CI (and the `test` job is
+`continue-on-error: true`, so nobody noticed). Real totals jumped 3042 → 4434
+tests once fixed.
+
+Fix: quote BOTH patterns so the shell passes them literally to node, whose
+`--test` glob handles `**` correctly and de-dupes overlapping file args:
+
+```
+"test": "node --import tsx --test \"tests/*.test.ts\" \"tests/**/*.test.ts\""
+```
+
+`pr-check.yml` `detect_tests` counts with `find tests -name '*.test.ts'` for the
+same reason. ~53 real failures are now visible (DB-integration tests needing a
+migrated Postgres in CI, missing `k8s/mautrix-discord*.yaml` on main, dead
+graph-executor tests, preview-gate logic drift); the job stays non-blocking until
+they're triaged.
 
 ## Data flow
 
