@@ -47,13 +47,16 @@ tracebacks to the cabinet (root cause for the owner's P0 on 2026-05-28).
 | `agentflow-agents/src/routes/me-integrations.ts:93` | `packStorageState(cookies, provider?)` — registry-aware repack |
 | `agentflow-agents/src/routes/me-integrations.ts:152` | `pickOrCreateHubProject(ownerUserId)` — sentinel project |
 | `agentflow-agents/src/routes/me-integrations.ts:178` | `upsertHubSecret(projectId, secretKey, masked, payload, why)` |
-| `agentflow-agents/src/routes/me-integrations.ts:226` | `listIntegrationStatus(ownerUserId)` — per-provider status aggregator |
-| `agentflow-agents/src/routes/me-integrations.ts:311` | `GET /integrations/registry` (owner-auth public dump) |
-| `agentflow-agents/src/routes/me-integrations.ts:318` | `GET /me/integrations` |
+| `agentflow-agents/src/routes/me-integrations.ts:258` | `computeProviderStatuses(legacyByKey, vaultByKey)` — pure merge of project_secrets + vault overlay; unit-tested |
+| `agentflow-agents/src/routes/me-integrations.ts:295` | `buildVaultOverlay(ownerUserId)` — projects active `user_credentials` rows onto provider `secret_key` via `KIND_TO_LEGACY_KEY` |
+| `agentflow-agents/src/routes/me-integrations.ts:326` | `listIntegrationStatus(ownerUserId)` — vault-first status aggregator (overlay + legacy project_secrets) |
+| `agentflow-agents/src/routes/me-integrations.ts:388` | `GET /integrations/registry` (owner-auth public dump) |
+| `agentflow-agents/src/routes/me-integrations.ts:395` | `GET /me/integrations` |
+| `agentflow-agents/src/services/credential-resolver.ts:33` | `KIND_TO_LEGACY_KEY` (exported) — vault kind → `secret_key`, shared by the resolver and the status overlay |
 | `agentflow-agents/src/routes/me-integrations.ts:329` | `handleProviderPost` — generic body validator + sealer |
 | `agentflow-agents/src/routes/me-integrations.ts:452` | `POST /me/integrations/kwork` — compat wrapper for PR #796 |
 | `agentflow-agents/src/routes/me-integrations.ts:475` | `POST /me/integrations/:provider` — generic handler |
-| `agentflow-agents/tests/integrations-generic.test.ts:1` | Unit tests — registry shape + body schemas + financial denylist |
+| `agentflow-agents/tests/integrations-generic.test.ts:1` | Unit tests — registry shape + body schemas + financial denylist + `computeProviderStatuses` vault/legacy merge |
 | `agentflow-agents/src/db/schema.ts:1266` | `project_secrets` table + `(project_id, key)` unique |
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/tools/integrations.py:fetch_registry` | Daemon-side registry GET with 5-minute module cache, keyed by API base |
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/tools/integrations.py:connect_integration` | Daemon dispatcher — `cookie_export` branch (open, probe, export, POST). `telegram_app` returns `not_implemented` (Track 2b). |
@@ -112,6 +115,28 @@ For `flow_kind='telegram_app'` the daemon POSTs
 `JSON.stringify({phone, session_string})` under
 `TELEGRAM_SESSION_STRING`. No cookies involved.
 
+### Status read is vault-first (`GET /me/integrations`)
+
+`listIntegrationStatus` reads BOTH stores and a provider is `connected` if
+EITHER has it:
+
+1. **Vault overlay** (`buildVaultOverlay`) — `listUserCredentials(owner)` →
+   for each `status='active'` row, project `kind` onto a provider `secret_key`
+   via the shared `KIND_TO_LEGACY_KEY` map (kwork→`KWORK_SESSION_JSON`, …).
+2. **Legacy `project_secrets`** pass — the original `(project_id, key)`
+   aggregation, kept as a cutover fallback.
+3. `computeProviderStatuses` folds the two maps: `connected` if either store
+   has the key, `last_synced_at` = newest timestamp across both, `source` =
+   `vault` (canonical, wins) | `project_secret` | `null`.
+
+This mirrors the vault fallback `/me/integrations/kwork/status` got in PR
+\#974. Before it, a session stored only in the `user_credentials` vault (the
+normal post-cutover state — that's where the cookie-export / sealed-session
+path writes and where the kwork bridge resolves from) showed `never` in the
+cabinet even though outreach worked. The overlay is generic: any vault `kind`
+with a matching provider `secret_key` lights up, no per-provider branching.
+The response now carries a `source` field per provider row.
+
 ## DB / Env / API
 
 - **Tables:**
@@ -141,6 +166,8 @@ For `flow_kind='telegram_app'` the daemon POSTs
 | Daemon POST returns 400 for kwork specifically | `no_kwork_session_cookie` | Same as above, but the compat wrapper at `me-integrations.ts:400` rewrites the error string |
 | Daemon POST returns 403 with `domain_denied` | `domain_denied` | Cookie batch contained a banking/exchange domain — daemon must not export cookies from financial sites. Tune `FINANCIAL_DOMAIN_DENYLIST` only if a false positive |
 | `/me/integrations` shows `never` after a successful POST | (no log — check `project_secrets` row) | `secret_key` mismatch between registry and the consumer; verify `INTEGRATION_PROVIDERS[*].secret_key` matches what the studio template reads |
+| `/me/integrations` shows `never` but outreach works (session in the vault) | (no log — `SELECT kind,status FROM user_credentials WHERE user_id=X`) | Pre-overlay bug: aggregator read only `project_secrets`. Fixed — `buildVaultOverlay` now reads `user_credentials`. If it recurs, confirm the vault `kind` has a row in `KIND_TO_LEGACY_KEY` (`credential-resolver.ts:33`) pointing at the provider's `secret_key` |
+| Vault read throws during status aggregation | `me/integrations vault_read_failed` | Best-effort by design — legacy `project_secrets` path still reported. Check `listUserCredentials` / DB health; status under-reports vault-only providers until fixed |
 | `connect_integration(telegram_app)` POSTs `{cookies:[]}` | `invalid_body` | Daemon dispatched cookie_export branch for a `flow_kind='telegram_app'` provider — daemon-side bug, route by `flow_kind` |
 | Hub project missing after first onboard | (no log — `SELECT * FROM projects WHERE owner_user_id=X AND kind='integration_hub'`) | `pickOrCreateHubProject` insert failed — check projects-table FK / slug collision |
 | Daemon `connect_integration` returns `not_logged_in` despite signed-in session | `tools/integrations.py:_parse_probe_result` → `{logged: false}` | `logged_probe_js` selector stale; update the row in `integration-providers.ts`. Daemon does not export cookies in this state to avoid burning a backend write. |
