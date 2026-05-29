@@ -44,8 +44,10 @@ injection boundary.
 | `agentflow-agents/src/coder-shim/goose-runner.ts:110` | `buildCoderPrompt` — frames the raw brief as an imperative "implement the brief by EDITING the cloned files at CWD" directive; branches on `kind` (HTTP vs tg_bot), never a slug |
 | `agentflow-agents/src/coder-shim/goose-runner.ts:143` | `buildGooseArgs` — `run --with-builtin developer --no-session --max-turns N --system <guardrail> -t <framed-prompt>`; `-t` is `buildCoderPrompt`, `--system` is `buildCoderSystemPrompt`; never a concrete model id |
 | `agentflow-agents/src/coder-shim/goose-runner.ts:194` | `runGooseArgv` — array-argv spawn (one process path for coder + recipe + schedule) |
-| `agentflow-agents/src/coder-shim/pipeline.ts:31` | `buildReport` (pure) — goose exit + probe → CloneStatusReport |
-| `agentflow-agents/src/coder-shim/pipeline.ts:114` | `runCoderTask` — clone → goose config → `runGoose` → probe → report |
+| `agentflow-agents/src/coder-shim/pipeline.ts:37` | `buildReport` (pure) — goose exit + dev-server result + probe → CloneStatusReport (hard install/spawn failure → ok:false) |
+| `agentflow-agents/src/coder-shim/pipeline.ts:145` | `runCoderTask` — clone → goose config → `runGoose` → `startDevServer` (HTTP kinds) → probe → report |
+| `agentflow-agents/src/coder-shim/dev-server.ts:206` | `startDevServer` — read package.json, pick package manager from lockfile, install deps, `freePort` (kill prior dev-server on this port — auto-retry idempotency), spawn `<pm> run dev\|start` detached on `0.0.0.0:<port>`; returns `dev_pid` + `package_manager` (PR #970) |
+| `agentflow-agents/src/coder-shim/dev-server.ts:39` | `pickPackageManager` / `installArgs` / `pickStartScript` / `startArgs` (pure planners) — pnpm>yarn>npm precedence; prefer `dev` over `start`; forward `--port/--host` per pm, tokenised argv |
 | `agentflow-agents/src/coder-shim/clone-status.ts:29` | `buildCloneStatusBody` — matches `internal.ts` `cloneStatusSchema`; secret in header only |
 | `agentflow-agents/src/coder-shim/bridge.ts:53` | `CoderShimBridge` — connect, hello, hello_ack secret rotation, heartbeat 15s, task routing |
 | `agentflow-agents/src/coder-shim/bridge.ts:82` | `getManifest` — cache the allowlist; fail-closed (null → reject) if the bundle is missing/malformed |
@@ -63,7 +65,7 @@ injection boundary.
 | `agentflow-agents/coder-shim-image/Dockerfile:1` | image: node 22 + bridge + goose from the fork |
 | `agentflow-agents/coder-shim-image/entrypoint.sh:1` | env check + `node dist/coder-shim/main.js` |
 | `agentflow-agents/.github/workflows/build-coder-shim.yml:1` | self-hosted build → `ghcr.io/<owner>/agentflow-coder-shim` |
-| `agentflow-agents/tests/coder-shim.test.ts:1` | 63 unit tests (protocol/scope/runner incl. `buildCoderSystemPrompt`/clone-status/report/resolver + recipe allowlist/argv/cron) |
+| `agentflow-agents/tests/coder-shim.test.ts:1` | 71 unit tests (protocol/scope/runner incl. `buildCoderSystemPrompt`/clone-status/report/resolver + recipe allowlist/argv/cron + dev-server planners + dev-server failure-branch reports) |
 
 ## Data flow
 ```
@@ -85,8 +87,14 @@ coder-shim bridge.handleCoderDispatch
    │       "implement the brief by EDITING the cloned files at CWD". Without the
    │       --system guardrail the model plans, says "ready to proceed" and exits 0
    │       with the workspace untouched — headless `goose run` has no second turn)
+   │    startDevServer (HTTP kinds): read package.json, pick pm from lockfile,
+   │       <pm> install, then spawn `<pm> run dev|start --port <port> --host
+   │       0.0.0.0` DETACHED (unref) so it keeps serving — headless `goose run`
+   │       exits after editing and leaves NO running server. install_failed /
+   │       dev_spawn_failed short-circuit to ok:false (project → failed + tail).
    │    probe 127.0.0.1:<port>  (HTTP kinds; skipped for tg_bot)
-   │  POST /internal/projects/:id/clone-status {ok, port, port_reachable, ...}
+   │  POST /internal/projects/:id/clone-status {ok, port, port_reachable,
+   │       dev_pid, package_manager, ...}
    ▼  WS task_complete  (or task_error)
 backend internal.ts clone-status → flips status, wires Service/Ingress, preview_url
 ```
@@ -153,7 +161,8 @@ charset-validated before reaching the scheduler.
 | Coder pod never connects | `[coder-shim] FATAL: missing required env` | entrypoint env check — `AF_API_KEY`/`AF_DEVICE_ID` unset on the pod |
 | goose binary missing | `[coder-shim] FATAL: goose binary not on PATH` | image build — goose download step failed |
 | clone-status never posts | `internal_secret_unset` returned by `postCloneStatus` | `AF_INTERNAL_API_SECRET` not on the pod |
-| Project stuck provisioning, goose ran | `clone-status posted ... ok=true http=...` then no promote | `port_reachable:false` — dev-server not up in the probe window; preview-reconciler promotes later |
+| Project stuck provisioning + preview 503, goose edited the files | `clone-status posted ... ok=true http=...`, clone_status event `port_reachable:false`, `dev_pid:null` | Pre-PR #970: `runCoderTask` only PROBED the port — nothing installed deps or started `next dev`/`vite`, so the probe always missed, the backend skipped `wirePreviewIngress`, and the preview 503'd. Fixed: `dev-server.ts:startDevServer` installs + spawns the dev-server detached on `0.0.0.0:<port>` before the probe. Verify: clone_status now carries `dev_pid` + `package_manager` and `port_reachable:true`. **Needs the coder-shim image rebuilt on merge.** |
+| HTTP project → failed with an install tail | clone_status event `error:'install_failed'` (or `dev_spawn_failed`) + `detail` = npm/pnpm output | `<pm> install` exited non-zero in the project pod — read the `detail` tail (peer-dep conflict, network, lockfile drift). `buildReport` flips ok:false so the operator sees the real cause instead of a silent 503. |
 | task_error `goose_failed` | `coder task ... crashed` / report `error:'goose_failed'` | read the report `detail` (goose tail) — model/gateway/scaffold issue |
 | task_error `template_repo_full_missing` for a real repo | none (synchronous) | template ref failed `TEMPLATE_RE` (flag-shaped or non `owner/repo`/https) |
 | Recipe dispatch rejected | `recipe dispatch ... rejected: recipe_not_allowed` | unknown / path-shaped recipe id — not in `manifest.json` allowlist |
