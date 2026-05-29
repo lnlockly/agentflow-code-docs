@@ -32,8 +32,9 @@ in the Phase-A2 create-project flow (see [projects](/subsystems/projects/)).
 | `agentflow-agents/src/services/github-template-search.ts:385` | `KIND_RECIPES` — per-kind search filters (language gate, stars, `size:<…`). |
 | `agentflow-agents/src/services/github-template-search.ts:543` | `extendedEnabled` — `FF_TEMPLATE_EXTENDED_SEARCH` gate (default ON). |
 | `agentflow-agents/src/services/github-template-search.ts:330` | `FRAMEWORK_SOURCE_BLOCKLIST` — only true framework source; structural hard-reject covers the rest. |
-| `agentflow-agents/src/services/foundation-structural-filter.ts:445` | `detectVertical` + `pickCuratedBypassList` + `deriveStructuralSignals` / `decideHardReject` / `structuralBias` — reused for vertical routing + file-tree hard-reject. |
-| `agentflow-agents/src/routes/projects.ts:920` | the only prod caller — `template = await pickBestTemplateForBrief(brief, resolvedKindForPicker)`. |
+| `agentflow-agents/src/services/github-template-search.ts:350` | `INSTALL_HOSTILE_REPOS` + `isInstallHostile` + `pickCleanCuratedLead` — yarn-only / external-backend repos that brick in-pod install; skipped as fallback lead AND filtered from search hits. |
+| `agentflow-agents/src/services/foundation-structural-filter.ts:445` | `detectVertical` (incl. `STOREFRONT_CORE_RX` dashboard-over-ecom guard) + `pickCuratedBypassList` + `deriveStructuralSignals` / `decideHardReject` / `structuralBias` — reused for vertical routing + file-tree hard-reject. |
+| `agentflow-agents/src/routes/projects.ts:912` | the only prod caller — honours an explicit `selected_foundation` (mode=`github_repo`) over the scorer; otherwise `pickBestTemplateForBrief(brief, resolvedKindForPicker)`. |
 
 ## Data flow
 
@@ -75,18 +76,45 @@ POST /me/projects { brief }
 | All search queries fail (rate-limit / 403) | `github_search_failed status=` | `github-template-search.ts` `runGithubQuery`; caller falls to capability fallback. |
 | A monorepo / framework-source finalist gets dropped | `[github-template-search] hard_reject reason=monorepo` | Intended — `refineByFileTree` + `decideHardReject`. Loosen the structural filter only if a real app template is mis-rejected. |
 | Template pick returns 400 with no fallback | `project_missing_template_repo` | `projects.ts` — brief had no `templateRepoFull` and no scorer match. |
+| Project dies at `install` before coder/DB/route-gate run (yarn-only / external-backend repo) | picked repo in `INSTALL_HOSTILE_REPOS` (e.g. `medusajs/nextjs-starter-medusa`, `packageManager: yarn@4`) | Add the repo to `INSTALL_HOSTILE_REPOS` (`github-template-search.ts:350`); it's then skipped as fallback lead and filtered from search hits. |
+| Dashboard/admin/CRUD brief lands on the ecom medusa storefront (`reasoning=capability_fallback_ecom_marketplace`) | `capability_fallback_ecom_marketplace` for an operator brief | `detectVertical` dashboard-over-ecom guard (`foundation-structural-filter.ts`): dashboard wins when no `STOREFRONT_CORE_RX` match. |
+| Caller's explicit `selected_foundation` ignored, scorer pick stored instead | stored `templateRepoFull` ≠ posted `selected_foundation.repo_full_name` | `projects.ts:912` — explicit `mode=github_repo` foundation now wins; `mode=scratch`/absent falls through to the scorer. |
 
 ## Capability-aware fallback tiers
 
 `pickFallbackForBrief(brief, kind)` order:
 
 1. **Kind fallback** — `tg_bot`/`api`/`spa`/`mini_app` → in-house kind starter.
-2. **Complex (DB/auth/dashboard/commerce)** → lead curated repo for the brief's
-   vertical (`kiranism/next-shadcn-dashboard-starter`,
-   `medusajs/nextjs-starter-medusa`, …). `reasoning: capability_fallback_<vertical>`.
-3. **App keyword** → vertical lead (`reasoning: vertical_fallback_<vertical>`).
+2. **Complex (DB/auth/dashboard/commerce)** → **first install-clean** curated repo
+   for the brief's vertical via `pickCleanCuratedLead` (`kiranism/next-shadcn-dashboard-starter`
+   for dashboard, `vercel/commerce` for ecom — `medusajs/nextjs-starter-medusa`
+   is skipped as yarn-only/external-backend). `reasoning: capability_fallback_<vertical>`.
+3. **App keyword** → install-clean vertical lead (`reasoning: vertical_fallback_<vertical>`).
 4. **Static-keyword brief** → `agentflow-static-starter`.
-5. **Ambiguous** → static, unless kind is web (then vertical lead).
+5. **Ambiguous** → static, unless kind is web (then install-clean vertical lead).
+
+### Install-safety + vertical discriminator (route-gate 2026-05-30)
+
+- `INSTALL_HOSTILE_REPOS` lists repos that brick a plain `npm/pnpm install` in
+  the project pod (yarn@4-pinned monorepos, starters that require an external
+  backend to boot). `medusajs/nextjs-starter-medusa` is the seed entry — it
+  ships `.yarnrc.yml` + `packageManager: yarn@4.12.0`, so the project died at
+  install before any code ran. Such repos can never win: skipped as a curated
+  fallback lead (`pickCleanCuratedLead`) and filtered from GitHub Search hits
+  (`runGithubQuery`).
+- `detectVertical` dashboard-over-ecom guard: an operator brief
+  (dashboard / admin / CRM / **CRUD** / back-office / data-table) with no
+  customer-facing storefront core (`STOREFRONT_CORE_RX`: магазин/marketplace/
+  корзина/cart/checkout/…) resolves to `dashboard_saas`, not `ecom_marketplace`.
+  A real online store that merely mentions «админка» still resolves to ecom.
+
+### Explicit `selected_foundation` wins over the scorer
+
+`POST /me/projects` with `selected_foundation: { mode: 'github_repo',
+repo_full_name, repo_url?, ref? }` skips the scorer entirely and persists the
+caller's repo as `templateRepoFull` / `foundationRepoFullName` (`ref` honoured,
+default `main`). `mode: 'scratch'` and an absent foundation fall through to
+`pickBestTemplateForBrief`. (`projects.ts:912`.)
 
 ## Verification (2026-05-29)
 
