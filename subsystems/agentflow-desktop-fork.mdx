@@ -1,6 +1,6 @@
 ---
 title: "AgentFlow Desktop (forked Goose Desktop)"
-description: "Rebranded fork of Block's Goose Desktop (Electron). Phase 1 = brand surface; Phase 2 = device-bridge dual-mode."
+description: "Rebranded fork of Block's Goose Desktop (Electron) with a device-bridge so the website drives the local goosed — dual-mode."
 ---
 
 # AgentFlow Desktop (forked Goose Desktop)
@@ -32,6 +32,12 @@ unchanged on purpose.
 | `agentflow-goose/ui/desktop/src/images/icon.{icns,ico,png,svg}` | regenerated AgentFlow app icons (dark square + lime chevron) |
 | `agentflow-goose/ui/desktop/src/images/iconTemplate*.png` | macOS menubar tray template (black chevron) |
 | `agentflow-goose/ui/desktop/forge.deb.desktop` / `forge.rpm.desktop` | Linux desktop entries renamed |
+| `agentflow-goose/ui/desktop/src/device-bridge/auth.ts` | auth.json load/save + connect headers (port of computer-mcp `auth.py`) |
+| `agentflow-goose/ui/desktop/src/device-bridge/wsBridge.ts` | WS reverse-tunnel: hello/hello_ack secret rotation, heartbeat, task_dispatch/cancel, reconnect backoff (port of `ws_client.py`) |
+| `agentflow-goose/ui/desktop/src/device-bridge/goosedDispatch.ts` | drives local goosed `POST /agent/start`→`/reply` SSE; accumulates answer + token usage |
+| `agentflow-goose/ui/desktop/src/device-bridge/queuedTasks.ts` | drains `/me/devices/:id/queued_tasks` on reconnect |
+| `agentflow-goose/ui/desktop/src/device-bridge/index.ts` | `startDeviceBridge()` wiring + `ws` connect-header adapter |
+| `agentflow-goose/ui/desktop/src/main.ts` (`ensureDeviceBridge`) | starts the bridge after goosed; gated `FF_DEVICE_BRIDGE=1` |
 
 ## Data flow
 ```
@@ -39,7 +45,8 @@ unchanged on purpose.
  Mode A chat ──►│ renderer (React+Vite) ─► main.ts ─► spawns local goosed (Rust)   │
                 │                                       extensions: developer +     │
  Mode B WS ────►│ device-bridge ⇄ wss://agentflow.website/_agents/_devices/connect │
- (Phase 2)      │   task_dispatch ─► same goosed (POST /reply SSE) ─► result        │
+ (FF_DEVICE_    │   task_dispatch ─► same goosed (POST /agent/start→/reply SSE)     │
+  BRIDGE=1)     │   ─► task_progress/task_complete frames; drain queued on reconnect│
                 └──────────────────────────────────────────────────────────────────┘
                           LLM for both = `flow` gateway (GOOSE_PROVIDER=openai,
                           GOOSE_MODEL=flow, OPENAI_HOST=https://agentflow.website)
@@ -52,8 +59,16 @@ unchanged on purpose.
 - Bundle id: `com.agentflow.desktop` (macOS). Deep-link scheme: `goose://` (kept —
   recipe/resume deep-links + server-emitted URLs depend on it).
 - Updater target default: `github.com/lnlockly/agentflow-goose/releases/latest`.
-- goosed headless dispatch (Phase 2): `POST /reply` (SSE), `/agent/*`, `/sessions/*`,
-  `/schedule/*` in `crates/goose-server`.
+- Device-bridge enrolment: `~/.agentflow/auth.json` (`api_key`, `device_id`,
+  `device_secret`/`enrollment_token`, `ws_url`) — same file the old daemon used.
+- Device-bridge env: `FF_DEVICE_BRIDGE=1` (opt-in until packaged-verified),
+  `AGENTFLOW_DIR` (auth dir override), `AF_API_URL` (REST base, default
+  `https://agentflow.website` → `/_agents`).
+- WS frames (device→server): `hello`, `heartbeat`, `task_progress`,
+  `task_complete`, `task_error`; (server→device): `hello_ack` (rotates
+  `device_secret`), `task_dispatch`, `task_cancel`, `subscribe_stream`/`unsubscribe_stream`.
+- goosed headless dispatch: `POST /agent/start` (→ `Session.id`) then `POST /reply`
+  (SSE, header `X-Secret-Key`), events `Message`/`Finish`/`Error` — `crates/goose-server`.
 - Docs links repointed: `goose-docs.ai` → `docs.agentflow.website`; issues →
   `github.com/lnlockly/agentflow-goose/issues`.
 
@@ -64,8 +79,25 @@ unchanged on purpose.
 | Auto-update can't find asset | asset name mismatch vs `bundleName` | `ui/desktop/src/utils/githubUpdater.ts:32` |
 | macOS app menu actions missing | app-menu lookup returns undefined if app name ≠ `'AgentFlow Desktop'` | `ui/desktop/src/main.ts:2175` |
 | Backend fails to launch | `AgentFlow Desktop Failed to Start` | `ui/desktop/src/main.ts:976` |
+| Bridge never connects | `device bridge skipped: ~/.agentflow/auth.json not enrolled` | enrol device / check auth.json |
+| Bridge connects then drops repeatedly | `[device-bridge] heartbeat timeout — closing` | network / server WS keepalive |
+| Dispatched task fails | `[device-bridge] task … cancelled` or `task_error: task_failed:` frame | `ui/desktop/src/device-bridge/goosedDispatch.ts` |
+| Queued tasks not replayed | `queued-task drain failed` | `ui/desktop/src/device-bridge/queuedTasks.ts` |
+
+## Device-bridge verification status
+The bridge module is unit-verified — 29 vitest tests (auth round-trip + header
+build, SSE framing + `/reply` answer/usage accumulation, WS handshake +
+secret-rotation + task dispatch/cancel/progress, queued-task normalization) pass,
+and the whole module typechecks clean under the repo's strict + `noUnusedLocals`/
+`noUnusedParameters`/`noImplicitReturns` flags. The live wiring (`main.ts`
+`ensureDeviceBridge`) is gated `FF_DEVICE_BRIDGE=1`. End-to-end Mode B against a
+real cabinet dispatch needs a packaged build (matrix b3/b4/b6) — that is the next
+verification step once P1 lands and a signed/packaged artifact exists.
 
 ## Not yet done (tracked follow-ups)
+- **Live-screen stream (b6 "watch live"):** `subscribe_stream`/`unsubscribe_stream`
+  are routed to an `onStreamSubscribe` hook, but the screen-capture publisher
+  (port of computer-mcp `CaptureLoop`) is not yet wired — flag for P3/P4.
 - **Renderer/i18n copy scrub:** ~65 `src/components/*` files + `src/i18n/messages/en.json`
   still say "goose" in user-facing copy (e.g. "Welcome to goose", "goose is thinking…").
   Deferred from Phase 1 to avoid breaking `i18n:check` (compiled-message parity). Needs a
@@ -73,8 +105,8 @@ unchanged on purpose.
 - **Splash frames** `src/images/loading-goose/*.svg` still the goose animation — replace
   with AgentFlow mark.
 - **Code-signing / notarization** certs (Apple + Windows EV) — infra/owner.
-- **Phase 2 device-bridge** (Mode B) — enroll + WS + `task_dispatch`→goosed + live-screen,
-  ported from `agentflow-computer-mcp/ws_client.py`.
+- **Packaged Mode-B e2e:** flip `FF_DEVICE_BRIDGE=1` in a packaged build, enrol via
+  cabinet, dispatch a task, confirm `task_complete` with a real answer artifact.
 
 ## Related
 - [Coder-shim goose bridge](/subsystems/coder-shim-goose-bridge) — pod/cloud coder side
