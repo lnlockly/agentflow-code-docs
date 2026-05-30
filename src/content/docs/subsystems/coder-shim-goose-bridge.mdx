@@ -50,9 +50,13 @@ long-lived service host).
 The shim exposes **two** direct-tools: `agent_dev_brief` (project coder) and
 `agent_run_recipe` (device use-cases — the cabinet "what should this device do?"
 picker). `agent_run_recipe` runs a bundled Goose recipe (`recipes/devices/<id>.yaml`)
-immediately, or registers it with Goose's scheduler when a `cron` is supplied
-(cloud recipes like C2 morning-digest). The recipe manifest is the allowlist + the
-injection boundary.
+immediately, or schedules it when a `cron` is supplied (cloud recipes like C2
+morning-digest). Scheduling registers with `goose schedule add` for list
+visibility AND — under the `FF_BRIDGE_SCHEDULER` flag — with an **in-process
+cron in the long-lived bridge** (`scheduler.ts`) that actually FIRES the recipe
+on each due minute with its persisted params (a headless pod has no goose
+scheduler daemon, so register-only left `Last Run: Never`; PR #1027). The recipe
+manifest is the allowlist + the injection boundary.
 
 ## Files (with line refs)
 | Path | Role |
@@ -112,7 +116,11 @@ injection boundary.
 | `agentflow-agents/src/coder-shim/goose-runner.ts:213` | `buildCoderPrompt` tg_bot branch — instructs goose (PART 1) to fill the handlers from the brief + drop the `SLOT:brief.start_greeting` placeholder, and (PART 2) to write `.env` from `$BOT_TOKEN`, `pip install -r requirements.txt`, launch `nohup python bot.py > bot.out 2>&1 &` DETACHED (never foreground — it polls forever), and self-verify via `pgrep -af bot.py` + `curl …/getMe`, reporting the `result.username`. Generic, no slug/model id |
 | `agentflow-agents/src/coder-shim/bridge.ts:53` | `CoderShimBridge` — connect, hello, hello_ack secret rotation, heartbeat 15s, task routing |
 | `agentflow-agents/src/coder-shim/bridge.ts:82` | `getManifest` — cache the allowlist; fail-closed (null → reject) if the bundle is missing/malformed |
-| `agentflow-agents/src/coder-shim/bridge.ts:239` | `handleRecipeDispatch` — validate → run-once (`runGooseArgv`) or schedule → task_complete/error |
+| `agentflow-agents/src/coder-shim/bridge.ts:239` | `handleRecipeDispatch` — validate → run-once (`runGooseArgv`) or schedule → task_complete/error. Cron branch ALSO registers the entry with the in-process `BridgeScheduler` (with persisted params) when `FF_BRIDGE_SCHEDULER` is on |
+| `agentflow-agents/src/coder-shim/bridge.ts` `recipeEnv` | env for a recipe subprocess — `OPENAI_API_KEY` + `GOOSE_DISABLE_KEYRING` + `AGENTFLOW_API_KEY`(←`AF_API_KEY`)/`AGENTFLOW_BASE_URL`(←`<apiUrl>/_agents`) so the `af_*` MCP extension starts and outbound (Telegram/memory) actually sends. Used by both run-once + scheduled-fire |
+| `agentflow-agents/src/coder-shim/bridge.ts` `fireScheduledRecipe` | the autonomous trigger — reconstructs the run-recipe from a persisted `ScheduleEntry` and runs `buildRecipeRunArgs` (params included) via `runGooseArgv`; returns ok → scheduler stamps `lastRunOk` |
+| `agentflow-agents/src/coder-shim/scheduler.ts:1` | **in-process recipe scheduler (the c5/b7 autonomous-fire fix, PR #1027).** `cronFieldMatches`/`cronMatches` (pure, unit-tested — star/list/range/step, 5+6-field, dom/dow OR-semantics, UTC minute-granular); `BridgeScheduler` — `load()` re-hydrates from `<workspace>/.coder-shim-schedules.json`, `upsert()` persists, `start()` ticks every 20s and fires due entries at most once per wall-clock minute (`lastFiredMinute` de-dupe), `fire` callback runs the recipe + stamps `lastRunAt`/`lastRunOk`. Constructed only when `FF_BRIDGE_SCHEDULER` is on |
+| `agentflow-agents/coder-shim-image/vendor/agentflow-mcp-server/` | vendored compiled dist of `agentflow-mcp-server` (af_* tools) — COPYed to `/opt/agentflow-mcp-server` so the recipe `agentflow` stdio extension can spawn it. Deps come from `/app/node_modules` via `NODE_PATH`. Provenance + re-vendor recipe in `VENDOR.md` (committed past the `dist` gitignore via a `!` exception) |
 | `agentflow-agents/src/coder-shim/main.ts:24` | entrypoint — env → bridge (`recipesDir`=`RECIPES_DIR` ?? `/app/recipes/devices`) |
 | `agentflow-agents/src/coder-shim/queued.ts:39` | `queuedRowToFrame` / `parseQueuedTasksResponse` / `buildQueuedTasksUrl` — cross-replica queued-task drain (BUG A) |
 | `agentflow-agents/src/coder-shim/bridge.ts:213` | `startQueuedPoll` / `drainQueuedTasks` — poll `GET /me/devices/:id/queued_tasks` every 10s, route through live handlers; `inFlight` guard de-dupes a live frame + a polled row |
@@ -129,7 +137,7 @@ injection boundary.
 | `agentflow-agents/coder-shim-image/Dockerfile:1` | image: node 22 + bridge + goose from the fork + **pnpm@9 + yarn@1.22 baked globally** (`npm i -g` → `/usr/local/bin`, on the non-root `pn` user's PATH) so a lockfile-selected manager resolves NATIVELY at every spawn site (install / `next build` / `next dev` / migrations) — node:22-slim ships only npm + corepack, so without this a `pnpm-lock.yaml` foundation `spawn pnpm ENOENT`s. + **python3 + a prebuilt venv `/opt/botvenv`** (aiogram>=3.4 + python-dotenv, chowned to `pn`); the venv bin is PREPENDED to `PATH` so goose's plain `pip install` + `python bot.py` resolve to it. `BOT_VENV=/opt/botvenv`. The image only PROVIDES the runtime — goose installs+launches |
 | `agentflow-agents/coder-shim-image/entrypoint.sh:1` | env check + `node dist/coder-shim/main.js` |
 | `agentflow-agents/.github/workflows/build-coder-shim.yml:1` | self-hosted build → `ghcr.io/<owner>/agentflow-coder-shim` |
-| `agentflow-agents/tests/coder-shim.test.ts:1` | 129 unit tests (incl. tg-runtime `buildGetMeUrl`/`parseGetMe` + `buildReport` tg_bot live/not-live gates + `buildCoderPrompt` tg_bot launch-instructions + clone-status `kind`) (incl. `extractSourceError` on real `next build`/`tsc` fixtures + route-resolve `deriveRoutes`/`failingRoutes`/`buildRouteHealPrompt` + project-db `hasDbDependency`/`dbPortFor`/`upsertEnvVar`/`pickMigrateCommand` + `buildCoderPrompt` edit-mode) (protocol/scope/runner incl. `buildCoderSystemPrompt`/clone-status/report/resolver + recipe allowlist/argv/cron) |
+| `agentflow-agents/tests/coder-shim.test.ts:1` | 146 unit tests (incl. scheduler `cronFieldMatches`/`cronMatches` (star/list/range/step, 5+6-field, dom/dow OR) + `BridgeScheduler` fire-once-per-minute/persist/skip-not-due/remove) (incl. tg-runtime `buildGetMeUrl`/`parseGetMe` + `buildReport` tg_bot live/not-live gates + `buildCoderPrompt` tg_bot launch-instructions + clone-status `kind`) (incl. `extractSourceError` on real `next build`/`tsc` fixtures + route-resolve `deriveRoutes`/`failingRoutes`/`buildRouteHealPrompt` + project-db `hasDbDependency`/`dbPortFor`/`upsertEnvVar`/`pickMigrateCommand` + `buildCoderPrompt` edit-mode) (protocol/scope/runner incl. `buildCoderSystemPrompt`/clone-status/report/resolver + recipe allowlist/argv/cron) |
 
 ## Data flow
 ```
@@ -211,10 +219,20 @@ coder-shim bridge.handleRecipeDispatch
    │  ensureGooseConfig (provider=openai, model=$GOOSE_MODEL=flow)
    │  cron set?
    │    YES → goose schedule add --schedule-id <dev>-<id> --cron <6f> --recipe-source <file>
-   │          → task_complete "scheduled: <id> (<schedule-id>)"
+   │          (for `goose schedule list` visibility) AND, when FF_BRIDGE_SCHEDULER:
+   │          BridgeScheduler.upsert({scheduleId, recipeId, file, params, cron})
+   │          → persisted to <workspace>/.coder-shim-schedules.json
+   │          → task_complete "scheduled: <id> (<schedule-id>) — in-process cron armed"
    │    NO  → goose run --no-session --max-turns N --recipe <file> --params k=v ...
    │          → task_complete (tail) / task_error
    ▼  WS task_complete / task_error  (no clone-status — a recipe is not a build)
+
+In-process scheduler fire (FF_BRIDGE_SCHEDULER, the autonomous trigger):
+   BridgeScheduler tick (every 20s) → cronMatches(entry.cron, now-UTC)?
+     → fireScheduledRecipe(entry): goose run --recipe <file> --params k=v …
+       (env = recipeEnv: OPENAI_API_KEY + AGENTFLOW_API_KEY/BASE_URL → af_* MCP
+        extension at /opt/agentflow-mcp-server sends Telegram/memory)
+     → stamp lastRunAt/lastRunOk + persist. Fires at most once per wall-clock minute.
 ```
 Injection boundary: the recipe id is the only thing that becomes a file path
 (`recipes/devices/<id>.yaml`, id matched `^[a-z0-9-]+$` AND found in the manifest);
@@ -252,6 +270,19 @@ charset-validated before reaching the scheduler.
 - Env (server side): `FF_DAEMON_IMAGE` — `goose` → coder-shim image; full ref →
   verbatim; unset → coder (2026-05-28 hotfix path). **GLOBAL — do not flip in prod
   until the matrix is green.**
+- Env (pod side): `FF_BRIDGE_SCHEDULER` — `1`/`true`/`yes` arms the in-process
+  recipe scheduler (`scheduler.ts`) that ACTUALLY fires scheduled recipes (a
+  headless pod has no goose scheduler daemon). Off by default → the bridge only
+  calls `goose schedule add` (register-only, never fires) — the legacy path,
+  byte-for-byte. ISOLATED per-pod flag; set it on one canary device to verify,
+  do not flip it fleet-wide until the matrix row is green.
+- Env (pod side): `AGENTFLOW_API_KEY` / `AGENTFLOW_BASE_URL` — the recipe
+  `agentflow` stdio extension's `env_keys`. The bridge's `recipeEnv()` injects
+  them from `AF_API_KEY` + `<apiUrl>/_agents` when not already set on the pod, so
+  the bundled `/opt/agentflow-mcp-server` extension starts and outbound steps
+  send. `AGENTFLOW_API_KEY` MUST be an `af_live_*` token or the MCP server
+  refuses to start. `NODE_PATH=/app/node_modules` (set in the Dockerfile) lets
+  the extension resolve its deps.
 - Env (server side): `FF_GOOSE_CANARY` — `1`/`true`/`yes` enables provisioning
   `template:'goose'` hosted devices (the isolated per-device canary). When unset,
   `POST /me/hosted-devices {template:'goose'}` returns 403 `goose_canary_disabled`.
@@ -310,9 +341,9 @@ charset-validated before reaching the scheduler.
 | goose device pod `ImagePullBackOff` | `failed to fetch anonymous token ... 401 Unauthorized` for `lnlockly/agentflow-coder-shim` | the coder-shim image is PRIVATE; the daemon STS must carry `imagePullSecrets: [{name: ghcr-pull}]` (added in `me-hosted-devices.ts` `renderDaemonManifest`, PR #956). The secret is applied per-tenant by `tenant-bootstrap.ts` `apply_ghcr_pull`. Legacy `agentflow-daemon-*` images are public so this only bit goose devices / fresh nodes without a cached image. |
 | task_error `recipe_run_failed` | report `recipe_run_failed: <goose tail>` | goose non-zero on `goose run --recipe` — read the tail (model/gateway/recipe issue) |
 | task_error `recipe_schedule_failed` | report `recipe_schedule_failed: <tail>` | `goose schedule add` non-zero — read the tail (cron/scheduler issue) |
-| Scheduled recipe registers OK but never autonomously fires | `[coder-shim] recipe <id> schedule <recipe>` succeeds, `task_complete scheduled: ...`, but `goose schedule list` shows `Last Run: Never` forever | **OPEN gap (blocks device c5/b7 autonomous):** `bridge.ts:handleRecipeDispatch` cron branch calls `goose schedule add`, which only persists the job to goose's store. The headless coder-shim pod runs goose only as one-shot CLI invocations — there is NO long-lived goose scheduler loop, and the `services-status` backend is deprecated/not started. Nothing triggers the cron. Fix options: (a) bridge runs its own in-process cron (`setInterval` + cron-match → `runGooseArgv(buildRecipeRunArgs)` with persisted params), re-hydrated on boot from a backend store; (b) supervise a goose scheduler service in the entrypoint. Verified live 2026-05-29 (device 31eb3b59, c2-morning-digest `*/1 * * * *`, Last Run: Never after 3 min). |
-| Scheduled recipe fires with empty required params | recipe run with blank `{{niche}}`/`{{url}}` etc. | **OPEN gap:** `recipes.ts:buildScheduleArgs` deliberately omits `--params` ("scheduler uses recipe defaults"), but every cloud recipe (c1–c6) has a required-no-default param. Persist `recipe.params` with the schedule and pass them on fire. Pairs with the scheduler-fire gap above. |
-| Outbound recipe `done` with no effect (no Telegram / no memory) | pod `ls /opt/agentflow-mcp-server/dist/index.js` → missing; recipe `Failed to start extension 'agentflow'` | **OPEN gap (blocks device c4 Telegram/c5/c6):** the coder-shim image (`coder-shim-image/Dockerfile` = node22 + git + goose only) never bundles `agentflow-mcp-server`, and `renderDaemonManifest` sets `AF_API_KEY`/`AF_API_URL` but not the recipe's `env_keys` `AGENTFLOW_API_KEY`/`AGENTFLOW_BASE_URL`. The af_* stdio extension can't start → outbound steps no-op (recipe never crashes → exit 0 → `status=done`). Fix: COPY agentflow-mcp-server dist into the image + map `AGENTFLOW_API_KEY`=`AF_API_KEY`, `AGENTFLOW_BASE_URL`=`$AF_API_URL/_agents`. Read-only recipes (l4-research-brief: `developer`+`computercontroller`) are unaffected — verified producing a real 5957-byte brief on device 31eb3b59. |
+| Scheduled recipe registers OK but never autonomously fires | `task_complete scheduled: ...` but `goose schedule list` shows `Last Run: Never` forever; with the in-process scheduler ON instead look for `[coder-shim] scheduler fired <id>` + `scheduler ran <id> ok=true` | **FIXED (PR #1027, flag `FF_BRIDGE_SCHEDULER`):** `bridge.ts:handleRecipeDispatch` cron branch only called `goose schedule add`, which persists the job to goose's store; the headless pod runs goose as one-shot CLI calls with NO long-lived goose scheduler loop, so nothing fired the cron. Fix = option (a): an in-process cron in the long-lived bridge (`scheduler.ts` `BridgeScheduler`) — ticks every 20s, `cronMatches()` per due minute → `runGooseArgv(buildRecipeRunArgs)` with the PERSISTED params, re-hydrated on boot from `<workspace>/.coder-shim-schedules.json`. `goose schedule add` is still called for `goose schedule list` visibility, but the in-process loop is what fires (so the visible "Last Run" is the entry's `lastRunAt`, not goose's store). Gated by `FF_BRIDGE_SCHEDULER` — off → byte-for-byte the legacy register-only path. Original repro: device 31eb3b59, c2-morning-digest, Last Run Never after 3 min, 2026-05-29. **Needs the coder-shim image rebuilt + the flag set on an isolated device to live-verify.** |
+| Scheduled recipe fires with empty required params | recipe run with blank `{{niche}}`/`{{url}}` etc. | **FIXED (PR #1027):** `recipes.ts:buildScheduleArgs` still omits `--params`, but the in-process fire path uses `buildRecipeRunArgs` (which DOES include `--params`) with the params captured + persisted in the `ScheduleEntry` at schedule time, so a fired recipe gets its real `{{niche}}`/`{{url}}`. The `buildScheduleArgs` drop is now moot for firing. |
+| Outbound recipe `done` with no effect (no Telegram / no memory) | pod `ls /opt/agentflow-mcp-server/dist/index.js` → present after the rebuild; if a recipe still no-ops check the goose log for `Failed to start extension 'agentflow'` / `AGENTFLOW_API_KEY ... Refusing to start` | **FIXED (PR #1027):** the image (`coder-shim-image/Dockerfile`) now COPYs the vendored `agentflow-mcp-server` compiled dist to `/opt/agentflow-mcp-server` (`NODE_PATH=/app/node_modules` resolves its only deps `@modelcontextprotocol/sdk` + `zod` from the bridge's node_modules — no second npm install), and `bridge.ts recipeEnv()` injects `AGENTFLOW_API_KEY`=`AF_API_KEY` + `AGENTFLOW_BASE_URL`=`<apiUrl>/_agents` into every recipe run (immediate + scheduled), forwarded to the stdio extension via the recipe's `env_keys`. Verified locally: the dist boots stdio, "31 tools registered". Read-only recipes (l4: `developer`+`computercontroller`) were always unaffected. **Needs the coder-shim image rebuilt + a live af_* outbound (e.g. a real Telegram send) to fully verify.** AF_API_KEY must be an `af_live_*` token (the MCP server refuses otherwise). |
 | Goose device never connects, ws-200 loop | `ws error: Unexpected server response: 200` then `ws closed; reconnecting in 4.0s` | `main.ts` built `wsUrl` without the `/_agents` ingress prefix — the bare path hit the landing proxy (HTTP 200, no upgrade). Fixed: `wsUrl = ${wsHost}/_agents/_devices/connect`. |
 | Coder build exits 0 but workspace untouched (placeholder still served) | goose cli log ends with `todo_write`+`tree` then a plan and "ready to proceed"/"Готов перейти к правкам" and **no `▸ write`/`text_editor` tool line**; `grep -rl "<brand>" /workspace/<slug>` returns nothing | `goose-runner.ts:74` — the framed `-t` + `GOOSE_MODE: auto` were not enough: `GOOSE_MODE: auto` only auto-APPROVES tool calls, it does not stop the model ending its turn after planning, and headless `goose run` has no second turn for a human to say "go ahead". Verified live on a tenant pod 2026-05-29 (project #1592, brief #734h1m5t): goose wrote a todo, ran `tree`, printed a plan, exited 0, 0 file edits. Fixed (PR #966): `buildCoderSystemPrompt` passed via `--system` forbids ending the turn after planning/reading and mandates editor-tool writes + a grep self-verify before finishing; `buildCoderPrompt` reworded to an imperative "implement … by EDITING". Re-verified on the same brief: goose wrote `src/config/landing.config.ts` (197 lines) with full brief content (Чёрный Кот ×8, Рубинштейна ×9, prices, phone). **Needs the coder-shim image rebuilt (`.github/workflows/build-coder-shim.yml`) on merge.** |
 | Coder build runs tools but writes nothing / picks `apps__create_app` | goose cli log `Tool call started ... apps__create_app` (not `developer__text_editor`) | tool-selection drift from extension bloat (8 extensions/17 tools enabled vs goose's 5/50 recommendation). The framed prompt + `GOOSE_MODE: auto` steer it back to the developer editor tools. |
