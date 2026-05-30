@@ -28,7 +28,7 @@ Hosted Device — это StatefulSet в персональном vcluster пол
 | `agentflow-agents/src/routes/me-hosted-devices.ts:451` | `resolveCreateKind` — named template ⇒ `kind:'daemon'` (фикс footgun: `{template:'goose'}` без kind → больше не python-заглушка) |
 | `agentflow-agents/src/routes/me-hosted-devices.ts:200` | `renderDaemonManifest` — образ daemon |
 | `agentflow-agents/src/services/bootstrap-schema.ts` | таблица `hosted_devices` |
-| `agentflow-landing/src/pages/CabinetHostedDeviceNew.tsx` | форма создания (имя, размер) |
+| `agentflow-landing/src/pages/CabinetHostedDeviceNew.tsx` | форма создания (имя, размер, kind, preinstall). Phase 4 (cloud reframe): копия подаёт облако как «агент 24/7», размеры названы по ЗАДАЧЕ (лёгкий/рабочий/мощный), ядра/память/диск — мелкий текст. `size` slug (`small`/`medium`/`large`) → payload НЕ менялся, только подписи; строки вынесены в `cabinet.hosted.*` ключи `src/i18n/{ru,en,zh}.json` |
 | `agentflow-landing/src/pages/CabinetHostedDeviceDetail.tsx` | детальная страница (pulse, events, terminal, logs, power) |
 | `agentflow-landing/src/styles/hosted-live.css` | namespace `.hlive__*` |
 | `agentflow-computer-mcp/Dockerfile` | образ daemon (Xvfb + Chromium + Playwright + tini) |
