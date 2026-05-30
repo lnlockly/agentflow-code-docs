@@ -1,0 +1,88 @@
+---
+title: "Cabinet navigation IA (core-5 + Ещё disclosure)"
+description: "How the authenticated cabinet sidebar + mobile bottom bar are structured: 5 core surfaces first, everything secondary tucked behind a collapsible group."
+---
+
+# Cabinet navigation IA
+
+## TL;DR
+
+The authenticated cabinet nav leads with the 5 surfaces the owner named as
+core — Проекты, Приложение (desktop agent), Облако (24/7), LLM-кабинет,
+Маркетплейс — under an «Основное» group, with a pinned «Главная» home above
+it. Everything else (agents, flows, device skills, the `/apps` launcher,
+referrals, billing, settings) is tucked behind a collapsible «Ещё»
+disclosure that defaults closed. All nav lives in one component;
+`/apps` is the overflow launcher and the avatar dropdown carries
+profile/settings/billing/logout.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:110` | `HOME_ITEM`, `CORE_NAV`, `MORE_NAV` definitions |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:165` | `BOTTOM_NAV` (mobile 5-tab bar) |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:234` | `moreOpen` «Ещё» disclosure state (localStorage `agentflow.sidebar.more-open`) |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:142` | `ADMIN_NAV` (shown only on `/admin/*` for `is_admin`) |
+| `agentflow-landing/src/pages/AppsLauncher.tsx:83` | `/apps` overflow grid (`SECTIONS`) |
+| `agentflow-landing/src/styles/dark-tokens.css:149` | `.af-sb__section-title` + `.af-sb__section-toggle` (disclosure header) |
+| `agentflow-landing/src/i18n/{ru,en,zh}.json` | `app.shell.nav.{home,application,cloud,llm_cabinet,more}`, `app.shell.section.{core,more}` |
+
+## Data flow
+
+```
+AppShellV2 (every cabinet route)
+  ├─ Главная            /cabinet                       (pinned, HOME_ITEM)
+  ├─ «Основное» (CORE_NAV, always open)
+  │   ├─ Проекты        /projects
+  │   ├─ Приложение     /cabinet/devices
+  │   ├─ Облако         /cabinet/devices/hosted/new
+  │   ├─ LLM-кабинет    /llm-cabinet
+  │   └─ Маркетплейс    /marketplace
+  ├─ «Ещё» ▸ (MORE_NAV, collapsed by default, persisted)
+  │   ├─ Мои агенты     /account/agents
+  │   ├─ Сценарии       /my/flows
+  │   ├─ Навыки         /cabinet/devices/skills
+  │   ├─ Приложения     /apps          ── overflow launcher (AppsLauncher)
+  │   ├─ Партнёрка      /account/referrals
+  │   ├─ Биллинг        /account/usage   (also in avatar menu)
+  │   └─ Настройки      /account/settings (also in avatar menu)
+  ├─ «Десктоп-агент»   GitHub release download links
+  └─ avatar dropdown   Profile · Settings · Billing · [Admin] · Logout
+
+mobile bottom bar (BOTTOM_NAV, 5): Главная · Проекты · Приложение · Маркетплейс · Ещё(/apps)
+admin: on /admin/* AND is_admin → ADMIN_NAV replaces the workspace groups
+```
+
+## DB / Env / API
+
+- Tables: none (pure client IA).
+- Env: none.
+- Routes referenced (all `RequireAuth`): `/cabinet`, `/projects`,
+  `/cabinet/devices`, `/cabinet/devices/hosted/new`, `/llm-cabinet`,
+  `/marketplace`, `/account/agents`, `/my/flows`,
+  `/cabinet/devices/skills`, `/apps`, `/account/{referrals,usage,settings}`.
+- localStorage: `agentflow.sidebar.more-open` (disclosure state).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Core surface missing from sidebar | `CORE_NAV` (grep the array) | `AppShellV2.tsx:110` — add the `NavItem` |
+| «Ещё» won't expand | `af-sb__section-toggle` | `AppShellV2.tsx` toggle button + `dark-tokens.css:149` |
+| Nav label shows raw key (`app.shell.nav.x`) | missing i18n key | add to all three of `src/i18n/{ru,en,zh}.json` |
+| Cut feature reappears in nav (souls / квесты / singularity) | `souls` / `quests` / `Singularity` in a NAV array | keep them out of `CORE_NAV`/`MORE_NAV` (removed in landing #545/#547) |
+
+## History
+
+- landing #545/#547 — first declutter pass: removed Singularity / Души /
+  Квесты / legacy marketplace dupe; regrouped into four outcome groups.
+- Category H `h-nav-declutter` (2026-05-30) — collapsed the four groups into
+  «Основное» (the core 5) + a single collapsible «Ещё», promoted the
+  previously hidden `/llm-cabinet` into the primary nav, surfaced Cloud as a
+  distinct entry. Map: `plans/autonomous/_cat-h-ia-map.md`.
+
+## Related
+- [Devices — unified routing](/subsystems/devices-unified)
+- [LLM cabinet frontend](/subsystems/llm-cabinet-frontend)
+- [Projects create flow](/subsystems/projects-create-flow)
