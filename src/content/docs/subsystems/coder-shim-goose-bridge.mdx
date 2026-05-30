@@ -100,7 +100,7 @@ manifest is the allowlist + the injection boundary.
 | `agentflow-agents/src/coder-shim/pipeline.ts:396` | ROUTE-RESOLVE GATE (step 4d, Next.js only) — after `next start` + the `/` probe, derive the brief's expected pages (`deriveExpectedPlan`, fail-open) → probe **EXPECTED ∪ DECLARED** (`mergeRouteSets`) → `failingRoutes`; failures feed a `buildExpectedRouteHealPrompt` goose pass (CREATE the missing page + full CRUD) → rebuild (devDeps re-installed, must compile) → restart → re-probe, ≤ adaptive `maxHeal`. After the budget `classifyRouteFailures`: HARD remaining → `ok:false error:'route_unresolved'` (failed); SOFT-only (brief page still missing) → promote + log. Heals goose UP to the full app past its single-pass ceiling. Generic — brief-derived, no slug; tg_bot/Vite skip it |
 | `agentflow-agents/src/coder-shim/pipeline.ts:219` | BUILD-VALIDATE + SELF-HEAL loop (step 4b) — after goose edits + a single install, run the compile check; on failure feed the SOURCE error (via `extractSourceError`) to a goose heal-pass and retry up to an ADAPTIVE budget (`healBudget`: base 3 → 5-6 for multi-file apps, shared with the route gate). `ok:true`/promote ONLY on a clean build; still-broken → `ok:false error:'build_failed'` with the compile tail so the project is marked `failed` (visible) not a silent running-500 |
 | `agentflow-agents/src/coder-shim/project-db.ts:48` | `hasDbDependency` (pure) — true if package.json (deps+devDeps) pulls a DB client (`pg`/`postgres`/`drizzle-orm`/`@prisma/client`/`kysely`/`slonik`/`knex`/`sequelize`/`typeorm`). Static landings have none → skipped. Unit-tested |
-| `agentflow-agents/src/coder-shim/project-db.ts:58` | `buildDatabaseUrl`/`dbPortFor`/`upsertEnvVar`/`pickMigrateCommand` (pure) — loopback URL `postgres://postgres@127.0.0.1:<port>/postgres`; per-preview-port DB port (`40000+previewPort%20000`, no collisions/stable across restarts); merge a `.env` var without clobber; pick the migrate cmd (npm `db:push`/`db:migrate` script > `prisma db push` > `drizzle-kit push` > null→raw `.sql`). Unit-tested |
+| `agentflow-agents/src/coder-shim/project-db.ts:58` | `buildDatabaseUrl`/`dbPortFor`/`pickDbPort`/`upsertEnvVar`/`pickMigrateCommand` (pure-ish) — loopback URL `postgres://postgres@127.0.0.1:<port>/postgres?sslmode=disable` (PR #1033, ssl off); per-preview-port DB port (`40000+previewPort%20000`); merge a `.env` var without clobber; pick the migrate cmd (npm `db:push`/`db:migrate` script > `prisma db push` > `drizzle-kit push` > null→raw `.sql`). **`pickDbPort(base,dataDir)` (PR #1034):** on a shared on-demand daemon (warm pool down) two FRESH projects could map to the same `dbPortFor` port and the 2nd would REUSE the 1st's PGlite (cross-project data bleed) — so it keeps the base port when this project already has a data dir (its own DB), but hops to the next free port when fresh + the base port is a foreign DB. Unit-tested |
 | `agentflow-agents/src/coder-shim/project-db.ts:185` | `detectDbNeed` — read package.json + grep src for `DATABASE_URL` usage → `{needs, deps, scripts, hasDrizzleConfig, hasPrismaSchema}`. needs = a DB dep OR code reading `DATABASE_URL` (catches the #1614 shape where goose hand-rolls `lib/db.ts` without a matching dep) |
 | `agentflow-agents/src/coder-shim/project-db.ts:245` | `startEmbeddedDb` — idempotent: if `127.0.0.1:<dbPort>` already accepts (a prior task's detached DB survived a restart/edit), reuse it; else spawn `pglite-launcher.js` DETACHED with the IMAGE's node, CWD=data-dir (so `killProjectDevServer` leaves it up), wait for the socket. `injectDatabaseUrl` writes `.env`+`.env.local`; `runMigrations` runs the picked cmd then raw `.sql` (best-effort, non-fatal) |
 | `agentflow-agents/src/coder-shim/pglite-launcher.ts:33` | standalone entrypoint — `PGlite.create(dataDir)` (file-backed Postgres-in-WASM) + `PGLiteSocketServer` on `127.0.0.1:<port>`; SIGTERM/SIGINT → clean stop. Resolves `@electric-sql/pglite*` from `/app/node_modules` (image deps); the project speaks only the wire protocol so its node_modules needs no pglite. **PR #1033:** `maxConnections:64` (the default 1 destroyed every served-`pg.Pool` socket past the first), `uncaughtException`/`unhandledRejection` guards (a stray socket error no longer exits the listener), and `patchSslReject` — peeks the leading 8 bytes (paused-mode `read(8)`+`unshift`, so the non-SSL path is byte-for-byte unchanged) and replies `'N'` to an SSLRequest so an SSL client fails fast instead of hanging |
@@ -243,20 +243,20 @@ charset-validated before reaching the scheduler.
 ## DB / Env / API
 - Tables: none new. Consumes `projects` via `/internal/projects/:id/clone-status`.
 - Per-project DB (step 4a-db): `DATABASE_URL` is **injected by the pipeline at
-  runtime**, not a static secret — `postgres://postgres@127.0.0.1:<dbPort>/postgres`
+  runtime**, not a static secret — `postgres://postgres@127.0.0.1:<dbPort>/postgres?sslmode=disable`
   pointing at an embedded **PGlite** (Postgres-in-WASM, file-backed at
   `/workspace/<slug>/.pglite-data`) served over a TCP socket by `pglite-launcher.js`.
-  Persists for the pod's lifetime (survives dev-server restarts + edits; lost on
-  pod recycle). The pod can't `apt install postgres` and we keep everything on our
-  own infra (no external managed DB), so this embedded path is the zero-infra
-  default. Deps `@electric-sql/pglite` + `@electric-sql/pglite-socket` ship in the
-  image (`package.json` dependencies).
-- **Durable follow-up (not built):** when a project really launches (not just a
-  preview/demo), cross-pod-recycle persistence comes from a **dedicated
-  projects-Postgres on our own cluster** — a per-project database/instance,
-  isolated from the platform's `agentflow-postgres`. NOT an external managed
-  service. The swap point is `startEmbeddedDb` → a provisioner that hands back a
-  cluster connection string; the rest of step 4a-db (inject + migrate) is unchanged.
+  The pod can't `apt install postgres` and we keep everything on our own infra
+  (no external managed DB), so this embedded path is the chosen default.
+  Deps `@electric-sql/pglite` + `@electric-sql/pglite-socket` ship in the image.
+- **Durability (owner decision 2026-05-30 — PGlite STAYS, durable via PVC; no
+  switch to cluster-PG):** `.pglite-data` lives under `/workspace`, which is the
+  STS `volumeClaimTemplates` 10Gi local-path PVC (`me-hosted-devices.ts`
+  `renderDaemonManifest`), so a project's data **survives pod restart / image
+  roll / reschedule** — the PVC stays bound and `DbSupervisor.ensureAll()`
+  re-spawns PGlite on boot against the same data dir. The supervisor's
+  keep-alive (PR #1033) is the accepted permanent runtime cost of this model.
+  Data is lost only if the PVC itself is deleted (project teardown).
 - Env (pod side, all already on the daemon pod): `AF_API_KEY`, `AF_API_URL`
   (default `https://agentflow.website`), `AF_DEVICE_ID`, `AF_DEVICE_TOKEN`,
   `AF_ENROLLMENT_TOKEN`, `AF_INTERNAL_API_SECRET`, `GOOSE_MODEL` (default `flow`),
