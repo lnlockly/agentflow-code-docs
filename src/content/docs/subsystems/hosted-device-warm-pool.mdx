@@ -15,6 +15,17 @@ DB row flips `is_warm=true` for the next claim. A 30-second refill
 ticker in `auto-pinger` keeps the pool topped up to
 `HOSTED_WARM_POOL_TARGET` (default 5).
 
+:::caution[Pool PAUSED in prod since 2026-05-30 — `HOSTED_WARM_POOL_TARGET=0`]
+The warm pool is currently disabled (`HOSTED_WARM_POOL_TARGET=0` in the
+`agentflow-agents` deployment env / `k8s/agentflow-agents.yaml`). Builds are
+NOT affected — project approve falls back to **on-demand** daemon provisioning
+(see below). The pool stays paused until the warm daemon image idles instead of
+exiting on a credential-less selftest. See "Incident 2026-05-30" + the new
+failure-mode rows. The `af-pool` namespace + agents RBAC ARE restored
+(`k8s/af-pool.yaml`), so flipping the target back to `5` re-enables refill once
+the image is fixed.
+:::
+
 ## Files
 
 | Path | Role |
@@ -31,6 +42,9 @@ ticker in `auto-pinger` keeps the pool topped up to
 | `agentflow-agents/src/routes/internal-hosted-pool.ts:1` | Ops: stats / refill / drain |
 | `agentflow-agents/src/services/auto-pinger.ts` | 30 s `runHostedPoolRefillTick` interval |
 | `agentflow-agents/migrations/2026-05-27b-hosted-devices-warm-pool.sql:1` | Schema migration |
+| `agentflow-agents/k8s/af-pool.yaml:1` | **af-pool namespace + agents-SA Role/RoleBinding** (sts/svc/pods/exec in af-pool) — restored 2026-05-30 |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:provisionDaemonOnDemand` | Exported on-demand provision helper (warm-claim → this) — reused by the project clone fallback |
+| `agentflow-agents/src/services/project-clone.ts:pickDaemonDevice` | Approve/clone fallback: no owned + no warm daemon → `provisionDaemonOnDemand` (no more hard `no_hosted_daemon`) |
 
 ## Data flow
 
@@ -112,7 +126,7 @@ ticker in `auto-pinger` keeps the pool topped up to
 ### Env
 | Variable | Default | Purpose |
 |---|---|---|
-| `HOSTED_WARM_POOL_TARGET` | `5` | Unclaimed warm rows the reconciler maintains. Clamped `[1, 50]`. |
+| `HOSTED_WARM_POOL_TARGET` | `5` (prod: **`0` = paused**, see Incident 2026-05-30) | Unclaimed warm rows the reconciler maintains. `0` ⇒ refill tick is a no-op. Clamped `[1, 50]` when ≥1. |
 | `HOSTED_POOL_TICK_MS` | `30000` | Refill loop cadence (min 5 s). |
 | `HOSTED_POOL_NAMESPACE` | `af-pool` | k8s namespace warm pods live in. |
 | `HOSTED_POOL_RECYCLE_ENABLED` | `true` | Set `false` to opt back into hard-delete on DELETE. |
@@ -173,12 +187,54 @@ ticker in `auto-pinger` keeps the pool topped up to
               └───────────┘
 ```
 
+## Incident 2026-05-30 — empty pool blocked ALL daemon-less builds (P0)
+
+Root cause chain:
+1. The **`af-pool` namespace was never created** on ff-france, and the
+   `agentflow-agents` SA had **no RBAC** to create StatefulSets there. Every
+   refill tick since 2026-05-26 failed with `namespaces "af-pool" not found`
+   (`hosted_pool_events.refill_apply_failed` ×5). The 5 warm rows stuck at
+   `status='error'`, pool permanently empty.
+2. `claimWarmDevice` found nothing → `PoolEmptyError`. The project approve path
+   (`project-clone.ts:pickDaemonDevice`) only returns a daemon ALREADY owned by
+   the user, so a user with no pre-existing daemon got a hard
+   `no_hosted_daemon` → could not approve → could not build.
+3. `countWarmUnclaimed` counts ALL `is_warm` rows regardless of status, so the
+   5 stuck `error` rows ALSO blocked refill from creating replacements.
+
+Two-part fix:
+- **Code (primary):** `triggerProjectClone` now falls back to
+  `provisionDaemonOnDemand` (the proven `POST /me/hosted-devices` kind=daemon →
+  tenant-vcluster `kubectl apply` path) when there is no owned daemon AND no
+  claimable warm row. The `user_devices` + `hosted_devices` rows are written
+  synchronously, so the next `pickDaemonDevice` finds them; the clone task
+  queues and the daemon drains it on first WS connect (~60 s pod boot). An
+  empty/dead warm pool NEVER hard-blocks a build again. Generic, no per-slug.
+- **Infra (secondary):** `k8s/af-pool.yaml` (re)creates the `af-pool` namespace
+  + a namespaced `Role`/`RoleBinding` granting the agents SA sts/svc/pods/
+  pods-exec in af-pool. After apply, `kubectl auth can-i create statefulsets
+  -n af-pool --as=…agentflow-agents` = `yes`; refill emits `refill_created`
+  (no more `refill_apply_failed`). The 5 stuck `error` rows were soft-deleted.
+
+Remaining gap (separate repo): warm pods still **CrashLoopBackOff** — the warm
+daemon image runs its selftest, finds no `auth.json`/`computer-scope.toml`
+(warm pods are credential-less by design) and **exits 1**. `claimWarmDevice`
+would hand a user that dead pod. So the pool is **paused** (`HOSTED_WARM_POOL_TARGET=0`)
+until `agentflow-computer-mcp` ships a "warm idle" entrypoint that idles instead
+of exiting when `AF_POOL_WARM=true` and no creds are present. (Note also:
+`claim.ts` never re-credentials the claimed pod — the `manifest.ts` comment
+"patch the pod env / restart at claim time" was never implemented; both must be
+addressed before re-enabling.)
+
 ## Failure modes
 
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
 | New device takes 60 s+ even though pool target = 5 | `hosted-pool: count query failed` | `services/hosted-pool/refill.ts:countWarmUnclaimed` — DB pool exhaustion |
 | `runHostedPoolRefillTick` ticks but no rows appear | `hosted-pool: refill apply failed` in `hosted_pool_events` | `af-pool` namespace missing or ResourceQuota exhausted |
+| Refill apply fails with `namespaces "af-pool" not found` / Forbidden on statefulsets | `refill_apply_failed` detail `exit=1 stderr=…af-pool…` | Apply `k8s/af-pool.yaml` (namespace + agents-SA Role/RoleBinding) |
+| Warm pods CrashLoopBackOff, never Ready | pod log `auth_file FAIL: …auth.json not found` + `FAIL: 2 required check(s) failed` | warm daemon image (`agentflow-computer-mcp` entrypoint) must idle when `AF_POOL_WARM=true` — keep `HOSTED_WARM_POOL_TARGET=0` meanwhile |
+| Daemon-less user can't approve a project | `no_hosted_daemon` in approve response (`project-clone.ts`) | Fixed: on-demand fallback in `triggerProjectClone`; if it ALSO fails, see event `log` msg `on-demand daemon provision failed: …` |
 | Recycle silently falls back to hard-delete | `hosted_pool_events.kind = 'recycle_fallback_hard_delete'` | wipe exec failed — pod was already CrashLoop. Check `me-hosted-devices.ts:DELETE` audit row's `detail` |
 | Pool grows unbounded | Manual: `SELECT COUNT(*) FROM hosted_devices WHERE is_warm` | `HOSTED_WARM_POOL_TARGET` env mis-set; clamp is 50 but a drift row outside reconciler still adds |
 | Claim returns empty pool for hours | `PoolEmptyError` in route log; `hosted_pool_events.kind='refill_apply_failed'` count up | Inspect `af-pool` namespace events; check `kubectl get sts -n af-pool` |
