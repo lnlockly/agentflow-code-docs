@@ -49,12 +49,17 @@ The official @AIAgentFlow_bot has **no webhook** (`getWebhookInfo.url === ""`) a
 - `callback_data` buttons on a card sent from the official bot are delivered to `agentflow-bot`, NOT to `tg-bot-poller` → the studio `tg_bot_callback_queue` → `tg-bot.handle_callback` pipeline never sees them.
 - Working buttons on the official bot must use **approval LINKS / URL buttons**: either the AP fork's `wait_for_approval` (hosted approve/reject links, no custom handler) or an `agentflow-agents` HTTP endpoint the URL button points at. Do not rely on `callback_data` + the poller for official-bot cards.
 
-**Shipped (PR #1005, studio interim path):**
+**Shipped (PR #1005, studio interim path) — prefetch-safe + single-use:**
 | Path | Role |
 |---|---|
-| `agentflow-agents/src/services/kwork-approval-token.ts` | HMAC(`AUTH_JWT_SECRET`) sign/verify of compact, expiring approval tokens (`send`/`skip`/`custom`). Constant-time compare. |
-| `agentflow-agents/src/routes/public-kwork-approval.ts` | `GET /public/kwork/respond?t=<token>` → ✅ `kwork-inbox.respond_to_want` (dry-run-safe), ✕ skip, ✏️ custom-text form. Idempotent; in-browser HTML confirm. Gated `FF_KWORK_TG_PIPELINE=1`. No session auth — the HMAC token IS the auth. |
-| `agentflow-agents/src/services/graph-executor/handlers/tg-bot-send-card.ts` | `approval:'links'` mode (kwork): official bot (`bot:'platform'`), signed URL buttons, upserts `kwork_lead_state` `want:<id>` with `{kind:'want_respond', replies, dry_run}`. |
+| `agentflow-agents/src/services/kwork-approval-token.ts` | HMAC(`AUTH_JWT_SECRET`) sign/verify of compact tokens (`send`/`skip`/`custom`), 1h TTL, scoped to the pending-ticket id. Constant-time compare. |
+| `agentflow-agents/src/routes/public-kwork-approval.ts` | `GET /public/kwork/respond?t=<token>` renders a **CONFIRM page and mutates nothing** (Telegram URL prefetch can't auto-fire). `POST` performs the action ONCE: ✅ `kwork-inbox.respond_to_want` (dry-run-safe) / ✕ skip / ✏️ custom-text. Single-use via the armed-ticket claim; in-browser HTML; gated `FF_KWORK_TG_PIPELINE=1`. The HMAC token IS the auth. |
+| `agentflow-agents/src/db/schema.ts` + `db/migrations/0079_kwork_pending_responses.sql` | `kwork_pending_responses` — one `armed` ticket per card; POST atomically claims `armed`→terminal (`sent`/`skipped`/`approved_dryrun`/`send_failed`) + `consumed_at`. Migration via psql post-merge (CI doesn't run migrations). |
+| `agentflow-agents/src/services/graph-executor/handlers/tg-bot-send-card.ts` | `approval:'links'` mode (kwork): arms a pending ticket → signs link tokens with its id → official bot (`bot:'platform'`) → stamps card msg id. |
+
+**Prefetch footgun (why GET ≠ action):** Telegram + clients prefetch URLs on render. A plain `GET ...?action=send` would auto-post the отклик with no tap. So the GET only renders a confirm page; the post happens on the confirm `POST`, and the single-use ticket makes replays no-op.
+
+**Legacy callback path:** `tg-bot.handle_callback` does NOT handle want-respond cards (`kwork.reply:<want_id>` → `loadKworkLead(dialog_id)` mismatch → `lead_state_missing`). The links path bypasses the callback handler entirely.
 
 Bot identity note: `AGENTFLOW_BOT_TOKEN` = **@AIAgentFlow_bot** (id 8536951969) — the SAME token the public `agentflow-bot` deployment runs, i.e. the real official bot. `@agentflow_bot` in template copy resolves to a SEPARATE bot `@Agentflow_bot` (id 7906381977) with NO token in the cluster — stale copy, do not target it. Link base: `KWORK_APPROVAL_BASE_URL` (default `https://agentflow.website/_agents`).
 
