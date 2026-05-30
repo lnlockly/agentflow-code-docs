@@ -99,6 +99,8 @@ admin: on /admin/* AND is_admin → ADMIN_NAV replaces the workspace groups
 | `/cabinet/agents` redirects to `/account/agents` instead of the hub | duplicate `<Route path="/cabinet/agents" …Navigate…>` | remove the stale redirect in `main.tsx` — the hub route must be the only one |
 | Core «Агенты» and «Мои агенты» both show «Агенты» | both NavItems use key `agents` | core uses `agents`, MORE_NAV uses `my_agents` — keep the keys distinct |
 | Hub tap targets render at 36px on mobile | `.af-shell-v2 button { min-height: 36px }` floor wins | `cabinet-agents.css` uses `min-height: 44px !important` on chips/refresh |
+| Deprecated surface re-surfaces in cabinet (farm / inbox) | `to="/farm"` or `to="/inbox"` in a nav/home/apps array | keep entry points out of `HomeWidgetsRow.tsx`, `AppShellV2.tsx` topbar, `AppsLauncher.tsx` (removed in landing #566) |
+| Home Balance card renders half-width | `.pdp .pd-widgets-row` not `grid-template-columns:1fr` | `cabinet-dashboard.css` — single-hero grid after the marketing card removal |
 
 ## History
 
@@ -124,6 +126,19 @@ admin: on /admin/* AND is_admin → ADMIN_NAV replaces the workspace groups
   renamed to `my_agents`, plus the `cabinet.agents.*` set. Removed the stale
   `/cabinet/agents → /account/agents` redirect. Wizard + autoposting are a
   follow-up. Concept: `agentflow/CABINET-CONCEPT.html` §5.2.
+- **Deprecation sweep** (2026-05-30, landing PR #566) — pulled cabinet entry
+  points to surfaces that are not in the concept. Removed: the home
+  «Маркетинг»/ферма card (`MarketingWidget` in `HomeWidgetsRow.tsx` → `/farm`),
+  leaving **«Баланс» as a single full-width hero** (`.pdp .pd-widgets-row`
+  switched to `grid-template-columns:1fr`); the topbar **Bell → `/inbox`**
+  button in `AppShellV2.tsx`; the `/inbox` and `/farm` tiles in
+  `AppsLauncher.tsx`. Orphaned i18n `projects.dashboard.widget.marketing.*`
+  (ru/en/zh) + unused icon imports (`Bell`, `Sprout`, `Inbox`, `Tractor`)
+  removed. Routes/pages left intact — only the cabinet entry points are gone;
+  a deeper page/route cleanup is a separate follow-up. Owner left as ASK (not
+  removed): `my_agents` (`/account/agents`), `flows` (`/my/flows`),
+  `device_skills` (`/cabinet/devices/skills`), `hire_agents` (`/marketplace`),
+  `apps` (`/apps`), `/quests`. Concept: `agentflow/CABINET-CONCEPT.html` §1.1.
 
 ## Related
 - [Devices — unified routing](/subsystems/devices-unified)
