@@ -7,20 +7,24 @@ description: "Customer-facing cabinet that surfaces API keys, usage, model catal
 
 ## TL;DR
 
-`/llm-cabinet` is the standalone cabinet shipped in `agentflow-landing`.
-Five tabs: Кабинет (dashboard with balance + usage tiles), История (per-request
-log), API (key CRUD + curl examples), Модели (catalog driven by
-`/llm/v1/models`), Инструкции (4 quickstart recipes). The Models and Curl
-tabs read live from the public LLM facade so the UI never drifts from the
-actually-enabled provider set.
+`/llm-cabinet` (titled «Баланс и AI») is the standalone cabinet shipped in
+`agentflow-landing`. Six tabs split into two groups in the top-nav: primary
+**Кабинет** (wallet dashboard — balance + spend + usage tiles) and **История**
+(per-request log); then a «Для разработчиков» divider fronting **Модели**
+(catalog driven by `/llm/v1/models`), **Псевдонимы** (model aliases), **API**
+(key CRUD + curl examples), **Инструкции** (quickstart recipes). All six stay
+deep-linkable via `?tab=`. The Models tab reads live from the public LLM facade
+so the UI never drifts from the actually-enabled provider set.
 
 ## Files (with line refs)
 
 | Path | Role |
 |---|---|
 | `agentflow-landing/src/pages/LlmCabinet.tsx` | route entry, renders `LlmCabinetShell` |
-| `agentflow-landing/src/sections/llm-cabinet/LlmCabinetShell.tsx:26` | tab registry (dashboard / history / api / models / instructions) |
-| `agentflow-landing/src/sections/llm-cabinet/tabs/DashboardTab.tsx:50` | calls `apiGet('/me/billing/usage?range=7d')` for tiles |
+| `agentflow-landing/src/sections/llm-cabinet/LlmCabinetShell.tsx:37` | `PRIMARY_TABS` (dashboard / history) |
+| `agentflow-landing/src/sections/llm-cabinet/LlmCabinetShell.tsx:44` | `DEVELOPER_TABS` (models / aliases / api / instructions) — rendered after the `.lc-tabs-group` «Для разработчиков» divider (line 114) |
+| `agentflow-landing/src/sections/llm-cabinet/tabs/DashboardTab.tsx:85` | calls `agentsGet('/me/billing/usage?range=7d')` for tiles; spend tile («Расход за 7 дней») leads at line 120 |
+| `agentflow-landing/src/sections/llm-cabinet/components/LcApiKeyCard.tsx:73` | `developerNote` muted caption frames the key block as developer-optional |
 | `agentflow-landing/src/sections/llm-cabinet/tabs/HistoryTab.tsx:107` | calls `apiGet('/me/api-keys/:id/recent?limit=100')` |
 | `agentflow-landing/src/sections/llm-cabinet/tabs/ApiTab.tsx:45` | `GET /me/api-keys` list + `POST /me/api-keys` create |
 | `agentflow-landing/src/sections/llm-cabinet/tabs/ApiTab.tsx:239` | OpenAI + Anthropic curl examples (path: `/llm/v1/chat/completions` and `/llm/v1/messages`) |
@@ -33,15 +37,26 @@ actually-enabled provider set.
 
 ```
 LlmCabinetShell (tab router via ?tab=)
-  ├─ Кабинет     ──► apiGet /me/billing/usage?range=7d
+  [primary]
+  ├─ Кабинет     ──► agentsGet /me/billing/usage?range=7d   (wallet dashboard)
   ├─ История    ──► apiGet /me/api-keys          (pick most-recent by last_used_at)
   │                └─► apiGet /me/api-keys/:id/recent?limit=100
+  · · · «Для разработчиков» divider (.lc-tabs-group) · · ·
+  [developers]
+  ├─ Модели     ──► fetch https://agentflow.website/llm/v1/models  (public, no auth)
+  ├─ Псевдонимы ──► agentsGet /me/llm/aliases
   ├─ API        ──► apiGet /me/api-keys          (list)
   │                ├─ apiPost /me/api-keys       (create, raw key returned once)
   │                └─ apiDelete /me/api-keys/:id (revoke)
-  ├─ Модели     ──► fetch https://agentflow.website/llm/v1/models  (public, no auth)
   └─ Инструкции ──► apiGet /me/api-keys          (first prefix for snippet)
 ```
+
+The tab grouping is presentation-only (A4b): `PRIMARY_TABS` and
+`DEVELOPER_TABS` render into one `.lc-tabs` track, so on mobile (390/360px)
+the whole row scrolls horizontally and the dev group stays reachable.
+`isTab()` still accepts all six ids, so `?tab=api` etc. deep-links unchanged.
+Group label comes from i18n key `llm_cabinet.group.developers`; the dashboard
+key-card caption from `llm_cabinet.dashboard.developer_optional`.
 
 `apiGet(path)` routes:
 
