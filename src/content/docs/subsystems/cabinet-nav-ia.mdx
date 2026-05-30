@@ -25,8 +25,14 @@ catalog of 6 use-case scenarios (filter-chips by category, each card →
 `/cabinet/agents/new?kind=<key>`) and «Твои агенты» — the user's running
 agents, reusing the exact device data path from `CabinetDevices`
 (`GET /me/devices` + `GET /me/hosted-devices`). `/cabinet/agents/new` is a
-wizard placeholder (the create wizard + autoposting setup ship as a
-separate follow-up).
+real 3-step scenario setup wizard (A2b — replaced the «Мастер скоро» stub):
+**1. Что будет делать** (scenario pre-selected from `?kind`, brief textarea),
+**2. Где + как часто** (cloud 24/7 recommended / Mac local + schedule chip),
+**3. Контроль** (approval toggle + daily spend cap). Launch is real: cloud
+posts `/me/hosted-devices` (daemon) + applies the control step as a
+`DeviceScope` via `devicesApi.updateScope`, then navigates to the live device
+page carrying the brief as `?task=`; a 404 degrades to a hand-off to the full
+cloud wizard. Mac hands off to the local installer at `/cabinet/devices/new`.
 
 ## Files (with line refs)
 
@@ -36,8 +42,9 @@ separate follow-up).
 | `agentflow-landing/src/components/layout/AppShellV2.tsx:147` | `MORE_NAV` (now leads with application + cloud) |
 | `agentflow-landing/src/components/layout/AppShellV2.tsx:187` | `BOTTOM_NAV` (mobile 5-tab bar — «Агенты» replaced «Приложение») |
 | `agentflow-landing/src/components/layout/AppShellV2.tsx:163` | `ADMIN_NAV` (shown only on `/admin/*` for `is_admin`) |
-| `agentflow-landing/src/pages/CabinetAgentsHub.tsx:47` | `/cabinet/agents` hub — `USE_CASES` catalog + «Твои агенты» (reuses device queries) |
-| `agentflow-landing/src/pages/CabinetAgentNew.tsx` | `/cabinet/agents/new` wizard placeholder (echoes `?kind=`, CTA → cloud create) |
+| `agentflow-landing/src/pages/CabinetAgentsHub.tsx:47` | `/cabinet/agents` hub — imports `AGENT_SCENARIOS` catalog + «Твои агенты» (reuses device queries) |
+| `agentflow-landing/src/pages/CabinetAgentNew.tsx` | `/cabinet/agents/new` real 3-step scenario wizard — cloud create via `/me/hosted-devices` + scope, or hand-off to local installer |
+| `agentflow-landing/src/lib/agentScenarios.ts` | shared scenario catalog (`AGENT_SCENARIOS`, `SCENARIO_CATEGORIES`, `findScenario`) — single source for hub + wizard |
 | `agentflow-landing/src/main.tsx:726` | `/cabinet/agents` + `/cabinet/agents/new` routes (old redirect to `/account/agents` removed) |
 | `agentflow-landing/src/styles/cabinet-agents.css` | hub styles (mobile-first; `!important` beats the 36px button floor for ≥44px taps) |
 | `agentflow-landing/src/pages/AppsLauncher.tsx:83` | `/apps` overflow grid (`SECTIONS`) |
@@ -70,7 +77,12 @@ AppShellV2 (every cabinet route)
 /cabinet/agents (CabinetAgentsHub)
   ├─ Каталог: 6 UseCase cards + category filter chips → /cabinet/agents/new?kind=<key>
   └─ «Твои агенты»: GET /me/devices + GET /me/hosted-devices (same path as CabinetDevices)
-/cabinet/agents/new (CabinetAgentNew) — «Мастер скоро» stub, CTA → /cabinet/devices/hosted/new
+/cabinet/agents/new (CabinetAgentNew) — 3-step scenario wizard
+  ├─ 1. Что будет делать  (scenario from ?kind + brief textarea)
+  ├─ 2. Где + как часто    (cloud daemon / Mac local + schedule chip)
+  ├─ 3. Контроль          (approval → confirm_before, cap → budget_usd)
+  └─ Запустить → cloud: POST /me/hosted-devices + updateScope → /cabinet/devices/hosted/<id>?task=
+                 (404 → hand-off /cabinet/devices/hosted/new) · Mac → /cabinet/devices/new
 
 mobile bottom bar (BOTTOM_NAV, 5): Главная · Проекты · Агенты · Маркетплейс · Ещё(/apps)
 admin: on /admin/* AND is_admin → ADMIN_NAV replaces the workspace groups
@@ -104,6 +116,14 @@ admin: on /admin/* AND is_admin → ADMIN_NAV replaces the workspace groups
 
 ## History
 
+- **A2b scenario wizard** (2026-05-31, landing PR #571) — replaced the
+  `/cabinet/agents/new` «Мастер скоро» stub with a real 3-step setup
+  (что будет делать → где + как часто → контроль). Cloud launch creates a
+  daemon via `/me/hosted-devices` + applies the control step as a
+  `DeviceScope` (`updateScope`), then navigates to the live device with the
+  brief as `?task=`; 404 hands off to the full cloud wizard, Mac hands off to
+  `/cabinet/devices/new`. Catalog extracted to `lib/agentScenarios.ts`
+  (shared by hub + wizard). Mobile-first verified at 390/360px.
 - landing #545/#547 — first declutter pass: removed Singularity / Души /
   Квесты / legacy marketplace dupe; regrouped into four outcome groups.
 - Category H `h-nav-declutter` (2026-05-30) — collapsed the four groups into
