@@ -60,10 +60,29 @@ bridge → /internal/mcp/tg-bot?owner=1 → send_card → @agentflow_e2e_verify_
 - **Image:** `ghcr.io/lnlockly/agentflow-kwork-bridge:<sha>` (+ `:latest`). v0.4
   first ship = commit `76972fa`.
 - **Routes** (all `POST application/json`, `x-bridge-secret` required; `GET /health`):
-  `/kwork/scan-dialogs`, `/kwork/scan-projects` (path-1), `/kwork/send-message`,
+  `/kwork/scan-dialogs`, `/kwork/scan-projects` (path-1; each want carries
+  `responses_count` = Kwork offers count, R1), `/kwork/send-message`,
   `/kwork/respond-to-project`, `/kwork/list-my-gigs` (v0.4), `/kwork/categories`
-  (v0.4), `/kwork/create-gig` (v0.4, `dry_run`-safe), `/tg/send-message`,
+  (v0.4), `/kwork/create-gig` (v0.4, `dry_run`-safe; accepts `work_examples[]` +
+  `delivery_days`, R2), `/kwork/draft` (v0.4.1 → MCP `draft_reply`),
+  `/kwork/gen-examples` (v0.4.1 → MCP `gen_work_examples`), `/tg/send-message`,
   `/tg/list-dialogs`, `/tg/get-user`.
+- **Automation contract (R1 + R2):**
+  - **Respond flow:** `scan-projects` → filter `responses_count != null &&
+    responses_count <= N` (default 5; `null` = unknown → skip) → `/kwork/draft
+    {want_id}` (flow-alias draft, never posts) → approval card → on ✅
+    `/kwork/respond-to-project`.
+  - **Create-gig flow:** `categories` + `list-my-gigs` (dedupe) →
+    `/kwork/gen-examples {topic,count}` (designapi images + flow text) → assemble
+    + `create-gig {…, work_examples, dry_run:true}` (card renders the full gig,
+    nothing published) → on ✅ same call `dry_run:false`. Kwork moderation
+    rejects gigs with no portfolio, so `work_examples` is required.
+  - `/kwork/draft` + `/kwork/gen-examples` need the agentflow-agents kwork-inbox
+    MCP tools `draft_reply` / `gen_work_examples` (return `tool_not_found` until
+    that PR deploys). `responses_count` + `work_examples` dry-run assembly work
+    standalone. There is NO native LLM AP piece — drafting/image-gen run
+    server-side via `flow` + designapi (a native AgentFlow-LLM AP piece is a
+    cleaner long-term follow-up, not built yet).
 - **Env:** `PORT` (8000), `AGENTFLOW_AGENTS_URL`
   (`http://agentflow-agents.franchise-factory.svc:4100`), `TG_MCP_URL`,
   `INTERNAL_API_SECRET` (secret `agentflow-agents-env`), `AP_BRIDGE_SECRET`
@@ -91,6 +110,8 @@ ever created during testing. The owner's Kwork session never leaves the sealed
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
 | `/kwork/{create-gig,list-my-gigs,categories}` returns `404 not_found` | `not_found` | running image predates the route — redeploy (push to main) |
+| `/kwork/draft` or `/kwork/gen-examples` → 400 | `tool_not_found:draft_reply` / `tool_not_found:gen_work_examples` | agentflow-agents kwork-inbox MCP tool not deployed yet — merge/deploy that PR |
+| `responses_count` is `null` on a want | (not in listing envelope) | flow treats null as "skip"; or fetch the want detail |
 | Route hit with missing/wrong header | `invalid_bridge_secret` | send `AP_BRIDGE_SECRET` as `x-bridge-secret` |
 | No owner identity on the call | `missing_owner_or_api_key` | supply `Authorization: Bearer af_live_*` or `ownerUserId` |
 | `/tg/*` called but secret unset | `tg_mcp_auth_secret_not_configured` | set `TG_MCP_AUTH_SECRET` env (`tg-bot.ts:116` analog) |
