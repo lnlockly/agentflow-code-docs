@@ -139,10 +139,21 @@ engine already implements every provider — this is detection only.
 
 - Verify: `cargo test -p goose providers::detect` → `8 passed`. (goose crate
   `default = []`, so this needs no clang/llama-cpp.)
-- **Still to wire (Parts 2–3, after #10):** a goosed route exposing
-  `detect_local_providers()` + the "Найдено на твоём компьютере" section atop
-  `ui/desktop/src/components/settings/providers/ProviderGrid.tsx`. `flow` stays
-  the default; picking a detected provider sets `GOOSE_PROVIDER`/`GOOSE_MODEL`.
+- **Wired (Parts 2–3, PR #13):**
+  - goosed route `GET /config/detected-providers` →
+    `detect_local_providers()` (`crates/goose-server/src/routes/config_management.rs`
+    `get_detected_providers`). Plain route, **not** in the OpenAPI doc —
+    `LocalInferenceApiDoc` is `#[cfg(feature="local-inference")]`-gated, so a
+    schema regen would need the llama-cpp/clang build to match CI; the renderer
+    calls it via the shared `client` (`client.get({ url: '/config/detected-providers' })`).
+  - UI `DetectedProvidersSection` renders a "Found on your computer" row atop
+    `ProviderGrid.tsx`; each detected provider that also exists in the picker
+    list launches through the existing flow. `flow` stays the default card.
+  - Verify in the app: open the provider picker → the section lists your local
+    tools (Claude Code / Cursor / Codex / Ollama / env-keyed providers); the
+    section is hidden when none match. Quick check without the UI:
+    `curl -s localhost:<goosed-port>/config/detected-providers` (the desktop
+    knows the port/secret) → JSON array of `{provider_id, display_name, source, detail}`.
 
 ## 3. Mode A — standalone (matrix b3)
 In the app chat, give a build + control task ("create a small Next.js page and
