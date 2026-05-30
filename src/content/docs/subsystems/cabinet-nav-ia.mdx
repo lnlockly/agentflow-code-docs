@@ -8,13 +8,15 @@ description: "How the authenticated cabinet sidebar + mobile bottom bar are stru
 ## TL;DR
 
 The authenticated cabinet nav leads with the 5 surfaces the owner named as
-core — Проекты, Приложение (desktop agent), Облако (24/7), LLM-кабинет,
-Маркетплейс — under an «Основное» group, with a pinned «Главная» home above
-it. Everything else (agents, flows, device skills, the `/apps` launcher,
-referrals, billing, settings) is tucked behind a collapsible «Ещё»
-disclosure that defaults closed. All nav lives in one component;
-`/apps` is the overflow launcher and the avatar dropdown carries
-profile/settings/billing/logout.
+core — Проекты, Приложение (desktop agent), Облако (24/7), **Баланс и AI**
+(renamed from «LLM-кабинет», Фаза 1), Маркетплейс — under an «Основное»
+group, with a pinned «Главная» home above it. Everything else (agents,
+flows, device skills, the `/apps` launcher, billing, settings) is tucked
+behind a collapsible «Ещё» disclosure that defaults closed. **Referrals
+were de-duplicated in Фаза 1: removed from «Ещё» and from the LLM-cabinet
+tab; they now live in exactly one place — the avatar dropdown.** All nav
+lives in one component; `/apps` is the overflow launcher and the avatar
+dropdown carries profile/referrals/settings/billing/logout.
 
 ## Files (with line refs)
 
@@ -37,18 +39,18 @@ AppShellV2 (every cabinet route)
   │   ├─ Проекты        /projects
   │   ├─ Приложение     /cabinet/devices
   │   ├─ Облако         /cabinet/devices/hosted/new
-  │   ├─ LLM-кабинет    /llm-cabinet
+  │   ├─ Баланс и AI    /llm-cabinet     (renamed from «LLM-кабинет», Фаза 1)
   │   └─ Маркетплейс    /marketplace
   ├─ «Ещё» ▸ (MORE_NAV, collapsed by default, persisted)
   │   ├─ Мои агенты     /account/agents
   │   ├─ Сценарии       /my/flows
   │   ├─ Навыки         /cabinet/devices/skills
   │   ├─ Приложения     /apps          ── overflow launcher (AppsLauncher)
-  │   ├─ Партнёрка      /account/referrals
   │   ├─ Биллинг        /account/usage   (also in avatar menu)
   │   └─ Настройки      /account/settings (also in avatar menu)
   ├─ «Десктоп-агент»   GitHub release download links
-  └─ avatar dropdown   Profile · Settings · Billing · [Admin] · Logout
+  └─ avatar dropdown   Profile · Рефералы · Settings · Billing · [Admin] · Logout
+                       (referrals live ONLY here now — Фаза 1 de-dup)
 
 mobile bottom bar (BOTTOM_NAV, 5): Главная · Проекты · Приложение · Маркетплейс · Ещё(/apps)
 admin: on /admin/* AND is_admin → ADMIN_NAV replaces the workspace groups
@@ -81,6 +83,13 @@ admin: on /admin/* AND is_admin → ADMIN_NAV replaces the workspace groups
   «Основное» (the core 5) + a single collapsible «Ещё», promoted the
   previously hidden `/llm-cabinet` into the primary nav, surfaced Cloud as a
   distinct entry. Map: `plans/autonomous/_cat-h-ia-map.md`.
+- Cabinet redesign **Фаза 1** (2026-05-30, landing PR #558) — renamed
+  «LLM-кабинет» → «Баланс и AI» (`app.shell.nav.llm_cabinet`, `apps.tile.llm_cabinet`,
+  `CabinetTopNav` subtitle, `LlmCabinet` document.title); removed the duplicate
+  «Рефералы» tab from `LlmCabinetShell` and the `MORE_NAV` row, leaving referrals
+  only in the avatar dropdown (`app.shell.menu.referrals`); decluttered the
+  `/cabinet` home (quick actions 9→4, stat tiles 4→2, referrals widget dropped).
+  Concept: `agentflow/CABINET-CONCEPT.html`.
 
 ## Related
 - [Devices — unified routing](/subsystems/devices-unified)
