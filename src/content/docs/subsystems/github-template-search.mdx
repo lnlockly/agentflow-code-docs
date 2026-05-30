@@ -41,6 +41,7 @@ in the Phase-A2 create-project flow (see [projects](/subsystems/projects/)).
 | `agentflow-agents/src/services/github-template-search.ts:141` | `DB_RX` — persistence signal. Also catches booking / reservation / CRUD intent (`запис`/`бронь`/`заявк`/`booking`/`reservation`) so a booking brief signals `needs_db` → drives the clean-foundation preference + heavy-ORM down-rank. |
 | `agentflow-agents/src/services/github-template-search.ts:1108` | `HEAVY_ORM_DEP_RX` — Prisma/Drizzle/TypeORM/Sequelize/Mongoose/knex fingerprint. A baked ORM is a LIABILITY for a from-scratch persistence brief (platform serves DB via PGlite + raw `pg`). |
 | `agentflow-agents/src/services/github-template-search.ts:1229` | `dbFromScratchPenalty(caps, pkg)` — `−5` `heavy_orm_vs_pglite` when a `needs_db` OR `complex` brief's finalist ships a heavy ORM; applied in `refineByFileTree` (defense-in-depth for complex briefs that enter github-search). `capabilityFileTreeBonus` no longer rewards a baked DB layer. |
+| `agentflow-agents/src/services/github-template-search.ts` `applyCleanFoundationGuard` + `templateShipsHeavyOrm` + `isCleanFoundationKind` | DECISIVE clean-foundation guard in `searchTemplatesForBrief`: for a `needs_db` persistence brief on a web kind, if the TOP pick ships a heavy ORM (by repo+desc+topics), LEAD with the clean curated foundation (`pickFallbackForBrief` → cruip-class). The `−5` penalty alone wasn't decisive — proj 1645 still picked ARKA (Drizzle+Next-Auth) despite it. Greppable `clean_foundation_guard persistence_brief`. |
 | `agentflow-agents/src/services/foundation-structural-filter.ts:144` | `KIND_SPA_SET` — now includes **`nextjs`** (the real prod kind), so the monorepo/desktop/framework/`component_library` hard-rejects + app-template bias finally gate every web brief. |
 | `agentflow-agents/src/services/foundation-structural-filter.ts:266` | `is_publishable_library` signal + `component_library` hard-reject (`:326`) — a charting/gantt/util LIB (publishes `main`/`module`/`types`, not `private`, no app dir) is rejected for web kinds. |
 | `agentflow-agents/src/routes/projects.ts:912` | the only prod caller — honours an explicit `selected_foundation` (mode=`github_repo`) over the scorer; otherwise `pickBestTemplateForBrief(brief, resolvedKindForPicker)`. |
@@ -100,6 +101,7 @@ POST /me/projects { brief }
 | Generated dashboard app 500s on every route: `@clerk/nextjs: Missing publishableKey` | picked repo in `EXTERNAL_AUTH_SAAS_REPOS` (e.g. `kiranism/next-shadcn-dashboard-starter`) or finalist logs `external_auth_saas reason=external_auth_saas_boot_blocking` | Curated dashboard lead is the self-contained `arhamkhnz/next-shadcn-admin-dashboard`; Clerk/Supabase repos skipped by `pickCleanCuratedLead` + penalized in `refineByFileTree`. We don't provision external-SaaS keys (own-infra). |
 | Booking/persistence brief picks a Prisma foundation → `prisma db push` fails on PGlite + strict ESLint blocks `next build` (proj 1642 → `kaje94/menufic`) | `[github-template-search] db_from_scratch reason=heavy_orm_vs_pglite penalty=5 candidate=…` | Intended — `dbFromScratchPenalty` down-ranks a baked ORM on a `needs_db` brief so a clean goose-fillable foundation wins. The clean pick lets the proven pg→PGlite build-heal path run (`coder-shim` 4a-db). |
 | Booking brief lands on a charting/gantt LIBRARY (proj 1643 → `neuronetio/gantt-schedule-timeline-calendar`) — nothing to serve | `[…] hard_reject reason=component_library candidate=…` | Intended — `is_publishable_library` + `component_library` reject in `decideHardReject` for web kinds (now incl. `nextjs`). A web brief needs an APP foundation, not an npm lib. |
+| Booking/persistence brief STILL picks a heavy-ORM booking system (proj 1645 → `pjborowiecki/ARKA-…-Appointment-Booking-System`, Drizzle+Next-Auth) even though the `−5` down-rank fired | reasoning shows `[-5 heavy_orm_vs_pglite]` yet the repo is the pick; no `clean_foundation_guard` line | The penalty wasn't decisive against a strong on-vertical ORM repo → `applyCleanFoundationGuard` now LEADS with the clean curated foundation (cruip) for a `needs_db` web brief whose top pick ships an ORM. Look for `clean_foundation_guard persistence_brief`. |
 | A web (`kind=nextjs`) brief's monorepo/desktop/lib candidate was NOT structurally rejected | (no `hard_reject` line for an obviously-bad pick) | `nextjs` was missing from `KIND_SPA_SET` — now added, so the gate fires for the real prod kind. |
 
 ## Capability-aware fallback tiers
@@ -257,6 +259,17 @@ The fix is generic + signal-driven (no per-slug):
    model the platform provisions DB and to prefer a clean foundation WITHOUT a baked
    ORM for a persistence brief (and never a component lib), instead of the old
    "prefer a repo that already ships Prisma/Drizzle".
+6. **Decisive clean-foundation guard.** Live verify on the rebuilt image showed the
+   `−5` down-rank was NOT decisive: proj 1645 (a coffee-shop booking brief) still
+   picked `pjborowiecki/ARKA-…-Appointment-Booking-System` (Drizzle + Next-Auth +
+   MySQL) — a strong on-vertical ORM repo out-scored the penalty. Root cause: the
+   main create flow (`pickBestTemplateForBrief`) never consults the curated clean
+   bypass (that lives in `recommendProjectFoundations` and excludes `kind=nextjs`).
+   `applyCleanFoundationGuard` in `searchTemplatesForBrief` makes it deterministic:
+   for a `needs_db` web brief whose TOP pick ships a heavy ORM (detected from
+   repo+desc+topics), it LEADS with the clean curated foundation (cruip-class) and
+   keeps the GitHub hits as alternatives. The `−5` penalty still orders those
+   alternatives; the guard guarantees the lead.
 
 NOT in scope (separate follow-up, task #23): Prisma `db push` vs PGlite migrations
 and strict-foundation ESLint as a `next build` blocker — both are sidestepped by
