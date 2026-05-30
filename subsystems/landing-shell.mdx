@@ -67,6 +67,28 @@ Owner complaint: admin links surfaced inside the regular workspace shell. Fix:
 - `/admin/hub` → `AdminHubV2` (gated by `AccessGate`)
 - `/account/admin/projects`, `/admin/campaigns`, `/admin/ads`, `/admin/flow`, `/admin/billing`, `/admin/workspace` — admin-only pages, all wrapped in `AppShellV2` so the ADMIN_NAV sidebar shows automatically.
 
+## Plain-language copy rule (h-polish 2026-05-30)
+
+User-facing strings stay plain human Russian. **Banned jargon** in any user-visible
+string: `казна`, `саплай`, `treasury`, `supply`, `operator`, `protocol`, plus any
+crypto/DAO/insider lingo. Also banned: `бесплатно` / `free` (AgentFlow is paid). The
+token-launchpad crypto product (`pages/LaunchToken.tsx`, `components/launch-token/*`,
+`components/token-pages/*`, `pages/Whitepaper.tsx`, `prod.economy.*` / `app.launch_token.*`
+i18n keys) is the one allowed exception — `treasury` / `supply` there are correct domain
+terms for that audience, not core-cabinet copy. The **public front door**
+(https://agentflow.website — `App.tsx` + `sections/landing-v3/*`) is verified clean via
+browser-MCP snapshot.
+
+Empty-states must read "no X yet, do Y" in Russian, never raw English `Loading…` / `Error:`
+or a dev string. Good references already in tree: `pages/ProjectsDashboard.tsx:549`
+(`EmptyProjects`), `pages/MarketplaceV2.tsx:698` (error + no-results), `app.agents.empty`
+i18n key. h-polish PR Russified `Profile.tsx` modal, `LiveProject.tsx` + `LiveProjectNewsPost.tsx`
+loading/empty, and reworded the `Desktop.tsx` demo card off `бесплатно`.
+
+**Known still-English (follow-up tranche):** `pages/ApiKeyDetail.tsx` (~39 EN strings —
+developer-focused), `pages/ApiKeys.tsx` + `pages/PricingPageV2.tsx` (`Free` tier label —
+needs an owner naming call), admin pages (`AdminAds`, `AdminLlmProviders`, `FlowEmissionDashboard`).
+
 ## Failure modes
 
 | Symptom | Log / grep signature | Where to fix |
@@ -74,6 +96,7 @@ Owner complaint: admin links surfaced inside the regular workspace shell. Fix:
 | Admin sees admin links inside `/studio` or `/projects` | `ADMIN_NAV` rendering when `isAdminPath` returns false | `AppShellV2.tsx:87` — extend `isAdminPath` |
 | Non-admin lands on `/admin/hub` and bounces to `/account` | `AdminHubV2` `Navigate to="/account"` | `AdminHubV2.tsx:62` — gate uses `user.is_admin` |
 | Hardcoded hex in a new page diverges from the palette | `grep -nE "'#[0-9A-Fa-f]{3,8}'" src/pages/<page>.tsx` | Replace with `var(--af-*)` from the table above |
+| Banned jargon / English copy reaches a user page | `grep -rniE "казна\|саплай\|treasury\|\bfree\b\|бесплатн\|Loading…\|Failed:" src/pages` (exclude launch-token) | Swap to plain RU per the copy rule above |
 
 ## Related
 
