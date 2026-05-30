@@ -77,8 +77,87 @@ and every studio template's account picker reads it from there.
 | Same cookies create N hub projects | (no log — `SELECT count(*) FROM projects WHERE owner_user_id=X AND kind='integration_hub'`) | `pickOrCreateHubProject` lookup broke — should return ≤1 |
 | 200/201 but studio account picker is empty | (no log — `SELECT * FROM project_secrets WHERE project_id=<hub> AND key='KWORK_SESSION_JSON'`) | `default-studio-flow-account.ts → listKworkSecretRows` not reading from the hub project |
 
+## kwork-inbox MCP tools (AI-assist)
+
+Three tools added in PR `feat/kwork-draft-genexamples-workexamples`
+(2026-05-30). All live in
+`agentflow-agents/src/mcp-servers/kwork-inbox.ts` inside `kworkInboxTools`.
+
+### `draft_reply`
+
+Generates N (default 3, max 6) human Russian кwork reply drafts. If
+`want_id` is given and title/description are absent, fetches the want
+detail first. Calls `invokeAI(ModelType.TEXT_LARGE)` with a Russian
+system prompt enforcing: 1–3 sentences, on-«вы», concrete project
+detail, no bullet lists, no off-platform links, no «бесплатно». Returns
+`{ok:true, drafts:[string,...], want_id?}`. NEVER posts — draft only.
+
+**Parse path:** LLM must return `{"drafts":[...]}`. Handler first tries
+`parseDraftReplyJson()` (extracts JSON even when embedded in prose), then
+falls back to sanitized raw text; on LLM throw returns a single
+placeholder. `parseDraftReplyJson` is exported for unit tests.
+
+**Deps exported for tests:** `parseDraftReplyJson`, `genDraftReplies`, `DraftReplyDeps`.
+
+Handler file: `src/mcp-servers/kwork-inbox.ts` (search `draft_reply: {`).
+
+### `gen_work_examples`
+
+Generates N (default 3, max 6) realistic portfolio examples. One
+`TEXT_LARGE` call returns a JSON array of `{title, description, image_prompt}`.
+Then one `IMAGE` call per example (parallel, budget 0.05 USD each).
+Examples reflect the gig topic (e.g. bot UI screenshots for a TG-bot gig),
+not generic stock. Returns `{ok:true, examples:[{image_url, title,
+description}], cost_usd?}`. Failed image generations are returned with
+`image_url:null + note` — others are unaffected.
+
+**Deps exported for tests:** `genWorkExamples`, `GenWorkExamplesDeps`.
+
+Handler file: `src/mcp-servers/kwork-inbox.ts` (search `gen_work_examples: {`).
+
+### `create_kwork` extension (`work_examples` + `delivery_days`)
+
+Two new optional inputs added to the existing `create_kwork` tool:
+
+- `delivery_days` (integer 1–90, default 1) — sent as `work_time`.
+- `work_examples` (array ≤6 of `{image_url, title?, description?}`) —
+  portfolio examples from `gen_work_examples`.
+
+When `work_examples` is present and `dry_run` is not set:
+1. Each image is fetched server-side and uploaded to kwork `/upload/img`.
+2. The handler GETs `/edit?id=<kwork_id>` and scans the HTML for a
+   portfolio field name matching `/(portfolio|example|work_example|примеры)/i`.
+3. If a field name is confirmed, a POST to `/sell/edit/<id>` attaches
+   the uploaded images. Returns `work_examples_attached:true`.
+4. If no field name is confirmed from the live HTML, images are uploaded
+   (kwork URLs ready) but portfolio attachment is skipped. Returns:
+   `{work_examples_attached:false, note:'manage_kworks example fields not confirmed — needs field mapping; images uploaded, kwork URLs in work_examples'}`.
+
+The tool is fully backward-compatible: `work_examples` omitted → identical
+to the prior behaviour. `dry_run:true` returns the form body without any
+HTTP calls to kwork.
+
+**Body-building extracted for tests:** `buildCreateKworkBody`, `CreateKworkBodyParams`.
+
+**Verdict on real submission:** documented-gap path active. The exact
+`manage_kworks` portfolio field names are not documented by kwork and the
+tool cannot confirm them without a live owner session. Upload always
+succeeds; attachment requires a live probe and is skipped when the probe
+fails to identify the field name. A follow-up PR can pin the field mapping
+once observed on a real gig edit response.
+
+## Failure modes (AI-assist tools)
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `draft_reply` returns placeholder | `(не удалось сгенерировать` | invokeAI failure — check LLM provider health via `[ai-router]` logs |
+| `gen_work_examples` returns `image_url:null` for some | `image_generation_failed:` in note field | designapi IMAGE provider error — check `DESIGNAPI_API_KEY` / `DESIGNAPI_BASE_URL` |
+| `create_kwork` returns `work_examples_attached:false` | `manage_kworks example fields not confirmed` | Portfolio field name not found in form HTML — needs manual probe of `/edit?id=<id>` response to identify field names then update handler |
+| `upload_error` in work_examples items | `upload_<status>` or `image_too_large` | kwork session expired or image >4 MiB |
+
 ## Related
 
 - [Generic Integrations](/subsystems/generic-integrations) — registry-driven onboarding shared by Kwork, VK, lolzteam, Instagram, LinkedIn, Telegram-app.
 - [Computer-MCP](/subsystems/computer-mcp) — daemon-side `connect_integration` tool.
 - [Multi-Agent Project Chat](/subsystems/multi-agent-project-chat) — how onboarded accounts surface in cabinet.
+- [kwork-rest-bridge](/subsystems/kwork-rest-bridge) — proxy that exposes `draft_reply`, `gen_work_examples`, and `create_kwork` (with `work_examples`) as HTTP routes for the studio AP flow.
