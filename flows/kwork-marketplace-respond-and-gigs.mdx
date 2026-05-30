@@ -17,11 +17,13 @@ and the Activepieces fork (`*-ap`, owner publishes in flows.agentflow.website).
 | Path | Role |
 |---|---|
 | `agentflow-agents/src/services/studio-flow-templates.ts:1848` | `kwork-projects-respond-basic` graph: cron → scan_wants → wants_to_leads_shim → ai.draft_replies → tg-bot.send_card. |
-| `agentflow-agents/src/services/graph-executor/handlers/kwork-scan-wants.ts:41` | `kwork.scan_wants` input schema. Coerces stringified numeric inputs (`min_budget`/`category_id`/`limit`) — studio graphs interpolate form fields as strings. |
+| `agentflow-agents/src/services/graph-executor/handlers/kwork-scan-wants.ts:41` | `kwork.scan_wants` input schema. Coerces stringified numeric inputs (`min_budget`/`category_id`/`limit`/`max_responses`) — studio graphs interpolate form fields as strings. |
+| `agentflow-agents/src/services/graph-executor/handlers/kwork-scan-wants.ts:160` | **R1 ≤5 filter** — surfaces `responses_count` (from `list_wants.offers_count`) and keeps only wants with `responses_count <= max_responses` (default 5, `0` disables). Unknown counts are dropped while filtering (no fake-pass). Output adds `max_responses` + `filtered_out`. |
+| `agentflow-agents/src/mcp-servers/tg-bot.ts:111` | `resolveOwnerBotToken(ownerUserId, {preferPlatform})` — **R3**: `preferPlatform` short-circuits to the official `AGENTFLOW_BOT_TOKEN` before any DB lookup. |
 | `agentflow-agents/src/mcp-servers/kwork-inbox.ts:2432` | `respond_to_want` — posts an отклик via `/api/offer/createoffer` (see kwork-auto-earn). |
 | `agentflow-agents/src/mcp-servers/kwork-inbox.ts:1948` | `create_kwork` — creates a new gig on the seller account (`/sell/create` candidates). |
 | `agentflow-agents/src/mcp-servers/kwork-inbox.ts:1554` | `list_my_kworks` — owner's existing gigs (dedupe before create). |
-| `agentflow-agents/src/mcp-servers/tg-bot.ts:390` | `send_card` — inline-keyboard approval card via owner's sealed `OWNER_TG_BOT_TOKEN` (falls back to platform `AGENTFLOW_BOT_TOKEN`). chat = `OWNER_TG_CHAT_ID`. |
+| `agentflow-agents/src/mcp-servers/tg-bot.ts:390` | `send_card` — inline-keyboard approval card. New `bot:'owner'\|'platform'` arg: `platform` FORCES the official **@AIAgentFlow_bot** (`AGENTFLOW_BOT_TOKEN`, addressed via `tg_links.tg_user_id`) regardless of the owner's personal/QA token (R3). |
 | `activepieces-spike/kwork-rest-bridge/server.mjs` | REST→MCP bridge. Routes: `/kwork/scan-projects`, `/kwork/respond-to-project`, `/kwork/list-my-gigs`, `/kwork/categories`, `/kwork/create-gig` (`dry_run` returns prepared payload without posting). |
 | `agentflow-agents/src/routes/marketplace.ts:1425` | `POST /me/marketplace/:slug/install` → legacy clone (studio) or `importFlowForOwner` (AP IMPORT_FLOW). |
 
@@ -40,7 +42,12 @@ marketplace install (POST /me/marketplace/<slug>/install)
 - Env (bridge): `AP_BRIDGE_SECRET`, `INTERNAL_API_SECRET`, `AGENTFLOW_AGENTS_URL`.
 - Routes: `POST /me/marketplace/:slug/install|run`, bridge `POST /kwork/{scan-projects,respond-to-project,list-my-gigs,categories,create-gig}`.
 - MCP tools: `kwork-inbox.{list_wants,respond_to_want,create_kwork,list_my_kworks,list_categories}`, `tg-bot.send_card`.
-- Approval card bot: reuse `@agentflow_e2e_verify_bot` (token sealed at project 1603 `BOT_TOKEN`, transplanted to owner `OWNER_TG_BOT_TOKEN`). Owner chat `1361064246`.
+- Approval card bot (R3): the **official** platform bot **@AIAgentFlow_bot** (id `8536951969`, `AGENTFLOW_BOT_TOKEN` env on `agentflow-agents`). Owner chat `1361064246` (`@avsee4`, in `tg_links`). The QA bot `@agentflow_e2e_verify_bot` (owner's `OWNER_TG_BOT_TOKEN`) is NOT used for owner-facing cards — call `send_card({bot:'platform'})`.
+
+## R4 — working buttons constraint (READ BEFORE wiring callbacks)
+The official @AIAgentFlow_bot has **no webhook** (`getWebhookInfo.url === ""`) and its `getUpdates` is already consumed by the separate `agentflow-bot` deployment (grammY, `agentflow-bot/src/bot/index.ts:380` `bot.on("callback_query:data")`). Therefore `tg-bot-poller` (which `getUpdates` on `OWNER_TG_BOT_TOKEN`) **cannot also poll the official bot** — two `getUpdates` consumers on one token = Telegram 409. Consequences:
+- `callback_data` buttons on a card sent from the official bot are delivered to `agentflow-bot`, NOT to `tg-bot-poller` → the studio `tg_bot_callback_queue` → `tg-bot.handle_callback` pipeline never sees them.
+- Working buttons on the official bot must use **approval LINKS / URL buttons**: either the AP fork's `wait_for_approval` (hosted approve/reject links, no custom handler) or an `agentflow-agents` HTTP endpoint the URL button points at. Do not rely on `callback_data` + the poller for official-bot cards.
 
 ## Failure modes
 | Symptom | Log signature for grep | Where to fix |
@@ -49,6 +56,9 @@ marketplace install (POST /me/marketplace/<slug>/install)
 | Card never delivered, `no_owner_bot_token` | `resolveOwnerBotToken` returns `no_owner_bot_token` | Set `OWNER_TG_BOT_TOKEN` (+ `OWNER_TG_CHAT_ID`) in `project_secrets` for the owner. |
 | AP create-gig flow run errors at list step | bridge `not_found` on `POST /kwork/list-my-gigs` | Bridge pod predates the create-gig routes — rebuild `kwork-rest-bridge` image with the current `server.mjs`. No CI exists for this pod yet (gap). |
 | отклик posted to a stranger that reads as GPT/spam | Kwork sends off-platform-penalty notice in inbox | Keep approval-gating ON; draft ≤3 phrases, на «вы», no lists, no off-platform mentions. |
+| Owner taps a card button on the official bot, nothing happens | tap recorded in `agentflow-bot` logs, never in `tg_bot_callback_queue`; or `kwork.handle_callback` returns `lead_state_missing` for a `want_id` | Official-bot `callback_data` can't reach `tg-bot-poller` (see R4). Use approval URL links. Also: project-respond cards emit `kwork.reply:<want_id>` but `handle_callback` `loadKworkLead(dialog_id)` has no row for a want → `lead_state_missing`. |
+| Card lands on QA bot `@agentflow_e2e_verify_bot` instead of the official bot | card `from.username` = e2e bot | Owner has `OWNER_TG_BOT_TOKEN` = e2e token → `send_card` defaults to `kind:'owner'`. Call `send_card({bot:'platform'})` for owner-facing cards (R3). |
+| Respond cards target crowded projects | many `responses_count > 5` in scan output | Pass `max_responses` (default 5) to `kwork.scan_wants`; it now filters server-side (R1). |
 
 ## Related
 - [Kwork auto-earn DM loop](/subsystems/kwork-auto-earn)
