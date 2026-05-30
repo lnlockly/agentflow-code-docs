@@ -95,6 +95,34 @@ cross-namespace rejection; real gig card msg 15801 on @AIAgentFlow_bot.
 | Gig card has no portfolio images / `work_examples_attached:false` | `gen_work_examples` examples all have `image_url:null` | designapi (RU IP) is geo-blocked from the OVH/France egress (task #11, owner-gated — fix = RU proxy / `HTTP_PROXY` for `*.designapi.ink`). Node tolerates null; gig ships text-only; images auto-attach once reachable. |
 | Gig token tapped, «Ссылка недействительна» | route logs reject on `kind` mismatch | A `respond` token was used on `/public/kwork/create-gig` or vice-versa — kind-namespacing rejects cross-surface tokens by design. Use the matching link. |
 
+## AP-native flows (studio-graph retirement, PR #1012 + #1015)
+The ActivePieces flows on flows.agentflow.website reuse the SAME prefetch-safe /
+single-use ticket as the studio path, via thin HTTP endpoints — so AP-native
+survives the studio-graph retirement.
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/kwork-approval-card.ts` | Shared `armAndSendRespondCard` / `armAndSendGigCard` — arm ticket + sign kind-correct links + official-bot card (`bot:'platform'`) + stamp msg id. dry_run default. |
+| `agentflow-agents/src/routes/internal-kwork-cards.ts` | `POST /internal/kwork/respond-card` + `/internal/kwork/gig-card`, `requireInternalSecret` (header `x-agentflow-secret`), gated `FF_KWORK_TG_PIPELINE=1`. Verified: with secret → `200 {ok,pending_id,message_id}`; no secret → 401. |
+| `agentflow-agents/scripts/fixtures/ap-kwork-projects-respond.json` | `kwork-projects-respond-ap`: schedule → bridge `/kwork/scan-projects` (`max_responses=5`) → bridge `/kwork/draft` (`{drafts:[…]}`) → `POST /internal/kwork/respond-card`. No `wait_for_approval` (out-of-band link tap). |
+| `agentflow-agents/scripts/fixtures/ap-kwork-create-gig.json` | `kwork-create-gig-ap`: manual → `POST /internal/kwork/gig-card` (owner-editable payload). |
+| `agentflow-agents/scripts/seed-ap-marketplace-templates.ts` | Seeds the two `kwork-*-ap` rows (engine=activepieces). |
+
+**Secrets via AP connections, never plaintext.** Both `x-bridge-secret` and
+`x-agentflow-secret` are `{{connections['kwork_bridge_secret']}}` /
+`{{connections['agentflow_internal_secret']}}` in the flow JSON — the owner
+creates two Secret-Text connections at publish; the seeded JSON carries no raw
+secret. (The legacy `ap-kwork-lead-funnel.json` still uses the
+`__AP_BRIDGE_SECRET__` plaintext substitution — migrate it to a connection.)
+
+**Owner publish gate:** publish each AP flow + add the two connections on
+flows.agentflow.website (SSO). No official-bot connection needed — the card is
+sent server-side by `/internal/*-card`. In-cluster reachability: AP →
+`http://agentflow-agents:4100/internal/…`, bridge `http://kwork-rest-bridge:8000`.
+
+**AP gig auto-draft** is a follow-up (`/internal/kwork/draft-gig` wrapping
+`kwork.draft_gig`); the studio `kwork-create-gig-basic` already auto-assembles.
+
 ## Related
 - [Kwork auto-earn DM loop](/subsystems/kwork-auto-earn)
 - [Activepieces marketplace](/subsystems/activepieces-marketplace)
