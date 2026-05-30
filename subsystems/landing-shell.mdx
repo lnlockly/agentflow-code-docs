@@ -11,6 +11,23 @@ All v2 pages (`/studio`, `/projects`, `/marketplace`, `/my/agents`, `/inbox`, `/
 
 **Apps-cleanup 2026-05-29 (UX overhaul §3):** the regular nav is now grouped by outcome, not one flat list. `WORKSPACE_SECTIONS` renders «Создать» (`CREATE_NAV`: Кабинет/Проекты/Устройства/Навыки) then «Работа» (`WORK_NAV`: Мои агенты/Маркетплейс/Приложения); `INSIGHTS_NAV` is the «Кабинет» group (Биллинг/Партнёрка/Настройки). Removed from the sidebar: **Singularity** (`/singularity` — static duplicate hub, no own backend) and **Квесты** (`/start` — gamification stub). The `/apps` launcher dropped its **Души** (`/workspace/souls`) tile — graph-executor was unwired (PR #917), souls is tombstoned. All three routes still resolve by direct URL (archive-not-break; souls `/me/souls` still answers 200 pre-Phase-3). Audit + per-item evidence: `plans/autonomous/_apps-cleanup-audit.md`. i18n keys `app.shell.section.{create,work,cabinet}` in ru/en/zh.
 
+**«Маркетплейс» = the flows app (IA 2026-05-30).** Owner correction: "the
+marketplace" is the rebranded templates/automation app at
+`flows.agentflow.website` (seam-2 SSO via `/flows` → `FlowsLaunch` →
+`POST /me/flows/sso`), **not** the in-app agent catalog. So the prominent
+`CORE_NAV` «Маркетплейс» now points at `/flows` (`AppShellV2.tsx` CORE_NAV +
+mobile BOTTOM_NAV). The in-app hire-an-agent catalog (`MarketplaceV2` at
+`/marketplace`) is a separate `MORE_NAV` item **«Нанять агента»** (i18n
+`app.shell.nav.hire_agents`, `UserPlus` icon) — distinct from «Мои агенты»
+(`/account/agents`, owned agents). The duplicate «Автоматизации»
+(`flows_app → /flows`) MORE entry was dropped. Legacy `/account/marketplace`
+(old `AccountMarketplace` → `Marketplace.tsx`, an embedded duplicate of the
+unified grid) is retired: route redirects to `/marketplace`, both components
+deleted, `FloatingGuide` refs repointed. Seam-2 SSO verified live:
+`POST /me/flows/sso` → 200 + activepieces JWT + `publicUrl
+flows.agentflow.website` (`FF_ACTIVEPIECES_ENABLED` on). Nav map summary:
+«Маркетплейс»→`/flows` · «Нанять агента»→`/marketplace` · «Мои агенты»→`/account/agents`.
+
 ## Files
 
 | Path | Role |
