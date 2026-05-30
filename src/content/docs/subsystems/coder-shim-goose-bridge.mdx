@@ -122,6 +122,9 @@ injection boundary.
 | `agentflow-agents/src/routes/me-hosted-devices.ts:142` | `resolveDaemonImage` — `template==='goose'` → coder-shim FIRST (deterministic, isolated); else `FF_DAEMON_IMAGE` override; else coder (hotfix) |
 | `agentflow-agents/src/routes/me-hosted-devices.ts:427` | `isGooseCanaryEnabled` — `FF_GOOSE_CANARY` gate; create path 403s `goose_canary_disabled` unless set |
 | `agentflow-agents/src/routes/me-hosted-devices.ts:418` | `createSchema.template` enum now includes `'goose'`; warm-pool claim skipped for goose (pool pods are coder-baked) |
+| `agentflow-agents/src/services/project-clone.ts` `resolveBuildCoderTemplate` | `FF_BUILD_CODER=goose` → build daemons run goose coder-shim; scoped to the build path (computer-use device provisioning untouched). Reversible by unsetting the flag |
+| `agentflow-agents/src/services/project-clone.ts` `pickDaemonDevice({requireTemplate})` | build-coder=goose requires a `template='goose'` daemon; never reuses the user's coder computer-use daemon for a build |
+| `agentflow-agents/src/services/project-clone.ts` `triggerProjectClone` | provisions a dedicated goose build-daemon on demand (via `provisionDaemonOnDemand`) when no goose daemon exists |
 | `agentflow-agents/src/db/migrations/0077_hosted_device_template_goose.sql:1` | widens `hosted_devices_template_check` to allow `'goose'` |
 | `agentflow-agents/coder-shim-image/Dockerfile:1` | image: node 22 + bridge + goose from the fork + **python3 + a prebuilt venv `/opt/botvenv`** (aiogram>=3.4 + python-dotenv, chowned to the runtime user `pn`); the venv bin is PREPENDED to `PATH` so goose's plain `pip install` + `python bot.py` resolve to it. `BOT_VENV=/opt/botvenv`. The image only PROVIDES the runtime — goose installs+launches |
 | `agentflow-agents/coder-shim-image/entrypoint.sh:1` | env check + `node dist/coder-shim/main.js` |
@@ -255,6 +258,15 @@ charset-validated before reaching the scheduler.
   This gate only controls *creating new* goose devices; `resolveDaemonImage` keys
   off the stored row, so an already-provisioned goose device keeps its image even
   if the flag is later unset.
+- Env (server side): `FF_BUILD_CODER` — `goose` routes **project builds** onto the
+  goose coder-shim instead of the legacy aider coder, WITHOUT a global
+  `FF_DAEMON_IMAGE` flip (computer-use device provisioning stays on coder/desktop).
+  Read by `resolveBuildCoderTemplate()` in `project-clone.ts`. When `=goose`,
+  `triggerProjectClone` picks a daemon with `template='goose'` (never the user's
+  coder computer-use daemon) and, if none exists, provisions a dedicated goose
+  build-daemon on demand. Unset/any-other value → builds keep the legacy `coder`
+  daemon (reversible). Scoped to the build path only. Pairs with the
+  `provisionDaemonOnDemand` fallback (warm-pool-independent).
 - API: `POST /me/hosted-devices {kind:'daemon', template:'goose'}` → goose device
   (canary-gated). All other create-path behaviour is unchanged.
 - WS: connects to `wss://<AF_API_URL host>/_agents/_devices/connect` with
