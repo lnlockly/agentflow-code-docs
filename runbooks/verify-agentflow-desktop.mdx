@@ -114,6 +114,36 @@ On macOS grant Screen Recording + Accessibility when prompted (computercontrolle
 - `~/.config/goose/config.yaml` now has `extensions.computercontroller` (+ `agentflow` if the bundle resolved) and the app log shows `[engine] routing goosed through the AgentFlow flow gateway` + `[engine] enabled goose extensions: …`.
 - Grep the app log for `[device-bridge]` to confirm the WS connected (look for the absence of `device bridge skipped: … not enrolled`).
 
+## 2b. Local provider detection (Rust half — PR #12)
+
+The desktop offers the user's own locally-installed AI tools (Claude Code, Codex,
+Cursor, Gemini, Ollama, LM Studio, env keys) one-click alongside `flow`. The
+engine already implements every provider — this is detection only.
+
+- Lib: `crates/goose/src/providers/detect.rs` →
+  `detect_local_providers() -> Vec<DetectedProvider>`. Read-only; nothing spawned.
+- Three signals (strongest first): `binary` (catalog `binary_name` on PATH) →
+  `local-server` (Ollama `:11434/api/tags`, OpenAI-compatible `:1234/v1/models`,
+  400 ms budget) → `env-key` (a required secret `ProviderMetadata.config_keys`
+  entry set in the env, e.g. `ANTHROPIC_API_KEY`). De-dupes to the strongest.
+- Source of truth = `catalog.rs` `binary_name` (so it tracks the catalog):
+
+  | provider_id | binary_name | how it authenticates |
+  |---|---|---|
+  | `claude-acp` | `claude-agent-acp` | uses your Claude login (no key) |
+  | `codex-acp` | `codex-acp` | uses your Codex/OpenAI login |
+  | `copilot-acp` | `copilot` | GitHub Copilot login |
+  | `cursor-agent` | `cursor-agent` | Cursor login |
+  | `ollama` | (local server) | local, no key |
+  | `lmstudio` | (local server) | local OpenAI-compatible |
+
+- Verify: `cargo test -p goose providers::detect` → `8 passed`. (goose crate
+  `default = []`, so this needs no clang/llama-cpp.)
+- **Still to wire (Parts 2–3, after #10):** a goosed route exposing
+  `detect_local_providers()` + the "Найдено на твоём компьютере" section atop
+  `ui/desktop/src/components/settings/providers/ProviderGrid.tsx`. `flow` stays
+  the default; picking a detected provider sets `GOOSE_PROVIDER`/`GOOSE_MODEL`.
+
 ## 3. Mode A — standalone (matrix b3)
 In the app chat, give a build + control task ("create a small Next.js page and
 take a screenshot of it in the browser"). PASS when:
