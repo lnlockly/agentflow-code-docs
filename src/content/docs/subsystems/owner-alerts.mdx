@@ -1,13 +1,13 @@
 ---
 title: "Owner alerts worker"
-description: "Flag-gated background worker that pipes five platform-health signals to the owner-notify Telegram bot with per-key throttling."
+description: "Flag-gated background worker that pipes six platform-health signals to the owner-notify Telegram bot with per-key throttling."
 ---
 
 # Owner alerts worker
 
 ## TL;DR
 
-A single generic background worker (`owner-alerts-worker.ts`) evaluates five
+A single generic background worker (`owner-alerts-worker.ts`) evaluates six
 platform-health signals on one 2-minute tick and posts a concise message to
 the existing owner-notify Telegram bot. It reuses the same bot token / chat-id
 resolution as the rest of the codebase (`OWNER_NOTIFY_BOT_TOKEN` secret, owner
@@ -27,10 +27,16 @@ Monitored signals:
   sum of container `restartCount` + `CrashLoopBackOff` waiting reasons.
 - **(c) platform LLM budget (flow balance)** — daily `flow_ledger` debit sum
   (same `LLM_DEBIT_KINDS` as the burn alerter) vs `LLM_DAILY_CAP_USD`. Spend
-  near the cap = platform LLM budget near exhaustion.
-- **(d) TLS cert expiry** — TLS socket connect to the public host, reads the
+  near the cap = platform LLM budget near exhaustion (the cost-guardrail-breach
+  signal; pings once #28's caps land).
+- **(d) project build-failure spike** — count of `clone_status` events that
+  promoted a project to `failed` in the last `OWNER_ALERTS_BUILD_WINDOW_MIN`
+  minutes (default 30); fires at `OWNER_ALERTS_BUILD_FAIL_THRESHOLD` (default 5).
+  A spike = the coder-shim build path is broadly broken (image regression,
+  gateway down, scorer mis-pick), not one flaky brief.
+- **(e) TLS cert expiry** — TLS socket connect to the public host, reads the
   peer cert `valid_to`.
-- **(e) deploy / rollout failure** — `kubectl rollout status deployment/agentflow-agents`
+- **(f) deploy / rollout failure** — `kubectl rollout status deployment/agentflow-agents`
   with a short deadline; a stuck rollout exits non-zero.
 
 ## Files (with line refs)
@@ -43,6 +49,7 @@ Monitored signals:
 | `agentflow-agents/src/services/owner-alerts-worker.ts:215` | `probeErrorRate()` — prom-registry 5xx + recordUsage-failure delta |
 | `agentflow-agents/src/services/owner-alerts-worker.ts:268` | `probePodRestarts()` — kubectl pod restart / crashloop scan |
 | `agentflow-agents/src/services/owner-alerts-worker.ts:320` | `probeFlowBalance()` — daily flow_ledger spend vs cap |
+| `agentflow-agents/src/services/owner-alerts-worker.ts` `probeBuildFailures()` | count of `clone_status`→`failed` events in the last `OWNER_ALERTS_BUILD_WINDOW_MIN` min vs `OWNER_ALERTS_BUILD_FAIL_THRESHOLD` (the `build_failures` signal, PR #1042). Fails OPEN on a query error |
 | `agentflow-agents/src/services/owner-alerts-worker.ts:389` | `probeTlsExpiry()` — TLS socket peer-cert `valid_to` check |
 | `agentflow-agents/src/services/owner-alerts-worker.ts:411` | `probeRollout()` — kubectl rollout status of the deployment |
 | `agentflow-agents/src/services/owner-alerts-worker.ts:439` | `sendOwnerAlert()` — POST to api.telegram.org (`text` field, not `message`) |
@@ -57,6 +64,7 @@ runOwnerAlertsTick (every 2min, only if FF_OWNER_ALERTS=1)
   ├─ probeErrorRate    ← matrixMetricsRegistry.getMetricsAsJSON()
   ├─ probePodRestarts  ← kubectl get pods -n franchise-factory -o json
   ├─ probeFlowBalance  ← SELECT SUM(-amount) FROM flow_ledger (today, debit kinds)
+  ├─ probeBuildFailures← SELECT COUNT(*) FROM project_events kind=clone_status next_status=failed (window)
   ├─ probeTlsExpiry    ← tls.connect(agentflow.website:443) → peer cert valid_to
   └─ probeRollout      ← kubectl rollout status deployment/agentflow-agents
         ↓ Alert[]
@@ -85,6 +93,8 @@ condition re-fires once after restart, then throttles.
   - `OWNER_ALERTS_RESTART_THRESHOLD` — container restart count threshold (default 5).
   - `OWNER_ALERTS_FLOW_PCT` — fraction of `LLM_DAILY_CAP_USD` that fires (default 0.85).
   - `LLM_DAILY_CAP_USD` — daily cap the budget signal compares against (default 50).
+  - `OWNER_ALERTS_BUILD_WINDOW_MIN` — lookback window for the build-failure-spike signal (default 30).
+  - `OWNER_ALERTS_BUILD_FAIL_THRESHOLD` — failed builds in the window that fire it (default 5).
   - `OWNER_ALERTS_TLS_HOST` — host to probe (default `agentflow.website`).
   - `OWNER_ALERTS_TLS_WARN_DAYS` — days-to-expiry threshold (default 14).
 - Routes / MCP tools: none — internal worker only.
@@ -96,6 +106,7 @@ condition re-fires once after restart, then throttles.
 | Worker never fires while enabled | `owner-alerts tick failed` | `services/auto-pinger.ts:325` |
 | prom registry read throws (5xx probe degrades to ok) | `owner_alerts_metrics_read_failed` | `services/owner-alerts-worker.ts:238` |
 | flow_ledger query fails (budget probe degrades to ok) | `owner_alerts_flow_query_failed` | `services/owner-alerts-worker.ts:335` |
+| build-failure probe query fails (degrades to ok, no false alert) | `owner_alerts_build_query_failed` | `services/owner-alerts-worker.ts` `probeBuildFailures()` |
 | TG send rejected / network down | `owner_alerts_send_failed` | `services/owner-alerts-worker.ts:439` |
 | Alert fired (audit which keys) | `owner_alerts_firing` | `services/owner-alerts-worker.ts:509` |
 | TG silently drops message (wrong field) | n/a — sender uses `text`, asserted in test | `tests/unit/owner-alerts-worker.test.ts` |
