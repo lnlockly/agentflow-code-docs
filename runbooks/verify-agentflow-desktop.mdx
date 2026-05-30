@@ -119,6 +119,7 @@ that lands — expected; do not fail the pass on b6 yet.
 | CLI/goosed build aborts | `ggml.h: fatal error: 'stdbool.h' file not found` (llama-cpp-sys-2) | install clang/libclang OR `--no-default-features --features portable-default[,code-mode]` |
 | Mode-B dispatch never runs | dispatch returns `{queued:true, session_id:null}` and `GET …/tasks/<id>` stays `status:queued, dispatched_at:null` | per-pod in-memory WS registry + multi-replica agents; device drains only on WS reconnect (`device-bridge/index.ts onConnected → fetchQueuedTasks`). Fix: fan-out dispatch by device id (pub/sub) or interval-poll `/queued_tasks` |
 | Benign cmd refused on device | `command not in shell_whitelist: <cmd>` | expected — daemon scope `shell_whitelist` enforced; add the cmd via `PUT /me/devices/:id/scope` |
+| CI red on every PR (Live Provider Tests) | `Authentication failed for https://api.anthropic.com/v1/messages. Status: 401` (`x-api-key header is required`) | `pr-smoke-test.yml` drives a live Anthropic provider but the org has no `ANTHROPIC_API_KEY` (LLM routes via the `flow` alias). FIXED: `check-fork` publishes `has_secrets`; `build-binary` + the 4 provider jobs skip when absent. Do NOT inject an Anthropic key |
 
 ## Verified by reality (2026-05-30, ref e346d7d)
 CLI on ff-france: build ✅ (portable-default), Mode-A `PONG` via flow ✅,
