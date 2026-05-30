@@ -250,13 +250,23 @@ charset-validated before reaching the scheduler.
   (no external managed DB), so this embedded path is the chosen default.
   Deps `@electric-sql/pglite` + `@electric-sql/pglite-socket` ship in the image.
 - **Durability (owner decision 2026-05-30 — PGlite STAYS, durable via PVC; no
-  switch to cluster-PG):** `.pglite-data` lives under `/workspace`, which is the
-  STS `volumeClaimTemplates` 10Gi local-path PVC (`me-hosted-devices.ts`
-  `renderDaemonManifest`), so a project's data **survives pod restart / image
-  roll / reschedule** — the PVC stays bound and `DbSupervisor.ensureAll()`
-  re-spawns PGlite on boot against the same data dir. The supervisor's
-  keep-alive (PR #1033) is the accepted permanent runtime cost of this model.
-  Data is lost only if the PVC itself is deleted (project teardown).
+  switch to cluster-PG):** `.pglite-data` lives under `/workspace`, the STS
+  `volumeClaimTemplates` 10Gi local-path PVC (`me-hosted-devices.ts`
+  `renderDaemonManifest`), so the data FILES survive a pod restart / image roll /
+  reschedule. **But PGlite-WASM ABORTS reopening a data dir left by an UNCLEAN
+  shutdown** (`[pglite] fatal: Aborted()`) — and the embedded PGlite is spawned
+  DETACHED (own process group), so the kubelet's SIGTERM to the bridge never
+  reaches it. So durability requires a CLEAN `db.close()` on pod termination
+  (PR #1034): `pglite-launcher` writes `<dataDir>/pglite-launcher.pid`;
+  `DbSupervisor.stopAll()` (awaited by `bridge.shutdownGracefully()` from the
+  entrypoint's SIGTERM handler, within the 60s terminationGracePeriod) SIGTERMs
+  each launcher so it `db.close()`s → the dir stays reopenable → on the next boot
+  `DbSupervisor.ensureAll()` re-spawns PGlite and the rows are intact. Verified
+  end-to-end (real `pg`): clean-close → reopen reads rows back; SIGKILL → reopen
+  aborts. **Residual:** an UNGRACEFUL kill (OOM / SIGKILL / node crash) still
+  leaves the dir unreopenable — a PGlite-WASM limitation; the graceful pod
+  lifecycle (rolling update / reschedule / drain) is covered. Data is otherwise
+  lost only if the PVC itself is deleted (project teardown).
 - Env (pod side, all already on the daemon pod): `AF_API_KEY`, `AF_API_URL`
   (default `https://agentflow.website`), `AF_DEVICE_ID`, `AF_DEVICE_TOKEN`,
   `AF_ENROLLMENT_TOKEN`, `AF_INTERNAL_API_SECRET`, `GOOSE_MODEL` (default `flow`),
