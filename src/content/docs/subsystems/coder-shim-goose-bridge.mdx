@@ -263,6 +263,7 @@ charset-validated before reaching the scheduler.
 | Edit applied but the preview still shows the pre-edit page | served page unchanged after a daemon-chat edit; pod `.coder-shim-dev.log` shows a 2nd `next start` failing `EADDRINUSE` | the prior dev server still holds the port, so the rebuilt app can't rebind. Fixed: `pipeline.ts` edit mode calls `killProjectDevServer(projectDir)` (kills only PIDs whose `/proc/<pid>/cwd` is this project) before restarting. |
 | Edit dispatched but workspace gone | clone-status `{ok:false, error:'workspace_missing_for_edit'}` | the pod was recycled between build and edit, so `/workspace/<slug>` no longer exists. The pipeline fails visibly rather than silently re-cloning a blank template over the user's work — re-approve to rebuild from the brief first. |
 | Edit wipes prior content — page regenerated from the template default | after a daemon-chat edit the preview shows demo/sample content again (e.g. a placeholder brand name, unfilled `data-slot`/`{{SLOT:*}}` markers) and only the just-requested block is right; the brief content + earlier edits are gone; `git`-less diff of `app/page.tsx` shows a full rewrite, not a small change | the edit re-dispatch (`edit:true`) skips the clone but `runGoose` still used the from-scratch BUILD prompt ("create every page, replace every placeholder") → the `flow` model regenerated the file from the template default instead of editing the filled one (p-edit-loop fail). Fixed (PR fix/coder-shim-edit-loop): `goose-runner.ts` `buildCoderPrompt` `opts.edit` branch emits a MINIMAL in-place edit prompt — read existing files first, apply only the change request, preserve all other content + prior edits, do NOT regenerate from template defaults or reintroduce placeholder markers; `pipeline.ts` passes `scope.edit` through. **Needs the coder-shim image rebuilt (`build-coder-shim.yml`) on merge.** |
+| Plain chat / suggestion-approve on a goose project does nothing (no SSE) | `POST /me/projects/:id/messages` or a suggestion-approve returns but the preview never changes; logs show `[chat-iterate] no canonical coder for kind=… — falling back to legacy path` then maestro `no coder found in plan history` | only the SSE `daemon-chat` route routed to `runGooseEditTurn`; the generic `/messages` handler + `enqueueOwnerMessage` (pipeline) ran the legacy chat-iterate/maestro triage, which has no canonical coder for a goose project (p-edit-loop gap C). Fixed (PR fix/goose-edit-loop): both call `dispatchGooseEdit({projectId, homeDeviceId, text})` FIRST — for a `home_device_id`-bound project with a substantive (≥20 char) message it dispatches the goose edit via `triggerProjectClone({editText})` and returns `mode:'goose_edit'`; short messages fall through unchanged. |
 
 ## Edit channel (goose projects)
 Goose-built projects are iterated from the cabinet chat (`POST /me/projects/:id/daemon-chat`). For a goose project (one with `home_device_id` set) the turn does NOT run the legacy Claude + code-exec loop — it re-dispatches the edit as another goose run in the SAME workspace:
@@ -298,8 +299,37 @@ brief) — the incremental edit prompt tells it to read + modify in place and
 preserve everything else. A failed edit (`build_failed`) leaves the previous
 working preview up (the dev server is only killed AFTER the build gate passes).
 
+### Generic chat / triage path (not just daemon-chat)
+The SSE `daemon-chat` route is the streaming surface, but the cabinet also posts
+plain chat through `POST /me/projects/:id/messages` (route handler) and the
+suggestion-approve flow goes through `enqueueOwnerMessage` (pipeline). For a
+goose project those legacy paths had NO canonical coder in plan history, so
+their chat-iterate / maestro triage was a dead no-op
+(`[chat-iterate] no canonical coder for kind=… → falling back to legacy path`
+→ maestro `no coder found in plan history`) — a plain chat message did nothing.
+
+Both now short-circuit to the goose edit path via a shared helper
+`dispatchGooseEdit` in `project-clone.ts`:
+
+```
+POST /me/projects/:id/messages   (or enqueueOwnerMessage)
+  → dispatchGooseEdit({ projectId, homeDeviceId, text })
+      home_device_id set AND text ≥ 20 chars (OWNER_MESSAGE_SUBSTANTIAL_MIN_CHARS)?
+        → triggerProjectClone(id, { editText })   // same dispatch as runGooseEditTurn
+          emits coder_dispatched{mode:'goose_edit'} + info; returns { routed:true }
+        → handler returns { ok:true, mode:'goose_edit' }
+      else → { routed:false } → caller continues its existing routing
+```
+
+Short / non-actionable messages (greetings, "ok") stay below the threshold and
+fall through unchanged. The helper is fire-and-return (non-blocking): the
+clone-status callback re-promotes the project and the chat UI polls events — it
+does NOT block on the 7-min build the way the SSE `runGooseEditTurn` poller does.
+
 Files: `agentflow-agents/src/services/project-daemon.ts` `runGooseEditTurn`;
-`agentflow-agents/src/services/project-clone.ts` `triggerProjectClone({editText})`;
+`agentflow-agents/src/services/project-clone.ts` `triggerProjectClone({editText})` + `dispatchGooseEdit`;
+`agentflow-agents/src/routes/projects.ts` `/me/projects/:id/messages` (goose short-circuit);
+`agentflow-agents/src/services/projects-pipeline.ts` `enqueueOwnerMessage` (goose short-circuit);
 `agentflow-agents/src/coder-shim/pipeline.ts` edit branch;
 `agentflow-agents/src/coder-shim/dev-server.ts` `killProjectDevServer`.
 
