@@ -82,12 +82,26 @@ browser-MCP snapshot.
 Empty-states must read "no X yet, do Y" in Russian, never raw English `Loading…` / `Error:`
 or a dev string. Good references already in tree: `pages/ProjectsDashboard.tsx:549`
 (`EmptyProjects`), `pages/MarketplaceV2.tsx:698` (error + no-results), `app.agents.empty`
-i18n key. h-polish PR Russified `Profile.tsx` modal, `LiveProject.tsx` + `LiveProjectNewsPost.tsx`
+i18n key. h-polish PR 1 Russified `Profile.tsx` modal, `LiveProject.tsx` + `LiveProjectNewsPost.tsx`
 loading/empty, and reworded the `Desktop.tsx` demo card off `бесплатно`.
 
-**Known still-English (follow-up tranche):** `pages/ApiKeyDetail.tsx` (~39 EN strings —
-developer-focused), `pages/ApiKeys.tsx` + `pages/PricingPageV2.tsx` (`Free` tier label —
-needs an owner naming call), admin pages (`AdminAds`, `AdminLlmProviders`, `FlowEmissionDashboard`).
+**Static `index.html` meta.** The pre-hydration `<title>` / `description` / OG / Twitter
+fallback (what crawlers + first-paint see before `useHead` runs) lives in `index.html`.
+Keep it plain RU, no `operator` / `decentralized marketplace` jargon — h-polish follow-up
+aligned it to the runtime `seo.home.title/desc` (`AgentFlow — AI собирает твой проект`) and
+flipped `<html lang>` + `og:locale` to `ru`. `useHead` (`src/lib/useHead.ts:122`) overrides
+`document.documentElement.lang` per active language at runtime.
+
+**Follow-up tranche — DONE (h-polish PR 2):** `pages/ApiKeyDetail.tsx` fully Russified
+(labels, period/window pickers via `PERIOD_LABEL`/`WINDOW_LABEL` maps, tables, empty-states);
+admin `Loading…` / `Error:` in `AdminAds` / `AdminLlmProviders` / `FlowEmissionDashboard` → RU.
+Token-launchpad mobile: verified 0 horizontal overflow at 375px on `/pricing` + `/launchpad`
+(browser-MCP) — already responsive, no fix needed.
+
+**Still deferred (owner product call):** the `Free` pricing/B2B tier label
+(`pages/ApiKeys.tsx`, `pages/PricingPageV2.tsx`, `ApiKeyDetail.tsx` `TIER_LABEL.free`) —
+brand tier name kept as-is pending an owner naming decision (a $0 tier literally named
+"Free" vs the no-`бесплатно` rule).
 
 ## Failure modes
 
