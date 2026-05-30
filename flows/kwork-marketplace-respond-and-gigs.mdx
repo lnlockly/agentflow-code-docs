@@ -1,0 +1,55 @@
+---
+title: "Kwork marketplace: approval-gated отклики + new gigs"
+description: "Owner installs Kwork respond/create-gig flows from the marketplace; each outward action is gated behind a TG approval card before the bridge posts to Kwork."
+---
+
+# Kwork marketplace: approval-gated отклики + new gigs
+
+## TL;DR
+The owner runs two Kwork automations from the marketplace on their LIVE Kwork
+account: (1) scan fresh `/projects` → AI-draft a human отклик → TG approval card
+→ post on owner approve; (2) draft a new gig → TG approval card → create on
+owner approve. Every outward action is approval-gated (no auto-blast — Kwork
+bans spammy/GPT bids). Two engines: studio-graph (`*-basic`, runs on cron now)
+and the Activepieces fork (`*-ap`, owner publishes in flows.agentflow.website).
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/studio-flow-templates.ts:1848` | `kwork-projects-respond-basic` graph: cron → scan_wants → wants_to_leads_shim → ai.draft_replies → tg-bot.send_card. |
+| `agentflow-agents/src/services/graph-executor/handlers/kwork-scan-wants.ts:41` | `kwork.scan_wants` input schema. Coerces stringified numeric inputs (`min_budget`/`category_id`/`limit`) — studio graphs interpolate form fields as strings. |
+| `agentflow-agents/src/mcp-servers/kwork-inbox.ts:2432` | `respond_to_want` — posts an отклик via `/api/offer/createoffer` (see kwork-auto-earn). |
+| `agentflow-agents/src/mcp-servers/kwork-inbox.ts:1948` | `create_kwork` — creates a new gig on the seller account (`/sell/create` candidates). |
+| `agentflow-agents/src/mcp-servers/kwork-inbox.ts:1554` | `list_my_kworks` — owner's existing gigs (dedupe before create). |
+| `agentflow-agents/src/mcp-servers/tg-bot.ts:390` | `send_card` — inline-keyboard approval card via owner's sealed `OWNER_TG_BOT_TOKEN` (falls back to platform `AGENTFLOW_BOT_TOKEN`). chat = `OWNER_TG_CHAT_ID`. |
+| `activepieces-spike/kwork-rest-bridge/server.mjs` | REST→MCP bridge. Routes: `/kwork/scan-projects`, `/kwork/respond-to-project`, `/kwork/list-my-gigs`, `/kwork/categories`, `/kwork/create-gig` (`dry_run` returns prepared payload without posting). |
+| `agentflow-agents/src/routes/marketplace.ts:1425` | `POST /me/marketplace/:slug/install` → legacy clone (studio) or `importFlowForOwner` (AP IMPORT_FLOW). |
+
+## Data flow
+```
+marketplace install (POST /me/marketplace/<slug>/install)
+  studio engine (*-basic):  cron → kwork.scan_wants → ai.draft_replies (flow alias)
+                             → tg-bot.send_card  →  owner taps "Отправить"
+                             → owner-bot-callbacks-router → kwork-inbox.respond_to_want
+  AP engine (*-ap):          schedule → HTTP kwork-rest-bridge → telegram-bot request_approval card
+                             (owner publishes + adds bot connection in flows.agentflow.website)
+```
+
+## DB / Env / API
+- Tables: `marketplace_templates` (rows `kwork-projects-respond-ap`, `kwork-create-gig-ap`, engine=`activepieces`); `project_secrets` (`OWNER_TG_BOT_TOKEN`, `OWNER_TG_CHAT_ID` per owner); `kwork_lead_state` (отклик dedupe PK `(owner, dialog_id)`).
+- Env (bridge): `AP_BRIDGE_SECRET`, `INTERNAL_API_SECRET`, `AGENTFLOW_AGENTS_URL`.
+- Routes: `POST /me/marketplace/:slug/install|run`, bridge `POST /kwork/{scan-projects,respond-to-project,list-my-gigs,categories,create-gig}`.
+- MCP tools: `kwork-inbox.{list_wants,respond_to_want,create_kwork,list_my_kworks,list_categories}`, `tg-bot.send_card`.
+- Approval card bot: reuse `@agentflow_e2e_verify_bot` (token sealed at project 1603 `BOT_TOKEN`, transplanted to owner `OWNER_TG_BOT_TOKEN`). Owner chat `1361064246`.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Respond flow never sends a card; first node fails | `step scan_wants (kwork.scan_wants)` + `expected number, received string` | `kwork-scan-wants.ts:optionalIntFromLoose` — string→number coercion for `min_budget`/`category_id`/`limit`. Fixed in agentflow-agents PR #1002. |
+| Card never delivered, `no_owner_bot_token` | `resolveOwnerBotToken` returns `no_owner_bot_token` | Set `OWNER_TG_BOT_TOKEN` (+ `OWNER_TG_CHAT_ID`) in `project_secrets` for the owner. |
+| AP create-gig flow run errors at list step | bridge `not_found` on `POST /kwork/list-my-gigs` | Bridge pod predates the create-gig routes — rebuild `kwork-rest-bridge` image with the current `server.mjs`. No CI exists for this pod yet (gap). |
+| отклик posted to a stranger that reads as GPT/spam | Kwork sends off-platform-penalty notice in inbox | Keep approval-gating ON; draft ≤3 phrases, на «вы», no lists, no off-platform mentions. |
+
+## Related
+- [Kwork auto-earn DM loop](/subsystems/kwork-auto-earn)
+- [Activepieces marketplace](/subsystems/activepieces-marketplace)
