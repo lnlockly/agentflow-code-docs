@@ -1,0 +1,70 @@
+---
+title: "Health Probes & Self-Recovery"
+description: "k8s liveness/readiness topology + the idempotent recovery-cron set that self-heals stuck builds and orphaned tasks."
+---
+
+# Health Probes & Self-Recovery
+
+## TL;DR
+Three health endpoints back the k8s probes; a set of idempotent recovery cron
+loops (run under `AGENTFLOW_ROLE=worker`) self-heal stuck project builds and
+orphaned tasks after a pod/daemon restart — no manual intervention. Probe
+coverage across `franchise-factory` deployments is uneven (audited 2026-05-30).
+
+## Health endpoints (with line refs)
+| Endpoint | Touches DB? | Use | File |
+|---|---|---|---|
+| `/health` | yes (SELECT 1 + eliza) | legacy combined | `agentflow-agents/src/routes/health.ts:51` |
+| `/health/live` | **no** (always 200) | **liveness** — restart only a hung event loop | `agentflow-agents/src/routes/health-dashboard.ts:273` |
+| `/health/ready` | yes (SELECT 1) | **readiness** — shed pod from Service on a Postgres flap | `agentflow-agents/src/routes/health-dashboard.ts:275` |
+
+Rule: **liveness must NOT depend on the DB**. A DB-dependent liveness probe
+restart-loops every api pod during a Postgres flap, turning a blip into an
+outage. Readiness (DB-aware) sheds traffic; liveness (`/health/live`) only kills
+a truly wedged process.
+
+## Probe topology (franchise-factory, audited 2026-05-30)
+| Deployment | liveness | readiness |
+|---|---|---|
+| `agentflow-agents` (api) | `/health/live` (added 2026-05-30) | `/health/ready` |
+| `agentflow-agents` (worker) | `/health` | `/health` |
+| `agentflow-api`, `-admin`, `-embed`, `-workers`, `-runtime`, `-remotion-runner`, `kwork-rest-bridge` | `/health` | `/health` |
+| `bot-platform`, `syngularity-service` | `/health/live` | `/health/ready` |
+| `agentflow-postgres` | `pg_isready` | `pg_isready` |
+| `agentflow-landing` | **NONE** | **NONE** |
+| `agentflow-bot` | NONE | `/api/health` |
+| `claude-oauth-proxy` | NONE | NONE |
+| `mautrix-telegram`, `mautrix-meta`, `sliding-sync`, `agentflow-tg-mcp`, `agentflow-playwright-mcp` | NONE | NONE |
+
+Gaps (owner/ops): `agentflow-landing` (no probes — wants a readiness `/`),
+`claude-oauth-proxy` (critical LLM path), `agentflow-bot`, the mautrix bridges.
+
+## Self-recovery cron set
+All wired in `agentflow-agents/src/services/auto-pinger.ts` (run under
+`AGENTFLOW_ROLE=worker`). Each is idempotent + survives pod/daemon restart.
+
+| Cron | Tick | What it heals | File |
+|---|---|---|---|
+| preview-reconciler | TICK_MS | `provisioning` projects whose dev port is up → promote to `running` + wire Ingress | `services/pingers/preview-reconciler.ts` |
+| stale-task-sweep | 60s | orphaned `in_progress` plan_tasks (claimed >8 min) → `failed` + retry (depth ≤3) | `services/pingers/stale-task-sweep.ts` |
+| pod-recovery | POD_TICK_MS | wedged/failed workspace pods | `services/pingers/pod-recovery.ts` |
+| healer | HEALER_TICK_MS | build-heal retries | `services/pingers/healer.ts` |
+| preview-health | PREVIEW_HEALTH_TICK_MS | demote previews that stop answering | `services/pingers/preview-health.ts` |
+| stale-pvc-sweep | PVC_SWEEP_TICK_MS | orphaned PVCs | `services/pingers/stale-pvc-sweep.ts` |
+
+`stale-task-sweep` uses an atomic `UPDATE … RETURNING` so two pods can't
+double-issue a retry. `device_tasks` re-queue on failed WS send
+(`status='queued', dispatched_at=NULL`, `routes/me-devices.ts:970`).
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Project stuck in `provisioning` after restart | preview-reconciler logs / `provisioning` rows past MAX_AGE_MIN | `services/pingers/preview-reconciler.ts` |
+| plan_task wedged `in_progress` forever | `orphan_after_pod_restart` | `services/pingers/stale-task-sweep.ts` |
+| api pod never restarts when event loop hangs | no `livenessProbe` on the deployment | `k8s/agentflow-agents.yaml` (api container) |
+| DB flap restart-loops api pods | liveness pointed at a DB-touching path | use `/health/live`, keep DB checks on readiness |
+
+## Related
+- [Workspace provisioning](/subsystems/workspace-provisioning)
+- [LLM budget governor](/subsystems/llm-budget-governor)
+- Audit: `plans/autonomous/_reliability-audit-2026-05-30.md`
