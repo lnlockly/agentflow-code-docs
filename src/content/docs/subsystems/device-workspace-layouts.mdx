@@ -8,11 +8,15 @@ description: "Universal /devices/:id/live workspace with three presets and per-s
 ## TL;DR
 A device's `/cabinet/devices/:id/live` page renders a CSS-grid workspace with three named slots (`main` / `side` / `bottom`). The three layout presets (`developer` / `simple` / `universal`) collapse onto a two-mode header pill — **«Простой ⇄ Профи»** (concept Phase 3, 5.4/5.7): Простой maps to the `simple` preset, Профи maps to `developer` (a device already on `universal` also reads as Профи). The preset id + per-slot overrides persist on `user_devices.layout_preset` / `user_devices.layout_config`. The per-slot swap menu shows only in Профи. Pages without a preset render the legacy MJPEG+composer grid; the «open workspace» button now opens into `simple` (Простой) by default.
 
+**PR #573 (2026-05-31): «Простой» is one calm column.** The `simple` preset collapsed to a single `chat` panel (`side`/`bottom` = `null`) — no preview pane, no `activity`/`terminal`/`file-tree` tabs, no tab strip. The live page renders the `simple` preset through a dedicated `SimpleWorkspace` (not `UniversalWorkspace`), which mounts `Chat` with `args.variant === 'simple'`. That variant swaps the techy header for a slim status line («Агент сейчас работает…» / last result / idle), labels bubbles «Ты» / «Агент», renders agent action frames as quiet inline activity, and shows a friendly empty state with 3 example tasks (`SIMPLE_EXAMPLES`, briefs reused from `live.preset.*`). All power tools stay reachable behind «🔵 Профи». SSE/dispatch untouched.
+
 ## Files (with line refs)
 | Path | Role |
 |---|---|
 | `agentflow-landing/src/components/workspace/presets.ts` | `PRESETS`, `parseSlot`, `mergeLayoutConfig` |
-| `agentflow-landing/src/components/workspace/UniversalWorkspace.tsx` | CSS-grid renderer; mobile single-pane tabs |
+| `agentflow-landing/src/components/workspace/UniversalWorkspace.tsx` | CSS-grid renderer; mobile single-pane tabs (used for Профи / `developer` / `universal`) |
+| `agentflow-landing/src/components/workspace/SimpleWorkspace.tsx` | «Простой» surface (PR #573) — one calm column, mounts `Chat` with `args.variant: 'simple'`; no tab strip |
+| `agentflow-landing/src/components/workspace/widgets/Chat.tsx` | `simple` variant: slim status line, «Ты»/«Агент» bubbles, inline action frames, `SIMPLE_EXAMPLES` empty state, `live.simple.*` i18n |
 | `agentflow-landing/src/components/workspace/LayoutPicker.tsx` | Header pill (two modes: Простой/Профи via `MODES` + `presetToMode`) + per-slot swap submenu (Профи only); takes a `t` prop for i18n labels |
 | `agentflow-landing/src/components/workspace/widgets/PreviewIframe.tsx` | `main` widget; empty state = «Дай агенту первую задачу» + example tasks reusing `live.preset.*` keys, dev hint behind a `<details>` |
 | `agentflow-landing/src/components/workspace/widgets/Activity.tsx` | `bottom` widget in Простой; `humanizeEventKind` maps machine `project_events` kinds → plain RU labels (raw kind kept in `title`) |
@@ -67,13 +71,13 @@ Mobile (<768px) collapses the grid to a sticky-tab single-pane view; non-active 
 
 ```ts
 PRESETS.developer  = { main: 'preview-iframe', side: 'tabs:[chat,file-tree,code-editor]', bottom: 'tabs:[activity,terminal,file-tree]' }  // → «Профи»
-PRESETS.simple     = { main: 'preview-iframe', side: 'chat',                              bottom: 'activity' }                              // → «Простой»
+PRESETS.simple     = { main: 'chat',           side: null,                               bottom: null }                                     // → «Простой» (rendered via SimpleWorkspace, PR #573)
 PRESETS.universal  = { main: 'xvfb-stream',    side: 'stack:[artefact,chat]',             bottom: 'tabs:[terminal,file-tree,events]' }       // legacy → reads as «Профи»
 ```
 
 Slot specs: bare widget id, `stack:[w1,w2]`, `tabs:[w1,w2,w3]`, or `null` (hidden).
 
-`simple.bottom` is `activity` (not `null`) so Простой shows the plain-language event feed (concept 5.4: «лента событий»). The two header pills map: `simple` → Простой, `developer`/`universal` → Профи (`presetToMode` in `LayoutPicker.tsx`). Clicking Профи always PATCHes `developer`; the live screen (`xvfb-stream`/`mjpeg-stream`) stays reachable in Профи via the per-slot swap menu.
+Since PR #573 the `simple` preset is `chat`-only (`side`/`bottom` = `null`); the «лента событий» now rides inside the chat as inline action frames + a slim status line rather than a separate `activity` slot. `SimpleWorkspace` renders it directly, so `UniversalWorkspace`/`mergeLayoutConfig` are bypassed for Простой (per-slot overrides are ignored there). The two header pills map: `simple` → Простой, `developer`/`universal` → Профи (`presetToMode` in `LayoutPicker.tsx`). Clicking Профи always PATCHes `developer`; the live screen (`xvfb-stream`/`mjpeg-stream`) stays reachable in Профи via the per-slot swap menu.
 
 ## Failure modes
 
