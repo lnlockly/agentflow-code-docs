@@ -34,6 +34,14 @@ marketplace install (POST /me/marketplace/<slug>/install)
   AP engine (*-ap):          schedule → HTTP kwork-rest-bridge → telegram-bot request_approval card
                              (owner publishes + adds bot connection in flows.agentflow.website)
 ```
+Directive: marketplace = activepieces ONLY; studio-graph engine is being retired
+(`plans/autonomous/_studio-graph-retire.md`). The AP-native fork pieces
+(`agentflow-flows/packages/pieces/community/agentflow-kwork`: `scan_leads`,
+`send_reply` with target=project+price, `scan_dialogs`; `agentflow-telegram`:
+`send_card` approval, `send_message`) are the directive-preferred surface. They
+ALL call the **kwork-rest-bridge** (`callBridge` → `/kwork/*`), so the bridge is
+the canonical AP backend — NOT legacy. A native `create_gig` action is the one
+gap (would call the new bridge `/kwork/create-gig`).
 
 ## DB / Env / API
 - Tables: `marketplace_templates` (rows `kwork-projects-respond-ap`, `kwork-create-gig-ap`, engine=`activepieces`); `project_secrets` (`OWNER_TG_BOT_TOKEN`, `OWNER_TG_CHAT_ID` per owner); `kwork_lead_state` (отклик dedupe PK `(owner, dialog_id)`).
@@ -45,7 +53,7 @@ marketplace install (POST /me/marketplace/<slug>/install)
 ## Failure modes
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
-| Respond flow never sends a card; first node fails | `step scan_wants (kwork.scan_wants)` + `expected number, received string` | `kwork-scan-wants.ts:optionalIntFromLoose` — string→number coercion for `min_budget`/`category_id`/`limit`. Fixed in agentflow-agents PR #1002. |
+| Kwork отклик flow sends no card (first node fails) | `invalid_type … expected number, received string … path [min_budget]` (also `[category_id]` / `[limit]`) in a `kwork.scan_wants` flow_run error | `kwork-scan-wants.ts:optionalIntFromLoose` — studio graphs interpolate form fields as strings (`'${input.min_budget}'` → `"0"`); coerce string→number, empty→unset. Fixed in agentflow-agents PR #1002 (merged 7c32b30c). |
 | Card never delivered, `no_owner_bot_token` | `resolveOwnerBotToken` returns `no_owner_bot_token` | Set `OWNER_TG_BOT_TOKEN` (+ `OWNER_TG_CHAT_ID`) in `project_secrets` for the owner. |
 | AP create-gig flow run errors at list step | bridge `not_found` on `POST /kwork/list-my-gigs` | Bridge pod predates the create-gig routes — rebuild `kwork-rest-bridge` image with the current `server.mjs`. No CI exists for this pod yet (gap). |
 | отклик posted to a stranger that reads as GPT/spam | Kwork sends off-platform-penalty notice in inbox | Keep approval-gating ON; draft ≤3 phrases, на «вы», no lists, no off-platform mentions. |
