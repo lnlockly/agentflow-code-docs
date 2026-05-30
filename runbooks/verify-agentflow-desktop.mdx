@@ -13,6 +13,16 @@ a packaged (ideally signed) app, a real machine, and the live gateway. The CI
 gate already proves the app typechecks + packages on every PR — this proves it
 actually *runs* both modes.
 
+**PR #10 (`agentflow-goose`) changes the launch contract:** flow-LLM +
+device-bridge are now **default-on when `~/.agentflow/auth.json` is enrolled**
+(opt out with `FF_FLOW_LLM=0` / `FF_DEVICE_BRIDGE=0`) — fixes the double-click
+401 "Missing API key". Same PR finished the user-visible de-brand
+(`Goose`/`goose` → `AgentFlow` across ~43 `ui/desktop/src` files; engine
+internals `goosed`/`GOOSE_*`/`goose://`/`.goosehints` kept) and regenerated the
+app + tray icons from the AgentFlow brand mark
+(`agentflow-landing/brand/logos/mark-only.svg` → `ui/desktop/src/images/icon.{icns,ico,png}`,
+`icon-light.*`, `iconTemplate*`).
+
 ## 0. Build the artifact
 
 **`pnpm run package` alone produces an app that CANNOT run** — it builds only the
@@ -76,9 +86,27 @@ so an already-provisioned device just works. To enrol fresh, add a device in
 { "api_key": "af_live_…", "device_id": "<uuid>",
   "enrollment_token": "<token>", "ws_url": "wss://agentflow.website/_agents/_devices/connect" }
 ```
-Launch with both flags on (opt-in until this pass signs off):
+**Default-on since PR #10 (`agentflow-goose`).** Flow-LLM and device-bridge now
+activate from `auth.json` alone — a double-clicked packaged app needs **no env
+vars**. The 401 "Missing API key" double-click bug was caused by the old gates
+(`FF_FLOW_LLM=1` / `FF_DEVICE_BRIDGE=1`), which a double-click never set, so the
+`af_live_*` key was never injected. Gating now:
+- `ui/desktop/src/device-bridge/gating.ts:21` `flowLlmEnabled()` → on whenever
+  `flowGatewayEnvFromAuth()` (`ui/desktop/src/device-bridge/index.ts:36`) returns
+  non-null (auth.json carries a key). Keyless launch → keeps the user's own provider.
+- `ui/desktop/src/device-bridge/gating.ts:31` `deviceBridgeEnabled()` → on whenever
+  `isEnrolled(auth)` (`ui/desktop/src/device-bridge/auth.ts:87`).
+- Opt-out (developer pins stock-goose): `FF_FLOW_LLM=0` / `FF_DEVICE_BRIDGE=0`
+  (also `false`) force-disable, via `isOptedOut()`
+  (`ui/desktop/src/device-bridge/gating.ts:12`).
+- Wired in `ui/desktop/src/main.ts:80` (bridge gate) +
+  `ui/desktop/src/main.ts:864` (flow gate).
+
 ```bash
-FF_DEVICE_BRIDGE=1 FF_FLOW_LLM=1 "out/AgentFlow Desktop-darwin-arm64/AgentFlow Desktop.app/Contents/MacOS/AgentFlow Desktop"
+# Enrolled double-click: zero env vars needed.
+"out/AgentFlow Desktop-darwin-arm64/AgentFlow Desktop.app/Contents/MacOS/AgentFlow Desktop"
+# Force the stock-goose path (own provider, no bridge):
+FF_FLOW_LLM=0 FF_DEVICE_BRIDGE=0 "out/.../AgentFlow Desktop"
 ```
 On macOS grant Screen Recording + Accessibility when prompted (computercontroller needs them).
 
@@ -120,6 +148,7 @@ that lands — expected; do not fail the pass on b6 yet.
 | Mode-B dispatch never runs | dispatch returns `{queued:true, session_id:null}` and `GET …/tasks/<id>` stays `status:queued, dispatched_at:null` | per-pod in-memory WS registry + multi-replica agents; device drains only on WS reconnect (`device-bridge/index.ts onConnected → fetchQueuedTasks`). Fix: fan-out dispatch by device id (pub/sub) or interval-poll `/queued_tasks` |
 | Benign cmd refused on device | `command not in shell_whitelist: <cmd>` | expected — daemon scope `shell_whitelist` enforced; add the cmd via `PUT /me/devices/:id/scope` |
 | CI red on every PR (Live Provider Tests) | `Authentication failed for https://api.anthropic.com/v1/messages. Status: 401` (`x-api-key header is required`) | `pr-smoke-test.yml` drives a live Anthropic provider but the org has no `ANTHROPIC_API_KEY` (LLM routes via the `flow` alias). FIXED: `check-fork` publishes `has_secrets`; `build-binary` + the 4 provider jobs skip when absent. Do NOT inject an Anthropic key |
+| Double-clicked app 401s on the model | `Missing API key` / `invalid_session` though `~/.agentflow/auth.json` has `api_key` | FIXED PR #10: flow-LLM gate was `FF_FLOW_LLM=1`-only; a double-click set no env var. Now default-on via `gating.ts:flowLlmEnabled` (`ui/desktop/src/main.ts:864`). If it recurs, confirm `flowGatewayEnvFromAuth()` (`device-bridge/index.ts:36`) reads a non-empty `api_key` and `FF_FLOW_LLM` is not pinned to `0` |
 
 ## Verified by reality (2026-05-30, ref e346d7d)
 CLI on ff-france: build ✅ (portable-default), Mode-A `PONG` via flow ✅,
