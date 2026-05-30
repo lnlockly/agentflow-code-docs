@@ -29,6 +29,9 @@ Hosted Device — это StatefulSet в персональном vcluster пол
 | `agentflow-agents/src/routes/me-hosted-devices.ts:200` | `renderDaemonManifest` — образ daemon |
 | `agentflow-agents/src/services/bootstrap-schema.ts` | таблица `hosted_devices` |
 | `agentflow-landing/src/pages/CabinetHostedDeviceNew.tsx` | форма создания (имя, размер, kind, preinstall). Phase 4 (cloud reframe): копия подаёт облако как «агент 24/7», размеры названы по ЗАДАЧЕ (лёгкий/рабочий/мощный), ядра/память/диск — мелкий текст. `size` slug (`small`/`medium`/`large`) → payload НЕ менялся, только подписи; строки вынесены в `cabinet.hosted.*` ключи `src/i18n/{ru,en,zh}.json` |
+| `agentflow-landing/src/pages/CabinetHostedDeviceNew.tsx:125` | `ENGINE_OPTIONS` — feature B «Расширенные настройки»: engine-picker → backend `template` (goose/coder/assistant/universal + disabled «скоро» OpenClaw/picoclaw) |
+| `agentflow-landing/src/pages/CabinetHostedDeviceNew.tsx:314` | payload guard — `template` шлётся ТОЛЬКО при `kind==='daemon' && engine!=='coder'`, иначе поле опускается (default-поток byte-identical) |
+| `agentflow-landing/src/pages/CabinetHostedDeviceNew.tsx:329` | graceful 403 `goose_canary_disabled` — откат на coder, повторное открытие advanced, дружелюбная строка, без краша |
 | `agentflow-landing/src/pages/CabinetHostedDeviceDetail.tsx` | детальная страница (pulse, events, terminal, logs, power) |
 | `agentflow-landing/src/styles/hosted-live.css` | namespace `.hlive__*` |
 | `agentflow-computer-mcp/Dockerfile` | образ daemon (Xvfb + Chromium + Playwright + tini) |
@@ -114,6 +117,51 @@ DELETE /me/hosted-devices/:id      →  kubectl delete sts + soft delete
 | Когда выбирать | проверить что vcluster жив, дёшево | реально что-то делать через af_* |
 
 `kind` поле задаётся в `POST /me/hosted-devices`. По умолчанию `plain`.
+
+## «Расширенные настройки» — engine picker + preinstall (feature B)
+
+`CabinetHostedDeviceNew` рендерит свёрнутый по умолчанию disclosure
+«Расширенные настройки» (`advancedOpen`, `CabinetHostedDeviceNew.tsx:256`).
+Простой поток не меняется: пока блок закрыт и движок остаётся `coder`,
+payload отправляется без поля `template` — byte-identical к до-feature
+запросу.
+
+**Engine → `template`.** `ENGINE_OPTIONS` (`CabinetHostedDeviceNew.tsx:125`)
+мапит карточки на backend-enum `template`:
+
+| Карточка | `template` | Поведение |
+|---|---|---|
+| AgentFlow · Goose | `goose` | бейдж «рекомендуем»; canary-gated на бэке (`FF_GOOSE_CANARY`) |
+| AgentFlow · Coder | `coder` | **default-выбор** (== DB default → поле опускается) |
+| AgentFlow · Assistant | `assistant` | узкий образ-ассистент |
+| Универсал | `universal` | полный десктоп |
+| OpenClaw / picoclaw | — | DISABLED «скоро», НИКОГДА не шлются (не в enum, `z.enum` дал бы 400) |
+
+Правило отправки (`CabinetHostedDeviceNew.tsx:314`): `template` уходит в
+payload **только** при `kind==='daemon' && engine!=='coder'`. Для `plain`
+template бессмысленен (см. footgun выше), а `coder` == DB default — поэтому
+оба случая опускают поле, и default-поток остаётся прежним. Дефолт = `coder`
+(не `goose`), чтобы создание не падало на canary-gate у юзера без флага.
+
+**Goose canary 403 — graceful** (`CabinetHostedDeviceNew.tsx:329`): если бэк
+вернул `403 goose_canary_disabled`, форма откатывает движок на `coder`,
+заново открывает advanced и показывает дружелюбную строку
+(`cabinet.hosted.engine.goose_unavailable`) — без краша, следующий submit
+проходит.
+
+**Preinstall (B2).** Набор фиксирован backend-enum `PREINSTALL_TOOLS`
+(`me-hosted-devices.ts:364`): `opencode`, `codex`, `nodejs`, `python_ds`,
+`ffmpeg` — ровно 5, новые слаги не выдумываются. UI переехал внутрь
+advanced, заголовки/подписи вынесены в `cabinet.hosted.preinstall.*`
+ключи. Шлётся только для `kind==='daemon'` (прежнее поведение).
+
+**flow LLM (B3).** Строка-reassurance `cabinet.hosted.flow.*`: нейросеть
+flow встроена во все облачные агенты, отдельный ключ не нужен (alias `flow`,
+имя модели не хардкодится).
+
+Все строки — `cabinet.hosted.{advanced,engine,flow,preinstall}.*` в
+`src/i18n/{ru,en,zh}.json`. Мобайл: engine-карточки `grid-cols-1` на телефоне,
+тач-таргеты ≥44px, проверено на 390px и 360px без горизонтального скролла.
 
 ## Related
 
