@@ -63,6 +63,25 @@ The official @AIAgentFlow_bot has **no webhook** (`getWebhookInfo.url === ""`) a
 
 Bot identity note: `AGENTFLOW_BOT_TOKEN` = **@AIAgentFlow_bot** (id 8536951969) — the SAME token the public `agentflow-bot` deployment runs, i.e. the real official bot. `@agentflow_bot` in template copy resolves to a SEPARATE bot `@Agentflow_bot` (id 7906381977) with NO token in the cluster — stale copy, do not target it. Link base: `KWORK_APPROVAL_BASE_URL` (default `https://agentflow.website/_agents`).
 
+## Create-gig approval (P2, PR #1008 / #1006)
+The gig analogue of R4 — same prefetch-safe + single-use signed-link model, a
+parallel surface for CREATING a new gig on manage_kworks.
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/kwork-approval-token.ts` | Token gains a `kind:'respond'\|'gig'` namespace. Omitted for respond (legacy R4 tokens byte-identical); a `gig` token can't drive the respond route and vice-versa. R4 route rejects non-`respond`; gig route rejects non-`gig`. |
+| `agentflow-agents/src/db/schema.ts` + `db/migrations/0080_kwork_pending_gigs.sql` | `kwork_pending_gigs` — armed single-use gig tickets holding the full `create_kwork` payload; POST atomically claims `armed`→terminal (`created`/`approved_dryrun`/`cancelled`/`create_failed`) + `consumed_at`. Migration via psql post-merge. |
+| `agentflow-agents/src/routes/public-kwork-gig.ts` | `GET /public/kwork/create-gig?t=` renders a confirm page (mutates nothing — prefetch-safe); `POST` → `kwork-inbox.create_kwork` (dry-run-safe) / ✕ cancel / ✏️ edit-description. Single-use; gated `FF_KWORK_TG_PIPELINE=1`. |
+| `agentflow-agents/.../handlers/kwork-send-gig-card.ts` (`kwork.send_gig_card`) | Arms a gig ticket → signs `kind='gig'` tokens with its id → official-bot card (`bot:'platform'`, ✅ Создать / ✏️ Правки / ✕ Отмена) → stamps msg id. |
+| `agentflow-agents/.../handlers/kwork-gen-work-examples.ts` (`kwork.gen_work_examples`) | R2 portfolio step — wraps the MCP tool; tolerates `image_url:null` (image gen geo-blocked, task #11) and attaches only `examples_with_image`. Never throws — gig flow continues. |
+| `agentflow-agents/src/services/studio-flow-templates.ts` | Template `kwork-create-gig-basic`: manual → `kwork.gen_work_examples` → `kwork.send_gig_card`. `dry_run` default TRUE (no publish). |
+
+dry_run TRUE = the confirm POST records intent WITHOUT publishing. Flip to false
+for a real gig (passes moderation only with proper примеры работ — R2; images
+attach once designapi is reachable). Verified by reality 2026-05-30 on
+`435a4281`: prefetch-safe + dry-run transition + single-use + ✕ cancel +
+cross-namespace rejection; real gig card msg 15801 on @AIAgentFlow_bot.
+
 ## Failure modes
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
@@ -73,6 +92,8 @@ Bot identity note: `AGENTFLOW_BOT_TOKEN` = **@AIAgentFlow_bot** (id 8536951969) 
 | Owner taps a card button on the official bot, nothing happens | tap recorded in `agentflow-bot` logs, never in `tg_bot_callback_queue`; or `kwork.handle_callback` returns `lead_state_missing` for a `want_id` | Official-bot `callback_data` can't reach `tg-bot-poller` (see R4). Use approval URL links. Also: project-respond cards emit `kwork.reply:<want_id>` but `handle_callback` `loadKworkLead(dialog_id)` has no row for a want → `lead_state_missing`. |
 | Card lands on QA bot `@agentflow_e2e_verify_bot` instead of the official bot | card `from.username` = e2e bot | Owner has `OWNER_TG_BOT_TOKEN` = e2e token → `send_card` defaults to `kind:'owner'`. Call `send_card({bot:'platform'})` for owner-facing cards (R3). |
 | Respond cards target crowded projects | many `responses_count > 5` in scan output | Pass `max_responses` (default 5) to `kwork.scan_wants`; it now filters server-side (R1). |
+| Gig card has no portfolio images / `work_examples_attached:false` | `gen_work_examples` examples all have `image_url:null` | designapi (RU IP) is geo-blocked from the OVH/France egress (task #11, owner-gated — fix = RU proxy / `HTTP_PROXY` for `*.designapi.ink`). Node tolerates null; gig ships text-only; images auto-attach once reachable. |
+| Gig token tapped, «Ссылка недействительна» | route logs reject on `kind` mismatch | A `respond` token was used on `/public/kwork/create-gig` or vice-versa — kind-namespacing rejects cross-surface tokens by design. Use the matching link. |
 
 ## Related
 - [Kwork auto-earn DM loop](/subsystems/kwork-auto-earn)
