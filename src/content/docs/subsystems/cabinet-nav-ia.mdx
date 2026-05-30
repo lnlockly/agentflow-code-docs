@@ -7,42 +7,57 @@ description: "How the authenticated cabinet sidebar + mobile bottom bar are stru
 
 ## TL;DR
 
-The authenticated cabinet nav leads with the 5 surfaces the owner named as
-core — Проекты, Приложение (desktop agent), Облако (24/7), **Баланс и AI**
-(renamed from «LLM-кабинет», Фаза 1), Маркетплейс — under an «Основное»
-group, with a pinned «Главная» home above it. Everything else (agents,
-flows, device skills, the `/apps` launcher, billing, settings) is tucked
-behind a collapsible «Ещё» disclosure that defaults closed. **Referrals
-were de-duplicated in Фаза 1: removed from «Ещё» and from the LLM-cabinet
-tab; they now live in exactly one place — the avatar dropdown.** All nav
-lives in one component; `/apps` is the overflow launcher and the avatar
-dropdown carries profile/referrals/settings/billing/logout.
+The authenticated cabinet nav leads with **4 core surfaces** — Проекты,
+**Агенты** (`/cabinet/agents` hub, A2), Маркетплейс, **Баланс и AI**
+(renamed from «LLM-кабинет», Фаза 1) — under an «Основное» group, with a
+pinned «Главная» home above it. **Приложение** (desktop agent) and
+**Облако** (24/7) moved out of core into «Ещё» in A2 — they remain the
+device substrate the «Агенты» hub reads from, just no longer top-level.
+Everything else (мои агенты, flows, device skills, the `/apps` launcher,
+billing, settings) is tucked behind a collapsible «Ещё» disclosure that
+defaults closed. **Referrals live in exactly one place — the avatar
+dropdown** (de-duplicated in Фаза 1). All nav lives in one component;
+`/apps` is the overflow launcher and the avatar dropdown carries
+profile/referrals/settings/billing/logout.
+
+The **«Агенты» hub** (`/cabinet/agents`) is two stacked sections: a static
+catalog of 6 use-case scenarios (filter-chips by category, each card →
+`/cabinet/agents/new?kind=<key>`) and «Твои агенты» — the user's running
+agents, reusing the exact device data path from `CabinetDevices`
+(`GET /me/devices` + `GET /me/hosted-devices`). `/cabinet/agents/new` is a
+wizard placeholder (the create wizard + autoposting setup ship as a
+separate follow-up).
 
 ## Files (with line refs)
 
 | Path | Role |
 |---|---|
-| `agentflow-landing/src/components/layout/AppShellV2.tsx:110` | `HOME_ITEM`, `CORE_NAV`, `MORE_NAV` definitions |
-| `agentflow-landing/src/components/layout/AppShellV2.tsx:165` | `BOTTOM_NAV` (mobile 5-tab bar) |
-| `agentflow-landing/src/components/layout/AppShellV2.tsx:234` | `moreOpen` «Ещё» disclosure state (localStorage `agentflow.sidebar.more-open`) |
-| `agentflow-landing/src/components/layout/AppShellV2.tsx:142` | `ADMIN_NAV` (shown only on `/admin/*` for `is_admin`) |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:128` | `CORE_NAV` (4 items: projects, agents, marketplace, llm_cabinet) |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:147` | `MORE_NAV` (now leads with application + cloud) |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:187` | `BOTTOM_NAV` (mobile 5-tab bar — «Агенты» replaced «Приложение») |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:163` | `ADMIN_NAV` (shown only on `/admin/*` for `is_admin`) |
+| `agentflow-landing/src/pages/CabinetAgentsHub.tsx:47` | `/cabinet/agents` hub — `USE_CASES` catalog + «Твои агенты» (reuses device queries) |
+| `agentflow-landing/src/pages/CabinetAgentNew.tsx` | `/cabinet/agents/new` wizard placeholder (echoes `?kind=`, CTA → cloud create) |
+| `agentflow-landing/src/main.tsx:726` | `/cabinet/agents` + `/cabinet/agents/new` routes (old redirect to `/account/agents` removed) |
+| `agentflow-landing/src/styles/cabinet-agents.css` | hub styles (mobile-first; `!important` beats the 36px button floor for ≥44px taps) |
 | `agentflow-landing/src/pages/AppsLauncher.tsx:83` | `/apps` overflow grid (`SECTIONS`) |
-| `agentflow-landing/src/styles/dark-tokens.css:149` | `.af-sb__section-title` + `.af-sb__section-toggle` (disclosure header) |
-| `agentflow-landing/src/i18n/{ru,en,zh}.json` | `app.shell.nav.{home,application,cloud,llm_cabinet,more}`, `app.shell.section.{core,more}` |
+| `agentflow-landing/src/i18n/{ru,en,zh}.json` | `app.shell.nav.{agents,my_agents,application,cloud,llm_cabinet,more}`, `cabinet.agents.*` |
 
 ## Data flow
 
 ```
 AppShellV2 (every cabinet route)
   ├─ Главная            /cabinet                       (pinned, HOME_ITEM)
-  ├─ «Основное» (CORE_NAV, always open)
+  ├─ «Основное» (CORE_NAV, always open — 4 items, A2)
   │   ├─ Проекты        /projects
-  │   ├─ Приложение     /cabinet/devices
-  │   ├─ Облако         /cabinet/devices/hosted/new
-  │   ├─ Баланс и AI    /llm-cabinet     (renamed from «LLM-кабинет», Фаза 1)
-  │   └─ Маркетплейс    /marketplace
+  │   ├─ Агенты         /cabinet/agents  (hub: catalog + «Твои агенты»)
+  │   ├─ Маркетплейс    /flows
+  │   └─ Баланс и AI    /llm-cabinet     (renamed from «LLM-кабинет», Фаза 1)
   ├─ «Ещё» ▸ (MORE_NAV, collapsed by default, persisted)
-  │   ├─ Мои агенты     /account/agents
+  │   ├─ Приложение     /cabinet/devices              (moved from core, A2)
+  │   ├─ Облако         /cabinet/devices/hosted/new   (moved from core, A2)
+  │   ├─ Мои агенты     /account/agents   (key `my_agents` — distinct from core «Агенты»)
+  │   ├─ Нанять агента  /marketplace
   │   ├─ Сценарии       /my/flows
   │   ├─ Навыки         /cabinet/devices/skills
   │   ├─ Приложения     /apps          ── overflow launcher (AppsLauncher)
@@ -52,7 +67,12 @@ AppShellV2 (every cabinet route)
   └─ avatar dropdown   Profile · Рефералы · Settings · Billing · [Admin] · Logout
                        (referrals live ONLY here now — Фаза 1 de-dup)
 
-mobile bottom bar (BOTTOM_NAV, 5): Главная · Проекты · Приложение · Маркетплейс · Ещё(/apps)
+/cabinet/agents (CabinetAgentsHub)
+  ├─ Каталог: 6 UseCase cards + category filter chips → /cabinet/agents/new?kind=<key>
+  └─ «Твои агенты»: GET /me/devices + GET /me/hosted-devices (same path as CabinetDevices)
+/cabinet/agents/new (CabinetAgentNew) — «Мастер скоро» stub, CTA → /cabinet/devices/hosted/new
+
+mobile bottom bar (BOTTOM_NAV, 5): Главная · Проекты · Агенты · Маркетплейс · Ещё(/apps)
 admin: on /admin/* AND is_admin → ADMIN_NAV replaces the workspace groups
 ```
 
@@ -60,10 +80,12 @@ admin: on /admin/* AND is_admin → ADMIN_NAV replaces the workspace groups
 
 - Tables: none (pure client IA).
 - Env: none.
-- Routes referenced (all `RequireAuth`): `/cabinet`, `/projects`,
-  `/cabinet/devices`, `/cabinet/devices/hosted/new`, `/llm-cabinet`,
-  `/marketplace`, `/account/agents`, `/my/flows`,
-  `/cabinet/devices/skills`, `/apps`, `/account/{referrals,usage,settings}`.
+- Routes referenced (all `RequireAuth` + `AccessGate`): `/cabinet`,
+  `/projects`, `/cabinet/agents`, `/cabinet/agents/new`, `/flows`,
+  `/llm-cabinet`, `/cabinet/devices`, `/cabinet/devices/hosted/new`,
+  `/account/agents`, `/marketplace`, `/my/flows`, `/cabinet/devices/skills`,
+  `/apps`, `/account/{referrals,usage,settings}`.
+- APIs (hub «Твои агенты»): `GET /me/devices`, `GET /me/hosted-devices`.
 - localStorage: `agentflow.sidebar.more-open` (disclosure state).
 
 ## Failure modes
@@ -74,6 +96,9 @@ admin: on /admin/* AND is_admin → ADMIN_NAV replaces the workspace groups
 | «Ещё» won't expand | `af-sb__section-toggle` | `AppShellV2.tsx` toggle button + `dark-tokens.css:149` |
 | Nav label shows raw key (`app.shell.nav.x`) | missing i18n key | add to all three of `src/i18n/{ru,en,zh}.json` |
 | Cut feature reappears in nav (souls / квесты / singularity) | `souls` / `quests` / `Singularity` in a NAV array | keep them out of `CORE_NAV`/`MORE_NAV` (removed in landing #545/#547) |
+| `/cabinet/agents` redirects to `/account/agents` instead of the hub | duplicate `<Route path="/cabinet/agents" …Navigate…>` | remove the stale redirect in `main.tsx` — the hub route must be the only one |
+| Core «Агенты» and «Мои агенты» both show «Агенты» | both NavItems use key `agents` | core uses `agents`, MORE_NAV uses `my_agents` — keep the keys distinct |
+| Hub tap targets render at 36px on mobile | `.af-shell-v2 button { min-height: 36px }` floor wins | `cabinet-agents.css` uses `min-height: 44px !important` on chips/refresh |
 
 ## History
 
@@ -90,6 +115,15 @@ admin: on /admin/* AND is_admin → ADMIN_NAV replaces the workspace groups
   only in the avatar dropdown (`app.shell.menu.referrals`); decluttered the
   `/cabinet` home (quick actions 9→4, stat tiles 4→2, referrals widget dropped).
   Concept: `agentflow/CABINET-CONCEPT.html`.
+- **A2 «Агенты» hub** (2026-05-30, landing PR #564) — new `/cabinet/agents`
+  hub (scenario catalog + «Твои агенты», reusing the device queries) plus a
+  `/cabinet/agents/new` wizard placeholder. `CORE_NAV` cut to 4 (Проекты,
+  Агенты, Маркетплейс, Баланс и AI); «Приложение» + «Облако» moved into «Ещё»;
+  the mobile bottom-bar «Приложение» tab became «Агенты». New i18n
+  `app.shell.nav.agents` (= «Агенты») with the old `/account/agents` entry
+  renamed to `my_agents`, plus the `cabinet.agents.*` set. Removed the stale
+  `/cabinet/agents → /account/agents` redirect. Wizard + autoposting are a
+  follow-up. Concept: `agentflow/CABINET-CONCEPT.html` §5.2.
 
 ## Related
 - [Devices — unified routing](/subsystems/devices-unified)
