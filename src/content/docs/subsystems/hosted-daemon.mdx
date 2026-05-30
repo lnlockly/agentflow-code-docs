@@ -111,11 +111,15 @@ Daemon в /cabinet/devices/hosted/:id
 
 ### Shell whitelist (`AF_SHELL_WHITELIST`)
 
-Hosted-daemon scopes default to `shell_whitelist=[]`. Empty whitelist
-means every `code_run_command` raises `shell_whitelist is empty;
-shell.exec disabled` (`scope.py:51`) → the autonomous loop's session
-terminates with `=== COMPLETION_BLOCKED ===` after the first
-`git fetch` / `pytest` / `npm install`.
+`scope.py:check_shell` now allows a fixed `SAFE_BASELINE_PROGRAMS` set
+(read-only diagnostics + common dev toolchain — `uname`, `ls`, `cat`,
+`grep`, `git`, `node`, `npm`, `python3`, `curl`, …) regardless of the
+device's `shell_whitelist`, and `Scope.shell_whitelist` carries a sane
+`DEFAULT_SHELL_WHITELIST`. A daemon whose stored scope omits or narrows
+the whitelist therefore no longer blocks basics. `AF_SHELL_WHITELIST`
+remains the way to EXTEND the baseline for destructive or host-specific
+programs the owner opts in to. See
+[Device shell scope](/subsystems/device-shell-scope).
 
 `docker/entrypoint.sh` now exports a sensible baseline whenever the env
 var is not set:

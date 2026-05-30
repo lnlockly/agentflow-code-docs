@@ -82,6 +82,7 @@ export default defineConfig({
             { label: 'Desktop Auto-Updater', slug: 'subsystems/desktop-auto-updater' },
             { label: 'Desktop Agent LLM', slug: 'subsystems/desktop_agent_llm' },
             { label: 'Cabinet Device — Autonomous Tab', slug: 'subsystems/cabinet-device-autonomous-tab' },
+            { label: 'Device Shell Scope & Permissions', slug: 'subsystems/device-shell-scope' },
             { label: 'Multi-Agent Runtime (Desktop)', slug: 'subsystems/multi-agent-runtime' },
             { label: 'Mac Menu-Bar App', slug: 'subsystems/mac-menu-bar-app' },
             { label: 'Recording Jobs', slug: 'subsystems/recording-jobs' },
