@@ -1,0 +1,77 @@
+---
+title: "Autopost (scheduled autoposting)"
+description: "Cron-driven content generation that posts to a user's TG channel and VK wall via the cross-poster."
+---
+
+# Autopost
+
+## TL;DR
+
+A scheduled autoposting agent: every due `autopost_schedules` row generates a
+post from its brief via the LLM router (`useModel(TEXT_LARGE)`) and fans it out
+to the owner's TG channel + VK wall through the existing cross-poster. It reuses
+the send/auth/scheduler substrate wholesale; the new pieces are only the content
+generator, a runner, two tables, CRUD routes, and the cron pass. Gated by
+`FF_AUTOPOST=1`.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/autopost/generate.ts:61` | `generatePost(brief, ownerUserId)` — LLM router → one post body. No model literals. |
+| `agentflow-agents/src/services/autopost/runner.ts:92` | `runAutopost(schedule, deps)` — generate → `dispatchPost` → insert `autopost_posts`. DI for tests. |
+| `agentflow-agents/src/services/autopost/runner.ts:58` | `rollupStatus(results)` — sent / partial / failed rollup. |
+| `agentflow-agents/src/routes/me-autopost.ts:62` | CRUD + `POST /:id/run-now`. `requireSession`. |
+| `agentflow-agents/src/services/agent-trigger-worker.ts:753` | `processAutopostSchedules(now)` — cron pass, claims due rows, stamps `last_fired_at`. |
+| `agentflow-agents/src/services/cross-poster/dispatcher.ts:15` | `dispatchPost({...,channelOverride?})` — extended with optional TG channel override. |
+| `agentflow-agents/src/db/schema.ts` | `autopostSchedules`, `autopostPosts` drizzle defs. |
+| `agentflow-agents/src/db/migrations/0081_autopost.sql` | Schema migration (applied manually). |
+
+## Data flow
+
+```
+cron tick (30s, FF_AUTOPOST=1)            POST /me/autopost/schedules/:id/run-now
+  processAutopostSchedules                  (requireSession, manual verify)
+        │  select enabled + computeCronDue        │
+        │  atomic claim (last_fired_at)           │
+        └────────────► runAutopost(schedule) ◄────┘
+                          │
+                generatePost(brief) ── useModel(TEXT_LARGE)
+                          │
+                dispatchPost({ownerUserId,text,targets,channelOverride})
+                          │                       │
+                  postToTelegram (userbot)   postToVk (wall.post)
+                          │
+                insert autopost_posts {text, result, status}
+```
+
+## DB / Env / API
+
+- Tables:
+  - `autopost_schedules(id, owner_user_id, cron_expr, targets jsonb, brief, channel_override, enabled, last_fired_at, created_at)`
+  - `autopost_posts(id, schedule_id, owner_user_id, text, result jsonb, status, posted_at)`
+- Env: `FF_AUTOPOST=1` (default off; also starts the trigger worker in `pool-worker/index.ts`).
+- Routes:
+  - `POST /me/autopost/schedules` `{cron_expr, brief, targets?, channel_override?, enabled?}`
+  - `GET /me/autopost/schedules`
+  - `DELETE /me/autopost/schedules/:id`
+  - `POST /me/autopost/schedules/:id/run-now` — fires immediately, returns `{status, post_id, text, results}`.
+- Reused MCP: TG send via `mcpDirect.callTool('telegram','send_message',...)` (inside `cross-poster/tg.ts`); VK via `wall.post`.
+- Preconditions (existing flows, not rebuilt): an active tg-mcp account +
+  `chat_tg_links.account_labels.default_channel` (or a `channel_override`), and/or
+  a VK `wall`-scope token in `chat_vk_links`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Generation produced nothing | `autopost_empty_generation` | `services/autopost/generate.ts` — model returned empty; recorded as failed post |
+| Blank brief on create | `autopost_empty_brief` | `services/autopost/generate.ts` — schedule brief empty |
+| TG post no-ops, account not linked | `TG: аккаунт не привязан` | `cross-poster/tg.ts:126` — no `chat_tg_links` row |
+| TG post no-ops, no default channel | `не настроен канал по умолчанию` | `cross-poster/tg.ts:133` — set `default_channel` or pass `channel_override` |
+| VK access denied | `error 15` / `scope \`wall\`` | `cross-poster/vk.ts` — token missing `wall` scope or expired |
+| Schedule never fires | (no `autopost schedule fired` log) | check `FF_AUTOPOST=1` and that the worker started (`pool-worker/index.ts`) |
+
+## Related
+- [Matrix Bots](/subsystems/matrix-bots) — cross-poster (`@af-poster`) engine.
+- [VK Bridge](/subsystems/vk-bridge) — VK wall.post + token storage.
