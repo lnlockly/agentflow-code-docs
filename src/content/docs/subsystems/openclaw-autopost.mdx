@@ -1,0 +1,107 @@
+---
+title: "OpenClaw «Автопостинг» ready-function"
+description: "One-click cabinet toggle that flips the in-pod af-autopost OpenClaw skill + cron so a device drafts and publishes a scheduled post from a saved brief."
+---
+
+# OpenClaw «Автопостинг»
+
+## TL;DR
+
+A one-click cabinet function for OpenClaw-engine devices. The «Функции» card
+saves a `brief` + `schedule` + `channel` and flips the in-pod `af-autopost`
+skill on. The platform never runs the cron: it pushes one `autopost_config`
+frame over the existing devices-ws, and the `openclaw-shim` bridge maps it onto
+the loopback Gateway's `config.patch` (`skills.entries.af-autopost.enabled`) +
+`cron.add`. The OpenClaw cron then owns the schedule, the flow-LLM draft, and
+the channel send. The `openclaw_autopost` table is the cabinet's source of truth
+so the toggle survives a pod restart (the bridge re-pushes from the row).
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/openclaw-image/skills/af-autopost/SKILL.md:1` | The baked-in skill — drafts one post from `skills.entries.af-autopost.config.brief`, publishes to the channel, one run = one post |
+| `agentflow-agents/src/openclaw-shim/autopost.ts:48` | `buildSkillConfigPatch` — merge-patch raw for `config.patch` (flips `enabled`, stores brief/channel/target) |
+| `agentflow-agents/src/openclaw-shim/autopost.ts:81` | `buildCronAddParams` — `cron.add` params (stable name `af-autopost`, `delivery:announce`) |
+| `agentflow-agents/src/openclaw-shim/autopost.ts:112` | `pickAutopostJobIds` — match existing autopost cron(s) by stable name from `cron.list` (de-dupe + replace) |
+| `agentflow-agents/src/openclaw-shim/autopost.ts:180` | `applyAutopost` — `config.get`→`config.patch`→`cron.list`→`cron.remove`*→`cron.add` (idempotent, self-healing) |
+| `agentflow-agents/src/openclaw-shim/bridge.ts:116` | `AutopostConfigInbound` — server→bridge `autopost_config` WS frame shape |
+| `agentflow-agents/src/openclaw-shim/bridge.ts:128` | `isAutopostConfig` — frame guard |
+| `agentflow-agents/src/openclaw-shim/bridge.ts:444` | `handleAutopostConfig` — calls `applyAutopost` (errors logged, never crash the bridge) |
+| `agentflow-agents/src/routes/me-devices.ts:1803` | `autopostEnableSchema` — `{ brief, schedule?, channel?, target? }`, 5-field cron regex |
+| `agentflow-agents/src/routes/me-devices.ts:2000` | `GET /me/devices/:id/autopost` — saved config + `device_online` |
+| `agentflow-agents/src/routes/me-devices.ts:2035` | `POST /me/devices/:id/autopost` — persist row + push `autopost_config` (enabled) |
+| `agentflow-agents/src/routes/me-devices.ts:2092` | `DELETE /me/devices/:id/autopost` — flip row off + push disable frame |
+| `agentflow-agents/migrations/2026-05-31b-openclaw-autopost.sql:15` | `openclaw_autopost` table (one row per device) |
+| `agentflow-agents/tests/openclaw-autopost.test.ts:1` | unit tests — builders + `applyAutopost` orchestration + enable schema |
+| `agentflow-landing/src/components/devices/DeviceFunctions.tsx:36` | «Функции» card — brief + schedule + channel + Включить/Сохранить/Выключить |
+| `agentflow-landing/src/pages/CabinetDeviceDetail.tsx` | mounts `<DeviceFunctions deviceId={device.id} />` after the status card |
+| `agentflow-landing/src/lib/devicesApi.ts` | `getAutopost` / `enableAutopost` / `disableAutopost` REST clients |
+| `agentflow-landing/src/types/devices.ts` | `AutopostStatus` response type |
+
+## Data flow
+
+```
+cabinet «Функции» (DeviceFunctions.tsx)
+  POST /me/devices/:id/autopost { brief, schedule, channel, target? }
+    → me-devices.ts: validate (autopostEnableSchema) + UPSERT openclaw_autopost
+    → getConnection(id).send({ type:'autopost_config', enabled:true, ... })   (device WS)
+        │  (offline → 409 { saved:true }; bridge re-pushes on reconnect)
+        ▼
+  openclaw-shim bridge: isAutopostConfig → handleAutopostConfig
+    → applyAutopost(gateway, true, cfg)
+        config.get   → baseHash
+        config.patch → skills.entries.af-autopost.enabled = true (+ config)
+        cron.list    → cron.remove every existing `af-autopost` job
+        cron.add     → schedule { cron expr }, delivery:announce → channel
+        ▼
+  OpenClaw cron tick → /af-autopost skill turn
+    → flow-LLM draft from brief → channel `send` (+ announce delivery)
+```
+
+`DELETE` mirrors the path with `enabled:false`: the patch flips the skill off,
+`cron.remove` clears the schedule, and no `cron.add` fires. The brief is kept in
+the row so re-enabling reuses it.
+
+## DB / Env / API
+
+- Tables: `openclaw_autopost` (device_id PK → `user_devices.id`, user_id, enabled,
+  brief, schedule, channel, target, updated_at). No credentials — the channel
+  token lives in the pod env / OpenClaw credentials store.
+- Env: none new (the device pod already has its flow-LLM + channel wiring).
+- Routes: `GET|POST|DELETE /me/devices/:id/autopost` (requireSession, owner-scoped).
+- WS frame: `autopost_config` (server→device, ignored harmlessly by non-OpenClaw daemons).
+- Gateway methods used: `config.get`, `config.patch`, `cron.list`, `cron.remove`, `cron.add`.
+- Model: routed through the pod's OpenClaw `flow` alias — no model hardcoded.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Toggle returns 409, config not applied | route returns `device_offline` with `saved:true` | pod asleep — config persisted, bridge re-pushes on reconnect; bring the device online |
+| Enable accepted but no cron registered | `autopost apply failed:` | `src/openclaw-shim/bridge.ts:444` (gateway error from `applyAutopost`) |
+| Duplicate posts | two `af-autopost` cron jobs | `pickAutopostJobIds` removes ALL name matches before add — `src/openclaw-shim/autopost.ts:112` |
+| Post is generic / placeholder | n/a (content) | `openclaw-image/skills/af-autopost/SKILL.md` — brief is the only topic source |
+| `invalid_body` on enable | route 400 `invalid_body` | bad cron shape — `autopostEnableSchema` (`me-devices.ts:1803`) requires 5 fields |
+
+## Verify on a live pod
+
+1. **Migration** (CI does not run migrations): apply once via the postgres pod —
+   `psql -U agentflow -d agentflow -f migrations/2026-05-31b-openclaw-autopost.sql`.
+2. **Enable from the cabinet**: open `/cabinet/devices/:id` on an OpenClaw device,
+   fill the «Автопостинг» brief, pick a near-term schedule, press «Включить».
+   Expect `202` (or `409 {saved:true}` if the pod is asleep — bring it online).
+3. **Confirm the skill + cron landed** in the pod logs:
+   `kubectl -n franchise-factory logs <openclaw-pod> | grep "autopost enabled"`
+   (bridge logs `autopost enabled schedule="…" channel=telegram`).
+4. **Confirm the cron fires**: set a `*/1 * * * *` schedule for the check, then
+   grep the pod for the skill turn / a `cron.runs` entry, or watch the configured
+   Telegram channel for the drafted post. One run = one post.
+5. **Disable**: press «Выключить» → `cron.remove` clears the schedule; the row
+   keeps the brief for re-enable.
+
+## Related
+
+- [OpenClaw /live wrapper](/subsystems/openclaw-live-wrapper)
+- [Device task lifecycle](/subsystems/device-task-lifecycle)
+- [Devices (unified)](/subsystems/devices-unified)
