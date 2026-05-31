@@ -1,0 +1,111 @@
+---
+title: "Cabinet «Функции» ready-function catalog"
+description: "Site/cabinet витрина (/cabinet/functions) of one-click ready-functions: landing, copy, image. Each card produces a real artifact, not a mock."
+---
+
+# Cabinet «Функции»
+
+## TL;DR
+
+`/cabinet/functions` (`CabinetFunctions.tsx`) is the catalog витрина where a
+user clicks a ready-function instead of describing an agent. Three functions are
+wired to real execution: «Сделать лендинг» reuses the existing projects pipeline
+(`createProject` → `approveProject` → poll `getProject` for the live preview
+URL), «Написать текст» calls `POST /me/functions/copy` (reuses
+`autopost/generate.ts::generatePost`), «Сгенерировать картинку» calls
+`POST /me/functions/image` (straight through the ai-router `IMAGE` capability).
+«Видео» + «AI-Охотник» are «скоро» placeholders. The catalog lives on the
+site/cabinet, never inside a pod.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-functions.ts:49` | `POST /me/functions/copy` — `generatePost(brief, ownerUserId)` → `{ ok, text }` |
+| `agentflow-agents/src/routes/me-functions.ts:73` | `POST /me/functions/image` — `invokeAI(ModelType.IMAGE, { prompt, cheap:true })` → `{ ok, url, b64, mime, model }` |
+| `agentflow-agents/src/routes/me-functions.ts:39` | `copySchema` (`brief` 5-4000) |
+| `agentflow-agents/src/routes/me-functions.ts:43` | `imageSchema` (`prompt` 3-2000) |
+| `agentflow-agents/src/server.ts:781` | `app.route('/', meFunctionsApp)` mount |
+| `agentflow-agents/src/services/autopost/generate.ts:61` | `generatePost` — reused by the copy function (proven autopost generator, `useModel(TEXT_LARGE)`) |
+| `agentflow-agents/src/ai-router/instrumented.ts:126` | `invokeAI` — image function entry point |
+| `agentflow-agents/src/llm-providers/designapi.ts:53` | `IMAGE_MODEL_CASCADE` = `gpt-image-1, flux-pro, dall-e-3, flux-2-max` |
+| `agentflow-agents/src/llm-providers/designapi.ts:246` | `POST {baseURL}/v1/images/generations` — designapi IMAGE handler |
+| `agentflow-agents/tests/me-functions.test.ts:1` | 8 schema unit tests |
+| `agentflow-landing/src/pages/CabinetFunctions.tsx:68` | `LandingCard` — `createProject` + `approveProject` + poll `getProject` for `preview_url` |
+| `agentflow-landing/src/pages/CabinetFunctions.tsx:177` | `CopyCard` — `generateFunctionCopy` + clipboard |
+| `agentflow-landing/src/pages/CabinetFunctions.tsx` | `ImageCard` — `generateFunctionImage`, renders url or `data:` b64 |
+| `agentflow-landing/src/lib/agentsApi.ts:5556` | `generateFunctionCopy(brief)` → `POST /me/functions/copy` |
+| `agentflow-landing/src/lib/agentsApi.ts:5570` | `generateFunctionImage(prompt)` → `POST /me/functions/image` |
+| `agentflow-landing/src/main.tsx:736` | `/cabinet/functions` route (lazy) |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:128` | «Функции» CORE_NAV entry (icon `Zap`) + BOTTOM_NAV |
+
+## Data flow
+
+```
+cabinet /cabinet/functions (CabinetFunctions.tsx)
+  │
+  ├─ «Сделать лендинг»
+  │    createProject(brief)             POST /me/projects     → { id, slug }
+  │    approveProject(id)               POST /me/projects/:id/approve
+  │    poll getProject(id) every 4s     GET  /me/projects/:id
+  │      until preview_url set → render <slug>.proj.agentflow.website link
+  │    (existing projects pipeline — template scorer + clone + preview-reconciler)
+  │
+  ├─ «Написать текст»
+  │    generateFunctionCopy(brief)      POST /me/functions/copy
+  │      → generatePost(brief, ownerUserId)  (useModel TEXT_LARGE)
+  │      → { text }                     render + clipboard copy
+  │
+  └─ «Сгенерировать картинку»
+       generateFunctionImage(prompt)    POST /me/functions/image
+         → invokeAI(IMAGE, { prompt, cheap:true })
+         → designapi cascade /v1/images/generations
+         → { url | b64 }                render <img src=url | data:…>
+```
+
+## DB / Env / API
+
+- Tables: none new. Landing function writes `projects` via the existing
+  pipeline; copy + image are stateless one-shots.
+- Env (agentflow-agents pod): `DESIGNAPI_BASE_URL` + `DESIGNAPI_API_KEY`
+  (image), the platform LLM router env for `useModel(TEXT_LARGE)` (copy).
+- Routes: `POST /me/functions/copy`, `POST /me/functions/image`
+  (`requireSession`, owner-scoped). Landing reuses `POST /me/projects` +
+  `POST /me/projects/:id/approve` + `GET /me/projects/:id`.
+- MCP tools: none. No model strings hardcoded — copy via `useModel`, image via
+  `invokeAI(ModelType.IMAGE)`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Image card shows `image_provider_unavailable` / 502 for every prompt | designapi returns `model_not_found ... under group rub` for all cascade models; route returns 502 `image_provider_unavailable` | designapi account/key in a group with **no image channel** (`group_no_image_access`). Enable an image channel on the designapi key, OR set a non-empty `OPENAI_API_KEY` so the BYOK-OpenAI IMAGE handler (`llm-providers/byok-openai.ts:88`) serves it. No code change. Observed 2026-05-31: `rub` group blocks images and the pod `OPENAI_API_KEY` was empty. |
+| Copy card 400 | route returns 400 `generation_failed` with `autopost_empty_brief` / `autopost_empty_generation` | blank/too-short brief — caller-fixable; the textarea min-length (5) normally prevents this |
+| Copy card 502 | route 502 `generation_failed` | LLM router outage or budget cap (`BudgetExceededError`) — retry / raise cap |
+| Landing card stuck «Агент работает…» past ~6 min | project `status` stays `provisioning`; preview never sets | cold pod / clone slow — card hands off to the workspace («Открой проект»). See `projects.mdx` failure modes (502 from edge, npm install). |
+| Landing card «Сборка не завершилась» | project `status='failed'` | build failed — open the project for the log. See `projects.mdx`. |
+
+## Verify
+
+Verified 2026-05-31 against `https://agentflow.website/_agents` as test user 293:
+
+- **Landing**: project 1668 (brief = кофейня «Тёплый угол», Казань) reached
+  `status='running'` with `preview_url=https://p-6s73568p.proj.agentflow.website/`.
+  `curl` → HTTP 200; DOM contains brief-derived content (`Тёплый угол`,
+  `городская кофейня · Казань`, фирменная обжарка section, seasonal menu with
+  prices, photo gallery, booking form, hours 8:00–22:00, заказ навынос) and no
+  `{{SLOT}}` markers.
+- **Copy**: `generatePost` (same code as `/me/functions/copy`) produced a real
+  brief-derived post for the «Тёплый угол» brief (mentions Казань, фирменная
+  обжарка, сезонные напитки, навынос).
+- **Image**: code path verified correct; designapi `rub` group currently has no
+  image channel (every cascade model 503 `model_not_found`) and the pod's
+  `OPENAI_API_KEY` is empty, so no real bytes can be produced until an image
+  channel is enabled. The endpoint returns 502 `image_provider_unavailable`
+  honestly rather than a placeholder.
+
+## Related
+
+- [`subsystems/projects`](/subsystems/projects/) — the landing function reuses this pipeline
+- [`subsystems/project-preview`](/subsystems/project-preview/) — `*.proj.agentflow.website` preview serving
+- [`subsystems/openclaw-autopost`](/subsystems/openclaw-autopost/) — device-scoped «Функции» (autopost), distinct from this cabinet catalog
