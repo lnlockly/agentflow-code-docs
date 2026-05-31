@@ -1,0 +1,103 @@
+---
+title: "OpenClaw Pod Engine (Phase 1)"
+description: "OpenClaw as a selectable hosted-device engine — boot + reachable, wired to the flow router, behind FF_OPENCLAW."
+---
+
+# OpenClaw Pod Engine (Phase 1)
+
+## TL;DR
+OpenClaw is a third hosted-device engine next to `goose` and the legacy `coder`
+daemon. A device created with `template:'openclaw'` (gated by `FF_OPENCLAW`)
+runs the `agentflow-openclaw` image: it boots OpenClaw's loopback Gateway, wires
+the agent LLM to our flow router, and runs an in-pod bridge that speaks the
+existing devices-ws task protocol — so a `dispatch_task` round-trips to OpenClaw
+and streams the agent's reply back. Phase-1 proves boot + reachability; the full
+`/live` wrapper + skills are later phases. Reversible: delete the device → gone.
+Goose/coder defaults are untouched.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-hosted-devices.ts:136` | `OPENCLAW_DAEMON_IMAGE_DEFAULT` image ref |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:160` | `resolveDaemonImage` openclaw branch (checked before FF_DAEMON_IMAGE) |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:457` | `isOpenclawCanaryEnabled()` — `FF_OPENCLAW` gate |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:1354` | create handler 403 `openclaw_canary_disabled` |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:773` | `openclawLines` — manifest env injection (OPENCLAW_GATEWAY_TOKEN + AGENTFLOW_FLOW_KEY) |
+| `agentflow-agents/src/openclaw-shim/config.ts:133` | `renderOpenclawConfig` — pure config renderer |
+| `agentflow-agents/src/openclaw-shim/config.ts:46` | `flowBaseUrl` — `<origin>/_agents/llm/v1` |
+| `agentflow-agents/src/openclaw-shim/config.ts:51` | `MissingFlowKeyError` — fail closed |
+| `agentflow-agents/src/openclaw-shim/gateway-client.ts:49` | `buildConnectFrame` — loopback operator connect (no device block) |
+| `agentflow-agents/src/openclaw-shim/gateway-client.ts:288` | `sendChat` — one chat round-trip |
+| `agentflow-agents/src/openclaw-shim/gateway-client.ts:92` | `extractChatFinalText` — final assistant text |
+| `agentflow-agents/src/openclaw-shim/bridge.ts:223` | `handleDispatch` — devices-ws dispatch → gateway chat.send |
+| `agentflow-agents/src/openclaw-shim/main.ts` | bridge entrypoint |
+| `agentflow-agents/src/openclaw-shim/write-config.ts` | renders openclaw.json at boot |
+| `agentflow-agents/openclaw-image/Dockerfile` | the image (bridge build + openclaw npm) |
+| `agentflow-agents/openclaw-image/entrypoint.sh` | render config → boot gateway → run bridge |
+| `agentflow-agents/.github/workflows/build-openclaw.yml` | ghcr CI |
+| `agentflow-agents/migrations/2026-05-31a-hosted-devices-template-openclaw.sql` | CHECK-widen for `'openclaw'` |
+
+## Data flow
+```
+POST /me/hosted-devices { template:'openclaw' }   (FF_OPENCLAW=1 or → 403)
+  → resolveDaemonImage('openclaw') → ghcr.io/lnlockly/agentflow-openclaw:latest
+  → STS in af-tenant-<userId> vcluster, env: OPENCLAW_GATEWAY_TOKEN (per-pod),
+    AGENTFLOW_FLOW_KEY (= device af_live key), AF_API_KEY/AF_DEVICE_ID/...
+
+entrypoint.sh:
+  write-config.js  → renders ~/.openclaw/openclaw.json (gateway.mode:local,
+                     bind:loopback, flowrouter provider, fail-closed)
+  openclaw gateway --bind loopback --port 18789   (background)
+  wait /healthz
+  main.js (bridge):
+    ── devices-ws ──▶  wss://agentflow.website/_agents/_devices/connect
+    ── loopback   ──▶  ws://127.0.0.1:18789  (operator)
+
+dispatch:  devices-ws task_dispatch{task} ──▶ gateway chat.send ──▶ flow LLM
+           task_complete{answer}           ◀── chat state:"final" event
+```
+
+## DB / Env / API
+- **Tables:** `hosted_devices.template` (CHECK now includes `'openclaw'`).
+- **Env (server):** `FF_OPENCLAW` (canary gate). **Env (pod):**
+  `OPENCLAW_GATEWAY_TOKEN`, `AGENTFLOW_FLOW_KEY`, `OPENCLAW_CONFIG_PATH`,
+  `OPENCLAW_STATE_DIR`, plus the standard `AF_API_KEY` / `AF_DEVICE_ID` /
+  `AF_ENROLLMENT_TOKEN` / `AF_API_URL`.
+- **Routes:** `POST /me/hosted-devices {template:'openclaw'}` (201, or 403
+  `openclaw_canary_disabled`). Bridge connects `/_agents/_devices/connect`.
+- **Model:** flow router at `<origin>/_agents/llm/v1`, alias `flow` (resolved by
+  `pickFlowUpstream`). No hardcoded model id — the ref is `flowrouter/flow`.
+- **Ports (pod):** 18789 (gateway WS + /healthz, loopback only), 8765 (bridge
+  /api/health, the k8s readiness probe).
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Pod boots but gateway never answers | `FATAL: gateway exited during boot` | `openclaw-image/entrypoint.sh` |
+| Gateway boots degraded (no model) | `AGENTFLOW_FLOW_KEY missing — refusing to boot` | `src/openclaw-shim/write-config.ts` |
+| Create returns 403 | `openclaw_canary_disabled` | set `FF_OPENCLAW=1` on agentflow-agents |
+| INSERT rejected on provision | `hosted_devices_template_check` | apply the 2026-05-31a migration |
+| Dispatch never completes | `dispatch <id> failed: openclaw_chat_failed` | `src/openclaw-shim/bridge.ts:223` |
+| Bridge can't reach loopback gateway | `gateway connect attempt N failed` | gateway not up / wrong token |
+
+## Security
+- Gateway binds **loopback only**; 18789 never leaves the pod. The bridge uses
+  OpenClaw's break-glass `gateway.controlUi.dangerouslyDisableDeviceAuth` + a
+  per-pod shared token — safe ONLY because the WS is loopback inside an
+  already tenant-isolated pod. Hardening follow-up: switch to the signed
+  device-client (`packages/gateway-client`) so the flag is unnecessary.
+- Flow key (`AGENTFLOW_FLOW_KEY`) is an env-ref in `openclaw.json` (never the
+  literal on disk); a missing key fails the gateway closed.
+- `agents.defaults.sandbox.mode: "non-main"` keeps untrusted inbound sandboxed.
+
+## What Phase 1 ships vs. remains
+Ships: image, boot, flow-router wiring, engine selection behind `FF_OPENCLAW`,
+the devices-ws ↔ gateway chat round-trip (send → flow LLM → reply).
+Remains: `/live` ApprovalBar + screen feed, OpenClaw skills library
+(af-autopost/digest/...), channel onboarding, PVC-persisted `~/.openclaw` state,
+the signed device-client.
+
+## Related
+- [Pod pre-warm pool](/subsystems/pod-prewarm-pool)
+- [Cabinet device live](/subsystems/cabinet-device-live)
+- Plan: `.artifacts/openclaw-pod-engine-plan.md`
