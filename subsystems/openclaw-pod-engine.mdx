@@ -79,6 +79,8 @@ dispatch:  devices-ws task_dispatch{task} ──▶ gateway chat.send ──▶ 
 | INSERT rejected on provision | `hosted_devices_template_check` | apply the 2026-05-31a migration |
 | Dispatch never completes | `dispatch <id> failed: openclaw_chat_failed` | `src/openclaw-shim/bridge.ts:223` |
 | Bridge can't reach loopback gateway | `gateway connect attempt N failed` | gateway not up / wrong token |
+| Every chat 403s at the flow facade | `403 Your request was blocked` / `reason=auth` | WAF blocks `OpenAI/*` UA — `config.ts` sets `FLOW_USER_AGENT` header override |
+| Connect rejected | `INVALID_REQUEST: invalid connect params` | `client.id`/`mode` must be `gateway-client`/`backend` |
 
 ## Security
 - Gateway binds **loopback only**; 18789 never leaves the pod. The bridge uses
@@ -91,8 +93,12 @@ dispatch:  devices-ws task_dispatch{task} ──▶ gateway chat.send ──▶ 
 - `agents.defaults.sandbox.mode: "non-main"` keeps untrusted inbound sandboxed.
 
 ## What Phase 1 ships vs. remains
-Ships: image, boot, flow-router wiring, engine selection behind `FF_OPENCLAW`,
-the devices-ws ↔ gateway chat round-trip (send → flow LLM → reply).
+Ships (verified live on ff-france 2026-05-31): image builds (1.85GB),
+gateway boots + `/healthz` live, `agent model: flowrouter/flow` wired, engine
+selection behind `FF_OPENCLAW`, and the devices-ws ↔ gateway chat round-trip —
+`chat.send "ответь PONG"` → embedded agent → flow LLM → **reply "PONG"**.
+Root cause resolved: the flow WAF 403s the OpenAI-SDK `User-Agent`; the config
+renderer overrides it to `AgentFlow-OpenClaw/1.0`.
 Remains: `/live` ApprovalBar + screen feed, OpenClaw skills library
 (af-autopost/digest/...), channel onboarding, PVC-persisted `~/.openclaw` state,
 the signed device-client.
