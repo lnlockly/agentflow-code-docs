@@ -480,6 +480,56 @@ Both speak the same `agent_dev_brief` dispatch contract and the same
 `/internal/projects/:id/clone-status` callback, so the backend does not care
 which one a given pod runs.
 
+## Free-form task path + headless live view (2026-05-31)
+
+Before this, a cloud daemon ran only two direct-tools — `agent_dev_brief`
+(project build) and `agent_run_recipe`. A plain `dispatch_task {task}` with **no
+`tool`** was dropped at `bridge.ts` `onMessage` ("Non-coder dispatches … are
+ignored"), so a cloud agent silently did nothing for any free-text instruction
+("run `uname -a`", "research X and write a summary").
+
+The bridge now routes an un-tooled `task_dispatch` through a free-form handler
+that runs it via goose, exactly like the recipe path: `goose run -t "<task>"`,
+developer tool enabled, `--system` headless guardrails, the user's text as a
+single `-t` argv element (shell metacharacters inert). Progress streams as
+`task_action` frames (`started`, `output`) and the model's final words land as
+`task_complete.answer`. Serialized behind the same build mutex as a project
+build so a free-form run + a concurrent build never OOM the pod.
+
+The cabinet live page gets a **headless mode**: a hosted `kind=daemon` pod has
+no Xvfb/Chromium/MJPEG, so `AgentScreen` painted a blank `<img>`. When
+`deviceKind==='hosted' && hosted.kind==='daemon'` the page renders
+`HeadlessLiveView` instead — the live task feed (RunTimeline) as the dominant
+panel plus a live pod-log terminal (`GET /me/hosted-devices/:id/logs` SSE =
+`kubectl logs -f`). A local Mac (real screen) and a `plain` hosted stub keep
+`AgentScreen`.
+
+The daemon STS now defaults `FF_BRIDGE_SCHEDULER=1` so scheduled recipes fire
+24/7 on a headless pod (reversible via a pod-level `FF_BRIDGE_SCHEDULER=0`).
+
+### Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/coder-shim/freeform.ts:34` | `isFreeformDispatch` guard (task_dispatch, id+task, no recognised tool) |
+| `agentflow-agents/src/coder-shim/freeform.ts:98` | `buildFreeformArgs` — `goose run -t`, `--system`, task as one element, no model on argv |
+| `agentflow-agents/src/coder-shim/bridge.ts:376` | route un-tooled dispatch → `handleFreeformDispatch` (onMessage) |
+| `agentflow-agents/src/coder-shim/bridge.ts:438` | same routing in the queued-task drain |
+| `agentflow-agents/src/coder-shim/bridge.ts:547` | `handleFreeformDispatch` — stream task_action + task_complete, build-mutex serialized |
+| `agentflow-agents/src/coder-shim/protocol.ts` | `TaskActionFrame` + `buildTaskAction` progress builder |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:730` | `schedulerLine` — `FF_BRIDGE_SCHEDULER` default-on in the daemon STS env |
+| `agentflow-landing/src/pages/CabinetDeviceLive.tsx:212` | `isHeadless` derivation; `:770` swaps AgentScreen → HeadlessLiveView |
+| `agentflow-landing/src/components/cabinet-live/HeadlessLiveView.tsx:39` | `PodLogTerminal` (logs SSE) + task feed |
+| `agentflow-landing/src/lib/devicesApi.ts` | `hostedLogsStream(hostedDeviceId)` EventSource |
+
+### Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Free-text task does nothing on cloud (pre-fix) | (no log — silently dropped) | `bridge.ts` onMessage free-form route |
+| Free-form run errored | `freeform task <id> crashed` | `bridge.ts` `handleFreeformDispatch` |
+| Cron recipe registers but never fires | `Last Run: Never` (goose schedule list) | set `FF_BRIDGE_SCHEDULER=1` (now default on daemon STS) |
+| Headless live shows blank screen | n/a — fixed: `isHeadless` renders task feed + log terminal | `CabinetDeviceLive.tsx:212` |
+
+
 ## Related
 - [Code-agent backend registry](/subsystems/code-agents-backend) — the in-daemon `CODE_AGENT_BACKEND=goose` path
 - [hosted-daemon](/subsystems/hosted-daemon) — pod image graph, daemon variants
