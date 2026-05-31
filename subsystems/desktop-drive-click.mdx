@@ -1,0 +1,74 @@
+---
+title: "Desktop Drive: «Взять управление» click path"
+description: "How a cabinet Drive tap reaches the agent's screen — 0..1 client coords → server pixel scaling → daemon computer.mouse.click."
+---
+
+# Desktop Drive: «Взять управление» click path
+
+## TL;DR
+Drive mode lets the owner click the live screen directly. PR #576 shipped the
+UI against a `POST /me/devices/:id/click` endpoint that never existed, so every
+click 404'd and was swallowed by `.catch(() => undefined)` — silent no-op. The
+fix wires the path end-to-end: the cabinet sends **normalized 0..1** coords, the
+server scales them to device pixels using the daemon's **logical** screen size
+(reported on `hello`), and fires `computer.mouse.click` over the tool RPC. The
+old code could never have worked from the client alone — the browser only sees
+the down-scaled MJPEG frame (Mac stream capped 1280px + Retina; cloud Xvfb
+stream capped 1400px), so it cannot know the daemon's click resolution.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/components/cabinet-live/AgentScreen.tsx:201` | `handleMonitorClick` — letterbox-corrects the tap to a 0..1 fraction (client-side, correct) |
+| `agentflow-landing/src/components/cabinet-live/AgentScreen.tsx:230` | `devicesApi.click(deviceId, {x, y, button})` — now surfaces the outcome (sent / offline / failed) instead of swallowing it |
+| `agentflow-landing/src/lib/devicesApi.ts:298` | `click()` REST client — `POST /me/devices/:id/click` |
+| `agentflow-agents/src/routes/me-devices.ts:1550` | `POST /me/devices/:id/click` route — validate 0..1, scale, dispatch via tool RPC |
+| `agentflow-agents/src/routes/me-devices.ts:934` | `normalizedClickToPixels(x, y, screen)` — pure 0..1 → clamped pixel mapper (unit-tested) |
+| `agentflow-agents/src/routes/me-devices.ts:925` | `CLICK_DEFAULT_SCREEN = {w:1440,h:900}` — fallback = cloud Xvfb default |
+| `agentflow-agents/src/services/devices-ws.ts:510` | hello handler reads + validates `screen` → `conn.screen` |
+| `agentflow-agents/src/services/device-registry.ts:34` | `DeviceConnection.screen?: {w,h}` — in-memory, no DB/migration |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_client.py:38` | `_probe_screen_size()` — best-effort `pyautogui.size()`; omitted on headless probe failure |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_client.py:194` | adds `screen` to the `hello` frame |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/platform/base.py:30` | `screen_size()` added to the backend Protocol |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/platform/{mac,linux,windows}.py` | `screen_size()` → `pyautogui.size()` (logical points) |
+
+## Data flow
+```
+cabinet tap (px in rendered img)
+  └─ AgentScreen.handleMonitorClick: letterbox-correct → fx,fy ∈ [0,1]
+       └─ POST /me/devices/:id/click { x:fx, y:fy, button }
+            └─ route: screen = conn.screen ?? CLICK_DEFAULT_SCREEN(1440×900)
+                 px = normalizedClickToPixels(fx,fy,screen)   // clamp to [0,dim-1]
+                 └─ dispatchTool(computer.mouse.click {x:px,y:py,button})  // tool_call_request
+                      └─ daemon _dispatch_tool → mouse.click → pyautogui.click(px,py)
+            ◀─ 202 {ok,x,y}  → banner «Клик отправлен» (or «офлайн» / «не удалось»)
+
+screen size: daemon hello { ..., screen:{w,h}=pyautogui.size() } → conn.screen
+```
+`pyautogui.size()` is the SAME logical space `pyautogui.click()` consumes, so
+the scaled pixel lands where the cursor goes — Retina-correct on Mac, exact on
+Xvfb. No DB row per click: the route uses the awaited tool RPC, not
+`task_dispatch`, so a Drive session of dozens of clicks writes zero
+`device_sessions` / `device_tasks`. The route also skips the device pause gate
+on purpose — Drive pauses the agent so the human can take over.
+
+## DB / Env / API
+- Routes: `POST /me/devices/:id/click { x:0..1, y:0..1, button?:'left'|'right' }` → `202 {ok,x,y}`
+- Errors: `400 invalid_body`, `404 not_found`, `409 device_offline`, `502 click_failed`
+- WS: `hello` gains optional `screen:{w,h}`; click runs over `tool_call_request`/`tool_call_result`
+- Daemon tool: `computer.mouse.click(x,y,button,clicks)` — absolute pixels, `pyautogui`
+- Env: cloud Xvfb size from `XVFB_WHD` (default `1440x900x24`, `agentflow-computer-mcp/docker/entrypoint.sh`)
+- Tables: none (screen size lives on the in-memory `DeviceConnection`)
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Click does nothing, no error | (pre-fix) `.catch(() => undefined)` swallowed a 404 | fixed — endpoint now exists; banner surfaces outcome |
+| Click lands offset on a local Mac | daemon predates screen-report → falls back to 1440×900 | update the Mac daemon so `hello` carries `screen` (`[device] online … screen=WxH`) |
+| Banner shows «Устройство офлайн» | `409 device_offline` from POST /click | daemon WS down — reconnect the device |
+| Banner shows «Не удалось отправить клик» | `502 click_failed` (tool RPC error/timeout) | check daemon `_dispatch_tool` / pyautogui display access |
+
+## Related
+- [Desktop daemon: live screen stream + cabinet toggle](/subsystems/desktop-agent-live-stream)
+- [computer-mcp](/subsystems/computer-mcp)
+- [Desktop platform backends](/subsystems/desktop-platform-backends)

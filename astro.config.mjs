@@ -81,6 +81,7 @@ export default defineConfig({
             { label: 'AgentFlow Desktop (Goose fork)', slug: 'subsystems/agentflow-desktop-fork' },
             { label: 'Desktop Auto-Updater', slug: 'subsystems/desktop-auto-updater' },
             { label: 'Desktop Agent LLM', slug: 'subsystems/desktop_agent_llm' },
+            { label: 'Desktop Drive — «Взять управление» click', slug: 'subsystems/desktop-drive-click' },
             { label: 'Cabinet Device — Autonomous Tab', slug: 'subsystems/cabinet-device-autonomous-tab' },
             { label: 'Device Shell Scope & Permissions', slug: 'subsystems/device-shell-scope' },
             { label: 'Multi-Agent Runtime (Desktop)', slug: 'subsystems/multi-agent-runtime' },
