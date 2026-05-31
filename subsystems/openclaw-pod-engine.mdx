@@ -91,6 +91,8 @@ dispatch (queued): cross-replica → device_tasks.status='queued' → bridge pol
 | Connect rejected | `INVALID_REQUEST: invalid connect params` | `client.id`/`mode` must be `gateway-client`/`backend` |
 | Dispatch stuck `queued`; bridge loops `devices-ws error: Unexpected server response: 401` then `reconnecting` | `devices-ws error:` + 401 | one-time enrollment token consumed on first connect → stateless pod re-presents it. `entrypoint.sh reenroll()` trades `AF_HOSTED_ROTATION_SECRET` for a fresh token on every boot |
 | Cross-replica dispatch stays `queued`, never drains | `queued poll drained 0 task(s)` absent | bridge must poll `GET /me/devices/:id/queued_tasks` — `bridge.ts startQueuedPoll/drainQueuedTasks` |
+| Agent answers a "browse" task from memory in ~1s; browser never navigates; `/live` screen blank | `Sandbox mode requires Docker, but the "docker" command was not found in PATH` (code=INVALID_CONFIG) | sandbox shells out to `docker` on every tool call; pod has no Docker → `config.ts` must render `agents.defaults.sandbox.mode: "off"` (#1070). Verify: agent `toolSummary.failures` must be `0` |
+| `/live` screenshot poll errors while no page is open | `live screen: screenshot skipped (request rejected: ... browser request timed out)` | expected when the agent has no active browser page yet — only surfaces once a tool call actually opens chromium; not an error if sandbox is `off` and the agent browses |
 
 ## Security
 - Gateway binds **loopback only**; 18789 never leaves the pod. The bridge uses
@@ -100,7 +102,13 @@ dispatch (queued): cross-replica → device_tasks.status='queued' → bridge pol
   device-client (`packages/gateway-client`) so the flag is unnecessary.
 - Flow key (`AGENTFLOW_FLOW_KEY`) is an env-ref in `openclaw.json` (never the
   literal on disk); a missing key fails the gateway closed.
-- `agents.defaults.sandbox.mode: "non-main"` keeps untrusted inbound sandboxed.
+- `agents.defaults.sandbox.mode: "off"` (#1070). OpenClaw's sandbox runtime
+  shells out to `docker` for every isolated execution — including each agent
+  tool call. The pod ships no Docker (it is itself the k8s tenant-isolation
+  boundary), so any other mode fails the gateway closed (`INVALID_CONFIG`) the
+  instant the agent uses a tool, and the agent silently falls back to answering
+  from memory. `off` is correct here precisely because the pod boundary already
+  provides the isolation a sandbox would.
 
 ## What Phase 1 ships vs. remains
 Ships (verified live on ff-france 2026-05-31): image builds (1.85GB),
