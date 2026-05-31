@@ -73,6 +73,7 @@ export default defineConfig({
             { label: 'Products Hub', slug: 'subsystems/products-hub' },
             { label: 'Onboarding Quests', slug: 'subsystems/onboarding-quests' },
             { label: 'Proxy Pool', slug: 'subsystems/proxy-pool' },
+            { label: 'Social Session Posting (cross-poster)', slug: 'subsystems/social-session-posting' },
             { label: 'VK Bridge', slug: 'subsystems/vk-bridge' },
             { label: 'Matrix Discord Bridge', slug: 'subsystems/mautrix-discord-bridge' },
             { label: 'Social Network', slug: 'subsystems/social-network' },
