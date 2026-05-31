@@ -1,0 +1,153 @@
+---
+title: "PicoClaw Pod Engine (Phase 1)"
+description: "PicoClaw (lightweight Go binary, no Docker) as a selectable hosted-device engine — wired to the flow router, behind FF_PICOCLAW."
+---
+
+# PicoClaw Pod Engine (Phase 1)
+
+## TL;DR
+PicoClaw is a fourth hosted-device engine next to `goose`, the legacy `coder`
+daemon, and `openclaw`. It is the **lightweight** engine: a single static Go
+binary (no Docker at runtime, ~10MB RAM, sub-second boot). A device created with
+`template:'picoclaw'` (gated by `FF_PICOCLAW`) runs the `agentflow-picoclaw`
+image: the entrypoint renders `config.json` + `.security.yml` from pod env, then
+an in-pod bridge speaks the existing devices-ws task protocol and drives the
+engine **one-shot per dispatch** (`picoclaw agent -m <task> --model flow`). So a
+`dispatch_task` round-trips to PicoClaw and returns the agent's reply. The agent
+LLM is wired to our flow router (alias `flow`, no hardcoded model). Reversible:
+delete the device → gone. Goose/coder/openclaw defaults are untouched.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-hosted-devices.ts:153` | `PICOCLAW_DAEMON_IMAGE_DEFAULT` image ref |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:184` | `resolveDaemonImage` picoclaw branch (checked before FF_DAEMON_IMAGE) |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:495` | `isPicoclawCanaryEnabled()` — `FF_PICOCLAW` gate |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:1437` | create handler 403 `picoclaw_canary_disabled` |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:838` | `picoclawLines` — manifest env injection (PICOCLAW_* + AGENTFLOW_FLOW_KEY) |
+| `agentflow-agents/src/picoclaw-shim/config.ts:176` | `renderPicoclawConfig` — pure config.json renderer |
+| `agentflow-agents/src/picoclaw-shim/config.ts:220` | `renderPicoclawSecurity` — pure .security.yml renderer (the ONLY place the key lands) |
+| `agentflow-agents/src/picoclaw-shim/config.ts:260` | `assertNoContainerExec` — fail-closed boot assertion (no docker/remote exec) |
+| `agentflow-agents/src/picoclaw-shim/config.ts:50` | reuses `flowBaseUrl` / `FLOW_MODEL_ALIAS` from openclaw-shim (no drift) |
+| `agentflow-agents/src/picoclaw-shim/config.ts:69` | `FLOW_USER_AGENT` — `AgentFlow-PicoClaw/1.0` (WAF UA override) |
+| `agentflow-agents/src/picoclaw-shim/config.ts:71` | `MissingFlowKeyError` — fail closed |
+| `agentflow-agents/src/picoclaw-shim/client.ts:90` | `PicoclawSubprocessClient` — spawns `picoclaw agent -m` |
+| `agentflow-agents/src/picoclaw-shim/client.ts:69` | `stripPicoclawOutput` — strips the `\n<Logo> <response>\n` decoration |
+| `agentflow-agents/src/picoclaw-shim/bridge.ts:288` | `handleDispatch` — devices-ws dispatch → `engine.run` |
+| `agentflow-agents/src/picoclaw-shim/bridge.ts:229` | `drainQueuedTasks` — cross-replica queued poll |
+| `agentflow-agents/src/picoclaw-shim/main.ts` | bridge entrypoint |
+| `agentflow-agents/src/picoclaw-shim/write-config.ts` | renders config.json + .security.yml at boot |
+| `agentflow-agents/picoclaw-image/Dockerfile` | image: compile shim + download checksum-verified Go binary |
+| `agentflow-agents/picoclaw-image/entrypoint.sh` | reenroll → render config → run bridge (no gateway boot) |
+| `agentflow-agents/.github/workflows/build-picoclaw.yml` | ghcr CI (self-hosted ff-france) |
+| `agentflow-agents/migrations/2026-06-01a-hosted-devices-template-picoclaw.sql` | CHECK-widen for `'picoclaw'` |
+| `agentflow-agents/tests/picoclaw-shim.test.ts` | 12 unit cases (config render + parsing) |
+
+## Data flow
+```
+POST /me/hosted-devices { template:'picoclaw' }   (FF_PICOCLAW=1 or → 403)
+  → resolveDaemonImage('picoclaw') → ghcr.io/lnlockly/agentflow-picoclaw:latest
+  → STS in af-tenant-<userId> vcluster, env: PICOCLAW_CONFIG_PATH,
+    PICOCLAW_SECURITY_PATH, PICOCLAW_WORKSPACE_DIR, AGENTFLOW_FLOW_KEY
+    (= device af_live key), AF_API_KEY/AF_DEVICE_ID/...
+
+entrypoint.sh:
+  reenroll()       → POST /me/hosted-devices/:id/reenroll {rotation_secret}
+                     → fresh AF_ENROLLMENT_TOKEN, clear AF_DEVICE_TOKEN
+                     (the one-time token is consumed on the first connect, so a
+                      stateless pod must re-mint one on every boot)
+  write-config.js  → renders ~/.picoclaw/config.json (model_list flow provider,
+                     restrict_to_workspace:false, exec local-only) +
+                     ~/.picoclaw/.security.yml (the flow key, mode 0600).
+                     assertNoContainerExec + fail-closed on missing key.
+  picoclaw version   (sanity; fail loud if the binary is missing)
+  main.js (bridge):
+    ── devices-ws ──▶  wss://agentflow.website/_agents/_devices/connect
+       headers: x-api-key + x-device-id + x-enrollment-token (first) /
+                x-device-secret (reconnect, from hello_ack, cached to disk)
+
+dispatch:   devices-ws task_dispatch{task}
+              ──▶ spawn `picoclaw agent -m <task> -s af-device:<id> --model flow`
+              ──▶ flow LLM
+            task_complete{answer}   ◀── engine stdout (logo-stripped)
+queued:     cross-replica → device_tasks.status='queued' → bridge polls
+            GET /me/devices/:id/queued_tasks (10s) → same handleDispatch
+```
+
+There is **no persistent engine connection** (unlike openclaw's loopback gateway
+WS). PicoClaw is a one-shot subprocess per dispatch, so the readiness probe gates
+only on the devices-ws connection. Per-step `/live` streaming is a Phase-2
+upgrade — PicoClaw exposes no operator WS that streams agent steps; its
+REST/EventBus surface needs source-level verification before the subprocess path
+is replaced.
+
+## DB / Env / API
+- **Tables:** `hosted_devices.template` (CHECK now includes `'picoclaw'` — apply
+  the 2026-06-01a migration manually post-merge; CI runs no migrations).
+- **Env (server):** `FF_PICOCLAW` (canary gate). **Env (pod):**
+  `PICOCLAW_CONFIG_PATH`, `PICOCLAW_SECURITY_PATH`, `PICOCLAW_WORKSPACE_DIR`,
+  `AGENTFLOW_FLOW_KEY`, plus the standard `AF_API_KEY` / `AF_DEVICE_ID` /
+  `AF_ENROLLMENT_TOKEN` / `AF_API_URL` / `AF_HOSTED_ROTATION_SECRET`.
+  Optional: `PICOCLAW_BIN`, `PICOCLAW_RUN_TIMEOUT_MS`, `PICOCLAW_CONTEXT_TOKENS`,
+  `PICOCLAW_DEVICE_SECRET_PATH`.
+- **Routes:** `POST /me/hosted-devices {template:'picoclaw'}` (201, or 403
+  `picoclaw_canary_disabled`). Bridge connects `/_agents/_devices/connect`.
+- **Model:** flow router at `<origin>/_agents/llm/v1`, alias `flow` (resolved by
+  `pickFlowUpstream`). No hardcoded model id — `model_list[].model = "openai/flow"`,
+  `agents.defaults.model_name = "flow"`. The `--model flow` CLI flag selects it.
+- **Ports (pod):** 8765 (bridge `/api/health`, the k8s readiness probe). No engine
+  port — the engine is a one-shot subprocess.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Engine boots degraded (no model) | `AGENTFLOW_FLOW_KEY missing — refusing to boot a degraded engine` | `src/picoclaw-shim/write-config.ts` (exits 2) |
+| Config carries a container/remote exec mode | `container/remote exec mode the pod cannot run` | `src/picoclaw-shim/config.ts assertNoContainerExec` |
+| Pod boots but engine binary missing | `FATAL: picoclaw binary not runnable` | `picoclaw-image/entrypoint.sh` / Dockerfile download stage |
+| Create returns 403 | `picoclaw_canary_disabled` | set `FF_PICOCLAW=1` on agentflow-agents |
+| INSERT rejected on provision | `hosted_devices_template_check` | apply the 2026-06-01a migration |
+| Dispatch never completes | `dispatch <id> failed: picoclaw_run_failed` | `src/picoclaw-shim/bridge.ts handleDispatch` |
+| Engine spawn fails | `picoclaw spawn failed` | binary not on PATH / `PICOCLAW_BIN` wrong |
+| Every chat 403s at the flow facade | `403 Your request was blocked` / `reason=auth` | WAF blocks `OpenAI/*` UA — `config.ts` sets `custom_headers User-Agent = AgentFlow-PicoClaw/1.0` |
+| Dispatch stuck `queued`; bridge loops `devices-ws error: ... 401` then `reconnecting` | `devices-ws error:` + 401 | one-time enrollment token consumed on first connect → stateless pod re-presents it. `entrypoint.sh reenroll()` trades `AF_HOSTED_ROTATION_SECRET` for a fresh token every boot |
+| Cross-replica dispatch stays `queued`, never drains | `queued poll drained 0 task(s)` absent | bridge must poll `GET /me/devices/:id/queued_tasks` — `bridge.ts startQueuedPoll/drainQueuedTasks` |
+
+## Security
+- **No Docker / no sandbox at runtime.** PicoClaw runs tool exec **in-process in
+  Go** — there is no container-exec mode to shell out to (verified against
+  `github.com/sipeed/picoclaw` `pkg/config/config.go ExecConfig`, which is
+  deny/allow-pattern based, never a container runtime). This is exactly the
+  OpenClaw failure (#1070: `Sandbox mode requires Docker`) avoided **by design**.
+  `agents.defaults.restrict_to_workspace: false` so the agent can use its tools
+  freely (the pod is the k8s tenant-isolation boundary — same call openclaw made
+  in #1070). `tools.exec.allow_remote: false` keeps exec local. `write-config`
+  runs `assertNoContainerExec` and fails closed if a future schema change or a
+  hand-edited config smuggles a `docker`/`container_exec`/`sandbox`/`allow_remote:
+  true` flag into the rendered config.
+- **Secret never in the main config.** PicoClaw does not document `${ENV}`
+  interpolation inside `config.json`, so the flow key is written ONLY to
+  `~/.picoclaw/.security.yml` (mapped by `model_name`, mode `0600`) and is omitted
+  from `config.json` — PicoClaw's own documented sensitive-data split. A missing
+  key fails the engine closed (`MissingFlowKeyError` → exit 2).
+- The devices-ws credential precedence (fresh enrollment token wins, else
+  AF_DEVICE_TOKEN, else cached secret) is identical to the openclaw shim and
+  avoids the spent-secret 401-loop.
+
+## What Phase 1 ships vs. remains
+Ships: the image (compile shim + checksum-verified PicoClaw `v0.2.9` Go binary),
+engine selection behind `FF_PICOCLAW`, the config.json + .security.yml render
+(secret-split, fail-closed, WAF UA override, sandbox-off), and the `dispatch_task`
+round-trip wiring — devices-ws `task_dispatch` → `picoclaw agent -m <task>
+--model flow` subprocess → `task_complete{answer}`, with the cross-replica queued
+poll and re-enroll resilience reused verbatim from openclaw. `npx tsc -p
+tsconfig.json` clean; 12/12 unit tests pass; the binary download + sha256 verified
+against the published checksum (the exact Dockerfile step).
+Remains: a live ff-france pod round-trip (pending FF_PICOCLAW + image build on
+CI), per-step `/live` streaming (pending source-level verification of PicoClaw's
+REST/EventBus surface — the subprocess path shows only start → done), and
+PVC-persisted `~/.picoclaw` state.
+
+## Related
+- [OpenClaw Pod Engine](/subsystems/openclaw-pod-engine) — the gold-template engine this mirrors
+- [Pod pre-warm pool](/subsystems/hosted-device-warm-pool)
+- Research: `.artifacts/picoclaw-hermes-engine-research.md` (PicoClaw section)
