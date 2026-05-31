@@ -136,6 +136,10 @@ Upstreams return Claude model ids in dot form (`claude-haiku-4.5`), but `flow_mo
 | `/llm/v1/messages` returns 400 "uses OpenAI wire format" | (removed 2026-05-23) — old behavior before bridge | upgrade to ai-router-unified deploy — bridge now translates instead of rejecting |
 | Fallback firing for Claude id | `[ai-router] anthropic_request_fallback: model=…` | seed a `llm_model_aliases` row OR enable a native Anthropic upstream |
 | Tool args truncated / unparseable | `tool_use.input._unparsed_args` present in response | upstream cut SSE mid-stream — check `upstream_http_*` log, retry, raise `max_tokens` |
+| Provider drained → every `flow` call 403s in Chinese | `预扣费额度失败 … insufficient_user_quota` (upstream body) | the upstream master account (e.g. `CODEXSALE_API_KEY`) is out of credit; `callUpstreamWithFallback` now fails over to the next enabled provider on quota/rate exhaustion (`[llm-retry] … quota/rate exhausted`). Top up the drained provider or repoint the `flow` alias |
+| Failover lands on a model the fallback provider rejects | `[llm-retry] … trying next` then a 4xx from the second provider | the body `model` is re-pointed to each candidate on failover (`rewriteBodyModel`); if still failing, the fallback row's `model` is not actually served by that provider — fix the `llm_provider_configs` row |
+| All providers drained | `503 upstream_unavailable` "temporarily over capacity" | no enabled provider of the request's wire format has credit; top up or enable another `llm_provider_configs` row. The clean 503 deliberately hides the raw upstream message |
+| Anthropic `/llm/v1/messages` all 503 `not configured (env missing)` | `upstream east-api-3-* not configured (env missing)` | `EAST_API_3_KEY` absent in the pod AND oauth/platform-anthropic rows disabled → no healthy anthropic upstream; set the env or enable a fallback row |
 
 ## Related
 
