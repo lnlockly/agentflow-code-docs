@@ -1,0 +1,77 @@
+---
+title: "OpenClaw /live wrapper: agent stream + approvals over the device SSE"
+description: "How the cabinet /live page wraps an in-pod OpenClaw Gateway — humanized timeline, chat input, and exec-approvals — without new infra, by binding the Gateway WS to the existing device task protocol."
+---
+
+# OpenClaw /live wrapper
+
+## TL;DR
+
+An OpenClaw pod runs a loopback Gateway (`ws://127.0.0.1:18789`). The
+`openclaw-shim` bridge speaks the SAME devices-ws task protocol the goose
+coder-shim + desktop daemon speak, so `/live` (`CabinetDeviceLive.tsx`) needs no
+new transport. The bridge forwards OpenClaw `agent` events (reasoning/tool
+steps) as humanized `task_action` rows («Думаю…», «Открываю сайт…», «Готово»),
+surfaces `exec.approval.requested` as an `approval_request` row that drives the
+cabinet ApprovalBar, and relays the owner's allow/deny back to
+`exec.approval.resolve`. Chat input stays `dispatch_task` → `chat.send`.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/openclaw-shim/gateway-client.ts:83` | connect requests `operator.read/write/approvals` scope so approval events are delivered |
+| `agentflow-agents/src/openclaw-shim/gateway-client.ts:173` | `parseApprovalRequest` — normalize `exec.approval.requested` event → `{id,command,warning}` |
+| `agentflow-agents/src/openclaw-shim/gateway-client.ts:370` | fan out `agent` events to `listeners.onAgentEvent` |
+| `agentflow-agents/src/openclaw-shim/gateway-client.ts:375` | `exec.approval.requested` → `onApproval`; `exec.approval.resolved` → `onApprovalResolved` |
+| `agentflow-agents/src/openclaw-shim/gateway-client.ts:438` | `resolveApproval(id, decision)` → `exec.approval.resolve` |
+| `agentflow-agents/src/openclaw-shim/humanize.ts:60` | `humanizeTool` — tool name+args → plain RU verb |
+| `agentflow-agents/src/openclaw-shim/humanize.ts:114` | `humanizeAgentEvent` — thinking/tool stream → one timeline step (assistant deltas/heartbeats dropped) |
+| `agentflow-agents/src/openclaw-shim/bridge.ts:175` | `activeTaskId` — agent events attach to the in-flight device task (main session is sequential) |
+| `agentflow-agents/src/openclaw-shim/bridge.ts:293` | `onAgentEvent` → `task_action` on the active task |
+| `agentflow-agents/src/openclaw-shim/bridge.ts:307` | `onApproval` → `approval_request` task_action (detail = JSON id+command) |
+| `agentflow-agents/src/openclaw-shim/bridge.ts:154` | `encodeApprovalDetail` — serialize approval into the row detail |
+| `agentflow-agents/src/types/devices.ts:210` | `approval_resolve` server→daemon WS frame |
+| `agentflow-agents/src/routes/me-devices.ts:1885` | `POST /me/devices/:id/approval` → sends `approval_resolve` to the device |
+| `agentflow-landing/src/components/cabinet-live/ApprovalBar.tsx:21` | `ExecApproval` shape (allow/deny) beside the legacy draft shape |
+| `agentflow-landing/src/pages/CabinetDeviceLive.tsx:347` | `applyApprovalRow` — intercept approval rows on the task SSE → ApprovalBar state |
+| `agentflow-landing/src/pages/CabinetDeviceLive.tsx:711` | `handleResolveApproval` → `devicesApi.resolveApproval` |
+| `agentflow-landing/src/lib/devicesApi.ts:274` | `resolveApproval` REST client |
+
+## Data flow
+
+```
+OpenClaw Gateway (loopback)          openclaw-shim bridge            agentflow-agents              cabinet /live
+  agent{stream:tool,...}    ──▶  humanizeAgentEvent ──▶ task_action ──▶ task SSE  ──▶ RunTimeline «Открываю сайт…»
+  exec.approval.requested   ──▶  onApproval ──▶ task_action            ──▶ task SSE  ──▶ ApprovalBar (allow/deny)
+                                                  action:approval_request
+  exec.approval.resolve     ◀──  resolveApproval ◀── approval_resolve  ◀── POST /me/devices/:id/approval ◀── allow/deny click
+  chat.send                 ◀──  sendChat        ◀── task_dispatch     ◀── POST /me/devices/:id/dispatch_task ◀── chat input
+  chat{state:final}         ──▶  task_complete                         ──▶ task SSE  ──▶ result panel
+```
+
+## DB / Env / API
+
+- Tables: none new — `device_action_log` already persists `task_action` rows.
+- Env: `OPENCLAW_GATEWAY_TOKEN`, `AGENTFLOW_FLOW_KEY`, `AF_API_KEY`,
+  `AF_DEVICE_ID`, `AF_API_URL` (pod-scoped, fail-closed at gateway start).
+- Routes: `POST /me/devices/:id/approval` (new),
+  `POST /me/devices/:id/dispatch_task`, `GET /me/devices/:id/tasks/stream`.
+- OpenClaw WS methods used: `chat.send`, `exec.approval.resolve`; events
+  consumed: `agent`, `chat`, `exec.approval.requested/resolved`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Approval never reaches cabinet | `approval requested id=` absent in pod logs | `agentflow-agents/src/openclaw-shim/bridge.ts:307` |
+| Allow/Deny does nothing | `approval resolve id=... sent=false` | gateway WS closed — `gateway-client.ts:438` returns false |
+| Approval events not delivered to shim | connect rejected / no `exec.approval.*` events | missing `operator.approvals` scope — `gateway-client.ts:83` |
+| Timeline shows raw tool ids | step renders `Работаю: <name>` | unmapped tool — extend `humanize.ts:60` |
+| Steps land on wrong/no task | rows with no bucket | `activeTaskId` null between runs — `bridge.ts:175` |
+
+## Related
+
+- [Device task lifecycle](/subsystems/device-task-lifecycle)
+- [Desktop daemon live stream](/subsystems/desktop-agent-live-stream)
+- Plan: `.artifacts/openclaw-pod-engine-plan.md` (Surface A)
