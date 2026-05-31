@@ -17,6 +17,15 @@ chat-only «Простой» from PR #573 — with this single screen + progress
 disclosure. The page root still owns all SSE / dispatch / stream state;
 the new pieces are presentation only.
 
+Phase 2 (PR landing #576) makes the live screen театр-grade: a cinematic
+focus mode (dim vignette + fixed overlay that also works on iOS), a
+click-ripple lifted from the agent's own click rows (ambient cursor when
+no coordinates), an address chip + subtitle-narrator synced over the
+video, a Watch⇄Drive «Взять управление» that forwards real clicks to
+`POST /click` (rendered-image scaling, left + right button) while the page
+pauses the agent, and a MediaRecorder session-recording → `.webm`.
+Keyboard / scroll input stay Phase 3 (no backend endpoint yet).
+
 ## Files (with line refs)
 
 | Path | Role |
@@ -29,7 +38,12 @@ the new pieces are presentation only.
 | `agentflow-landing/src/components/cabinet-live/StatusHero.tsx:17` | lamp state → CSS class map (working/waiting/idle/error/offline) |
 | `agentflow-landing/src/components/cabinet-live/ApprovalBar.tsx:36` | `if (!pending) return null` — never fakes a pending approval |
 | `agentflow-landing/src/components/cabinet-live/RunTimeline.tsx:240` | humanise per-row (`humanizeAction` + `humanizeChatText`) |
-| `agentflow-landing/src/components/cabinet-live/AgentScreen.tsx:56` | MJPEG `bustNow` watchdog (ported from legacy LiveScreenFeed) |
+| `agentflow-landing/src/components/cabinet-live/AgentScreen.tsx:135` | MJPEG `bustNow` watchdog (ported from legacy LiveScreenFeed) |
+| `agentflow-landing/src/components/cabinet-live/AgentScreen.tsx:158` | Phase 2 click-ripple — maps a feed click through `renderedImgRect` (letterbox-correct) |
+| `agentflow-landing/src/components/cabinet-live/AgentScreen.tsx:181` | Phase 2 Drive — `handleMonitorClick` scales rendered-img → 0..1 for `POST /click` (left + right) |
+| `agentflow-landing/src/components/cabinet-live/AgentScreen.tsx:259` | Phase 2 recording — MediaRecorder over a canvas painting MJPEG frames → `.webm` |
+| `agentflow-landing/src/components/cabinet-live/glassModel.ts:257` | `deriveScreenSignal(tasks, verdict, t)` — caption / address chip / click pulse from the SSE feed |
+| `agentflow-landing/src/pages/CabinetDeviceLive.tsx:948` | `handleDriveChange` pauses/resumes the device while a human drives |
 | `agentflow-landing/src/components/cabinet-live/UnderTheHood.tsx:36` | `dlive:hood:<deviceId>` localStorage open/tab persistence |
 | `agentflow-landing/src/components/cabinet-live/ResultsRail.tsx:1` | Artefact of `deviceWorkspaceStore.activeFile`; omits when none |
 | `agentflow-landing/src/components/cabinet-live/IdleState.tsx:1` | «💤 Агент свободен» + composer + preset library |
@@ -65,6 +79,9 @@ UnderTheHood ▾ → lazy Terminal (WS /terminal) · FileTree · CodeEditor
   `dlive:hoodTab:<id>` (Под капотом open state + last tab).
 - i18n: `live.hero.*`, `live.act.*`, `live.approve.*`, `live.screen.*`,
   `live.hood.*`, `live.results.*`, `live.idle.*`, `live.feed.title` (ru/en/zh).
+- i18n (Phase 2): `live.feed.drive`, `live.feed.drive_on`, `live.feed.drive_hint`,
+  `live.feed.drive_return`, `live.feed.record`, `live.feed.record_stop`,
+  `live.feed.recording`, `live.feed.record_unsupported`, `live.feed.theater_exit`.
 
 ## Failure modes
 
@@ -73,16 +90,34 @@ UnderTheHood ▾ → lazy Terminal (WS /terminal) · FileTree · CodeEditor
 | Live screen never shows a frame (online device) | `live.screen.offline.title` rendered | `agentflow-landing/src/components/cabinet-live/AgentScreen.tsx:56` (bustNow / first-frame timeout) |
 | Approval bell never appears | `const pendingApproval` is hardcoded `null` | `agentflow-landing/src/pages/CabinetDeviceLive.tsx:938` — no draft-inbox source yet (Phase 2) |
 | Feed shows raw tool names | `humanizeAction` returned de-snaked fallback | `agentflow-landing/src/components/cabinet-live/glassModel.ts:59` (add a keyword) |
+| Drive click lands off-target | rendered-img scaling vs remote resolution | `AgentScreen.tsx` `handleMonitorClick` → `renderedImgRect` (letterbox math); clicks on bars are dropped |
+| Record button disabled | `recordSupported` false (no MediaRecorder / `canvas.captureStream`) | `AgentScreen.tsx` `pickRecordMime()` / `recordSupported` — button shows `live.feed.record_unsupported` |
+| Agent stays paused after Drive | `drivePausedRef` resume call failed | `CabinetDeviceLive.tsx` `handleDriveChange` — fallback is the detail-page Resume button |
 
-## Phase 2–4 backlog
+## Phase 2 (shipped — PR landing #576)
+
+- Театр focus mode: dim vignette + fixed overlay (CSS-driven so it expands
+  on iOS where native fullscreen is a no-op), Esc / exit button to leave.
+- Cursor-trail + click-ripple from the agent's own click rows
+  (`deriveScreenSignal` → `parseCoords`), ambient «watching» cursor when the
+  feed gives no coordinates — no faked positions.
+- Address chip (app / url host) + subtitle-narrator (the live feed line)
+  floating over the video, synced to the action stream.
+- Watch⇄Drive «Взять управление»: clicks forward to `POST /click` with
+  rendered-image → 0..1 scaling (left + right button), the page pauses /
+  resumes the agent via the device idle toggle, banner «Ты за рулём».
+- ⏺ Запись: MediaRecorder over a canvas painting the MJPEG frames →
+  downloadable `.webm`; disabled with a hint where the browser lacks it.
+
+## Phase 3–4 backlog
 
 - ApprovalBar data source: an `awaiting_approval` SSE event / draft inbox so
   the bell renders with real pending actions.
-- Театр polish: cursor-trail, click ripple, subtitle-narrator over the screen.
-- Take-control «Drive»: `WS /me/devices/:id/input` (keyboard / scroll / drag),
-  agent-pause handshake.
-- ⌘K palette, session recording + DVR scrub, context-follows-action panel
-  promotion, mobile push approvals.
+- Drive keyboard / scroll / drag: needs a backend `WS /me/devices/:id/input`
+  (only `POST /click` exists today), plus a true agent-hold handshake (pause
+  prevents new dispatch but does not freeze a running task).
+- ⌘K palette, recording DVR scrub + share-to-report, context-follows-action
+  panel promotion, mobile push approvals.
 
 ## Related
 
