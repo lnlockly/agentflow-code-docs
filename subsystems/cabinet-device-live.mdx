@@ -1,0 +1,91 @@
+---
+title: "Cabinet device-live: «Стеклянный кабинет» (one screen)"
+description: "The /cabinet/devices/:id/live surface — one screen for everyone with a verdict lamp, approval bell, humanised feed, live screen visible to all, and progressive IDE depth behind «Под капотом»."
+---
+
+# Cabinet device-live: «Стеклянный кабинет»
+
+## TL;DR
+
+`/cabinet/devices/:id/live` is ONE screen for every user: a verdict line
++ lamp (StatusHero), an approval bell (ApprovalBar), the run feed in plain
+language (RunTimeline), the live MJPEG screen as a framed monitor visible
+to ALL by default (AgentScreen), and the terminal / files / code tools
+tucked behind a collapsible «Под капотом» (UnderTheHood). Phase 1 (PR
+landing #574) replaced the binary Простой⇄Профи toggle — and the
+chat-only «Простой» from PR #573 — with this single screen + progressive
+disclosure. The page root still owns all SSE / dispatch / stream state;
+the new pieces are presentation only.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/pages/CabinetDeviceLive.tsx:918` | `deriveVerdict(...)` call — lamp + live line from device/task state |
+| `agentflow-landing/src/pages/CabinetDeviceLive.tsx:938` | `pendingApproval = null` — ApprovalBar omitted until a Phase 2 source emits one |
+| `agentflow-landing/src/pages/CabinetDeviceLive.tsx:989` | glass composition: hero → approval → (feed ‖ screen) → под капотом |
+| `agentflow-landing/src/components/cabinet-live/glassModel.ts:59` | `humanizeAction(primary, t)` — tool name → plain phrase |
+| `agentflow-landing/src/components/cabinet-live/glassModel.ts:109` | `deriveVerdict(input, t)` — offline → error → working → idle priority |
+| `agentflow-landing/src/components/cabinet-live/StatusHero.tsx:17` | lamp state → CSS class map (working/waiting/idle/error/offline) |
+| `agentflow-landing/src/components/cabinet-live/ApprovalBar.tsx:36` | `if (!pending) return null` — never fakes a pending approval |
+| `agentflow-landing/src/components/cabinet-live/RunTimeline.tsx:240` | humanise per-row (`humanizeAction` + `humanizeChatText`) |
+| `agentflow-landing/src/components/cabinet-live/AgentScreen.tsx:56` | MJPEG `bustNow` watchdog (ported from legacy LiveScreenFeed) |
+| `agentflow-landing/src/components/cabinet-live/UnderTheHood.tsx:36` | `dlive:hood:<deviceId>` localStorage open/tab persistence |
+| `agentflow-landing/src/components/cabinet-live/ResultsRail.tsx:1` | Artefact of `deviceWorkspaceStore.activeFile`; omits when none |
+| `agentflow-landing/src/components/cabinet-live/IdleState.tsx:1` | «💤 Агент свободен» + composer + preset library |
+| `agentflow-landing/src/styles/cabinet-live-glass.css:1` | mobile-first layout (single column → desktop grid-areas) |
+
+## Data flow
+
+```
+GET /me/devices/:id            → device (status, paused, scope)
+GET /me/devices/:id/tasks/stream (SSE) → action | complete | error
+   │                                       │
+   ▼                                       ▼
+page root: tasks[] buckets (newest first), composerBusy, todayCost
+   │
+   ▼ deriveVerdict({isOnline, paused, composerBusy, tasks}, t)
+   │   offline → error → working → idle   (waiting/🟡 = Phase 2)
+   ▼
+StatusHero lamp + live line  ‖  RunTimeline (humanised)  ‖  AgentScreen (MJPEG)
+                                                  │
+                                                  ▼ POST /me/devices/:id/stream
+                                                    (pause/resume capture, unchanged)
+UnderTheHood ▾ → lazy Terminal (WS /terminal) · FileTree · CodeEditor
+```
+
+## DB / Env / API
+
+- Routes (all unchanged, presentation-only PR): `GET /me/devices/:id`,
+  `GET /me/devices/:id/tasks/stream` (SSE), `GET /me/devices/:id/live_stream`
+  (MJPEG), `POST /me/devices/:id/dispatch_task`, `POST /me/devices/:id/stream`,
+  `POST /me/devices/:id/click`, `WS /me/devices/:id/terminal`.
+- Env: none added.
+- localStorage: `dlive:showFeed:<id>` (capture pause), `dlive:hood:<id>` +
+  `dlive:hoodTab:<id>` (Под капотом open state + last tab).
+- i18n: `live.hero.*`, `live.act.*`, `live.approve.*`, `live.screen.*`,
+  `live.hood.*`, `live.results.*`, `live.idle.*`, `live.feed.title` (ru/en/zh).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Live screen never shows a frame (online device) | `live.screen.offline.title` rendered | `agentflow-landing/src/components/cabinet-live/AgentScreen.tsx:56` (bustNow / first-frame timeout) |
+| Approval bell never appears | `const pendingApproval` is hardcoded `null` | `agentflow-landing/src/pages/CabinetDeviceLive.tsx:938` — no draft-inbox source yet (Phase 2) |
+| Feed shows raw tool names | `humanizeAction` returned de-snaked fallback | `agentflow-landing/src/components/cabinet-live/glassModel.ts:59` (add a keyword) |
+
+## Phase 2–4 backlog
+
+- ApprovalBar data source: an `awaiting_approval` SSE event / draft inbox so
+  the bell renders with real pending actions.
+- Театр polish: cursor-trail, click ripple, subtitle-narrator over the screen.
+- Take-control «Drive»: `WS /me/devices/:id/input` (keyboard / scroll / drag),
+  agent-pause handshake.
+- ⌘K palette, session recording + DVR scrub, context-follows-action panel
+  promotion, mobile push approvals.
+
+## Related
+
+- [Desktop daemon: live screen stream + cabinet toggle](/subsystems/desktop-agent-live-stream)
+- [computer-mcp](/subsystems/computer-mcp)
+- [cabinet-device-autonomous-tab](/subsystems/cabinet-device-autonomous-tab)
