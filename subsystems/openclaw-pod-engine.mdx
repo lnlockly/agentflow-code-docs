@@ -45,16 +45,24 @@ POST /me/hosted-devices { template:'openclaw' }   (FF_OPENCLAW=1 or → 403)
     AGENTFLOW_FLOW_KEY (= device af_live key), AF_API_KEY/AF_DEVICE_ID/...
 
 entrypoint.sh:
+  reenroll()       → POST /me/hosted-devices/:id/reenroll {rotation_secret}
+                     → fresh AF_ENROLLMENT_TOKEN, clear AF_DEVICE_TOKEN
+                     (the one-time token is consumed on the first connect, so a
+                      stateless pod must re-mint one on every boot)
   write-config.js  → renders ~/.openclaw/openclaw.json (gateway.mode:local,
                      bind:loopback, flowrouter provider, fail-closed)
   openclaw gateway --bind loopback --port 18789   (background)
   wait /healthz
   main.js (bridge):
     ── devices-ws ──▶  wss://agentflow.website/_agents/_devices/connect
+       headers: x-api-key + x-device-id + x-enrollment-token (first) /
+                x-device-secret (reconnect, from hello_ack, cached to disk)
     ── loopback   ──▶  ws://127.0.0.1:18789  (operator)
 
-dispatch:  devices-ws task_dispatch{task} ──▶ gateway chat.send ──▶ flow LLM
-           task_complete{answer}           ◀── chat state:"final" event
+dispatch (live):   devices-ws task_dispatch{task} ──▶ gateway chat.send ──▶ flow LLM
+                   task_complete{answer}           ◀── chat state:"final" event
+dispatch (queued): cross-replica → device_tasks.status='queued' → bridge polls
+                   GET /me/devices/:id/queued_tasks (10s) → same handleDispatch
 ```
 
 ## DB / Env / API
@@ -81,6 +89,8 @@ dispatch:  devices-ws task_dispatch{task} ──▶ gateway chat.send ──▶ 
 | Bridge can't reach loopback gateway | `gateway connect attempt N failed` | gateway not up / wrong token |
 | Every chat 403s at the flow facade | `403 Your request was blocked` / `reason=auth` | WAF blocks `OpenAI/*` UA — `config.ts` sets `FLOW_USER_AGENT` header override |
 | Connect rejected | `INVALID_REQUEST: invalid connect params` | `client.id`/`mode` must be `gateway-client`/`backend` |
+| Dispatch stuck `queued`; bridge loops `devices-ws error: Unexpected server response: 401` then `reconnecting` | `devices-ws error:` + 401 | one-time enrollment token consumed on first connect → stateless pod re-presents it. `entrypoint.sh reenroll()` trades `AF_HOSTED_ROTATION_SECRET` for a fresh token on every boot |
+| Cross-replica dispatch stays `queued`, never drains | `queued poll drained 0 task(s)` absent | bridge must poll `GET /me/devices/:id/queued_tasks` — `bridge.ts startQueuedPoll/drainQueuedTasks` |
 
 ## Security
 - Gateway binds **loopback only**; 18789 never leaves the pod. The bridge uses
@@ -95,10 +105,17 @@ dispatch:  devices-ws task_dispatch{task} ──▶ gateway chat.send ──▶ 
 ## What Phase 1 ships vs. remains
 Ships (verified live on ff-france 2026-05-31): image builds (1.85GB),
 gateway boots + `/healthz` live, `agent model: flowrouter/flow` wired, engine
-selection behind `FF_OPENCLAW`, and the devices-ws ↔ gateway chat round-trip —
-`chat.send "ответь PONG"` → embedded agent → flow LLM → **reply "PONG"**.
-Root cause resolved: the flow WAF 403s the OpenAI-SDK `User-Agent`; the config
-renderer overrides it to `AgentFlow-OpenClaw/1.0`.
+selection behind `FF_OPENCLAW`, and the **full `dispatch_task` round-trip** —
+`POST /me/devices/:id/dispatch_task {task:"ответь PONG"}` → bridge → OpenClaw
+agent → flow LLM → `device_tasks.status='done'` + `device_action_log`
+`task_complete {"answer":"PONG"}`. Verified across all three cases: live
+(same-replica push), re-enroll resilience (pod restart with a consumed token →
+no 401-loop), and cross-replica queued (drained by the 10s poll, no restart).
+Root causes resolved: (1) the flow WAF 403s the OpenAI-SDK `User-Agent` →
+`config.ts` overrides it to `AgentFlow-OpenClaw/1.0`; (2) the one-time
+enrollment token is consumed on the first devices-ws connect → `entrypoint.sh
+reenroll()` re-mints one every boot; (3) cross-replica dispatches → `bridge.ts`
+polls `queued_tasks`.
 Remains: `/live` ApprovalBar + screen feed, OpenClaw skills library
 (af-autopost/digest/...), channel onboarding, PVC-persisted `~/.openclaw` state,
 the signed device-client.
