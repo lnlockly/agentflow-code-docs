@@ -16,6 +16,13 @@ description: "Customer-facing cabinet that surfaces API keys, usage, model catal
 deep-linkable via `?tab=`. The Models tab reads live from the public LLM facade
 so the UI never drifts from the actually-enabled provider set.
 
+The page is re-skinned onto the shared cabinet design system
+(`dark-tokens.css` / `cabinet-dashboard.css`): the scoped `--lc-*` variables
+in `llm-cabinet.css:11` remap onto the `--af-*` tokens (lime accent `#A6F25C`,
+surfaces `#0A0A0C / #141417 / #17171B`, Inter/Geist), so `/llm-cabinet` matches
+`/cabinet` and `/cabinet/agents` instead of the old acid-`#d4ff00` palette. No
+component markup changed for the colour pass — only the token map.
+
 ## Files (with line refs)
 
 | Path | Role |
@@ -87,10 +94,21 @@ come from `VISUAL_MAP` keyed by regex on `model.id` (claude-opus, gpt-5.5,
 gemini, deepseek, …). Unknown models fall through to `FALLBACK_VISUAL`
 (monochrome dot glyph).
 
-Pricing strings appear only when `pricing.input` and `pricing.output` are
-present. Without them the cabinet shows `уточняется` so the catalog can
-display a new model the second it lands in `llm_provider_configs`,
-before pricing is seeded.
+Pricing strings appear only when the live row carries pricing. The
+`/llm/v1/models` payload nests it as `pricing.input_per_mtok` /
+`pricing.output_per_mtok` (NOT `pricing.input` / `pricing.output`) — the
+parser at `llm-cabinet-models.ts:263` reads `input_per_mtok` first and keeps
+`input` as a legacy fallback. Before this fix every row rendered `уточняется`
+(Models tab) / `—` (dashboard price rail) because the parser read the wrong
+keys. Without any pricing the cabinet shows `уточняется` so the catalog can
+display a new model the second it lands in `llm_provider_configs`, before
+pricing is seeded.
+
+The `flow` alias row (an internal routing alias, `pricing: null`) is filtered
+out of the catalog at `llm-cabinet-models.ts:266`. The dashboard price rail
+(`DashboardTab.tsx`) now calls `fetchEnabledModels()` itself rather than
+rendering the static `MODELS` fallback (which ships no pricing), so its rail
+shows live `$/1M` prices and its «Все N →» count tracks the live catalog.
 
 ## Failure modes
 
@@ -101,6 +119,9 @@ before pricing is seeded.
 | History tab empty for an active key | `apiGet('/me/api-keys/:id/recent?limit=100')` returns `{rows: []}` | confirm `api_key_usage` writes; see [Public LLM Facade § stream usage capture](/subsystems/public-llm-facade) |
 | Model dropdown only shows static 4 | `fetchEnabledModels()` threw, fell back to `MODELS` static array | check network for `/llm/v1/models` 5xx; static array kept as last-resort |
 | Status column always green even on 4xx | `statusColor(code)` not matching | `HistoryTab.tsx:76` — only treats 2xx as `var(--lc-acid)`; verify `r.status_code` is numeric in row |
+| Price rail / Models tab show `—` / `уточняется` for every row | parser reads `pricing.input` (undefined) instead of `pricing.input_per_mtok` | `llm-cabinet-models.ts:263` — read `input_per_mtok` first |
+| «API ключ» label wraps to vertical single chars at 360px | old `.flex.justify-between` row could not shrink | `LcApiKeyCard.tsx` uses `.lc-keycard-head` (wraps as a unit, label stays `nowrap`) |
+| Models table columns crush to vertical chars on mobile | `.lc-table` had no `min-width`, so the 8-col table compressed instead of scrolling | `llm-cabinet.css` — `.lc-table { min-width: 640px }` + `th/td { white-space: nowrap }` inside `overflow-x:auto` |
 
 ## Related
 
