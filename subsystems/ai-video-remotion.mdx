@@ -1,0 +1,92 @@
+---
+title: "AI-Видео (brief → Remotion reel)"
+description: "POST /me/functions/video turns a brief into a real vertical MP4 via the Remotion runner."
+---
+
+# AI-Видео (brief → Remotion reel)
+
+## TL;DR
+
+`POST /me/functions/video { brief }` generates a short script via the flow LLM
+router, renders one reusable Remotion composition (`brief-reel`, vertical
+1080x1920) on the standalone `agentflow-remotion-runner` pod, and returns a
+real MinIO MP4 URL. No new infra — it reuses the renderer, MinIO upload, and
+designapi image path already documented in
+[Remotion renderer](/subsystems/remotion-renderer).
+
+## Files (with line refs)
+
+| Repo / path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-functions.ts:70` | `POST /me/functions/video` — orchestrates script → optional images → render. |
+| `agentflow-agents/src/services/video-script.ts:167` | `generateVideoScript` — brief → props via `invokeAI(ModelType.TEXT_LARGE)`. |
+| `agentflow-agents/src/services/video-script.ts:132` | `normalizeScript` — clamps scene count (1-6) + text lengths, hex validation. |
+| `agentflow-agents/src/services/video-script.ts:183` | `attachSceneBackgrounds` — optional designapi bg per scene (soft-fail). |
+| `agentflow-agents/src/services/remotion-runner-client.ts:61` | `renderRemotion` — server-side POST to the runner, normalises the envelope. |
+| `agentflow-agents/remotion-runner/src/compositions/brief-reel.tsx:413` | `BriefReel` composition — hero / scene / outro cards, vertical reel. |
+| `agentflow-agents/remotion-runner/src/compositions/brief-reel.tsx:483` | `briefReelDurationFrames` — frame count from card count. |
+| `agentflow-agents/remotion-runner/src/Root.tsx:87` | Registers `brief-reel` (1080x1920) + `calculateMetadata` from scene count. |
+| `agentflow-agents/src/server.ts:908` | Mounts `meFunctionsApp` at `/`. |
+| `agentflow-agents/tests/unit/video-script.test.ts` | 8 tests — normalisation, fenced-json parse, prop stripping. |
+| `agentflow-agents/tests/unit/remotion-runner-client.test.ts` | 5 tests — not_configured / happy / render-error / bad-response / unreachable. |
+
+## Data flow
+
+```
+POST /me/functions/video { brief }            (requireSession → session.sub)
+   │
+   ├─ brief? ──► generateVideoScript ──► invokeAI(ModelType.TEXT_LARGE)   [flow router]
+   │                └─ extractJson → normalizeScript (clamp scenes/text/hex)
+   │   script? ──► normalizeScript (skip LLM)
+   │
+   ├─ with_images? ──► attachSceneBackgrounds ──► generateImageSoftFail   [designapi, soft-fail]
+   │
+   └─ renderRemotion({ composition_id:'brief-reel', props })
+            └─► POST http://agentflow-remotion-runner:4200/render
+                  └─► selectComposition + renderMedia (chromium) → MinIO
+            ◄── { ok, mp4_url, duration_sec, size_bytes, render_ms }
+   ◄── { ok, mp4_url, duration_sec, width:1080, height:1920, script }
+```
+
+## DB / Env / API
+
+- **Tables:** none. Stateless — render artifacts live in MinIO under
+  `remotion/brief-reel/<uuid>.mp4`.
+- **Env (agents pod):** `REMOTION_RUNNER_URL` (default
+  `http://agentflow-remotion-runner:4200`). Empty → `renderRemotion` returns
+  `remotion_runner_not_configured` (no HTTP attempted). LLM + image providers
+  resolve through the flow router (no model name hardcoded).
+- **Routes:**
+  - `POST /me/functions/video` — body `{ brief?, script?, with_images?, fps? }`,
+    requires `brief` OR `script`. Returns `{ ok, mp4_url, duration_sec,
+    size_bytes, render_ms, composition_id:'brief-reel', width:1080,
+    height:1920, script }`.
+- **Composition props (`brief-reel`):**
+  `{ title, subtitle?, scenes:[{heading, body?, bgImage?}], cta?, brand?,
+  accentColor?, bgColor? }`. `bgImage` must be an absolute http(s) URL the
+  render pod can fetch; a dead URL falls back to the branded gradient.
+
+## Failure modes
+
+| Symptom | Log / response signature for grep | Where to fix |
+|---|---|---|
+| Missing brief and script | `400 { error:"validation_error" }` | Caller — send `brief` or `script`. |
+| LLM returned no JSON | `502 { error:"script_generation_failed" }`; `video_script_no_json` thrown | Model regression — inspect `generateVideoScript` reply; retry. |
+| Empty LLM reply | `video_script_empty_llm_reply` | Flow router returned no text block — check provider health. |
+| Runner pod down / Service unreachable | `503 { reason:"remotion_runner_unreachable" }` | `kubectl -n franchise-factory get pods -l app=agentflow-remotion-runner`. |
+| Render >5 min | `503 { reason:"remotion_runner_timeout" }` | Shorten scenes; AbortSignal.timeout fires at 5 min. |
+| Bad props / Chromium crash | `502 { reason:"render_failed" }` | Inspect `details`; usually a malformed prop or OOM. |
+| Runner URL unset | `503 { reason:"remotion_runner_not_configured" }` (no HTTP) | Set `REMOTION_RUNNER_URL` on `deploy/agentflow-agents`. |
+| Image provider down (with_images) | warn `scene background generation failed` — render continues on gradient | Expected soft-fail; no action. |
+
+## Verification (real render)
+
+Rendered a coffee-shop brief on the live prod runner (2026-06-01). ffprobe:
+`h264 1080x1920 30fps duration=14.27 nb_frames=428 size=1411296
+format_name=mov,mp4,m4a`. Valid playable MP4, Cyrillic text rendered
+(fonts-noto in the runner image).
+
+## Related
+
+- [Remotion renderer](/subsystems/remotion-renderer) — the runner pod, MinIO
+  upload, and the `@agentflow-video` MCP tool this function shares.
