@@ -48,7 +48,7 @@ collapses to the clean task feed when it stops.
 | `agentflow-agents/src/openclaw-shim/gateway-client.ts` `captureScreenshotPath` | take a screenshot, resolve with the local file path (null = no active tab) |
 | `agentflow-agents/src/openclaw-shim/bridge.ts` `startScreenPoll`/`captureAndPushFrame` | on `subscribe_stream`, poll `/screenshot` (~1.5fps), read the file, push `stream_frame` |
 | `agentflow-agents/src/coder-shim/protocol.ts` `buildStreamFrame` | base64 JPEG → MJPEG `stream_frame` wire frame |
-| `agentflow-agents/src/openclaw-shim/config.ts` `renderOpenclawConfig` | adds `browser:{enabled,headless}` so the browser tool + `browser.request` exist |
+| `agentflow-agents/src/openclaw-shim/config.ts` `renderOpenclawConfig` | adds `browser:{enabled,headless}` **and `plugins.entries.browser.enabled:true`** — the latter is what actually registers `browser.request` at gateway boot |
 | `agentflow-agents/openclaw-image/Dockerfile` | bakes Chromium (`playwright-core install --with-deps chromium`) so the browser tool can launch |
 | `agentflow-landing/src/components/cabinet-live/HeadlessLiveView.tsx` `BrowserScreenPane` | opens the device MJPEG, self-reveals on the first frame, hides ~6s after the last |
 | `agentflow-landing/src/pages/CabinetDeviceLive.tsx` (HeadlessLiveView call) | passes the canonical `deviceId` so the pane can open `live_stream` |
@@ -89,7 +89,8 @@ Live screen (only while a cabinet tab watches):
 - Reused MJPEG route: `GET /me/devices/:id/live_stream` (no change).
 - Image: Chromium baked via `playwright-core install --with-deps chromium`;
   `PLAYWRIGHT_BROWSERS_PATH=/home/node/.cache/ms-playwright`. Config:
-  `browser.enabled=true`, `browser.headless=true`.
+  `browser.enabled=true`, `browser.headless=true`, AND
+  `plugins.entries.browser.enabled=true` (REQUIRED — see failure modes).
 
 ## Failure modes
 
@@ -100,7 +101,8 @@ Live screen (only while a cabinet tab watches):
 | Approval events not delivered to shim | connect rejected / no `exec.approval.*` events | missing `operator.approvals` scope — `gateway-client.ts:83` |
 | Timeline shows raw tool ids | step renders `Работаю: <name>` | unmapped tool — extend `humanize.ts:60` |
 | Steps land on wrong/no task | rows with no bucket | `activeTaskId` null between runs — `bridge.ts:175` |
-| Screen pane never appears while browsing | `live screen: screenshot skipped` repeats; or no `subscribe_stream` | browser tool missing (no Chromium) — `openclaw-image/Dockerfile`; or scope — `gateway-client.ts buildConnectFrame` |
+| `browser.request` → `unknown method` | `errorCode=INVALID_REQUEST errorMessage=unknown method: browser.request`; gateway boot log shows `1 plugin: memory-core` | browser plugin not registered — config needs `plugins.entries.browser.enabled:true`, NOT just the root `browser` block (`config.ts renderOpenclawConfig`). Live-verified: that flips boot to `7 plugins: browser, …` and exposes `browser.request` |
+| Screen pane never appears while browsing | `live screen: screenshot skipped` repeats; or no `subscribe_stream` | browser plugin missing (see row above); or Chromium missing — `openclaw-image/Dockerfile`; or scope — `gateway-client.ts buildConnectFrame` |
 | `browser.request` rejected | `request rejected` in pod logs | missing `operator.admin` scope — `gateway-client.ts buildConnectFrame` |
 | Screenshot returns no path | `live screen: screenshot skipped (no active tab)` | agent has no open browser tab yet — expected; pane stays idle |
 | Pane flickers shut between frames | pane toggles rapidly | raise `FRAME_IDLE_HIDE_MS` — `HeadlessLiveView.tsx` |
