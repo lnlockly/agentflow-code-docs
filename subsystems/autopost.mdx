@@ -37,9 +37,13 @@ post.
 | `agentflow-agents/src/services/cross-poster/tg.ts:250` | `resolveSafeSender(...)` — fail-closed account selection. Returns `autopost_no_safe_sender` / `autopost_no_session`. |
 | `agentflow-agents/src/services/cross-poster/safe-sender.ts:82` | `isPersonalOwnerAccount(account)` — generic predicate (config phone/username, not a hardcoded id). |
 | `agentflow-agents/src/services/cross-poster/safe-sender.ts:104` | `hasLiveSession(account)` — true only when `session_encrypted` is non-blank. |
+| `agentflow-agents/src/services/autopost/insights.ts:39` | `listAutopostPosts(scheduleId,owner)` + `scheduleTraffic(...)` — posts history + ref-code signup metrics (raw SQL on `users.invited_by_ref_code`). |
+| `agentflow-agents/src/services/autopost/audience.ts:158` | `findAudience({brief,owner})` — AI-Охотник: LLM-derived TG search queries → live `search_telegram` → ranked channels; degrades to `tg_not_connected`. |
 | `agentflow-agents/src/db/schema.ts` | `autopostSchedules` (incl. `refCode`), `autopostPosts` drizzle defs. |
 | `agentflow-agents/src/db/migrations/0081_autopost.sql` | Base schema migration (applied manually). |
 | `agentflow-agents/src/db/migrations/0082_autopost_ref_code.sql` | Adds `ref_code` (applied manually — CI does not run migrations). |
+| `agentflow-landing/src/pages/CabinetAutopost.tsx` | The «AI-Охотник» cabinet (`/cabinet/autopost`) — setup + monitoring UI. |
+| `agentflow-landing/src/lib/autopostApi.ts` | Typed client for all autopost + TG-picker routes. |
 
 ## Data flow
 
@@ -79,6 +83,10 @@ cron tick (30s, FF_AUTOPOST=1)            POST /me/autopost/schedules/:id/run-no
   - `GET /me/autopost/schedules`
   - `DELETE /me/autopost/schedules/:id`
   - `POST /me/autopost/schedules/:id/run-now` — fires immediately, returns `{status, post_id, text, results}`.
+  - `GET /me/autopost/schedules/:id/posts` — published/failed history (`autopost_posts`), most-recent-first.
+  - `GET /me/autopost/schedules/:id/traffic` — `{postsTotal, postsSent, lastSentAt, signups, refCode}`. `signups` is null when the schedule has no `ref_code` (attribution never faked).
+  - `POST /me/autopost/find-audience` `{brief}` — AI-Охотник. Always 200; `{ok:false, reason:'tg_not_connected'|'tg_search_failed'|'empty_brief'}` on degrade, else `{ok:true, queries, channels[]}`.
+- Cabinet: `/cabinet/autopost` (`CabinetAutopost.tsx`) — TG channel picker (live `/me/telegram/dialogs`), daily-time schedule, optional ref-link, per-agent monitoring + run-now + post history + audience search. Honest "подключи Telegram" banner when no live session.
 - Reused MCP: TG send via `mcpDirect.callTool('telegram','send_message',...)` (inside `cross-poster/tg.ts`); VK via `wall.post`.
 - Preconditions (existing flows, not rebuilt): a non-personal tg-mcp account
   with a live Telethon session, channel via
@@ -97,6 +105,8 @@ cron tick (30s, FF_AUTOPOST=1)            POST /me/autopost/schedules/:id/run-no
 | Refused to send — chosen account has no Telethon session (the false-positive fix) | `autopost_no_session` | `cross-poster/tg.ts:272` (`resolveSafeSender`) — connect/restore the session for the platform account (`platform_tg_accounts.session_encrypted` is NULL). Recorded as `failed`, never `sent`. |
 | VK access denied | `error 15` / `scope \`wall\`` | `cross-poster/vk.ts` — token missing `wall` scope or expired |
 | Schedule never fires | (no `autopost schedule fired` log) | check `FF_AUTOPOST=1` and that the worker started (`pool-worker/index.ts`) |
+| Audience search empty / "подключи Telegram" | `tg_account_not_linked` / `tg_primary_login_missing` | no live TG session — `find-audience` returns `reason:'tg_not_connected'`; user must link an account (`tg-accounts.ts`) |
+| Traffic `signups` shows `—` | (schedule `ref_code` is null) | set a ref-link on the schedule; `scheduleTraffic` returns null signups without one (`services/autopost/insights.ts`) |
 
 ## Value loop (measuring a post)
 
