@@ -1,0 +1,114 @@
+---
+title: "Social Account Farms (simulation-first)"
+description: "Owner-scoped multi-account farms for TikTok/Instagram/Facebook/Threads/Telegram, driven by a SIM engine behind a pluggable adapter — /me/social-farms/* endpoints, fabricated data flagged sim=true."
+---
+
+# Social Account Farms
+
+## TL;DR
+
+A "ферма аккаунтов" surface for TikTok / Instagram / Facebook / Threads /
+Telegram. A SIM engine fabricates the whole lifecycle — account provisioning,
+warmup, posting + engagement, follower growth, the occasional ban — behind a
+pluggable `SocialPlatformAdapter`. SIM is the default (`SOCIAL_FARM_SIM != '0'`);
+real-platform adapters are stubs that throw `requires_real_integration`, so no
+ToS-violating automation ships. Every farm, account and action row carries
+`sim=true` and the cabinet shows a SIM badge — fabricated data is never sold as
+real activity. Platform differences live in one config table
+(`platforms.ts`); the adapter, engine and routes stay generic with no
+`if (platform === 'x')` business logic.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/migrations/2026-06-01c-social-farms.sql` | The 3 tables — `social_farms`, `social_farm_accounts`, `social_farm_actions`. Applied MANUALLY on the postgres pod (CI does not run migrations). |
+| `agentflow-agents/src/db/schema.ts:4449` | `socialFarms` Drizzle table (parent, one per platform-farm) |
+| `agentflow-agents/src/db/schema.ts:4470` | `socialFarmAccounts` Drizzle table (accounts per farm) |
+| `agentflow-agents/src/db/schema.ts:4502` | `socialFarmActions` Drizzle table (audit log of every sim/real action) |
+| `agentflow-agents/src/services/social-farm/platforms.ts:38` | `SOCIAL_PLATFORMS` per-platform config — the ONLY place platform differences live |
+| `agentflow-agents/src/services/social-farm/platforms.ts:107` | `getPlatformConfig(platform)` — throws on unknown key |
+| `agentflow-agents/src/services/social-farm/platforms.ts:120` | `warmupStepIncrement(cfg)` — warmup speed derived from `warmupDays` |
+| `agentflow-agents/src/services/social-farm/adapter.ts:82` | `SocialPlatformAdapter` interface (provision/warmup/performAction/fetchMetrics) |
+| `agentflow-agents/src/services/social-farm/adapter.ts:97` | `isSimMode()` — `SOCIAL_FARM_SIM != '0'` |
+| `agentflow-agents/src/services/social-farm/adapter.ts:107` | `getAdapter(platform)` — SimAdapter (default) or real stub |
+| `agentflow-agents/src/services/social-farm/sim-adapter.ts:81` | `SimAdapter` — fabricates handles/personas, warmup, actions, follower curve, ban chance |
+| `agentflow-agents/src/services/social-farm/real-stubs.ts:73` | `getRealAdapter(platform)` — TikTok/Instagram/Facebook/Threads/Telegram stubs, each throwing `requires_real_integration` |
+| `agentflow-agents/src/services/social-farm/engine.ts:152` | `planAccountTick(adapter, farm, account, actionsToday, now)` — pure per-account state step (unit-tested without a DB) |
+| `agentflow-agents/src/services/social-farm/engine.ts:280` | `queueProvisioningAccounts(farm, count)` — mint + insert provisioning rows |
+| `agentflow-agents/src/services/social-farm/engine.ts:350` | `tickSocialFarm(farmId)` — load rows, run the pure stepper, persist |
+| `agentflow-agents/src/services/social-farm/engine.ts:463` | `tickAllSocialFarms()` — tick every active farm; per-farm errors isolated |
+| `agentflow-agents/src/services/agent-trigger-worker.ts:821` | `processSocialFarms()` — worker pass, gated by `FF_SOCIAL_FARM=1` |
+| `agentflow-agents/src/routes/me-social-farms.ts:136` | Routes — owner-scoped CRUD + manual tick |
+| `agentflow-agents/src/server.ts:778` | `app.route('/', meSocialFarmsApp)` registration |
+| `agentflow-agents/tests/unit/social-farm/engine.test.ts` | node --test — pacing/cap math, SimAdapter lifecycle, in-memory tick harness (12 tests) |
+
+## Data flow
+
+```
+POST /me/social-farms {platform, name, accounts_target, daily_action_cap, content_theme}
+  → INSERT social_farms (sim = isSimMode())
+  → queueProvisioningAccounts(farm, accounts_target)
+        → getAdapter(platform).provisionAccount() per slot
+        → INSERT social_farm_accounts (status='provisioning')
+
+worker tick (FF_SOCIAL_FARM=1, every 30s)  ─┐   POST /me/social-farms/:id/tick (demo)
+  tickAllSocialFarms()                       ├─→ tickSocialFarm(farmId)
+                                             ┘     │
+   for each non-paused farm:
+     1. top up provisioning accounts toward accounts_target
+     2. for each non-terminal account:
+          usedToday = count capped actions since UTC midnight
+          plan = planAccountTick(adapter, farm, account, usedToday, now)
+            provisioning → warming (stamp warmup_started_at, log 'provision')
+            warming      → adapter.warmupStep; ≥100% → active (stamp activated_at)
+            active       → adapter.fetchMetrics (followers/following/posts)
+                           maybe ban (banChancePerTick) → status='banned'
+                           else run min(remaining cap, 1..3) capped actions,
+                                pacing-gated by actionGapMs(cap)
+          persist patch + INSERT social_farm_actions rows
+```
+
+The daily cap is enforced off the action log (count of `post|like|follow|
+comment|view` rows since UTC midnight), not in-memory, so ticks are idempotent
+and safe to repeat. Lifecycle bookkeeping (`provision|warmup_step|ban`) is
+logged but never rate-limited.
+
+## DB / Env / API
+
+- **Tables:** `social_farms`, `social_farm_accounts`, `social_farm_actions`
+  (migration `2026-06-01c-social-farms.sql`, applied manually on the postgres
+  pod in ns `franchise-factory`).
+- **Env:**
+  - `SOCIAL_FARM_SIM` — SIM adapter unless explicitly `'0'` (default SIM).
+  - `FF_SOCIAL_FARM` — `'1'` enables the recurring worker tick pass.
+- **Routes** (all owner-scoped via `requireSession`, owner id =
+  `(c.get('session') as {sub}).sub`, cross-owner reads 404):
+  - `POST   /me/social-farms` → 201 `{ok, farm, accounts_queued}`
+  - `GET    /me/social-farms` → `{ok, farms:[{...farm, counts, accounts_count, followers_total, actions_today}]}`
+  - `GET    /me/social-farms/:id` → `{ok, farm, accounts}`
+  - `GET    /me/social-farms/:id/accounts` → `{ok, accounts}`
+  - `GET    /me/social-farms/:id/actions?limit=50` → `{ok, actions}`
+  - `POST   /me/social-farms/:id/accounts {count}` → `{ok, added}`
+  - `POST   /me/social-farms/:id/pause` / `/resume` → `{ok}`
+  - `POST   /me/social-farms/:id/tick` → `{ok, farm, accounts}` (run one tick now)
+  - `DELETE /me/social-farms/:id` → `{ok, deleted}`
+- **MCP tools:** none — this is platform code, not an MCP surface.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Real mode minted no accounts (added: 0) | `requires_real_integration` | `agentflow-agents/src/services/social-farm/real-stubs.ts:32` |
+| Farm has an unconfigured platform string | `tick unknown_social_platform` | `agentflow-agents/src/services/social-farm/engine.ts:350` |
+| Provision skipped a slot | `provision_account_failed` | `agentflow-agents/src/services/social-farm/engine.ts:280` |
+| A farm error inside the tick pass | `social_farm_tick_failed` | `agentflow-agents/src/services/social-farm/engine.ts:463` |
+| Whole tick pass threw | `social_farm tick pass failed` | `agentflow-agents/src/services/agent-trigger-worker.ts:821` |
+| Worker pass never runs | (no log — `FF_SOCIAL_FARM != '1'`) | `agentflow-agents/src/services/agent-trigger-worker.ts:822` |
+| Accounts stuck `provisioning` | (no log — worker off, or `tick` never called) | `POST /me/social-farms/:id/tick` |
+
+## Related
+
+- [Contact Farm](/subsystems/farm) — the earlier per-user MTProto contact farm (real, single-platform).
+- [Autopost + cross-poster](/subsystems/matrix-bots) — the autopost worker pass this tick pass mirrors.
+- [Funnel Analytics](/subsystems/funnel-analytics)
