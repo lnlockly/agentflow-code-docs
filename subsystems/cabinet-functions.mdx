@@ -18,10 +18,21 @@ agentflow-agents; «Сделать лендинг» reuses the projects pipeline
 | `agentflow-agents/src/routes/me-functions.ts:60` | `POST /me/functions/copy` — brief → post text (reuses `generatePost`) |
 | `agentflow-agents/src/routes/me-functions.ts:88` | `POST /me/functions/research` — brief → market/topic analysis |
 | `agentflow-agents/src/routes/me-functions.ts:117` | `POST /me/functions/ideas` — brief → 5-8 content/campaign ideas |
-| `agentflow-agents/src/routes/me-functions.ts:144` | `POST /me/functions/image` — prompt → one image |
-| `agentflow-agents/src/routes/me-functions.ts:148` | `POST /me/functions/video` — brief/script → brief-reel MP4 |
+| `agentflow-agents/src/routes/me-functions.ts:172` | `POST /me/functions/trends` — brief → 5-7 viral content angles |
+| `agentflow-agents/src/routes/me-functions.ts:199` | `POST /me/functions/funnel` — brief → 4-6 step sales auto-funnel |
+| `agentflow-agents/src/routes/me-functions.ts:226` | `POST /me/functions/slides` — brief → `{slides:[{title,body}], text}` carousel |
+| `agentflow-agents/src/routes/me-functions.ts:257` | `POST /me/functions/voice` — text → real mp3 (`{url, b64, mime, bytes, voice_id}`) |
+| `agentflow-agents/src/routes/me-functions.ts:293` | `POST /me/functions/image` — prompt → one image |
+| `agentflow-agents/src/routes/me-functions.ts:358` | `POST /me/functions/video` — brief/script → brief-reel MP4 |
 | `agentflow-agents/src/services/text-function.ts:86` | `generateResearch(brief, {ownerUserId})` — flow-routed analysis |
 | `agentflow-agents/src/services/text-function.ts:91` | `generateIdeas(brief, {ownerUserId})` — flow-routed ideas |
+| `agentflow-agents/src/services/text-function.ts:138` | `generateTrends` / `generateFunnel` — flow-routed `TEXT_LARGE` |
+| `agentflow-agents/src/services/text-function.ts:204` | `generateSlides` — JSON array → `{slides, text}` (`extractJsonArray` strips ```json fence) |
+| `agentflow-agents/src/services/voice-function.ts:74` | `transliterateLatinTokens` — Latin runs → Cyrillic when text contains Russian |
+| `agentflow-agents/src/services/voice-function.ts:116` | `generateVoice` — `invokeAI(TEXT_TO_SPEECH)` → `persistMultimodalArtifact` mp3 |
+| `agentflow-agents/src/llm-providers/elevenlabs.ts:30` | ElevenLabs `TEXT_TO_SPEECH` handler reused by the voice function |
+| `agentflow-landing/src/lib/agentsApi.ts:5574` | `generateFunctionTrends` / `…Funnel` / `…Slides` / `…Voice` |
+| `agentflow-landing/src/pages/CabinetFunctions.tsx:408` | `TrendsCard` / `FunnelCard` / `SlidesCard` / `VoiceCard` (audio player) |
 | `agentflow-agents/src/services/text-function.ts:58` | shared `invokeAI(ModelType.TEXT_LARGE)` call — no hardcoded model |
 | `agentflow-agents/src/services/autopost/generate.ts` | `generatePost` — reused by the copy function |
 | `agentflow-agents/src/services/video-script.ts` | brief → brief-reel props for the video function |
@@ -49,13 +60,19 @@ The text functions return plain text (no JSON parse): the model reply is
 trimmed; an empty trimmed reply throws `text_function_empty_llm_reply`.
 
 ## DB / Env / API
-- Routes: `POST /me/functions/copy`, `/me/functions/research`,
-  `/me/functions/ideas`, `/me/functions/image`, `/me/functions/video`.
+- Routes: `POST /me/functions/{copy,research,ideas,trends,funnel,slides,voice,image,video}`.
 - Auth: `requireSession` (cabinet session cookie OR `x-api-key: af_live_…`).
-- LLM: `invokeAI(ModelType.TEXT_LARGE)` → `flow` alias. No model strings are
-  hardcoded; provider resolution + priority live in the `llm_provider_configs`
-  / `llm_model_aliases` PG tables. `ownerUserId` carries BYOK lookup + billing.
-- No new tables. No new env vars.
+- LLM (text): `invokeAI(ModelType.TEXT_LARGE)` → `flow` alias. No model strings
+  hardcoded; provider resolution + priority live in `llm_provider_configs` /
+  `llm_model_aliases`. `ownerUserId` carries BYOK lookup + billing.
+- Voice: `invokeAI(ModelType.TEXT_TO_SPEECH)` → ElevenLabs handler. Voice id is
+  NOT hardcoded — `FUNCTIONS_VOICE_ID` env, else the handler default
+  `xdADm9fX0hNasTe0AGW0`. mp3 persisted via `persistMultimodalArtifact`
+  (`/files/multimodal/<sha>.mp3`). Latin runs are transliterated to Cyrillic
+  before TTS (ElevenLabs mispronounces Latin mid-Russian).
+- Env (voice): `ELEVENLABS_API_KEY` (required), `FUNCTIONS_VOICE_ID` (optional),
+  `UPLOAD_DIR` + `UPLOADS_PUBLIC_BASE` (artifact persistence).
+- No new tables. trends/funnel/slides add no env.
 
 ## Failure modes
 | Symptom | Log signature for grep | Where to fix |
@@ -65,6 +82,10 @@ trimmed; an empty trimmed reply throws `text_function_empty_llm_reply`.
 | Empty model reply (400, caller re-runs) | `text_function_empty_llm_reply` | `services/text-function.ts:81` |
 | Blank/oversized brief rejected at edge | `invalid_body` | `me-functions.ts` (zod schemas) |
 | Budget cap hit before the LLM call | `budget_cap_hit` | `ai-router/instrumented.ts` |
+| Trends/funnel card 502 | `trends generation failed` / `funnel generation failed` | `me-functions.ts:188` / `:215` |
+| Slides card 400, model returned non-JSON | `slides generation failed` + `text_function_slides_unparseable` / `text_function_slides_empty` | `services/text-function.ts:179` (`extractJsonArray` already strips a ```json fence) |
+| Voice card 502 for every text | `voice generation failed` + `all_providers_failed for TEXT_TO_SPEECH: elevenlabs=elevenlabs 401 ... payment_issue` | ElevenLabs invoice unpaid — pay it OR set `OPENAI_API_KEY` for the BYOK-OpenAI TTS handler. No code change. Observed 2026-06-01. |
+| Voice mispronounces a Latin brand | n/a (audio) | `transliterateLatinTokens` (`voice-function.ts:74`) rewrites Latin→Cyrillic only when Russian present |
 
 ## Verification (live, flow router)
 Owner-key smoke (lead runs post-merge):
@@ -78,6 +99,22 @@ through the `flow` alias, owner user=1): research returned 5 markdown sections
 (аудитория / конкуренты / риски / отстройка); ideas returned 7 numbered post
 hooks with formats (reels / сторис / рассылка). Both brief-derived, no fake
 stats/links, no «бесплатно».
+
+Batch-2 verified 2026-06-01 in-pod (same router, owner user=1, brief =
+«барбершоп в Питере, мужские стрижки и уход за бородой»):
+- **trends** — 5+ numbered viral angles (до/после Reels, POV кресло, разбор
+  ошибок ухода, питерский стиль недели), brief-derived.
+- **funnel** — 4-step touch sequence with ready example copy per step, ending
+  on «закрытие на запись / оплата».
+- **slides** — parsed a 6-item JSON array into `{title, body}` slides (крючок →
+  призыв «Запишись в барбершоп»); fence-tolerant parser handles ```json wrap.
+- **voice** — code path reached the ElevenLabs handler with the transliterated
+  text and the prod key, but the ElevenLabs account returned `401 payment_issue`
+  (unpaid invoice) and no `OPENAI_API_KEY` fallback is set, so no mp3 bytes can
+  be produced until the invoice is paid. The endpoint returns 502
+  `voice_generation_failed` honestly. Transliteration is independently verified:
+  `transliterateLatinTokens('Привет от AgentFlow и KuCoin')` →
+  `'Привет от Агентфлов и Кукоин'`; a pure-English string is left untouched.
 
 ## Related
 - [Autopost](/subsystems/autopost) — `generatePost`, reused by the copy function.
