@@ -39,6 +39,27 @@ site/cabinet, never inside a pod.
 | `agentflow-landing/src/main.tsx:736` | `/cabinet/functions` route (lazy) |
 | `agentflow-landing/src/components/layout/AppShellV2.tsx:128` | «Функции» CORE_NAV entry (icon `Zap`) + BOTTOM_NAV |
 
+### Batch 2 functions (voice / trends / funnel / slides)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-functions.ts:172` | `POST /me/functions/trends` — `generateTrends(brief)` → `{ ok, text }` (5-7 viral angles) |
+| `agentflow-agents/src/routes/me-functions.ts:199` | `POST /me/functions/funnel` — `generateFunnel(brief)` → `{ ok, text }` (4-6 step sales auto-funnel) |
+| `agentflow-agents/src/routes/me-functions.ts:226` | `POST /me/functions/slides` — `generateSlides(brief)` → `{ ok, slides:[{title,body}], text }` |
+| `agentflow-agents/src/routes/me-functions.ts:257` | `POST /me/functions/voice` — `generateVoice(text)` → `{ ok, url, b64, mime, bytes, voice_id }` real mp3 |
+| `agentflow-agents/src/routes/me-functions.ts:168` | `trendsSchema` / `funnelSchema` / `slidesSchema` (`brief` 5-4000), `voiceSchema` (`text` 2-5000) |
+| `agentflow-agents/src/services/text-function.ts:138` | `generateTrends` — `invokeAI(TEXT_LARGE)`, niche viral angles |
+| `agentflow-agents/src/services/text-function.ts:143` | `generateFunnel` — `invokeAI(TEXT_LARGE)`, touch sequence → оплата |
+| `agentflow-agents/src/services/text-function.ts:204` | `generateSlides` — `invokeAI(TEXT_LARGE)` → JSON array → `{ slides, text }`, tolerant ```json fence parser |
+| `agentflow-agents/src/services/voice-function.ts:74` | `transliterateLatinTokens` — Latin runs → Cyrillic when text contains Russian (ElevenLabs mispronounces Latin mid-RU) |
+| `agentflow-agents/src/services/voice-function.ts:116` | `generateVoice` — `invokeAI(TEXT_TO_SPEECH)` → `persistMultimodalArtifact` → `{ url, b64, mime, bytes }`. Voice id from `FUNCTIONS_VOICE_ID` env, else handler default |
+| `agentflow-agents/src/llm-providers/elevenlabs.ts:30` | ElevenLabs `TEXT_TO_SPEECH` handler reused by the voice function |
+| `agentflow-agents/tests/me-functions.test.ts:1` | 36 unit tests (schemas + text services + slides parser + translit + voice persist, LLM/TTS stubbed) |
+| `agentflow-landing/src/lib/agentsApi.ts:5574` | `generateFunctionTrends` / `generateFunctionFunnel` / `generateFunctionSlides` / `generateFunctionVoice` |
+| `agentflow-landing/src/pages/CabinetFunctions.tsx:408` | `TrendsCard` / `FunnelCard` (reuse `TextFunctionCard`) |
+| `agentflow-landing/src/pages/CabinetFunctions.tsx:444` | `SlidesCard` — structured numbered slide cards + copy |
+| `agentflow-landing/src/pages/CabinetFunctions.tsx:537` | `VoiceCard` — inline `<audio>` player from url / `data:` b64 + download |
+
 ## Data flow
 
 ```
@@ -74,6 +95,14 @@ cabinet /cabinet/functions (CabinetFunctions.tsx)
   `POST /me/projects/:id/approve` + `GET /me/projects/:id`.
 - MCP tools: none. No model strings hardcoded — copy via `useModel`, image via
   `invokeAI(ModelType.IMAGE)`.
+- Batch-2 routes: `POST /me/functions/{trends,funnel,slides,voice}`
+  (`requireSession`, owner-scoped). trends/funnel/slides route the brief through
+  `invokeAI(TEXT_LARGE)` (text-function.ts); voice routes the text through
+  `invokeAI(TEXT_TO_SPEECH)` → ElevenLabs (elevenlabs.ts) and persists the mp3
+  via `persistMultimodalArtifact` (served at `/files/multimodal/<sha>.mp3`).
+- Env (voice): `ELEVENLABS_API_KEY` (required), `FUNCTIONS_VOICE_ID` (optional —
+  falls back to the handler default `xdADm9fX0hNasTe0AGW0`), `UPLOAD_DIR` +
+  `UPLOADS_PUBLIC_BASE` (artifact persistence). No model/voice strings hardcoded.
 
 ## Failure modes
 
@@ -84,6 +113,9 @@ cabinet /cabinet/functions (CabinetFunctions.tsx)
 | Copy card 502 | route 502 `generation_failed` | LLM router outage or budget cap (`BudgetExceededError`) — retry / raise cap |
 | Landing card stuck «Агент работает…» past ~6 min | project `status` stays `provisioning`; preview never sets | cold pod / clone slow — card hands off to the workspace («Открой проект»). See `projects.mdx` failure modes (502 from edge, npm install). |
 | Landing card «Сборка не завершилась» | project `status='failed'` | build failed — open the project for the log. See `projects.mdx`. |
+| Voice card 502 for every text | route 502 `voice_generation_failed`; router throws `all_providers_failed for TEXT_TO_SPEECH: elevenlabs=elevenlabs 401 ... payment_issue` | ElevenLabs subscription has a failed/incomplete invoice — pay it, OR set a non-empty `OPENAI_API_KEY` so the BYOK-OpenAI TTS handler (`llm-providers/byok-openai.ts`) serves `TEXT_TO_SPEECH`. No code change. Observed 2026-06-01: ElevenLabs `payment_issue` and pod `OPENAI_API_KEY` empty. |
+| Slides card 400 | route 400 `generation_failed` with `text_function_slides_unparseable` / `text_function_slides_empty` | model returned non-JSON / empty — re-run; the parser already strips a ```json fence and the surrounding prose (`text-function.ts:179` `extractJsonArray`). |
+| Voice mispronounces a Latin brand word | n/a (audio quality) | `transliterateLatinTokens` rewrites Latin runs to Cyrillic only when the text contains Russian; a pure-Latin (English) script is left untouched. |
 
 ## Verify
 
