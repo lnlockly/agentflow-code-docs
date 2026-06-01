@@ -1,0 +1,83 @@
+---
+title: "Cabinet «Функции» (ready-function catalog)"
+description: "Owner-facing one-shot AI functions — brief in, one real artifact out — backing the /cabinet/functions catalog page."
+---
+
+# Cabinet «Функции»
+
+## TL;DR
+The «Функции» catalog (`/cabinet/functions`) is a витрина of one-click AI
+functions: the user types one brief/prompt and gets ONE real artifact back
+synchronously — a post, a market analysis, content ideas, an image, an MP4, or
+a live landing. Each card calls a thin `POST /me/functions/*` endpoint on
+agentflow-agents; «Сделать лендинг» reuses the projects pipeline instead.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-functions.ts:60` | `POST /me/functions/copy` — brief → post text (reuses `generatePost`) |
+| `agentflow-agents/src/routes/me-functions.ts:88` | `POST /me/functions/research` — brief → market/topic analysis |
+| `agentflow-agents/src/routes/me-functions.ts:117` | `POST /me/functions/ideas` — brief → 5-8 content/campaign ideas |
+| `agentflow-agents/src/routes/me-functions.ts:144` | `POST /me/functions/image` — prompt → one image |
+| `agentflow-agents/src/routes/me-functions.ts:148` | `POST /me/functions/video` — brief/script → brief-reel MP4 |
+| `agentflow-agents/src/services/text-function.ts:86` | `generateResearch(brief, {ownerUserId})` — flow-routed analysis |
+| `agentflow-agents/src/services/text-function.ts:91` | `generateIdeas(brief, {ownerUserId})` — flow-routed ideas |
+| `agentflow-agents/src/services/text-function.ts:58` | shared `invokeAI(ModelType.TEXT_LARGE)` call — no hardcoded model |
+| `agentflow-agents/src/services/autopost/generate.ts` | `generatePost` — reused by the copy function |
+| `agentflow-agents/src/services/video-script.ts` | brief → brief-reel props for the video function |
+| `agentflow-agents/src/server.ts:781` | `meFunctionsApp` mounted ONCE (`app.route('/', meFunctionsApp)`) |
+| `agentflow-landing/src/pages/CabinetFunctions.tsx` | the card grid + inline-result UI |
+| `agentflow-landing/src/lib/agentsApi.ts:5556` | `generateFunctionCopy` |
+| `agentflow-landing/src/lib/agentsApi.ts:5562` | `generateFunctionResearch` |
+| `agentflow-landing/src/lib/agentsApi.ts:5568` | `generateFunctionIdeas` |
+| `agentflow-agents/tests/me-functions.test.ts` | schema + text-function unit tests (LLM stubbed) |
+
+## Data flow
+```
+CabinetFunctions.tsx card
+  → agentsApi.generateFunction{Copy,Research,Ideas,Image}(brief|prompt)
+    → POST /me/functions/{copy,research,ideas,image,video}  (x-api-key / session)
+      → requireSession → ownerUserId = session.sub
+      → text functions: services/text-function.ts
+          → invokeAI(ModelType.TEXT_LARGE, {messages}, {ownerUserId, agentSlug})
+          → flow alias → live provider (e.g. gpt-5.3-codex), billed to owner
+      → { ok:true, text }  (or { ok:false, error, detail })
+  → card renders the text inline + a «Копировать» button
+```
+
+The text functions return plain text (no JSON parse): the model reply is
+trimmed; an empty trimmed reply throws `text_function_empty_llm_reply`.
+
+## DB / Env / API
+- Routes: `POST /me/functions/copy`, `/me/functions/research`,
+  `/me/functions/ideas`, `/me/functions/image`, `/me/functions/video`.
+- Auth: `requireSession` (cabinet session cookie OR `x-api-key: af_live_…`).
+- LLM: `invokeAI(ModelType.TEXT_LARGE)` → `flow` alias. No model strings are
+  hardcoded; provider resolution + priority live in the `llm_provider_configs`
+  / `llm_model_aliases` PG tables. `ownerUserId` carries BYOK lookup + billing.
+- No new tables. No new env vars.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Research card shows "try again", 502 | `research generation failed` | `me-functions.ts:106` |
+| Ideas card shows "try again", 502 | `ideas generation failed` | `me-functions.ts:133` |
+| Empty model reply (400, caller re-runs) | `text_function_empty_llm_reply` | `services/text-function.ts:81` |
+| Blank/oversized brief rejected at edge | `invalid_body` | `me-functions.ts` (zod schemas) |
+| Budget cap hit before the LLM call | `budget_cap_hit` | `ai-router/instrumented.ts` |
+
+## Verification (live, flow router)
+Owner-key smoke (lead runs post-merge):
+```bash
+curl -X POST https://agentflow.website/_agents/me/functions/research \
+  -H "x-api-key: af_live_…" -H "Content-Type: application/json" \
+  -d '{"brief":"рынок доставки кофе в Москве"}'
+```
+Verified 2026-06-01 in-pod via `invokeAI(TEXT_LARGE)` (model `gpt-5.3-codex`
+through the `flow` alias, owner user=1): research returned 5 markdown sections
+(аудитория / конкуренты / риски / отстройка); ideas returned 7 numbered post
+hooks with formats (reels / сторис / рассылка). Both brief-derived, no fake
+stats/links, no «бесплатно».
+
+## Related
+- [Autopost](/subsystems/autopost) — `generatePost`, reused by the copy function.
