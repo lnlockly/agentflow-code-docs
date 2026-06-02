@@ -69,7 +69,6 @@ export default defineConfig({
             { label: 'Funnel Analytics', slug: 'subsystems/funnel-analytics' },
             { label: 'Reminders v2', slug: 'subsystems/reminders-v2' },
             { label: 'Contact Farm', slug: 'subsystems/farm' },
-            { label: 'Social Account Farms (SIM)', slug: 'subsystems/social-farm' },
             { label: 'Projects Dashboard', slug: 'subsystems/projects-dashboard' },
             { label: 'Products Hub', slug: 'subsystems/products-hub' },
             { label: 'Onboarding Quests', slug: 'subsystems/onboarding-quests' },
