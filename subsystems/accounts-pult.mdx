@@ -1,0 +1,100 @@
+---
+title: "Accounts Control Pult (backend)"
+description: "MCP-first, platform-generic backend for /cabinet/accounts — unified account list, cross-platform action log, and a server-side command loop with confirm-before-send."
+---
+
+# Accounts Control Pult (backend)
+
+## TL;DR
+`/cabinet/accounts` is a three-zone shell for driving every connected social
+account (telegram · kwork · future instagram/avito) from one place. The backend
+is **MCP-first and generic over platforms**: each platform is one provider row
+in a registry — adding a platform = add an MCP server + one registry row, never
+an `if (platform === …)` branch. Three surfaces: list accounts, read a unified
+action log, and run a free-form command server-side with destructive sends
+gated to owner approval.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-accounts.ts:48` | `GET /me/accounts` — aggregator over the provider registry |
+| `agentflow-agents/src/routes/me-accounts.ts:56` | `GET /me/accounts/actions?platform=&account_id=&limit=` — unified feed |
+| `agentflow-agents/src/routes/me-accounts.ts:109` | `POST /me/accounts/:accountId/command` (SSE) — server-side MCP command loop |
+| `agentflow-agents/src/routes/me-accounts.ts:171` | `POST /me/accounts/:accountId/command/approve` — fire a held draft |
+| `agentflow-agents/src/services/account-providers/index.ts:33` | `PLATFORM_PROVIDERS` registry (telegram→`telegram`, kwork→`kwork-inbox`) |
+| `agentflow-agents/src/services/account-providers/index.ts:62` | `listAllAccounts` — fan out across providers, isolate failures |
+| `agentflow-agents/src/services/account-providers/index.ts:99` | `resolveOwnedAccount` — parse `platform:id`, owner-scope verify |
+| `agentflow-agents/src/services/account-providers/telegram.ts:75` | telegram provider (reuses `listTelegramAccountsForOwner`) |
+| `agentflow-agents/src/services/account-providers/kwork.ts:70` | kwork provider (reuses `/status` connection-state logic) |
+| `agentflow-agents/src/services/account-providers/types.ts` | normalized `Account` shape (matches frontend) |
+| `agentflow-agents/src/services/account-action-log.ts:64` | `writeAccountAction` — generic best-effort row writer |
+| `agentflow-agents/src/services/account-action-log.ts:97` | `readAccountActions` — owner-scoped feed, `detail` flattened |
+| `agentflow-agents/src/services/account-action-log.ts:201` | `withAccountActionLog` — generic registry wrapper (generalizes kwork `withActionLog`) |
+| `agentflow-agents/src/services/account-command.ts:60` | `DESTRUCTIVE_TOOLS` — per-MCP-server gate set (confirm-before-send) |
+| `agentflow-agents/src/services/account-command.ts:176` | `runAccountCommand` — native tool_use loop, server-side dispatch |
+| `agentflow-agents/src/services/account-command.ts:389` | `approveAccountCommand` — fire held draft, owner+account scoped |
+| `agentflow-agents/src/services/mcp-direct.ts:140` | `mcpDirect.listTools(server, ctx)` — platform tool discovery |
+| `agentflow-agents/src/mcp-servers/kwork-inbox.ts:3805` | kwork choke point now writes via `withAccountActionLog` (platform='kwork') |
+| `agentflow-agents/src/routes/me-integrations-kwork.ts:427` | `GET /me/integrations/kwork/actions` — kwork-filtered back-compat alias |
+| `agentflow-agents/src/db/schema.ts:3591` | `accountActionLog` drizzle table |
+| `agentflow-agents/src/server.ts:972` | `app.route('/', meAccountsApp)` mount |
+| `agentflow-landing/src/lib/agentsApi.ts` | frontend `Account` / `AccountAction` / `streamAccountCommand` (PR #600) |
+
+## Data flow
+```
+LIST    GET /me/accounts
+          → requireSession (owner=session.sub)
+          → listAllAccounts → PLATFORM_PROVIDERS.map(p => p.list(owner))
+            telegram → list_accounts MCP tool ; kwork → secret/vault state
+          → Account[] { id:"telegram:42", platform, account_id, handle,
+                        display_name, status, status_detail, avatar_hint, default }
+
+LOG     GET /me/accounts/actions?platform=&account_id=
+          → resolveOwnedAccount(account_id) → {platform, account_ref}
+          → readAccountActions(owner, platform, account_ref) over account_action_log
+          → AccountActionRow[] { id, platform, account_ref, kind, target, status,
+                                 detail(string|null), created_at }
+
+CMD     POST /me/accounts/:accountId/command  { text, model }   (SSE)
+          → resolveOwnedAccount → { provider, account }
+          → listPlatformTools(provider) → Anthropic tools[]
+          → invokeAI(TEXT_LARGE) loop:
+              safe tool      → mcpDirect.callTool(server) server-side → action_done + log row(ok|failed)
+              destructive    → HELD as pending draft → emit `draft` + log row(awaiting_approval)
+          SSE: thread · text · tool_use · draft · action_done · error · done
+APPROVE POST /me/accounts/:accountId/command/approve { action_id|draft_id, text? }
+          → fire held tool via mcpDirect.callTool → log row(ok|failed)
+```
+
+## DB / Env / API
+- Tables: `account_action_log` (was `kwork_action_log`; migration
+  `2026-06-02b-account-action-log.sql` RENAMEs it + adds `platform text NOT NULL
+  DEFAULT 'kwork'`). Columns: `id, owner_user_id, platform, account_ref, kind,
+  target, status, detail_json, created_at`.
+- Env: reuses LLM router (`invokeAI(ModelType.TEXT_LARGE)`), telegram MCP
+  (`TG_MCP_URL` / `TG_MCP_TOKEN`), internal MCP secret (`INTERNAL_*`). No new env.
+- Routes: `GET /me/accounts`, `GET /me/accounts/actions`,
+  `POST /me/accounts/:accountId/command` (SSE),
+  `POST /me/accounts/:accountId/command/approve`. Back-compat alias
+  `GET /me/integrations/kwork/actions` (kwork-filtered, one release).
+- MCP tools: dispatched server-side via `mcpDirect.callTool('telegram'|'kwork-inbox', …)`.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `/me/accounts` empty for a connected platform | provider returns `[]` on throw | `services/account-providers/index.ts:62` (per-provider isolation) |
+| Command stream returns no tools | `event:error code=platform_unavailable` | `services/account-command.ts` (MCP server unreachable) |
+| Approve says draft gone | `draft_not_found` (404) | `services/account-command.ts:389` (TTL 30 min / owner-mismatch) |
+| Action log read shows old kwork rows only | migration not applied | apply `2026-06-02b-account-action-log.sql` via postgres pod |
+| Drift test red after schema edit | `tests/ci-schema.sql is stale` | regenerate golden dump / keep `account_action_log` name |
+
+## Confirm-before-send
+Destructive tools (`DESTRUCTIVE_TOOLS`, keyed by MCP server) never fire inside
+the command loop — they are emitted as `awaiting_approval` drafts and held
+in-memory (30-min TTL), fired only by `command/approve`. Read-only tools
+dispatch immediately. This keeps `KWORK_AUTO_SEND` / telegram sends owner-gated
+without a per-platform branch.
+
+## Related
+- [Cabinet «Функции»](/subsystems/cabinet-functions)
+- [Code-agents backend](/subsystems/code-agents-backend)
