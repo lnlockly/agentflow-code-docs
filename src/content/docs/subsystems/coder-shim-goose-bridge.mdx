@@ -285,8 +285,19 @@ charset-validated before reaching the scheduler.
   reads the token. `OWNER_TG_ID` gates the bot's `/admin` panel; it is optional —
   the user-facing `/start`/`/help`/`/faq`/`/order` handlers work without it.
 - Env (server side): `FF_DAEMON_IMAGE` — `goose` → coder-shim image; full ref →
-  verbatim; unset → coder (2026-05-28 hotfix path). **GLOBAL — do not flip in prod
-  until the matrix is green.**
+  verbatim; unset → coder (2026-05-28 hotfix path). **NOW SET TO `goose` IN PROD
+  (`k8s/agentflow-agents.yaml`, goose-only mission Phase 1, 2026-06-02).** Scope is
+  narrow despite the "GLOBAL" name: this only changes the DEFAULT image for new
+  on-demand cloud hosted devices created via `POST /me/hosted-devices` WITHOUT an
+  explicit `template`. It does NOT touch (a) project BUILDS — those already pin
+  goose via `FF_BUILD_CODER` and `provisionDaemonOnDemand({template:'goose'})`,
+  resolving goose regardless of this flag; (b) the WARM POOL —
+  `services/hosted-pool/manifest.ts` hardcodes `agentflow-daemon:latest` and never
+  reads `FF_DAEMON_IMAGE`; (c) existing running pods — the
+  `daemon-image-reconciler` that would rollout-restart them is OFF
+  (`DAEMON_IMAGE_RECONCILE_ENABLED` unset → default false). Reversible:
+  `kubectl set env deploy/agentflow-agents FF_DAEMON_IMAGE-` → new cloud devices
+  revert to `DAEMON_IMAGES.coder`.
 - Env (pod side): `FF_DB_SUPERVISOR` — default ON; set to `0`/`false`/`no`/`off`
   to disable the embedded-DB keep-alive supervisor (`db-supervisor.ts`). When on
   (the default), each project's PGlite is respawned if it dies and re-hydrated on
