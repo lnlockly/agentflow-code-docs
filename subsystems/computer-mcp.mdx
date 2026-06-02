@@ -31,7 +31,9 @@ task_error` to `device_action_log`, and proxies the daemon's local MJPEG capture
 | `agentflow-agents/src/routes/me-devices.ts:489`     | `GET /me/devices/:id/tasks/stream` (device-wide SSE) |
 | `agentflow-agents/src/routes/me-devices.ts:549`     | `GET /me/devices/:id/tasks/:task_id/stream` (per-task SSE) |
 | `agentflow-agents/src/routes/me-devices.ts:613`     | `GET /me/devices/:id/live_stream` (MJPEG proxy) |
-| `agentflow-agents/src/routes/me-telegram.ts:175`    | `POST /me/telegram/send` — backs daemon's `af_send_telegram_message` |
+| `agentflow-agents/src/routes/me-telegram.ts` `resolveAccountId` | resolves the Telethon `account_id` from the System-A `list_accounts` list (NOT `chat_tg_links`); honors an explicit `account_id` for multi-account; defaults to first `status='active'`. |
+| `agentflow-agents/src/routes/me-telegram.ts` `dispatchSend/Dialogs/Messages/Search/React/Whoami/Accounts` | the `af_telegram_*` REST surface — back daemon's `af_send_telegram_message` + `af_telegram_*` |
+| `agentflow-agents/src/services/tg-account-source.ts` `listTelegramAccountsForOwner` / `pickUsableTelegramAccount` | System-A account list (MCP `list_accounts`) used by `resolveAccountId`. |
 | `agentflow-agents/src/routes/me-matrix.ts:192`      | `POST /me/matrix/send` (alias `/me/matrix/post`) — backs daemon's `af_post_matrix_room` |
 | `agentflow-agents/src/services/kind-registry.ts:18` | `desktop_agent` added to `PROJECT_KINDS` |
 | `agentflow-agents/src/services/kind-registry.ts:24` | `desktop_agent` added to `USER_FACING_PROJECT_KINDS` |
@@ -106,7 +108,21 @@ Cabinet                 agentflow-agents (pod)                  agentflow-deskto
   - `GET  /me/devices/:id/tasks/:task_id/stream` → SSE (per-task, closes on complete/error)
   - `GET  /me/devices/:id/tasks/history?limit=50` → 200 `{ok, items: [{task_id, brief, started_at, ended_at, cost_usd, status}]}` — newest first; powers the cabinet "История" tab via `services/device-task-history.ts`
   - `GET  /me/devices/:id/live_stream` → `multipart/x-mixed-replace; boundary=frame`
-  - `POST /me/telegram/send` → 200 `{ok, message_id}` / 503 `tg_account_not_linked` / 503 `tg_primary_login_missing` / 502 MCP error. Body `{chat_id, text}`. `chat_id="me"` routes to Saved Messages.
+  - `POST /me/telegram/send` → 200 `{ok, message_id}` / 503 `tg_account_not_linked` / 503 `tg_unreachable` / 400 `account_id_not_owned` / 502 MCP error. Body `{chat_id, text, account_id?}`. `chat_id="me"` routes to Saved Messages. Account resolution now reads the System-A Telethon list (`list_accounts`), NOT `chat_tg_links` — see "id-space" note below. Optional `account_id` targets a specific connected account (multi-account); defaults to the first `status='active'`.
+  - `GET  /me/telegram/accounts` → 200 `{ok, accounts:[…], default_account_id}` — list the caller's connected MTProto accounts so the agent can pick which `account_id` to act as.
+  - `GET  /me/telegram/{dialogs,messages,search,whoami}` + `POST /me/telegram/react` — all accept an optional `account_id` (query for GET, body for POST) and resolve via the System-A list.
+
+> **id-space (the fix).** Two "connect Telegram" systems coexist:
+> System A (real MTProto agent) — `/me/tg-accounts/*` → Telethon session in
+> tg-mcp `accounts` table, identified by integer `accounts.id`. System B
+> (mautrix chat puppeting) — `/me/chat/tg/*` → `chat_tg_links` with a string
+> `primary_login_id` (a bridge login_id). Until 2026-06-02 the `af_telegram_*`
+> surface resolved its `account_id` from `chat_tg_links.primary_login_id`, a
+> DIFFERENT id-space, so accounts connected the real way (System A) had no
+> `chat_tg_links` row and always 503'd, and only ONE "primary" account was
+> ever addressable. It now resolves from the Telethon `list_accounts` list
+> (`resolveAccountId` → `listTelegramAccountsForOwner`), supports multiple
+> accounts via `account_id`, and leaves System-B chat puppeting untouched.
   - `POST /me/matrix/send` (alias `POST /me/matrix/post`) → 200 `{ok, event_id}` / 404 `room_not_found` / 502 `bridge_error` / 502 `matrix_bridge_unreachable`. Body `{room_id, text}`. Posts as the caller's Dendrite puppet via `issueMatrixTokenForAfUser`.
 - WS protocol additions (`WsMessage` in `packages/shared-types/devices.ts`):
   - S→C: `task_dispatch`, `subscribe_stream`, `unsubscribe_stream`
@@ -195,8 +211,9 @@ Files:
 | Live viewport black until page reload (cabinet user reports "have to refresh"); fixed 2026-05-22 | look for `[device] resync subscribe_stream device=... pending=N`; if MISSING after `[device] online` while a live tab is open, the daemon never received the re-arm | `services/devices-ws.ts:hello` calls `resyncStreamSubscription(deviceId, send)`; if absent, the daemon stays unsubscribed across reconnects (heartbeat timeout, sleep/wake) |
 | Daemon ignores `task_dispatch` | `ws task_dispatch id=... task=...` missing from `agentflow-desktop` log | upgrade daemon to ≥0.2.1 (PR auto/ws-client-task-dispatch-2026-05-22 wired routing) |
 | `task_action` SSE silent though daemon is online | `current_task_id` empty inside `DriverState` | local-input path: viewer's `POST /task` now assigns `local-*` id via `enqueue_task` — old viewer builds put raw strings and never tag the task |
-| `af_send_telegram_message` returns 503 `tg_account_not_linked` | none — synchronous response | caller has no `chat_tg_links` row; bind via cabinet → Telegram |
-| `af_send_telegram_message` returns 503 `tg_primary_login_missing` | none — synchronous response | `chat_tg_links.primary_login_id` is null or non-numeric; user must pick a primary via `POST /me/chat/tg/set-primary` |
+| `af_telegram_*` / `af_send_telegram_message` returns 503 `tg_account_not_linked` | none — synchronous response | caller has NO connected MTProto account; connect via `POST /me/tg-accounts/add-phone` + `/confirm-code` (System A). NB resolution is via the Telethon `list_accounts` list, NOT `chat_tg_links` — see id-space note. |
+| `af_telegram_*` returns 503 `tg_unreachable` | none — synchronous response | tg-mcp pod down / `list_accounts` MCP call threw. Check the tg-mcp deployment. |
+| `af_telegram_*` returns 400 `account_id_not_owned` | none — synchronous response | explicit `account_id` is not in the caller's connected accounts. Call `GET /me/telegram/accounts` to list valid ids. |
 | `af_post_matrix_room` returns 502 `matrix_bridge_unreachable` | `[chat-tg] ... token issue failed` (pattern reused) | Dendrite down or `MATRIX_AUTH_KEY` rotated; user re-login via Element SSO |
 | Cabinet timeline empty after `/tasks/stream` connect | `[device-task-stream] history_load_failed` | SQL replay failed; the live path still works — check `device_action_log` join with `device_sessions` and migration `2026-05-22a-device-tasks.sql` |
 | History tab on `/cabinet/devices/:id` empty though tasks ran | `[device-task-history] load_failed` | SQL join failed — verify `device_action_log` has `task_id` populated and `kind` set (migration `2026-05-22a-device-tasks.sql`); the dispatch endpoint now inserts a `task.dispatch` row with `args.brief` so history is non-empty from the moment a task is queued |

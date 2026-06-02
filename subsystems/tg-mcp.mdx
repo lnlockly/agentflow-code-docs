@@ -32,10 +32,12 @@ description: "Python MCP сервер для MTProto-операций: 24 tools 
 | `agentflow-tg-mcp/src/agentflow_tg_mcp/server.py:624` | lifespan: `pool.warm_all()` + `pool.start_keepalive()` on boot. |
 | `agentflow-tg-mcp/src/agentflow_tg_mcp/crypto.py:8` | `wrap_bytes` — Fernet encrypt. |
 | `agentflow-tg-mcp/src/agentflow_tg_mcp/crypto.py:12` | `unwrap_bytes` — Fernet decrypt. |
-| `agentflow-tg-mcp/src/agentflow_tg_mcp/storage.py:9` | SQLite `SCHEMA` — `accounts` table (`session_blob BLOB`, `status`, unique (owner_user_id, phone)). |
-| `agentflow-tg-mcp/src/agentflow_tg_mcp/storage.py:28` | `Account` dataclass. |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/storage.py:9` | SQLite `SCHEMA` — `accounts` table (`session_blob BLOB`, `status`, unique (owner_user_id, phone)) + `pending_logins` table (durable in-flight login mirror). |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/storage.py` `store_pending_login` / `get_pending_login` / `delete_pending_login` | CRUD for `pending_logins` — encrypted in-progress StringSession + `phone_code_hash` + `awaiting_password`, keyed `(owner_user_id, phone)`. |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/storage.py:28` | `Account` dataclass (+ `PendingLoginRow`). |
 | `agentflow-tg-mcp/src/agentflow_tg_mcp/storage.py:70` | `upsert_pending` — добавить аккаунт со status='pending' (после code_request). |
 | `agentflow-tg-mcp/src/agentflow_tg_mcp/storage.py:90` | `store_session` — wrap StringSession и save в DB. |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/state.py` `persist_pending` / `recover_pending` / `forget_pending` | Durable mirror of the in-flight login. `add_phone` write-throughs the encrypted StringSession; `confirm_code` rebuilds the SAME auth_key client from SQLite when the in-memory pending is gone (pod restart). StringSession round-trips the auth_key, so `sign_in` still succeeds. |
 | `agentflow-tg-mcp/src/agentflow_tg_mcp/auth.py:11` | `Caller` dataclass — `{ owner_user_id, is_platform, … }`. |
 | `agentflow-tg-mcp/src/agentflow_tg_mcp/auth.py:26` | `authenticate` — JWT HS256 (verify_sub=False) → fallback X-MCP-Auth + explicit owner_user_id. |
 | `agentflow-tg-mcp/src/agentflow_tg_mcp/config.py` | env: `TG_API_ID`, `TG_API_HASH`, `FERNET_KEY`, `MCP_AUTH_SECRET`, `AUTH_JWT_SECRET`, `AGENTFLOW_AGENTS_URL`, `INTERNAL_API_SECRET`, `SESSION_DIR`, `DB_PATH`, `MCP_HOST=127.0.0.1`, `MCP_PORT=4500`. |
@@ -87,6 +89,7 @@ on real scrape request:
 
 **SQLite (`DB_PATH`):**
 - `accounts` (`owner_user_id`, `phone`, `session_blob BLOB`, `status`, `auth_step`, `created_at`, `updated_at`). Unique (owner_user_id, phone).
+- `pending_logins` (`owner_user_id`, `phone`, `account_id`, `session_blob BLOB` (encrypted in-progress StringSession), `phone_code_hash`, `awaiting_password`, `created_at`). PK (owner_user_id, phone). Durable mirror so an add-phone → confirm-code flow survives a pod restart; cleared on successful `confirm_code` (`forget_pending`).
 
 **Env:**
 - `TG_API_ID`, `TG_API_HASH` — Telegram developer credentials.
@@ -122,6 +125,9 @@ on real scrape request:
 | Session мёртвая — `warm()` зашумел | `warm_authorize_failed` | `telethon_pool.py:111` (`warm`) |
 | Warm пропустил аккаунт (нет session_blob) | `warm_pool_skip` | `telethon_pool.py:131` (`warm_all`) |
 | Phone code expired | `phone_code_expired` | `_register_tools` (auth tools, server.py:105) |
+| Pod restart between add-phone and confirm-code lost the flow (legacy) | `no pending login for this (owner, phone)` | FIXED: `state.py` `recover_pending` rebuilds from `pending_logins`. If still raised, the durable row was never written — check `persist_pending_failed`. |
+| Durable pending-login write failed (disk hiccup) | `persist_pending_failed` | `state.py` `persist_pending` — best-effort, swallowed so the live in-memory login still works; only the restart-recovery path is lost. |
+| Pending login recovered after restart | `pending_login_recovered` (info, normal) | `state.py` `recover_pending` — informational, confirms the durable path worked. |
 | Callback to agentflow-agents 500 | `tg_callback_send_failed` | `routes/internal.ts:49` |
 | `send_file` returns `error=invalid_base64` | `invalid_base64` (literal) | Caller passed non-b64 string. Fix the upstream — `tg.send_file` graph handler always reads via `code-exec.read_file_b64` which returns clean b64. |
 | `send_file` returns `error=empty_payload` | `empty_payload` (literal) | Decoded to zero bytes. Source file was empty / pod path mismatch. Check upstream producer node output. |
