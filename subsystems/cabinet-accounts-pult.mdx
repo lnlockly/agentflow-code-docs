@@ -1,0 +1,69 @@
+---
+title: "Cabinet «Пульт аккаунтов» (/cabinet/accounts)"
+description: "ChatGPT-style three-zone command center for connected social accounts — frontend slice; backend contract for the agents service."
+---
+
+# Cabinet «Пульт аккаунтов»
+
+## TL;DR
+`/cabinet/accounts` is a three-zone command center (288 / 1fr / 360) for the
+owner's connected social accounts, sibling to `/projects` and `/cabinet/agents`.
+LEFT lists accounts across platforms, CENTER is a chat composer (neural-net
+model picker + SSE command stream + draft-approve cards), RIGHT has «Лог
+действий» (unified action feed) and a DESIGN-ONLY «Автоматизации» tab. The page
+is MCP-first/generic — it never branches on a specific platform string — and
+every backend read degrades to empty / «скоро» so it renders before the
+agents-service endpoints ship.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/pages/CabinetAccounts.tsx:1` | Page — three zones inside AppShellV2, generic over platform |
+| `agentflow-landing/src/styles/cabinet-accounts.css:1` | `.cap-*` styling using platform dark-tokens (NOT the mockup palette) |
+| `agentflow-landing/src/lib/agentsApi.ts` (`getAccounts`) | `GET /me/accounts` -> `Account[]`; 404/501/0 -> `[]` |
+| `agentflow-landing/src/lib/agentsApi.ts` (`getAccountActions`) | `GET /me/accounts/actions?account_id=&limit=` -> `AccountAction[]`; degrades to `[]` |
+| `agentflow-landing/src/lib/agentsApi.ts` (`streamAccountCommand`) | `POST /me/accounts/:id/command` SSE; emits `command_not_available` on 404/501 |
+| `agentflow-landing/src/lib/agentsApi.ts` (`approveAccountCommand`) | `POST /me/accounts/:id/command/approve {draft_id}`; `{ok:false,error:'not_available'}` on 404/501 |
+| `agentflow-landing/src/sections/llm-cabinet/data/llm-cabinet-models.ts` (`fetchEnabledModels`) | Live `/llm/v1/models` catalog reused for the neural-net picker; default «Flow» |
+| `agentflow-landing/src/main.tsx` | Lazy route `/cabinet/accounts` (near `/cabinet/agents`) |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx` (`CORE_NAV`) | «Аккаунты» nav entry (UsersIcon, key `accounts`) |
+| `agentflow-landing/src/i18n/{en,ru,zh}.json` | `app.shell.nav.accounts` + `cabinet.accounts.*` keys |
+
+## Data flow
+```
+LEFT   GET /me/accounts -> Account[] grouped by platform (PLATFORM_META map)
+         + «+ Подключить» -> /account/integrations/telegram | .../kwork/connect
+
+CENTER composer.send -> POST /me/accounts/:accountId/command (SSE)
+         model = picker (flow -> null = auto-router)
+         events: thread | text | thought | tool_use | draft | action_done | error | done
+         draft card «Отправить» -> POST /me/accounts/:accountId/command/approve {draft_id}
+
+RIGHT  tab=log  -> GET /me/accounts/actions?account_id= -> timeline (status-coloured nodes)
+       tab=auto -> DESIGN-ONLY static cards + local-state toggles (no engine)
+```
+
+## DB / Env / API
+- Routes (agents service, port 4100, all `requireSession`):
+  - `GET /me/accounts`
+  - `GET /me/accounts/actions?account_id=&limit=`
+  - `POST /me/accounts/:accountId/command` (SSE)
+  - `POST /me/accounts/:accountId/command/approve`
+- Env (frontend): `VITE_AGENTS_URL` (agents base), `VITE_API_URL` (auth base).
+- Normalized shapes: `Account { id, platform, account_id, handle, display_name,
+  status, status_detail, avatar_hint, default }`; `AccountAction { id, platform,
+  account_ref, kind, target, status, detail, created_at }`.
+- Model catalog: public `GET /llm/v1/models` (via `fetchEnabledModels`); «flow»
+  is filtered from that list and re-added by the picker as the auto-router head.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| LEFT zone empty though accounts exist | `getAccounts` returns `[]` on 404/501 | wire `GET /me/accounts` aggregator |
+| Composer shows «скоро» state | `command_not_available` SSE error | deploy `POST /me/accounts/:id/command` |
+| Draft «Отправить» shows unavailable notice | `approveAccountCommand` -> `not_available` | deploy `.../command/approve` |
+| Action log empty | `getAccountActions` returns `[]` | deploy `GET /me/accounts/actions` (unified `account_action_log`) |
+
+## Related
+- [Cabinet «Функции»](/subsystems/cabinet-functions)
+- [Cabinet nav IA](/subsystems/cabinet-nav-ia)
