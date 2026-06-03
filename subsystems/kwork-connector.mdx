@@ -1,0 +1,95 @@
+---
+title: "kwork-connector — reauth-required vs genuinely-empty"
+description: "The Kwork connector distinguishes an expired/missing session from a genuinely empty inbox so the Пульт shows «Переподключите Kwork» instead of a blank «пока пусто»."
+---
+
+# kwork-connector
+
+## TL;DR
+
+The Kwork connector is a thin adapter over the `kwork-inbox` MCP server. Every
+read tool (`list_dialogs`, `list_wants`, `list_my_kworks`, `get_dialog`) returns
+typed errors as data — including auth/cookie failures. Without classification an
+expired session collapses into `[]` and looks identical to a genuinely empty
+inbox: the Пульт shows «пока пусто» when the real reason is «Kwork cookies
+истекли». The connector detects auth errors via `reauthReasonFromEnvelope` /
+`assertAuthed`, throws `ConnectorReauthError('kwork', reason)`, and the browse
+route surfaces a typed `needsReauth:true, reason:'reauth_required'` empty state.
+
+## Cookie-refresh requirement
+
+Kwork sessions are stored as cookies (raw header or Playwright `storage_state`
+JSON) under `KWORK_SESSION_JSON`, resolved by `resolveSessionCookies`. Kwork
+cookies expire — when they do, the MCP gets a `/login` redirect or the «Вход на
+сайт» HTML on an authenticated path, which `kworkRequest` maps to the
+`auth_expired` signal. There is no silent refresh: the owner re-pastes a fresh
+session via **`POST /me/integrations/kwork/connect`** (the in-Пульт reconnect
+flow). Until they do, every kwork read returns `needsReauth` and no live data —
+by design, so the UI never renders stale or fake dialogs.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/connector-core/connectors/kwork.ts:107` | `REAUTH_ERROR_PREFIXES` — the auth/cookie error-string set |
+| `agentflow-agents/src/connector-core/connectors/kwork.ts:124` | `reauthReasonFromEnvelope(raw)` — pure: returns the reauth error string or `null` |
+| `agentflow-agents/src/connector-core/connectors/kwork.ts:135` | `assertAuthed(raw)` — throws `ConnectorReauthError(PLATFORM, reason)` (line 137) on an auth envelope |
+| `agentflow-agents/src/connector-core/connectors/kwork.ts:344` | `listEntities(exchange)` calls `assertAuthed` before parse |
+| `agentflow-agents/src/connector-core/connectors/kwork.ts:355` | `listEntities(dialogs)` calls `assertAuthed` |
+| `agentflow-agents/src/connector-core/connectors/kwork.ts:372` | `listEntities(my_gigs)` calls `assertAuthed` |
+| `agentflow-agents/src/connector-core/connectors/kwork.ts:407` | `readEntity(dialogs)` calls `assertAuthed` |
+| `agentflow-agents/src/connector-core/connectors/kwork.ts:420` | `executeAction(respond)` calls `assertAuthed` before `respond_to_want` |
+| `agentflow-agents/src/routes/me-accounts.ts:441` | `browseEntities` maps `ConnectorReauthError` → `{ ok:true, entities:[], needsReauth:true, reason }` (no `degraded`) |
+| `agentflow-agents/src/routes/me-accounts.ts:489` | `browseThread` maps `ConnectorReauthError` → `needsReauth:true` |
+| `agentflow-agents/src/routes/me-integrations-kwork.ts:228` | `POST /me/integrations/kwork/connect` — owner re-pastes session cookies |
+| `agentflow-agents/src/mcp-servers/kwork-inbox.ts:148` | `resolveSessionCookies` — emits `session_secret_not_found` / `session_secret_unseal_failed` when cookies missing/unreadable |
+| `agentflow-agents/src/mcp-servers/kwork-inbox.ts:294` | `kworkRequest` sets `signal:'auth_expired'` on /login redirect or «Вход на сайт» HTML |
+| `agentflow-agents/tests/connector-kwork.test.ts:1` | `reauthReasonFromEnvelope` classification + connector throws-on-expired |
+| `agentflow-agents/tests/connector-entity-browse.test.ts:1` | route surfaces `needsReauth` and keeps `degraded` for other throws |
+
+## Data flow
+
+```
+Web ─GET /me/accounts/kwork:<id>/connector/entities?kind=dialogs─▶ me-accounts.ts
+  browseEntities() → getConnector('kwork').listEntities('dialogs')
+    mcpDirect.callTool('kwork-inbox','list_dialogs', {KWORK_SESSION_JSON})
+      ├─ valid cookies   → {ok,dialogs:[…]} → parseDialogs → Entity[]
+      ├─ expired cookies → {error:'auth_expired'} → assertAuthed
+      │     → throw ConnectorReauthError('kwork','reauth_required')
+      │     → browseEntities catches → {ok:true, entities:[], needsReauth:true,
+      │        reason:'reauth_required'}   ← UI shows «Переподключите Kwork»
+      │        → owner POST /me/integrations/kwork/connect re-pastes cookies
+      └─ transient err   → {error:'rate_limited'|'http_error'|…} → []  (degraded:true)
+```
+
+`auth_expired`, `session_secret_not_found`, `session_secret_unseal_failed`, and
+the other secret-resolution errors classify as reauth. `rate_limited`, `banned`,
+`captcha`, `http_error`, `network_error` stay on the degrade-to-empty path
+(transient / platform-side, not a session problem).
+
+## DB / Env / API
+
+- Secrets: `KWORK_SESSION_JSON` (project_secrets / vault kind `kwork`) — the
+  session cookies. Refreshed by the owner, never auto-rotated.
+- Routes:
+  - `GET /me/accounts/:id/connector/entities?kind=` → `{ ok, entities, degraded?, needsReauth?, reason? }`
+  - `GET /me/accounts/:id/connector/entities/:eid/thread?kind=` → `{ ok, thread, degraded?, needsReauth?, reason? }`
+  - `POST /me/integrations/kwork/connect` — re-paste session after «Kwork cookies истекли»
+- MCP tools wrapped: `list_dialogs`, `list_wants`, `list_my_kworks`,
+  `get_dialog`, `respond_to_want` (kwork-inbox server).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Диалоги shows «пока пусто» when cookies are expired | `needsReauth` / `reauth_required` | `src/connector-core/connectors/kwork.ts:135` (`assertAuthed`) |
+| Auth error swallowed into an empty list | `reauthReasonFromEnvelope` returns the error string | `src/connector-core/connectors/kwork.ts:124` |
+| Stored session row missing / unreadable | `session_secret_not_found` / `session_secret_unseal_failed` | `src/mcp-servers/kwork-inbox.ts:191` |
+| Kwork serves /login on an authenticated path | `auth_expired` | `src/mcp-servers/kwork-inbox.ts:294` |
+| respond on expired session | `ConnectorReauthError` (before `respond_to_want`) | `src/connector-core/connectors/kwork.ts:420` |
+
+## Related
+
+- [connector-core](/subsystems/connector-core) — the generic contract this connector implements
+- [accounts-pult](/subsystems/accounts-pult) — the Пульт that renders the reauth state
+- [cabinet-accounts-pult](/subsystems/cabinet-accounts-pult) — the frontend «+ Подключить» reconnect surface

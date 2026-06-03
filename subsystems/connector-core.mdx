@@ -1,0 +1,103 @@
+---
+title: "connector-core — generic platform connector contract"
+description: "One Connector interface + registry every platform (telegram + kwork now, vk later) keys off, with zero per-platform branching outside the registry."
+---
+
+# connector-core
+
+## TL;DR
+
+`connector-core` is the formal contract that turns `Platform → Account →
+EntityKind → Entity → Action` into one interface (`Connector`) plus a registry.
+A connector is a thin adapter over the existing MCP tools (tg-mcp, kwork-inbox)
+— it never re-implements transport. The Telegram and Kwork connectors are both
+registered; the approval queue and the Пульт frontend import `getConnector`
+from here, so adding a platform is one `registerConnector(...)` line plus one
+connector file, never an `if (platform === …)`.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/connector-core/types.ts:12` | `PlatformId = 'telegram' \| 'kwork' \| 'vk'` + domain types (`Account`, `Entity`, `Thread`, `ActionIntent`, `Action`, `ActionResult`) |
+| `agentflow-agents/src/connector-core/connector.ts:25` | `Connector` interface — `listAccounts` / `listEntities` / `readEntity` / `buildAction` / `executeAction` |
+| `agentflow-agents/src/connector-core/connector.ts:56` | `ConnectorError` — stable `code` + `detail`, message `${code}:${detail}` |
+| `agentflow-agents/src/connector-core/connector.ts:78` | `ConnectorReauthError extends ConnectorError` — the expired-session marker the browse route maps to `needsReauth` |
+| `agentflow-agents/src/connector-core/registry.ts:13` | `registerConnector(c)` — bind a `PlatformId` to a connector |
+| `agentflow-agents/src/connector-core/registry.ts:17` | `getConnector(p)` — throws `ConnectorError('connector_not_registered')` when absent |
+| `agentflow-agents/src/connector-core/registry.ts:28` | `listPlatforms()` — every registered `PlatformDef` (UI nav) |
+| `agentflow-agents/src/connector-core/bootstrap.ts:18` | `bootstrapConnectors()` — registers `telegramConnector` + `kworkConnector`; called once from `server.ts` |
+| `agentflow-agents/src/connector-core/index.ts:1` | public surface (registry + types + `bootstrapConnectors`) |
+| `agentflow-agents/src/connector-core/connectors/telegram.ts:107` | `parseDialogs(raw, account, kind)` — pure `get_dialogs` → `Entity[]`, kind-filtered |
+| `agentflow-agents/src/connector-core/connectors/telegram.ts:134` | `parseThread(raw)` — pure `get_messages` → `ThreadMessage[]` |
+| `agentflow-agents/src/connector-core/connectors/telegram.ts:252` | `telegramConnector` — shims `mcpDirect.callTool('telegram', …)`; `executeAction` → `send_message` |
+| `agentflow-agents/src/connector-core/connectors/telegram.ts:312` | `buildAction(account, intent, ctx)` — pure dry-run draft; resolves target, NEVER sends |
+| `agentflow-agents/src/connector-core/connectors/kwork.ts:332` | `kworkConnector.listEntities` — exchange / dialogs / my_gigs, `assertAuthed` on each |
+| `agentflow-agents/src/routes/me-accounts.ts:424` | `browseEntities(input, deps)` — pure connector-backed list handler |
+| `agentflow-agents/src/routes/me-accounts.ts:466` | `browseThread(input, deps)` — pure connector-backed thread handler |
+| `agentflow-agents/src/routes/me-accounts.ts:500` | `GET /me/accounts/:id/connector/entities?kind=` route |
+| `agentflow-agents/src/routes/me-accounts.ts:514` | `GET /me/accounts/:id/connector/entities/:eid/thread?kind=` route |
+| `agentflow-agents/src/server.ts:164` | `import { bootstrapConnectors }` |
+| `agentflow-agents/src/server.ts:324` | `bootstrapConnectors()` call |
+| `agentflow-agents/tests/connector-registry.test.ts:1` | registry round-trip + `connector_not_registered` |
+| `agentflow-agents/tests/connector-telegram.test.ts:1` | parse + buildAction-no-send (recorded fixtures) |
+| `agentflow-agents/tests/connector-entity-browse.test.ts:1` | handler status/shape + degrade-to-empty |
+
+## Data flow
+
+«напиши Косте, что готово» → confirmed send:
+
+```
+Web ─POST /me/accounts/telegram:42/command {text} (SSE)─▶ me-accounts.ts
+  command loop (flow model) picks intent {type:'send', payload:{to:'Костя', text}}
+  connector.buildAction():
+    resolveTarget('Костя') → resolveContact → get_dialogs fuzzy-match → entityId
+    Action{ preview:{title,target,body}, dryRun:true }   ← NO send here
+  arm() INSERT entity_approval_queue status='armed' ─emit SSE draft {approvalId}─▶ Web
+Web renders the action card → Подтвердить
+  ─POST /me/approvals/:id/confirm─▶ atomic claim armed→executing
+    getConnector('telegram').executeAction() → mcpDirect.callTool('telegram','send_message')
+    status→executed, externalId set ─▶ Web flips card to «Отправлено ✓»
+```
+
+Entity-browse (live now):
+
+```
+Web ─GET /me/accounts/telegram:42/connector/entities?kind=dialogs─▶ me-accounts.ts
+  requireSession → resolveConnectorAccount (owner-scope) → browseEntities()
+  getConnector('telegram').listEntities() → mcpDirect.callTool('telegram','get_dialogs')
+  parseDialogs() → Entity[]   (degrades to [] + degraded:true on a connector throw)
+```
+
+## DB / Env / API
+
+- Tables: none owned by connector-core; the approval queue owns
+  `entity_approval_queue`. The Telegram connector reads accounts indirectly via
+  the `list_accounts` tg-mcp tool; the Kwork connector reads `KWORK_SESSION_JSON`.
+- Env: none new. Connectors inherit the MCP transport config from
+  `services/mcp-direct.ts`.
+- Routes:
+  - `GET /me/accounts/:id/connector/entities?kind=&q=&limit=` → `{ ok, entities, degraded?, needsReauth?, reason? }`
+  - `GET /me/accounts/:id/connector/entities/:eid/thread?kind=&limit=` → `{ ok, thread, degraded?, needsReauth?, reason? }`
+- MCP tools wrapped: `list_accounts`, `get_dialogs`, `get_messages`,
+  `send_message` (telegram); `list_dialogs`, `list_wants`, `list_my_kworks`,
+  `get_dialog`, `respond_to_want` (kwork-inbox).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Browse/execute hits an unregistered platform | `connector_not_registered` | `src/connector-core/registry.ts:19` |
+| `executeAction` called on a malformed Action | `action_missing_dry_run_flag` | `src/connector-core/connectors/telegram.ts:321` |
+| Unknown / unowned account id | `account_not_found` | `src/routes/me-accounts.ts:431` |
+| Browse without `kind` | `missing_kind` | `src/routes/me-accounts.ts:429` |
+| MCP timeout / tg-mcp down → empty list not a 500 | `degraded: true` | `src/routes/me-accounts.ts:447` |
+| Expired/missing session → typed empty instead of a fake «пока пусто» | `needsReauth: true` / `reauth_required` | `src/routes/me-accounts.ts:441` |
+| Send resolved no target / empty body | `no_target` / `empty_body` | `src/connector-core/connectors/telegram.ts:325` |
+
+## Related
+
+- [accounts-pult](/subsystems/accounts-pult) — the entity-browse service the connector wraps
+- [kwork-connector](/subsystems/kwork-connector) — reauth-required vs genuinely-empty for the Kwork connector
+- [approval-queue](/subsystems/approval-queue) — imports `getConnector` for `executeAction`
+- [account-groups](/subsystems/account-groups)

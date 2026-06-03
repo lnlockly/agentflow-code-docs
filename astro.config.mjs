@@ -101,6 +101,21 @@ export default defineConfig({
           ],
         },
         {
+          label: 'Cabinet & Пульт',
+          items: [
+            { label: 'Пульт аккаунтов (frontend)', slug: 'subsystems/cabinet-accounts-pult' },
+            { label: 'Accounts Control Pult (backend)', slug: 'subsystems/accounts-pult' },
+            { label: 'Accounts Pult — Entities', slug: 'subsystems/accounts-pult-entities' },
+            { label: 'Connector Core', slug: 'subsystems/connector-core' },
+            { label: 'Kwork Connector (reauth)', slug: 'subsystems/kwork-connector' },
+            { label: 'Approval Queue', slug: 'subsystems/approval-queue' },
+            { label: 'Account Groups (farms)', slug: 'subsystems/account-groups' },
+            { label: 'Account Automations', slug: 'subsystems/account-automations' },
+            { label: 'Cabinet «Функции»', slug: 'subsystems/cabinet-functions' },
+            { label: 'Cabinet Device — Live (Стеклянный кабинет)', slug: 'subsystems/cabinet-device-live' },
+          ],
+        },
+        {
           label: 'Flows',
           items: [
             { label: 'Create Project', slug: 'flows/create-project' },

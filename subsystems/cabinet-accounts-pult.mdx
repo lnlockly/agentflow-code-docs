@@ -28,6 +28,8 @@ agents-service endpoints ship.
 | `agentflow-landing/src/main.tsx` | Lazy route `/cabinet/accounts` (near `/cabinet/agents`) |
 | `agentflow-landing/src/components/layout/AppShellV2.tsx` (`CORE_NAV`) | «Аккаунты» nav entry (UsersIcon, key `accounts`) |
 | `agentflow-landing/src/i18n/{en,ru,zh}.json` | `app.shell.nav.accounts` + `cabinet.accounts.*` keys |
+| `agentflow-landing/src/components/accounts/browse/DialogView.tsx:234` (`EntityDetail`) | Non-openable kind card (Kwork «Кворки/Биржа», gigs/exchange). `humanizeKey` turns connector meta keys (`last_message_at`) into readable labels; `formatMetaValue` renders `*_at/date/ts` as locale time, booleans as да/нет; `isHiddenKey` drops `*_id/title/url`. Generic — no per-platform field map. |
+| `agentflow-landing/src/components/accounts/ApprovalFeed.tsx:94` (`.cap-approve-count`) | Pending-action count badge beside the queue heading (per-account + cross-account General feed). |
 
 ## Data flow
 ```
@@ -63,6 +65,7 @@ RIGHT  tab=log  -> GET /me/accounts/actions?account_id= -> timeline (status-colo
 | Composer shows «скоро» state | `command_not_available` SSE error | deploy `POST /me/accounts/:id/command` |
 | Draft «Отправить» shows unavailable notice | `approveAccountCommand` -> `not_available` | deploy `.../command/approve` |
 | Action log empty | `getAccountActions` returns `[]` | deploy `GET /me/accounts/actions` (unified `account_action_log`) |
+| Kwork gig/exchange detail shows raw `snake_case` keys | `EntityDetail` dumped `meta` verbatim | fixed by `humanizeKey`/`formatMetaValue` in `browse/DialogView.tsx` |
 
 ## Related
 - [Cabinet «Функции»](/subsystems/cabinet-functions)
