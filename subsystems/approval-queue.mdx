@@ -1,0 +1,85 @@
+---
+title: "Approval queue (entity_approval_queue)"
+description: "Generic cross-platform armed → confirm gate every side-effecting account action flows through."
+---
+
+# Approval queue
+
+## TL;DR
+One generic table + one service generalises the proven Kwork "armed → confirm"
+single-use pattern into a cross-platform gate: every side-effecting action (DM,
+post, gig respond, bulk farm action) is `arm()`-ed as an `armed` row, and the
+owner's confirm runs an **atomic single-use claim** (`UPDATE … WHERE
+status='armed' RETURNING *`) → `connector.executeAction` **once** → terminal
+status. A replayed confirm finds a non-`armed` row and no-ops (idempotent). This
+backs the General Пульт right-rail feed and the per-account confirm cards.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/db/migrations/0087_entity_approval_queue.sql` | table DDL (state machine in §4 of the build arch) |
+| `agentflow-agents/src/db/schema.ts` (`entityApprovalQueue`) | drizzle mirror of the table |
+| `agentflow-agents/src/approval/queue.ts:90` | `arm(userId, {action})` — inserts one `armed` row, returns id (no side effects) |
+| `agentflow-agents/src/approval/queue.ts:141` | `listArmed(userId, {status})` → `ApprovalItem[]` (parses `payload.preview`) |
+| `agentflow-agents/src/approval/queue.ts:177` | `edit(userId, id, payload)` — replace payload, stay `armed` (only while armed) |
+| `agentflow-agents/src/approval/queue.ts:198` | `reject(userId, id)` — `armed → rejected` |
+| `agentflow-agents/src/approval/executor.ts:76` | `confirm(userId, id)` — atomic claim → `executeAction` → status write |
+| `agentflow-agents/src/approval/executor.ts:87` | the atomic single-use claim `UPDATE … SET status='executing' … WHERE status='armed' RETURNING *` |
+| `agentflow-agents/src/approval/executor.ts` (`confirmAll`) | bulk confirm; never throws on one bad row |
+| `agentflow-agents/src/approval/index.ts` | module public surface (import from here, not the leaves) |
+| `agentflow-agents/src/routes/me-approvals.ts:41` | `GET /me/approvals` — owner queue feed |
+| `agentflow-agents/src/routes/me-approvals.ts:53` | `POST /me/approvals/:id/confirm` |
+| `agentflow-agents/src/routes/me-approvals.ts:72` | `POST /me/approvals/:id/edit` |
+| `agentflow-agents/src/routes/me-approvals.ts:95` | `POST /me/approvals/:id/reject` |
+| `agentflow-agents/src/routes/me-approvals.ts:107` | `POST /me/approvals/confirm-all` |
+| `agentflow-agents/src/server.ts:977` | `app.route("/", meApprovalsApp)` mount |
+| `agentflow-agents/src/connector-core/` | **local shim** for the connector contract (real T1.1 module merges separately; shim deleted on rebase) |
+| `agentflow-agents/src/routes/public-kwork-approval.ts:121` | the seed pattern this generalises (`claimArmed`) |
+| `agentflow-agents/tests/approval-executor.test.ts` | proves single confirm executes once, second is a no-op, throw → failed |
+| `agentflow-agents/tests/approval-queue.test.ts` | arm/list/edit/reject + `toApprovalItem` |
+| `agentflow-agents/tests/me-approvals.test.ts` | route integration (real DB + stub connector) |
+
+## Data flow
+```
+Web (Пульт) ──POST /me/accounts/:id/command {text}──▶ connector.buildAction(...)
+                                                       → arm(userId, action)   (status='armed')
+GET /me/approvals?status=armed ──▶ listArmed → ApprovalItem[]   (right-rail feed)
+POST /me/approvals/:id/confirm ──▶ confirm():
+    UPDATE … SET status='executing' WHERE id, user_id, status='armed' RETURNING *
+      ├─ zero rows  → { alreadyHandled:true }   (idempotent no-op — replay / race / foreign owner)
+      ├─ dry_run    → status='executed' (connector NOT called)
+      └─ else       → getConnector(platform).executeAction(action) ONCE
+                        → status='executed' (+external_id) | 'failed' (+error_message)
+```
+
+State machine:
+```
+armed ──confirm──▶ executing ──ok──▶ executed
+  │                    └──fail──▶ failed
+  ├──edit──▶ armed (payload replaced, same row)
+  └──reject──▶ rejected
+```
+
+## DB / Env / API
+- **Table:** `entity_approval_queue` — `id, user_id, agent_id, platform, account_ref, group_id, action_type, entity_id, payload(jsonb), dry_run, status, scheduled_at, external_id, error_message, created_at, executed_at`. Index `idx_eaq_user_status (user_id, status)`.
+- **Status enum (text):** `armed | executing | executed | failed | rejected`.
+- **Env:** none new (uses `DATABASE_URL`; auth via `requireSession` / `AUTH_JWT_SECRET`).
+- **Routes:** `GET /me/approvals`, `POST /me/approvals/:id/{confirm,edit,reject}`, `POST /me/approvals/confirm-all`. All `requireSession`, scoped by `session.sub`.
+- **Connector contract:** `getConnector(platform).executeAction(action, {ownerUserId})` is the ONLY side-effecting call. Registered via the connector registry — adding a platform is one row, no route/UI change.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Confirm sends twice / double-post | (none — guarded) the claim returns zero rows → `already_handled` | `src/approval/executor.ts:87` (atomic claim) |
+| Replayed confirm no-ops silently | `already_handled` in the route JSON | `src/routes/me-approvals.ts:53` |
+| Confirm 502 on connector failure | `execute_failed` (route) / `error_message` column set | `src/approval/executor.ts` (terminal write) |
+| No connector for the row's platform | `connector_not_registered` (ConnectorError) | `src/connector-core/registry.ts` (register the platform) |
+| Edit / reject returns 409 | `not_armed` | row already claimed/terminal — refresh the feed |
+| Edit missing body | `payload_required` | `src/routes/me-approvals.ts:72` |
+| Stale `armed` drafts pile up | (Wave 6) healer loop sweeps old `armed` rows | future `services/approval-healer.ts` |
+| Row stuck `executing` after a crash mid-`executeAction` | `status='executing'` with no `executed_at` (not re-claimable — claim needs `armed`) | (Wave 6) healer requeues `executing` rows older than N min back to `armed` or marks `failed` |
+
+## Related
+- [accounts-pult](/subsystems/accounts-pult) — the Пульт UI this queue feeds.
+- [accounts-pult-entities](/subsystems/accounts-pult-entities) — entity browse the command loop drafts from.
+- connector-core (T1.1) — the `Connector` interface + registry the executor resolves through (lands on a sibling branch; this queue ships a local shim until it merges).
