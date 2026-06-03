@@ -40,7 +40,7 @@ FloatingGuide  AgentChatPanel (renderUiBlocks=true)
 - Routes consumed (via `executeUiBlock` → `agentsApi`):
   - `GET /me/personal-team` — to scope new projects to the user's hub.
   - `POST /me/projects` — for `create_project` intent.
-- Intent kinds: `navigate` (SPA push), `logout` (auth tear-down + redirect to `/`), `create_project` ({brief, projectKind?, title?} → `createProject()` + push to `/account/projects/:id`). Unknown kinds log to console and no-op.
+- Intent kinds: `navigate` (SPA push), `logout` (auth tear-down + redirect to `/`), `create_project` (`{brief, projectKind?, title?}` → `createProject()` + push to `/account/projects/:id`). Unknown kinds log to console and no-op.
 
 ## Failure modes
 

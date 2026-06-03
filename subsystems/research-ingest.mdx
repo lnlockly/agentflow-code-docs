@@ -17,7 +17,7 @@ loads that plugin, so every call returned 404 `"API endpoint not found"`.
 
 ### Async ack (2026-05-15)
 
-`POST /me/agents/:slug/memories/ingest` now returns **202 + `job_id` in <2s**
+`POST /me/agents/:slug/memories/ingest` now returns **202 + `job_id` in `<2s`**
 and runs fetch/chunk/embed in the background via `setImmediate`. Clients poll
 `GET /me/agents/:slug/memories/ingest/:job_id` until `status` is `done` or
 `failed`. Before this change a Wikipedia-sized URL ingest blocked the request

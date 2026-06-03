@@ -2,6 +2,7 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import starlightLlmsTxt from 'starlight-llms-txt';
+import mermaid from 'astro-mermaid';
 
 // https://astro.build/config
 // `site` + `base` are set for the default GitHub Pages URL so the deploy
@@ -11,6 +12,14 @@ export default defineConfig({
   site: 'https://lnlockly.github.io',
   base: '/agentflow-code-docs',
   integrations: [
+    // Render ```mermaid fenced blocks client-side (no build-time browser,
+    // no extra server). MUST come before starlight() so it can tell
+    // Expressive Code to skip the `mermaid` language and leave the block
+    // for the browser-side mermaid runtime. Used by architecture/c4-overview.
+    mermaid({
+      theme: 'dark',
+      autoTheme: true,
+    }),
     starlight({
       title: 'AgentFlow Code',
       description:
@@ -35,6 +44,7 @@ export default defineConfig({
           items: [
             { label: 'Code Map', slug: 'index' },
             { label: 'Architecture Overview', slug: 'architecture/overview' },
+            { label: 'C4 Architecture Map (browsable)', slug: 'architecture/c4-overview' },
           ],
         },
         {
@@ -52,7 +62,9 @@ export default defineConfig({
         {
           label: 'Subsystems',
           items: [
-            { label: 'Projects (new architecture)', slug: 'subsystems/projects' },
+            // 'subsystems/projects' slug had no backing .mdx (never tracked) —
+            // it silently broke the static build once MDX parsing succeeded.
+            // Projects are covered by 'Projects Frontend' + 'Projects Dashboard' below.
             { label: 'Code Exec MCP', slug: 'subsystems/code-exec-mcp' },
             { label: 'Pod Pre-Warm Pool', slug: 'subsystems/pod-prewarm-pool' },
             { label: 'Caddy Preview', slug: 'subsystems/caddy-preview' },
@@ -74,7 +86,6 @@ export default defineConfig({
             { label: 'Onboarding Quests', slug: 'subsystems/onboarding-quests' },
             { label: 'Proxy Pool', slug: 'subsystems/proxy-pool' },
             { label: 'VK Bridge', slug: 'subsystems/vk-bridge' },
-            { label: 'Matrix Discord Bridge', slug: 'subsystems/mautrix-discord-bridge' },
             { label: 'Social Network', slug: 'subsystems/social-network' },
             { label: 'Autonomous Goals', slug: 'subsystems/autonomous-goals' },
             { label: 'Install Wizard (unified)', slug: 'subsystems/install-wizard' },
@@ -83,20 +94,9 @@ export default defineConfig({
             { label: 'Desktop Agent LLM', slug: 'subsystems/desktop_agent_llm' },
             { label: 'Desktop Drive — «Взять управление» click', slug: 'subsystems/desktop-drive-click' },
             { label: 'Cabinet Device — Autonomous Tab', slug: 'subsystems/cabinet-device-autonomous-tab' },
-            { label: 'Device Shell Scope & Permissions', slug: 'subsystems/device-shell-scope' },
-            { label: 'Multi-Agent Runtime (Desktop)', slug: 'subsystems/multi-agent-runtime' },
             { label: 'Mac Menu-Bar App', slug: 'subsystems/mac-menu-bar-app' },
             { label: 'Recording Jobs', slug: 'subsystems/recording-jobs' },
-            { label: 'Academy', slug: 'subsystems/academy' },
-            { label: 'Showcase Kits', slug: 'subsystems/showcase-kits' },
-            { label: 'Owner Alerts Worker', slug: 'subsystems/owner-alerts' },
             { label: 'Activepieces Marketplace', slug: 'subsystems/activepieces-marketplace' },
-          ],
-        },
-        {
-          label: 'Academy',
-          items: [
-            { label: 'Curriculum Map', slug: 'academy/curriculum-map' },
           ],
         },
         {
@@ -124,7 +124,6 @@ export default defineConfig({
             { label: 'Chat-stack Smoke (Playwright)', slug: 'runbooks/chat-smoke-e2e' },
             { label: 'Verify AgentFlow Desktop', slug: 'runbooks/verify-agentflow-desktop' },
             { label: 'Update the RAG', slug: 'runbooks/update-rag-docs' },
-            { label: 'Revolution Doctrine', slug: 'runbooks/revolution-doctrine' },
           ],
         },
       ],
