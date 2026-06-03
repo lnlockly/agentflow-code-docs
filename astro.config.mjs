@@ -98,6 +98,7 @@ export default defineConfig({
             { label: 'Mac Menu-Bar App', slug: 'subsystems/mac-menu-bar-app' },
             { label: 'Recording Jobs', slug: 'subsystems/recording-jobs' },
             { label: 'Activepieces Marketplace', slug: 'subsystems/activepieces-marketplace' },
+            { label: 'God-file Splits (barrels)', slug: 'subsystems/god-file-splits' },
           ],
         },
         {
@@ -107,7 +108,7 @@ export default defineConfig({
             { label: 'Accounts Control Pult (backend)', slug: 'subsystems/accounts-pult' },
             { label: 'Accounts Pult — Entities', slug: 'subsystems/accounts-pult-entities' },
             { label: 'Connector Core', slug: 'subsystems/connector-core' },
-            { label: 'Kwork Connector (reauth)', slug: 'subsystems/kwork-connector' },
+            { label: 'Kwork Connector (current HTML + reauth)', slug: 'subsystems/kwork-connector' },
             { label: 'Approval Queue', slug: 'subsystems/approval-queue' },
             { label: 'Account Groups (farms)', slug: 'subsystems/account-groups' },
             { label: 'Account Automations', slug: 'subsystems/account-automations' },

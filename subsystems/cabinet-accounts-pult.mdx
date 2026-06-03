@@ -30,6 +30,14 @@ agents-service endpoints ship.
 | `agentflow-landing/src/i18n/{en,ru,zh}.json` | `app.shell.nav.accounts` + `cabinet.accounts.*` keys |
 | `agentflow-landing/src/components/accounts/browse/DialogView.tsx:234` (`EntityDetail`) | Non-openable kind card (Kwork «Кворки/Биржа», gigs/exchange). `humanizeKey` turns connector meta keys (`last_message_at`) into readable labels; `formatMetaValue` renders `*_at/date/ts` as locale time, booleans as да/нет; `isHiddenKey` drops `*_id/title/url`. Generic — no per-platform field map. |
 | `agentflow-landing/src/components/accounts/ApprovalFeed.tsx:94` (`.cap-approve-count`) | Pending-action count badge beside the queue heading (per-account + cross-account General feed). |
+| `agentflow-landing/src/components/accounts/CommandCenter.tsx:107` (`case 'draft'`) | On a `draft` SSE frame: append the draft card AND invalidate the approvals query so the right-rail Queue surfaces the armed card (#656) |
+| `agentflow-landing/src/components/accounts/CommandCenter.tsx:112` | `qc.invalidateQueries({ queryKey: approvalsKey(account.id) })` + `approvalsKey(null)` (per-account rail + General feed) |
+| `agentflow-landing/src/components/accounts/CommandCenter.tsx:139` | End-of-turn reconcile invalidation — covers a draft armed without a discrete `draft` SSE frame reaching the client |
+| `agentflow-landing/src/components/accounts/CommandCenter.tsx:62` | History replay filter — keeps user turns + any turn with text or drafts; drops empty tool-only rows so no blank 🪿 bubble replays (#656) |
+| `agentflow-landing/src/components/accounts/CommandCenter.tsx:201` (`m.text.trim().length > 0 &&`) | Render a chat bubble only when the turn has real text — suppresses empty command bubbles (#656) |
+| `agentflow-landing/src/components/accounts/ApprovalFeed.tsx:29` (`approvalsKey`) | `['accounts-pult-approvals', accountId]` — the shared query key CommandCenter invalidates; `null` = General cross-account feed |
+| `agentflow-landing/src/components/accounts/ApprovalFeed.tsx:46` | `useQuery({ queryKey, queryFn: getApprovals, refetchInterval: 8000 })` — the queue feed the invalidation refreshes immediately |
+| `agentflow-landing/src/lib/agentsApi/` (barrel, #652) | `agentsApi` is now a behavior-preserving barrel folder (`index.ts` re-exports `chat`/`accounts`/`approvals`/… modules); existing `import { X } from '.../agentsApi'` sites unchanged |
 
 ## Data flow
 ```
@@ -44,6 +52,39 @@ CENTER composer.send -> POST /me/accounts/:accountId/command (SSE)
 RIGHT  tab=log  -> GET /me/accounts/actions?account_id= -> timeline (status-coloured nodes)
        tab=auto -> DESIGN-ONLY static cards + local-state toggles (no engine)
 ```
+
+## Command-flow: draft → armed approval queue (#656)
+
+A side-effecting command (DM, post, gig respond) never sends straight from the
+composer. The backend arms it as an `armed` row in `entity_approval_queue` and
+emits a `draft` SSE frame. CommandCenter handles that frame by both rendering an
+inline `DraftCard` AND **invalidating the approvals query** so the right-rail
+Queue refreshes without waiting for its 8s poll:
+
+```
+composer.send ─POST /me/accounts/:id/command (SSE)─▶ backend arms draft
+   SSE 'draft' frame ─▶ CommandCenter (case 'draft', CommandCenter.tsx:107)
+      ├─ cur.drafts.push(evt.draft)                       (inline DraftCard)
+      └─ qc.invalidateQueries(approvalsKey(account.id))   (CommandCenter.tsx:112)
+         qc.invalidateQueries(approvalsKey(null))         (General feed)
+            ▼
+   ApprovalFeed useQuery(['accounts-pult-approvals', id]) refetches immediately
+      → the armed card appears in the Queue for «Подтвердить»
+   SSE 'done' frame ─▶ end-of-turn reconcile invalidation (CommandCenter.tsx:139)
+      (covers a draft armed WITHOUT a discrete 'draft' frame reaching the client)
+```
+
+Two #656 polish rules sit alongside the refresh:
+- **No empty command bubbles** — a chat bubble renders only when the turn has
+  real text (`m.text.trim().length > 0`, `CommandCenter.tsx:201`); the history
+  replay filter (`CommandCenter.tsx:62`) drops tool-only rows with no text and
+  no drafts so a reload never replays a blank 🪿 bubble.
+- The shared key `approvalsKey(accountId)` = `['accounts-pult-approvals',
+  accountId]`; `accountId=null` is the cross-account General feed. CommandCenter
+  invalidates BOTH so a draft armed in a per-account view also lands in General.
+
+The armed → confirm execution itself lives in the backend
+[approval-queue](/subsystems/approval-queue) (`POST /me/approvals/:id/confirm`).
 
 ## DB / Env / API
 - Routes (agents service, port 4100, all `requireSession`):
@@ -66,7 +107,10 @@ RIGHT  tab=log  -> GET /me/accounts/actions?account_id= -> timeline (status-colo
 | Draft «Отправить» shows unavailable notice | `approveAccountCommand` -> `not_available` | deploy `.../command/approve` |
 | Action log empty | `getAccountActions` returns `[]` | deploy `GET /me/accounts/actions` (unified `account_action_log`) |
 | Kwork gig/exchange detail shows raw `snake_case` keys | `EntityDetail` dumped `meta` verbatim | fixed by `humanizeKey`/`formatMetaValue` in `browse/DialogView.tsx` |
+| Armed draft doesn't appear in the Queue until the 8s poll | missing `invalidateQueries(approvalsKey(...))` on the `draft` frame | `src/components/accounts/CommandCenter.tsx:112` (#656) |
+| Blank 🪿 bubble replays after reload | tool-only history row passed the replay filter | `src/components/accounts/CommandCenter.tsx:62` (#656 — keep only text/draft/user turns) |
 
 ## Related
 - [Cabinet «Функции»](/subsystems/cabinet-functions)
 - [Cabinet nav IA](/subsystems/cabinet-nav-ia)
+- [approval-queue](/subsystems/approval-queue) — backend armed → confirm gate the draft flows into
