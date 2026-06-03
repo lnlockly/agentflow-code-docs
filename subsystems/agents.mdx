@@ -77,7 +77,7 @@ AgentWorkspace.tsx:151 → KnowledgeSidebar renders
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
 | Researcher agent has no knowledge sidebar | (frontend) `agent.category === 'researcher'` returns `false` for a row where `character.category === 'researcher'` | Check the insert path that created it — mirror missing. |
-| New row lands with `category=NULL` despite preset taxonomy | `psql -c "SELECT id, slug, category, character->>'category' FROM agents WHERE category IS NULL AND character ? 'category'"` returns rows | `services/agent-provision.ts:81` — verify the typeof guard and the values({…}) call still pass `category:`. |
+| New row lands with `category=NULL` despite preset taxonomy | `psql -c "SELECT id, slug, category, character->>'category' FROM agents WHERE category IS NULL AND character ? 'category'"` returns rows | `services/agent-provision.ts:81` — verify the typeof guard and the `values({…})` call still pass `category:`. |
 | TS error after touching `provisionAgent` insert payload | `tsc` complains about `presetCategory: string \| null` | The type pin in the helper variable is intentional — keep it. |
 
 ## Backfill
