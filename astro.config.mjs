@@ -45,6 +45,7 @@ export default defineConfig({
             { label: 'Code Map', slug: 'index' },
             { label: 'Architecture Overview', slug: 'architecture/overview' },
             { label: 'C4 Architecture Map (browsable)', slug: 'architecture/c4-overview' },
+            { label: 'Dependency Map (browsable)', slug: 'architecture/dependency-map' },
           ],
         },
         {
