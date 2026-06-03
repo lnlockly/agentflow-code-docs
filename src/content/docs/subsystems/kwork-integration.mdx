@@ -20,6 +20,8 @@ that row when surfacing account pickers.
 For the generic flow + every other provider, see
 [Generic Integrations](/subsystems/generic-integrations).
 
+**Read path (load-bearing):** `resolveSessionCookies` (`kwork-inbox.ts:148`) calls `resolveCredential(userId,'kwork')`, which treats the `user_credentials` **vault** as PRIMARY and only falls back to `project_secrets` when the vault has no active row. Because `/connect` historically wrote ONLY to `project_secrets`, an older active vault row could shadow freshly-pasted cookies → kwork served a logged-out `/inbox` → `window.chatList` absent → empty dialogs. `/connect` now mirrors into the vault too.
+
 ## Files (with line refs)
 
 | Path | Role |
@@ -29,6 +31,10 @@ For the generic flow + every other provider, see
 | `agentflow-agents/src/routes/me-integrations.ts:475` | `POST /me/integrations/:provider` — generic handler called by the wrapper |
 | `agentflow-agents/src/routes/me-integrations-kwork.ts:1` | Paste-JSON UX (`/me/integrations/kwork/connect`) — separate router |
 | `agentflow-agents/src/services/seal.ts:67` | `sealString` — AES-256-GCM envelope for the cookie payload |
+| `agentflow-agents/src/services/credential-resolver.ts:90` | `resolveCredential` — READ path; vault (`user_credentials`) is PRIMARY, `project_secrets` is the legacy fallback |
+| `agentflow-agents/src/services/user-credentials.ts:141` | `getUserCredential` — returns the single `status='active'` vault row for `(user_id,'kwork')` |
+| `agentflow-agents/src/mcp-servers/kwork-inbox.ts:148` | `resolveSessionCookies` → calls `resolveCredential` then `parseCookieInput` (raw header OR storage_state JSON) |
+| `agentflow-agents/tests/kwork-credential-resolver-precedence.test.ts:1` | Regression — vault shadows project_secrets; raw cookie_header round-trips verbatim |
 | `agentflow-agents/presets/kwork-account-replier.json:1` | Preset character + required secrets list (reads `KWORK_SESSION_JSON`) |
 | `agentflow-agents/tests/integrations-kwork.test.ts:1` | Unit tests — cookie / body schemas |
 | `agentflow-agents/tests/integrations-generic.test.ts:1` | Unit tests — registry contract incl. Kwork |
@@ -76,6 +82,7 @@ and every studio template's account picker reads it from there.
 | Daemon POST returns 403 with `domain_denied` | `domain_denied` | Cookie batch contained a banking/exchange domain — daemon-side bug |
 | Same cookies create N hub projects | (no log — `SELECT count(*) FROM projects WHERE owner_user_id=X AND kind='integration_hub'`) | `pickOrCreateHubProject` lookup broke — should return ≤1 |
 | 200/201 but studio account picker is empty | (no log — `SELECT * FROM project_secrets WHERE project_id=<hub> AND key='KWORK_SESSION_JSON'`) | `default-studio-flow-account.ts → listKworkSecretRows` not reading from the hub project |
+| `entities=[]` from `/me/accounts/kwork:owner/entities?kind=dialogs` even after fresh cookies re-loaded; parser works in isolation | (no log — `SELECT id,status,updated_at FROM user_credentials WHERE user_id=X AND kind='kwork'` vs `project_secrets.updated_at`) | Stale **active vault row** shadowed the fresh `project_secrets` cookie header because `resolveCredential` reads the vault FIRST. Fix: `/me/integrations/kwork/connect` now mirrors the payload into the vault via `saveUserCredential` (revokes the stale active row). `me-integrations-kwork.ts` |
 
 ## Related
 
