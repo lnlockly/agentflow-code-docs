@@ -62,7 +62,7 @@ armed ──confirm──▶ executing ──ok──▶ executed
 
 ## DB / Env / API
 - **Table:** `entity_approval_queue` — `id, user_id, agent_id, platform, account_ref, group_id, action_type, entity_id, payload(jsonb), dry_run, status, scheduled_at, external_id, error_message, created_at, executed_at`. Index `idx_eaq_user_status (user_id, status)`.
-- **Status enum (text):** `armed | executing | executed | failed | rejected`.
+- **Status enum (text):** `armed | executing | executed | failed | rejected | expired`. `expired` is a terminal status set in place when a confirm hits an `armed` row older than the confirmable window (`ARMED_TTL_SECONDS`, 24h, measured from `COALESCE(scheduled_at, created_at)`) — the connector is never called.
 - **Env:** none new (uses `DATABASE_URL`; auth via `requireSession` / `AUTH_JWT_SECRET`).
 - **Routes:** `GET /me/approvals`, `POST /me/approvals/:id/{confirm,edit,reject}`, `POST /me/approvals/confirm-all`. All `requireSession`, scoped by `session.sub`.
 - **Connector contract:** `getConnector(platform).executeAction(action, {ownerUserId})` is the ONLY side-effecting call. Registered via the connector registry — adding a platform is one row, no route/UI change.
@@ -76,7 +76,7 @@ armed ──confirm──▶ executing ──ok──▶ executed
 | No connector for the row's platform | `connector_not_registered` (ConnectorError) | `src/connector-core/registry.ts` (register the platform) |
 | Edit / reject returns 409 | `not_armed` | row already claimed/terminal — refresh the feed |
 | Edit missing body | `payload_required` | `src/routes/me-approvals.ts:72` |
-| Stale `armed` drafts pile up | (Wave 6) healer loop sweeps old `armed` rows | future `services/approval-healer.ts` |
+| Confirm of an old draft fires a now-stale action | `stale_expired` in the route JSON (409); `confirm()` returns `staleExpired:true` and flips the row to `expired` | `src/approval/executor.ts:76` — TTL-bounded atomic claim (`ARMED_TTL_SECONDS`) |
 | Row stuck `executing` after a crash mid-`executeAction` | `status='executing'` with no `executed_at` (not re-claimable — claim needs `armed`) | (Wave 6) healer requeues `executing` rows older than N min back to `armed` or marks `failed` |
 
 ## Related
