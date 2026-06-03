@@ -8,47 +8,82 @@ description: "ChatGPT-style three-zone command center for connected social accou
 ## TL;DR
 `/cabinet/accounts` is a three-zone command center (288 / 1fr / 360) for the
 owner's connected social accounts, sibling to `/projects` and `/cabinet/agents`.
-LEFT lists accounts across platforms, CENTER is a chat composer (neural-net
-model picker + SSE command stream + draft-approve cards), RIGHT has «Лог
-действий» (unified action feed) and a DESIGN-ONLY «Автоматизации» tab. The page
-is MCP-first/generic — it never branches on a specific platform string — and
-every backend read degrades to empty / «скоро» so it renders before the
-agents-service endpoints ship.
+LEFT lists accounts (grouped by platform) with a group-pill switcher, CENTER is
+a **Просмотр / Команда** toggle (Просмотр = entity browser: data-driven kind nav
+→ entity list → real message thread; Команда = the SSE command composer), and
+RIGHT defaults to **«Очередь»** — the generic approval feed where every armed
+action is confirmed/edited/rejected before it fires (plus Лог / Автоматизации /
+Интеграции tabs). The cross-account **«Общий пульт»** at `/cabinet/accounts/all`
+aggregates that queue across every account with one command bar. The page is
+MCP-first/generic — it never branches on a platform string — and every backend
+read degrades to empty / «скоро» so it renders before the agents-service v2
+endpoints ship. Wave-1 T1.7/T1.8 (PR `feat/pult-v2-wired`).
 
 ## Files (with line refs)
 | Path | Role |
 |---|---|
-| `agentflow-landing/src/pages/CabinetAccounts.tsx:1` | Page — three zones inside AppShellV2, generic over platform |
-| `agentflow-landing/src/styles/cabinet-accounts.css:1` | `.cap-*` styling using platform dark-tokens (NOT the mockup palette) |
+| `agentflow-landing/src/pages/CabinetAccounts.tsx:1` | Page — three zones inside AppShellV2; owns group-filter + selected-account state |
+| `agentflow-landing/src/pages/CabinetAccountsGeneral.tsx:1` | «Общий пульт» (`/cabinet/accounts/all`) — cross-account command bar + aggregated ApprovalFeed (Pencil njG4x) |
+| `agentflow-landing/src/components/accounts/CenterPanel.tsx:1` | Просмотр/Команда toggle → EntityBrowser / CommandCenter |
+| `agentflow-landing/src/components/accounts/EntityBrowser.tsx:1` | Browse surface — EntityKindNav + EntityList + DialogView (`getThread`) |
+| `agentflow-landing/src/components/accounts/EntityKindNav.tsx:1` | Data-driven kind nav from `account.entityKinds`, falls back to `ENTITY_KINDS` registry. Pure `resolveEntityKinds()` |
+| `agentflow-landing/src/components/accounts/ApprovalFeed.tsx:1` | Approval queue — concrete cards + Подтвердить/Изменить/Отклонить + «Подтвердить все» (TanStack mutations, optimistic drop) |
+| `agentflow-landing/src/components/accounts/GroupsPills.tsx:1` | Account-group (farm) switcher above the list. Pure `deriveGroups()` (status-derived until Wave-2 `account_groups`) |
+| `agentflow-landing/src/components/accounts/RightPanel.tsx:1` | RIGHT tabs: Очередь (ApprovalFeed) / Лог / Авто / Интеграции; Очередь default |
+| `agentflow-landing/src/styles/cabinet-accounts.css` | `.cap-*` styling using dark-tokens; soft-green accent (acid lime retired) |
 | `agentflow-landing/src/lib/agentsApi.ts` (`getAccounts`) | `GET /me/accounts` -> `Account[]`; 404/501/0 -> `[]` |
-| `agentflow-landing/src/lib/agentsApi.ts` (`getAccountActions`) | `GET /me/accounts/actions?account_id=&limit=` -> `AccountAction[]`; degrades to `[]` |
+| `agentflow-landing/src/lib/agentsApi.ts` (`getEntities`/`getThread`) | §5 aliases over `getAccountEntities`/`getEntityMessages`; degrade to `[]` |
+| `agentflow-landing/src/lib/agentsApi.ts` (`getApprovals`) | `GET /me/approvals?status=armed&account_id=` -> `ApprovalItem[]`; degrades to `[]` |
+| `agentflow-landing/src/lib/agentsApi.ts` (`confirmApproval`/`editApproval`/`rejectApproval`/`confirmAll`) | `POST /me/approvals/:id/{confirm,edit,reject}` + `/confirm-all`; `not_available` on 404/501/0 |
 | `agentflow-landing/src/lib/agentsApi.ts` (`streamAccountCommand`) | `POST /me/accounts/:id/command` SSE; emits `command_not_available` on 404/501 |
-| `agentflow-landing/src/lib/agentsApi.ts` (`approveAccountCommand`) | `POST /me/accounts/:id/command/approve {draft_id}`; `{ok:false,error:'not_available'}` on 404/501 |
-| `agentflow-landing/src/sections/llm-cabinet/data/llm-cabinet-models.ts` (`fetchEnabledModels`) | Live `/llm/v1/models` catalog reused for the neural-net picker; default «Flow» |
-| `agentflow-landing/src/main.tsx` | Lazy route `/cabinet/accounts` (near `/cabinet/agents`) |
-| `agentflow-landing/src/components/layout/AppShellV2.tsx` (`CORE_NAV`) | «Аккаунты» nav entry (UsersIcon, key `accounts`) |
-| `agentflow-landing/src/i18n/{en,ru,zh}.json` | `app.shell.nav.accounts` + `cabinet.accounts.*` keys |
+| `agentflow-landing/src/main.tsx` | Lazy routes `/cabinet/accounts` + `/cabinet/accounts/all` |
+| `agentflow-landing/src/i18n/{en,ru,zh}.json` | `cabinet.accounts.{center.view,center.command,tab.queue,approve.*,groups.*,general.*}` keys |
 
 ## Data flow
 ```
 LEFT   GET /me/accounts -> Account[] grouped by platform (PLATFORM_META map)
-         + «+ Подключить» -> /account/integrations/telegram | .../kwork/connect
+         GroupsPills (deriveGroups) -> narrow list by status (Wave-2: account_groups)
+         + «+ Подключить» -> in-pult ConnectDrawer
 
-CENTER composer.send -> POST /me/accounts/:accountId/command (SSE)
-         model = picker (flow -> null = auto-router)
-         events: thread | text | thought | tool_use | draft | action_done | error | done
-         draft card «Отправить» -> POST /me/accounts/:accountId/command/approve {draft_id}
+CENTER tab=Просмотр -> EntityBrowser
+           EntityKindNav (account.entityKinds | registry) -> select kind
+           GET /me/accounts/:id/entities?kind= (getEntities) -> EntityList
+           open dialog -> getThread (GET …/entities/:eid/messages) -> bubbles
+           reply -> draft -> approve gate (same DraftCard)
+       tab=Команда -> CommandCenter -> POST /me/accounts/:id/command (SSE)
 
-RIGHT  tab=log  -> GET /me/accounts/actions?account_id= -> timeline (status-coloured nodes)
-       tab=auto -> DESIGN-ONLY static cards + local-state toggles (no engine)
+RIGHT  tab=Очередь -> GET /me/approvals?account_id= -> ApprovalItem[]
+           card: target + body + schedule/affects
+           Подтвердить -> POST /me/approvals/:id/confirm (atomic claim -> execute)
+           Изменить    -> POST /me/approvals/:id/edit {payload}  (re-arm)
+           Отклонить   -> POST /me/approvals/:id/reject
+           «Подтвердить все» -> POST /me/approvals/confirm-all {ids}
+       tab=log/auto/integrations -> existing panels
+
+GENERAL /cabinet/accounts/all -> command bar (streamAccountCommand 'all')
+         + ApprovalFeed (no accountId) = cross-account queue
 ```
 
 ## DB / Env / API
 - Routes (agents service, port 4100, all `requireSession`):
   - `GET /me/accounts`
+  - `GET /me/accounts/:id/entities?kind=` · `GET /me/accounts/:id/entities/:eid/messages`
+  - `GET /me/approvals?status=armed&account_id=` (NEW — sibling backend branch)
+  - `POST /me/approvals/:id/{confirm,edit,reject}` · `POST /me/approvals/confirm-all` (NEW)
   - `GET /me/accounts/actions?account_id=&limit=`
   - `POST /me/accounts/:accountId/command` (SSE)
   - `POST /me/accounts/:accountId/command/approve`
+- New normalized shape: `ApprovalItem { id, platform, account_ref, agent_id,
+  action_type, entity_id, group_id, status, preview{title,target,body,
+  scheduled_at,affects}, payload, scheduled_at, external_id, error_message,
+  created_at, executed_at }` (01-ARCH §1). `Account.entityKinds?` folds the
+  platform def's `EntityKind[]` so the kind nav is data-driven.
+- Theme: T1.8 retired acid lime — `--af-accent: #4cb782` (+ `--af-accent-soft`,
+  `--af-accent-tint`, `--af-on-accent`) in `dark-tokens.css`; `--acid: #4cb782`
+  in `globals.css`. Stray hex literals in unrelated subsystems
+  (launchpad/token-pages/games/studio/admin/decks) still read `#A6F25C`/`#d4ff00`
+  — a follow-up brand-wide sweep, out of scope for this Пульт PR (the token flip
+  already recolors every `var(--af-accent)`/`var(--acid)` consumer).
 - Env (frontend): `VITE_AGENTS_URL` (agents base), `VITE_API_URL` (auth base).
 - Normalized shapes: `Account { id, platform, account_id, handle, display_name,
   status, status_detail, avatar_hint, default }`; `AccountAction { id, platform,
@@ -60,9 +95,12 @@ RIGHT  tab=log  -> GET /me/accounts/actions?account_id= -> timeline (status-colo
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
 | LEFT zone empty though accounts exist | `getAccounts` returns `[]` on 404/501 | wire `GET /me/accounts` aggregator |
+| Approval feed empty though actions armed | `getApprovals` returns `[]` on 404/501/0 | deploy `GET /me/approvals` (sibling backend branch) |
+| Подтвердить shows no effect | `confirmApproval` -> `not_available` | deploy `POST /me/approvals/:id/confirm` |
+| «Подтвердить все» no-ops | `confirmAll` -> `{confirmed:0,failed:0}` | deploy `POST /me/approvals/confirm-all` |
+| Browse «Просмотр» list empty | `getEntities` returns `[]` | deploy `GET /me/accounts/:id/entities` |
+| Group pills missing | `deriveGroups` returns 1 group (only «Все») | expected until ≥2 distinct account statuses / Wave-2 `account_groups` |
 | Composer shows «скоро» state | `command_not_available` SSE error | deploy `POST /me/accounts/:id/command` |
-| Draft «Отправить» shows unavailable notice | `approveAccountCommand` -> `not_available` | deploy `.../command/approve` |
-| Action log empty | `getAccountActions` returns `[]` | deploy `GET /me/accounts/actions` (unified `account_action_log`) |
 
 ## Related
 - [Cabinet «Функции»](/subsystems/cabinet-functions)
