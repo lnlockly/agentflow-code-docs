@@ -1,0 +1,89 @@
+---
+title: "Connector-core — generic platform adapters"
+description: "One Platform→Account→EntityKind→Entity→Action spine the Пульт + approval queue key off; Telegram + Kwork adapters."
+---
+
+# Connector-core
+
+## TL;DR
+A single generic spine — `Platform → Account → EntityKind → Entity → Action` —
+that the Пульт ×3 and the approval queue consume with zero per-platform
+branching outside the registry. Each platform is one `Connector` file that shims
+the existing MCP tools (tg-mcp, kwork-inbox) into these shapes. Wave 1 shipped
+Telegram; Wave 2 adds the **Kwork** adapter so Kwork's browse mode works
+(«кворк не работает в режиме просмотра» fixed: the want-feed renders live).
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/connector-core/types.ts:11` | Domain types: `PlatformId`, `Account`, `Entity`, `Action`, `EntityKind`. |
+| `agentflow-agents/src/connector-core/connector.ts:25` | The `Connector` interface + `ConnectorError`. |
+| `agentflow-agents/src/connector-core/registry.ts:13` | `registerConnector` / `getConnector` / `hasConnector` / `listPlatforms`. The ONLY place a platform id binds to a connector. |
+| `agentflow-agents/src/connector-core/bootstrap.ts:21` | `bootstrapConnectors()` registers telegram + kwork at boot. |
+| `agentflow-agents/src/connector-core/connectors/telegram.ts:252` | Telegram adapter (Wave 1). |
+| `agentflow-agents/src/connector-core/connectors/kwork.ts:265` | **Kwork adapter (Wave 2 — this page).** |
+| `agentflow-agents/src/routes/me-accounts.ts:364` | `browseEntities` drives `getConnector(platform).listEntities` for `GET /me/accounts/:id/connector/entities`. |
+| `agentflow-agents/src/approval/executor.ts:113` | The approval-queue `confirm` calls `connector.executeAction` once, atomically. |
+
+## Kwork adapter
+
+### Entity kinds → kwork-inbox MCP tools
+| EntityKind.key | label | MCP tool | parser |
+|---|---|---|---|
+| `exchange` | Биржа заданий | `list_wants` | `parseWants` (`kwork.ts:130`) |
+| `dialogs` | Диалоги | `list_dialogs` | `parseDialogs` (`kwork.ts:154`) |
+| `my_gigs` | Мои кворки | `list_my_kworks` | `parseGigs` (`kwork.ts:168`) |
+
+`readEntity('dialogs')` → `get_dialog` → `parseThread` (`kwork.ts:190`).
+`readEntity('exchange')` → `get_want` → one read-only "buyer brief" message.
+`buildAction(respond)` (`kwork.ts:222`) drafts a dry-run Action — NO submit.
+`executeAction(respond)` (`kwork.ts:392`) → `respond_to_want` — the ONLY
+side-effecting path, run once by the approval-queue confirm.
+
+### Account model
+Kwork is one logical account per owner (one connected session). The owner is
+pinned into the MCP server URL (`?owner=<uid>`); kwork tools are keyed by
+`account_session_secret_key` — the name of the `project_secrets` row holding the
+session cookies — NOT a numeric account id. The connector uses the canonical
+default key `KWORK_SESSION_JSON` (`kwork.ts` `DEFAULT_SESSION_KEY`), matching
+`services/account-entities/kwork.ts`. `accountRef` resolves to `owner`.
+
+### Data flow
+```
+GET /me/accounts/kwork:owner/connector/entities?kind=exchange
+  → me-accounts.ts browseEntities
+  → getConnector('kwork').listEntities(account,'exchange',ctx)
+  → mcpDirect.callTool('kwork-inbox','list_wants',{account_session_secret_key:'KWORK_SESSION_JSON',limit})
+  → parseWants(raw, account) → Entity[]   (subtitle = budget ₽ or preview)
+```
+
+## DB / Env / API
+- Tables: none added. Reads `project_secrets` (via the kwork-inbox MCP) +
+  `user_credentials` vault (via `account-providers/kwork.ts`).
+- Routes: `GET /me/accounts/:accountId/connector/entities?kind=exchange|dialogs|my_gigs`,
+  `GET /me/accounts/:accountId/connector/entities/:kind/:entityId/messages`.
+- MCP tools wrapped: `kwork-inbox` `list_wants`, `list_dialogs`, `list_my_kworks`,
+  `get_dialog`, `get_want`, `respond_to_want`.
+
+## Kwork — pending / missing MCP tools (backend gaps)
+The Wave-2 brief assumed `dialogs`/`my_gigs` had **no** list tool yet and should
+return `[]`. That assumption was stale: the kwork-inbox MCP **does** expose
+`list_dialogs` + `list_my_kworks`, so all three kinds are wired to real tools
+(strictly better than faking empties; no synthetic data). What is genuinely NOT
+available, and is documented here instead of stubbed:
+
+| Gap | Effect | Where it would land |
+|---|---|---|
+| No multi-account fan-out — kwork is single-session, keyed by a secret name, not a numeric account id. | One `kwork:owner` account per owner; a second Kwork login needs a non-default `account_session_secret_key`. | `kwork.ts` `sessionKeyFor` (thread an explicit key via account meta). |
+| No dialog-reply Action in the connector. `send_message` exists on the MCP but the Пульт command loop for kwork dialogs is out of T2.1 scope. | `executeAction` only handles `type:'respond'` (want bids); other types return `unsupported_action_type:*`. | `kwork.ts` `executeAction` (add a `send` branch → `send_message`). |
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Browse returns empty for a connected Kwork account | tool envelope `{error:'auth_expired'\|'rate_limited'}` from kwork-inbox → `arrayFrom` yields `[]` | re-paste session: `me-integrations-kwork.ts`; parser `kwork.ts:118` |
+| Want budget shows `0 ₽` instead of preview | budget coerced from `null` | `num()` guards `null`/`''` first, `kwork.ts` `num` |
+| Confirm a non-want action fails | `unsupported_action_type:` | `kwork.ts` `executeAction` (dialog send not wired) |
+
+## Related
+- [accounts-pult-entities](/subsystems/accounts-pult-entities) — the parallel service-impl browse path.
+- [approval-queue](/subsystems/approval-queue) — `executeAction` consumer.
