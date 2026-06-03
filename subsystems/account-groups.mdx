@@ -1,0 +1,81 @@
+---
+title: "Account groups (farms)"
+description: "User-owned named bundles of connected accounts that back the Пульт group pills and future bulk-command targeting."
+---
+
+# Account groups (farms)
+
+## TL;DR
+An `account_groups` row is a user-owned set of connected accounts — a "farm":
+`name` («Прогрев», «Поддержка») + `account_refs[]` of platform-native refs
+(`telegram:42`). It backs the Пульт group pills (Все / Прогрев / Поддержка)
+and gives a single ref-set for future bulk-command targeting through the
+[approval queue](/subsystems/approval-queue). The table is platform-agnostic —
+each ref carries its own `platform:` prefix, so there is **no per-platform
+column or branch**.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/db/migrations/0088_account_groups.sql` | table DDL + `idx_account_groups_user`; runs on boot via the migrations runner |
+| `agentflow-agents/src/db/schema.ts:4535` | `accountGroups` drizzle mirror of the table |
+| `agentflow-agents/src/account-groups/groups.ts:72` | `normalizeRefs(refs)` — trim empties + de-dupe, first-seen order (the one canonicaliser) |
+| `agentflow-agents/src/account-groups/groups.ts:77` | `toAccountGroup(row)` — raw row → Пульт shape (derives `count`) |
+| `agentflow-agents/src/account-groups/groups.ts:92` | `listGroups(userId)` — owner-scoped, newest first |
+| `agentflow-agents/src/account-groups/groups.ts:112` | `createGroup(userId, {name, accountRefs})` — insert one row |
+| `agentflow-agents/src/account-groups/groups.ts:147` | `renameGroup(userId, id, name)` — owner-scoped, null on miss |
+| `agentflow-agents/src/account-groups/groups.ts:170` | `deleteGroup(userId, id)` — owner-scoped, false on miss |
+| `agentflow-agents/src/account-groups/groups.ts:191` | `setMembers(userId, id, refs)` — replace whole membership |
+| `agentflow-agents/src/account-groups/groups.ts:217` | `updateMembers(userId, id, {add, remove})` — incremental delta |
+| `agentflow-agents/src/account-groups/groups.ts:252` | `resolveGroupRefs(userId, id)` — group → account_refs[] for a bulk fan-out |
+| `agentflow-agents/src/account-groups/index.ts` | module public surface (import from here, not the leaf) |
+| `agentflow-agents/src/routes/me-account-groups.ts:57` | `GET /me/account-groups` — owner farms feed |
+| `agentflow-agents/src/routes/me-account-groups.ts:65` | `POST /me/account-groups` — create |
+| `agentflow-agents/src/routes/me-account-groups.ts:103` | `PATCH /me/account-groups/:id` — rename + membership |
+| `agentflow-agents/src/routes/me-account-groups.ts:163` | `DELETE /me/account-groups/:id` |
+| `agentflow-agents/src/server.ts:973` | `app.route("/", meAccountGroupsApp)` mount |
+| `agentflow-agents/tests/account-groups.test.ts` | service unit spec (fake sql, no DB) |
+| `agentflow-agents/tests/me-account-groups.test.ts` | route integration (real Postgres; skips when unreachable) |
+
+## Data flow
+```
+Пульт group pills            bulk-command targeting (future)
+        |                              |
+   GET /me/account-groups        resolveGroupRefs(userId, groupId)
+        |                              |  -> account_refs[]
+  listGroups(userId) ------------------+     fans out over the
+        |                                     approval queue
+        v
+  account_groups (owner-scoped by user_id)
+  POST   -> createGroup
+  PATCH  -> renameGroup | setMembers | updateMembers(add/remove)
+  DELETE -> deleteGroup
+```
+
+PATCH body slots apply in order: `name` (rename) -> `account_refs` (replace
+whole membership) -> `add`/`remove` (incremental delta). Any subset is allowed;
+none recognised -> `400 nothing_to_update`.
+
+## DB / Env / API
+- Tables: `account_groups (id, user_id, name, account_refs text[], created_at, updated_at)`,
+  index `idx_account_groups_user (user_id)`.
+- Env: none new.
+- Routes (all `requireSession`, owner = `session.sub`):
+  - `GET    /me/account-groups` -> `{ ok, count, groups: AccountGroup[] }`
+  - `POST   /me/account-groups { name, account_refs }` -> `201 { ok, group }`
+  - `PATCH  /me/account-groups/:id { name?, account_refs?, add?, remove? }` -> `200 { ok, group }`
+  - `DELETE /me/account-groups/:id` -> `200 { ok, deleted: true }`
+- MCP tools: none (data layer only).
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Create rejected, empty name | route returns `name_required` | `src/account-groups/groups.ts:120` |
+| Create/replace rejected, refs not an array | route returns `account_refs_invalid` | `src/account-groups/groups.ts:125` |
+| PATCH/DELETE on a group you don't own -> 404 | route returns `not_found` | owner-scope `WHERE ... user_id = ${userId}` in `groups.ts` |
+| PATCH with no known field -> 400 | route returns `nothing_to_update` | `src/routes/me-account-groups.ts:120` |
+
+## Related
+- [Approval queue](/subsystems/approval-queue) — the bulk fan-out target a group resolves into.
+- [Accounts Control Pult (backend)](/subsystems/accounts-pult) — the surface that renders the group pills.
+- [Connector core](/subsystems/connector-core) — the `${platform}:${ref}` account-ref shape stored in `account_refs[]`.
