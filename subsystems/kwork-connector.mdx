@@ -29,6 +29,38 @@ Without the unwrap, `kworkReauthError(raw)` and the parsers read fields off the
 never surfaces as reauth. This was the live "Биржа / Диалоги / Мои кворки all
 empty even when active" bug; fixed by unwrapping at each `callTool` site.
 
+## Current server-rendered inbox parsing (2026-06)
+
+Kwork's `/inbox` is now a server-rendered Vue shell - there is **no
+`__INITIAL_STATE__` blob and no clean JSON dialogs endpoint**. The dialog list
+is inlined into the page as `window.chatList=[...]`, and the authenticated owner
+id sits in `window.USER_ID="<n>"`. The `kwork-inbox` MCP parses this directly:
+
+- `list_dialogs` -> `parseChatListFromInboxHtml(html)` walks `window.chatList`.
+  Each row maps: `user_id` -> `dialog_id` (the PEER id - **not** `member_id`,
+  which is the owner's own id), `username` -> peer login, `message` /
+  `lastMessage.message` -> preview, `time` (unix sec) -> ISO, `unread_count`,
+  `pic` -> absolute members-CDN avatar URL. The legacy
+  `__INITIAL_STATE__`/`stateInbox` heuristic (`normaliseDialogs`) stays wired
+  as a fallback for older layouts.
+- `get_dialog` -> the `/inbox/<id>` page carries no message blob; messages come
+  from `POST /inbox_more_messages {userId,allUnread,csrftoken}` ->
+  `{success:true,data:{messages:[...]}}`. `parseMoreMessagesEnvelope(payload,
+  ownerId)` flips rows where `MSGFROM === window.USER_ID` to `role:'me'` and
+  lifts `files.*.url` into attachments. The page-state-marker scrape +
+  rendered-DOM scrape stay as fallbacks. **csrftoken is required** on this POST
+  (the `csrf_user_token` cookie === the page `window.csrftoken`).
+- `send_message` -> `POST /sendmessage` with `message_body`, `submg=1`,
+  `msgto=<dialog_id>`, `csrftoken=<cookie>`. The form `action` and hidden
+  `csrftoken`/`submg`/`msgto` fields are confirmed in the live inbox HTML.
+- `executeAction('send', {entityId:<dialog_id>, payload:{text}})` on the
+  connector routes a dialog reply through `send_message`; `executeAction
+  ('respond', ...)` still routes a public-want offer through `respond_to_want`.
+
+Parsers are pure + exported for unit coverage in
+`tests/mcp-servers/kwork-parse-current-inbox.test.ts` (synthetic fixture - no
+real cookies / private message content committed).
+
 ## Cookie-refresh requirement
 
 Kwork sessions are stored as cookies (raw header or Playwright `storage_state`
@@ -102,6 +134,8 @@ the other secret-resolution errors classify as reauth. `rate_limited`, `banned`,
 | Stored session row missing / unreadable | `session_secret_not_found` / `session_secret_unseal_failed` | `src/mcp-servers/kwork-inbox.ts:191` |
 | Kwork serves /login on an authenticated path | `auth_expired` | `src/mcp-servers/kwork-inbox.ts:294` |
 | respond on expired session | `ConnectorReauthError` (before `respond_to_want`) | `src/connector-core/connectors/kwork.ts:420` |
+| `list_dialogs` returns `[]` despite valid cookies | `parseChatListFromInboxHtml` returns empty (no `window.chatList=` in HTML) | Kwork changed the inbox shell - update the marker / row mapping in `src/mcp-servers/kwork-inbox.ts` (`parseChatListFromInboxHtml`) |
+| `get_dialog` returns 0 messages on a non-empty dialog | `/inbox_more_messages` POST missing `csrftoken` or shape changed | `src/mcp-servers/kwork-inbox.ts` `get_dialog` handler + `parseMoreMessagesEnvelope` |
 
 ## Related
 
