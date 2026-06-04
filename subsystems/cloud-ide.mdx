@@ -19,6 +19,10 @@ the `PASSWORD` env, and a missing Secret/key is the classic boot failure.
 | Path | Role |
 |---|---|
 | `agentflow-agents/app-manifests/cloud-ide.json` | JSON app manifest (modes `editor`/`task`, `embed` panel → `https://ide.agentflow.website`) |
+| `agentflow-landing/src/lib/appManifest.ts` (`CLOUD_IDE_EMBED_URL`, `CLOUD_IDE_MANIFEST`, `FALLBACK_MANIFESTS['cloud-ide']`) | FE fallback manifest — one embed panel at the IDE host, added the same generic way as `tasks` |
+| `agentflow-landing/src/pages/CloudIdePage.tsx` | `/cloud-ide` page — builds the embed panel inline, renders via generic `AppPanelView` (reuses `EmbedPanel` loading/error + open-in-new-tab) |
+| `agentflow-landing/src/main.tsx` (`/cloud-ide` route) | auth-gated route → `CloudIdePage` |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx` (`MORE_NAV`) | «Облако / IDE» sidebar row (`key: 'cloud_ide'`, `Code2` icon) |
 | `agentflow-agents/k8s/cloud-ide/kustomization.yaml` | kustomize entry (excludes the example secret on purpose, :6) |
 | `agentflow-agents/k8s/cloud-ide/00-pvc.yaml` | persistent `/home/coder/workspace` |
 | `agentflow-agents/k8s/cloud-ide/10-deployment.yaml:91` | `PASSWORD` env via `secretKeyRef` → `cloud-ide-auth.password` (:93) |
@@ -30,6 +34,7 @@ the `PASSWORD` env, and a missing Secret/key is the classic boot failure.
 ```
 app-manifests/cloud-ide.json  → /apps/cloud-ide (embed panel)
                                    → iframe https://ide.agentflow.website
+agentflow-landing /cloud-ide  → CloudIdePage → AppPanelView(embed) → same iframe
 ingress ide.agentflow.website (TLS cloud-ide-tls)
    → code-server Deployment (codercom/code-server)
        env PASSWORD ← secretKeyRef cloud-ide-auth.password
@@ -55,3 +60,4 @@ ingress ide.agentflow.website (TLS cloud-ide-tls)
 ## Related
 - [JSON App Manifests](/subsystems/json-app-manifests) — `cloud-ide.json` is one manifest
 - [Generic App Renderer](/subsystems/generic-app-renderer) — renders the `embed` panel
+- FE surface lives in `agentflow-landing` (`/cloud-ide` page + `cloud-ide` fallback manifest), reusing the #672 embed panel; landing PR #673.
