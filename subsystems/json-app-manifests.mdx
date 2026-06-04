@@ -29,8 +29,13 @@ Examples: `accounts-pult.json` (Пульт) and `cloud-ide.json`
 | `agentflow-agents/src/app-manifests/registry.ts:58` | `loadManifestsFromDir()` — `.json` → slug map, skips bad files |
 | `agentflow-agents/src/app-manifests/registry.ts:111` | `registry()` — cached map (`resetRegistryCache()` at :117) |
 | `agentflow-agents/src/app-manifests/registry.ts:122` | `listManifests()` / `getManifest()` (:127) |
-| `agentflow-agents/src/routes/me-apps.ts:25` | `GET /me/apps` (requireSession) — list |
-| `agentflow-agents/src/routes/me-apps.ts:30` | `GET /me/apps/:slug` — one, 404 when unknown |
+| `agentflow-agents/src/routes/me-apps.ts:33` | `GET /me/apps` (requireSession) — list |
+| `agentflow-agents/src/routes/me-apps.ts:38` | `GET /me/apps/:slug` — one, 404 when unknown |
+| `agentflow-agents/src/routes/me-apps.ts:54` | `POST /me/apps/route` — free-text → JSON-app route (requireSession) |
+| `agentflow-agents/src/services/app-composer-router.ts:196` | `routeComposerMessage()` — pure router (catalog + slug-validator + LLM injected) |
+| `agentflow-agents/src/services/app-composer-router.ts:85` | `liveCatalogSource` — projects the live registry into a compact catalog |
+| `agentflow-agents/src/services/app-composer-router.ts:95` | `makeLiveLlmCaller()` — routes through `useModel(TEXT_LARGE)`, no model string |
+| `agentflow-agents/src/services/app-composer-router.ts:146` | `parseRouterReply()` — defensive JSON parse (fence strip, prose slice, clamp) |
 | `agentflow-agents/src/cli/agentflow-apps.ts:105` | `runApps(argv,print)` — `list` / `show` / `run` verbs |
 | `agentflow-agents/src/cli/agentflow-apps.ts:37` | `renderList()` reads the registry (GUI + CLI share it) |
 | `agentflow-agents/app-manifests/accounts-pult.json` | First example manifest (Пульт) |
@@ -44,16 +49,24 @@ app-manifests/*.json (in image)
 registry.ts  slug→AppManifest (cached)
    ├─ HTTP: GET /me/apps        → listManifests()
    ├─ HTTP: GET /me/apps/:slug  → getManifest(slug)   (404 if absent)
+   ├─ HTTP: POST /me/apps/route → routeComposerMessage(msg)
+   │           liveCatalogSource → compact catalog
+   │           useModel(TEXT_LARGE) → strict-JSON pick
+   │           slugValidator coerces a hallucinated slug → null
+   │           confidence < 0.45 → {appSlug:null, reason}
    └─ CLI:  agentflow-apps list|show|run → same registry
    ▼
-FE: /apps grid + /apps/:slug renderer (generic panel map)
+FE: /apps grid + /apps/:slug renderer (generic panel map);
+    composer box POSTs /me/apps/route → opens the chosen app+mode prefilled
 ```
 
 ## DB / Env / API
 - Tables: none — manifests are on-disk JSON (DB-backed/user-authored apps are a later phase, see `routes/me-apps.ts:8`).
 - Env: none required; disk resolution mirrors `services/preset-store.ts` candidate-dir list (`registry.ts:7`).
-- Routes: `GET /me/apps`, `GET /me/apps/:slug` (both `requireSession`).
+- Routes: `GET /me/apps`, `GET /me/apps/:slug`, `POST /me/apps/route` (all `requireSession`).
+  - `POST /me/apps/route` body `{ message: string }` → `{ appSlug, mode, prefill, confidence, reason }`. `message` must be a string (else `400 message_required`); a non-JSON body returns `400 invalid_json_body`. The handler never 500s on a bad LLM reply — it returns `appSlug:null` with a reason.
 - CLI: `agentflow-apps list | show <slug> | run <slug> <cmd>`.
+- LLM: `POST /me/apps/route` calls `useModel(ModelType.TEXT_LARGE)` with `ownerUserId` from the session for billing attribution; no model name is hardcoded.
 - Manifest `uses`: free-string `engine` + `mcp_tools` (engine selection still routes through `useModel`, never a hardcoded model).
 
 ## Failure modes
@@ -63,6 +76,9 @@ FE: /apps grid + /apps/:slug renderer (generic panel map)
 | A bad `.json` silently skipped from registry | `loadManifestsFromDir` collects `errors[]` (file kept out of map) | `agentflow-agents/src/app-manifests/registry.ts:58` |
 | No candidate dir found at boot | `findManifestsDir()` returns `null` → empty registry | `agentflow-agents/src/app-manifests/registry.ts:40` |
 | CLI unknown verb | prints `unknown command: <verb>` + USAGE | `agentflow-agents/src/cli/agentflow-apps.ts:121` |
+| Composer route returns null app on a garbled LLM reply | `[composer-router] parse_failed` | `agentflow-agents/src/services/app-composer-router.ts:233` |
+| Composer route drops an invented app slug | `[composer-router] hallucinated_slug` | `agentflow-agents/src/services/app-composer-router.ts:239` |
+| Composer route degrades when all providers are down | `[composer-router] llm_call_failed` | `agentflow-agents/src/services/app-composer-router.ts:227` |
 
 ## Related
 - [Generic App Renderer](/subsystems/generic-app-renderer) — the FE that draws any manifest
