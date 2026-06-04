@@ -1,0 +1,56 @@
+---
+title: "Generic App Renderer (frontend)"
+description: "agentflow-landing draws any JSON AppManifest generically: /apps store grid, /apps/:slug panel renderer, composer, with a fallback registry until BE ships."
+---
+
+# Generic App Renderer (frontend)
+
+## TL;DR
+The frontend half of [JSON App Manifests](/subsystems/json-app-manifests). One
+generic React shell renders ANY manifest: `/apps` is the store grid
+(`AppsIndex`), `/apps/:slug` is the renderer (`AppRenderer`) that draws the
+manifest header + a `type → component` panel map (`PANEL_COMPONENTS`) + a
+composer. Until the backend `GET /me/apps` ships in every deployment, the FE
+falls back to `FALLBACK_MANIFESTS` so the surface never blanks. Unknown panel
+types degrade to an info notice instead of crashing.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/pages/AppsIndex.tsx:23` | `/apps` store grid; `fetchAppCatalogue()` (:28) |
+| `agentflow-landing/src/pages/AppRenderer.tsx:38` | `/apps/:slug`; `fetchAppManifest(slug)` (:47), maps `manifest.panels` (:134) |
+| `agentflow-landing/src/components/apps/AppPanels.tsx:134` | `PANEL_COMPONENTS` (`type→component`) |
+| `agentflow-landing/src/components/apps/AppPanels.tsx:143` | `AppPanelView` — unknown type → degraded notice (:148) |
+| `agentflow-landing/src/components/apps/AppPanels.tsx:113` | `InfoPanel` (also `ListPanel`:39, `FeedPanel`:63, `ActionsPanel`:87) |
+| `agentflow-landing/src/components/apps/AppComposer.tsx` | bottom composer driven by `manifest.composer` |
+| `agentflow-landing/src/lib/appManifest.ts:325` | `fetchAppManifest` → `GET /me/apps/:slug` + fallback |
+| `agentflow-landing/src/lib/appManifest.ts:342` | `fetchAppCatalogue` → `GET /me/apps` + fallback |
+| `agentflow-landing/src/lib/appManifest.ts:304` | `FALLBACK_MANIFESTS` (used until BE ships) |
+| `agentflow-landing/src/lib/appManifest.ts:29` | `AppPanelType = 'list'\|'feed'\|'actions'\|'info'` |
+| `agentflow-landing/src/main.tsx:386` | lazy routes `/apps` → AppsIndex, `/apps/:slug` → AppRenderer |
+
+## Data flow
+```
+/apps        → AppsIndex → fetchAppCatalogue() → GET /me/apps   (fallbackCatalogue on fail)
+/apps/:slug  → AppRenderer → fetchAppManifest(slug) → GET /me/apps/:slug  (FALLBACK_MANIFESTS on fail)
+                 │ header (title/icon/description)
+                 │ manifest.panels.map → AppPanelView → PANEL_COMPONENTS[panel.type]
+                 └ AppComposer(manifest.composer)  → action buttons drop a command into draft
+```
+
+## DB / Env / API
+- Tables: none (FE only).
+- Env: none specific — uses the app's `apiGet` base.
+- Routes consumed: `GET /me/apps`, `GET /me/apps/:slug`.
+- `/apps` was previously the AppsLauncher; UX-strip 2026-05-31 made bare `/apps` the store grid and `/apps/:slug` the manifest renderer (`main.tsx:368`).
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Unknown panel type renders blank | FE text «Неизвестный тип панели:» | `agentflow-landing/src/components/apps/AppPanels.tsx:148` |
+| App slug not found | FE text «Апп «<slug>» не найден.» | `agentflow-landing/src/pages/AppRenderer.tsx:100` |
+| BE `/me/apps` not deployed → grid still renders | falls back to `fallbackCatalogue()` | `agentflow-landing/src/lib/appManifest.ts:310` |
+
+## Related
+- [JSON App Manifests](/subsystems/json-app-manifests) — schema + registry + `/me/apps`
+- [Cloud IDE](/subsystems/cloud-ide) — `embed`-panel app rendered here

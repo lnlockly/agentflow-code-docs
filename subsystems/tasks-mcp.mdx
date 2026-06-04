@@ -1,0 +1,58 @@
+---
+title: "Tasks MCP"
+description: "Internal MCP server that bridges agents to the self-hosted Plane workspace; errors-as-data, no-op until PLANE_* env is set."
+---
+
+# Tasks MCP
+
+## TL;DR
+`src/mcp-servers/tasks.ts` is an internal MCP server that lets agents read and
+write Plane projects/issues (the [Plane Task Manager](/subsystems/plane-task-manager)).
+It is registered at `/internal/mcp/tasks` in `routes/internal-mcp.ts`. Every tool
+returns errors **as data**: when `PLANE_API_BASE` / `PLANE_API_TOKEN` /
+`PLANE_WORKSPACE` are unset it answers `{ok:false, error:'tasks_not_configured'}`
+instead of throwing, so the server is a safe no-op until a workspace token is
+configured.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/mcp-servers/tasks.ts:64` | `resolvePlaneConfig()` — reads `PLANE_*` env, normalises base to one trailing slash |
+| `agentflow-agents/src/mcp-servers/tasks.ts:80` | `tasks_not_configured` error envelope + hint string (:83) |
+| `agentflow-agents/src/mcp-servers/tasks.ts:110` | `buildPlaneRequest()` — URL + `X-API-Key` header builder |
+| `agentflow-agents/src/mcp-servers/tasks.ts:157` | `planeFetch()` — HTTP call |
+| `agentflow-agents/src/mcp-servers/tasks.ts:191` | `planeErrorEnvelope()` — auth_error / rate_limited / http_error |
+| `agentflow-agents/src/mcp-servers/tasks.ts:286` | `tasksTools` registry (list_projects, list/create/update issues, comment) |
+| `agentflow-agents/src/mcp-servers/tasks.ts:524` | `buildIssueBody()` — HTML body from fields |
+| `agentflow-agents/src/mcp-servers/tasks.ts:570` | `handleTasksMcp(c, ctx)` — HTTP entrypoint |
+| `agentflow-agents/src/routes/internal-mcp.ts:41` | imports `handleTasksMcp` |
+| `agentflow-agents/src/routes/internal-mcp.ts:107` | `TASKS_PATHS = ['/internal/mcp/tasks', …]` |
+| `agentflow-agents/src/routes/internal-mcp.ts:435` | dispatch → `handleTasksMcp(c, { ownerUserId })` |
+
+## Data flow
+```
+Eliza agent → POST /internal/mcp/tasks  (MCP JSON-RPC)
+   → handleTasksMcp → resolvePlaneConfig(process.env)
+       │ unset → {ok:false, error:'tasks_not_configured'}  (no throw)
+       └ set   → buildPlaneRequest → planeFetch → Plane api (X-API-Key)
+                    └ planeErrorEnvelope on non-2xx (errors as data)
+```
+
+## DB / Env / API
+- Tables: none (delegates state to Plane).
+- Env: `PLANE_API_BASE`, `PLANE_API_TOKEN`, `PLANE_WORKSPACE` (agents secret).
+- Route: `POST /internal/mcp/tasks` (internal MCP surface).
+- Tools: `list_projects`, list/create/update issues, add comment (`tasksTools`, `tasks.ts:286`). Each returns `{ok:true,…}` or a typed `{ok:false,error}`.
+- Scope: owner-pinned via `ownerUserId`, but the single workspace is addressed by the env token so owner-scope is advisory (`internal-mcp.ts:419`).
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| All tools no-op | `tasks_not_configured` | set `PLANE_*` env; `agentflow-agents/src/mcp-servers/tasks.ts:80` |
+| 401 from Plane | `error:'auth_error'` | bad/expired token → re-run plane-bootstrap |
+| 429 from Plane | `error:'rate_limited'` | `agentflow-agents/src/mcp-servers/tasks.ts:191` |
+| other Plane non-2xx | `error:'http_error'` | `agentflow-agents/src/mcp-servers/tasks.ts:191` |
+
+## Related
+- [Plane Task Manager](/subsystems/plane-task-manager) — the Plane backend + bootstrap
+- [Code Exec MCP](/subsystems/code-exec-mcp) — sibling internal MCP server
