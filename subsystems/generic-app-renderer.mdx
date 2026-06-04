@@ -28,6 +28,11 @@ types degrade to an info notice instead of crashing.
 | `agentflow-landing/src/lib/appManifest.ts:304` | `FALLBACK_MANIFESTS` (used until BE ships) |
 | `agentflow-landing/src/lib/appManifest.ts:29` | `AppPanelType = 'list'\|'feed'\|'actions'\|'info'` |
 | `agentflow-landing/src/main.tsx:386` | lazy routes `/apps` → AppsIndex, `/apps/:slug` → AppRenderer |
+| `agentflow-landing/src/components/apps/AppAuthGate.tsx` | Generic «Authorize» gate — one affordance per `auth.method` (browser_login / magic_link / api_key / oauth). Reused by ANY app declaring `auth`. |
+| `agentflow-landing/src/components/apps/HeygenApp.tsx` | HeyGen `appView` — composer brief → `generateHeygen`, poll → `<video>`, gates on `needsAuth`. |
+| `agentflow-landing/src/lib/appAuth.ts` | Typed `fetchAppAuthStatus` / `authorizeApp` / `generateHeygen` / `fetchHeygenStatus` (uses `./api` apiGet/apiPost). |
+| `agentflow-landing/src/lib/appManifest.ts` | `AppAuthMethod` + `AppAuthConfig` (`auth?:`), `appView?:` field, `heygen` fallback manifest. |
+| `agentflow-landing/src/pages/AppRenderer.tsx` | `needsAuth = Boolean(manifest.auth) && !authed` gates the body; `APP_VIEWS` registry routes `appView` (no slug branch). |
 
 ## Data flow
 ```
@@ -38,10 +43,43 @@ types degrade to an info notice instead of crashing.
                  └ AppComposer(manifest.composer)  → action buttons drop a command into draft
 ```
 
+## Generic Authorize gate (kwork-style, any app)
+
+A manifest may carry an `auth` block: `{ method, label?, description?, loginUrl?, magicLinkField?, apiKeyField?, authorizeUrl? }`. When present, `AppRenderer` hides the body behind `AppAuthGate` until the user authorizes — same flow for EVERY app, no per-slug branch.
+
+```
+AppRenderer (manifest.auth present, authed=false)
+  └─ AppAuthGate(slug, appTitle, auth)
+       GET /me/apps/:slug/auth-status → { ready, method, authorizeAction? }
+         ready:true → onReady() → reveal body
+       per method affordance:
+         browser_login → <ProxiedBrowserFlow platform={slug} …>  (REUSED drawer)
+         magic_link    → paste field → POST /me/apps/:slug/authorize { magicLink }
+         api_key       → key field  → POST /me/apps/:slug/authorize { apiKey }
+         oauth         → <a href=authorizeUrl target=_blank>
+       onReady() → AppRenderer.setAuthed(true) → renderBody()
+```
+
+`browser_login` REUSES the existing secure browser-login drawer (`ProxiedBrowserFlow`, see [proxied-browser-connect](/subsystems/proxied-browser-connect)) — the slug is threaded as the `platform`, so the same `/me/integrations/:platform/browser-login/*` contract drives it. No second browser-login UI was built.
+
+### HeyGen app surface
+
+`heygen` declares `appView:'heygen'` + `auth.method:'browser_login'`. `AppRenderer` looks `appView` up in `APP_VIEWS` (a `view→component` registry, never a slug branch) and renders `HeygenApp`:
+
+```
+HeygenApp
+  composer brief → POST /me/apps/heygen/generate
+    → { needsAuth:true, authorizeAction } → inline <AppAuthGate>
+    → { jobId } → poll GET /me/apps/heygen/jobs/:id/status every 4s
+         status:done + videoUrl → <video src=videoUrl controls>
+         status:failed → error
+  subtle «генерирую…» state while processing
+```
+
 ## DB / Env / API
 - Tables: none (FE only).
 - Env: none specific — uses the app's `apiGet` base.
-- Routes consumed: `GET /me/apps`, `GET /me/apps/:slug`.
+- Routes consumed: `GET /me/apps`, `GET /me/apps/:slug`, `GET /me/apps/:slug/auth-status`, `POST /me/apps/:slug/authorize`, `POST /me/apps/heygen/generate`, `GET /me/apps/heygen/jobs/:id/status`, plus the reused `/me/integrations/:platform/browser-login/*` for `browser_login`.
 - `/apps` was previously the AppsLauncher; UX-strip 2026-05-31 made bare `/apps` the store grid and `/apps/:slug` the manifest renderer (`main.tsx:368`).
 
 ## Failure modes
@@ -50,6 +88,8 @@ types degrade to an info notice instead of crashing.
 | Unknown panel type renders blank | FE text «Неизвестный тип панели:» | `agentflow-landing/src/components/apps/AppPanels.tsx:148` |
 | App slug not found | FE text «Апп «<slug>» не найден.» | `agentflow-landing/src/pages/AppRenderer.tsx:100` |
 | BE `/me/apps` not deployed → grid still renders | falls back to `fallbackCatalogue()` | `agentflow-landing/src/lib/appManifest.ts:310` |
+| auth-status route missing → gate still shows | `fetchAppAuthStatus` catch → manifest `auth` block drives the affordance | `agentflow-landing/src/components/apps/AppAuthGate.tsx` (mount effect catch) |
+| HeyGen generate returns `needsAuth` | inline `<AppAuthGate>` re-authorizes without leaving the app | `agentflow-landing/src/components/apps/HeygenApp.tsx` (`phase.kind === 'needs_auth'`) |
 
 ## Related
 - [JSON App Manifests](/subsystems/json-app-manifests) — schema + registry + `/me/apps`
