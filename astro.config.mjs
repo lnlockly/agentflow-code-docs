@@ -110,6 +110,8 @@ export default defineConfig({
             { label: 'Connector Core', slug: 'subsystems/connector-core' },
             { label: 'Kwork Connector (current HTML + reauth)', slug: 'subsystems/kwork-connector' },
             { label: 'Proxied Cloud-Browser Connect (FE)', slug: 'subsystems/proxied-browser-connect' },
+            { label: 'Proxied Browser Login (backend + chromium)', slug: 'subsystems/proxied-browser-login' },
+            { label: 'Per-account Proxy Session (NodeMaven)', slug: 'subsystems/per-account-proxy-session' },
             { label: 'Approval Queue', slug: 'subsystems/approval-queue' },
             { label: 'Account Groups (farms)', slug: 'subsystems/account-groups' },
             { label: 'Account Automations', slug: 'subsystems/account-automations' },

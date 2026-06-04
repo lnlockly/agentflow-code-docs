@@ -100,8 +100,14 @@ the cluster egresses from. `kworkRequest` flags a 403 with a
 (`kwork-inbox.ts:292`); on the CAPTCHA-HTML 200 path `window.chatList` is
 absent, so `parseChatListFromInboxHtml` returns `[]`. The same cookies on a
 residential IP succeed. **Fix = route kwork egress through a residential proxy**
-(see [proxy-pool](/subsystems/proxy-pool)); this is an IP-reputation problem,
-not a session, parser, or fetch-header bug.
+and mint the session on that same IP. The shipped fix has two halves:
+[per-account proxy session](/subsystems/per-account-proxy-session) (#1114) gives
+every kwork call a deterministic sticky NodeMaven residential exit IP, and
+[proxied browser login](/subsystems/proxied-browser-login) (#1115) launches an
+in-pod chromium behind that proxy so the cookie is minted on the residential IP
+it will later be replayed from. The older per-resource
+[proxy-pool](/subsystems/proxy-pool) backs the VK cookie-paste path. This is an
+IP-reputation problem, not a session, parser, or fetch-header bug.
 
 ## Files (with line refs)
 
