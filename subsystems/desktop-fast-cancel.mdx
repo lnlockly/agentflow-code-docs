@@ -14,7 +14,7 @@ for ~90 s. Now the daemon honors cancel in ≤2 s by streaming the Anthropic
 SSE response with a watchdog that closes the socket on `abort_flag`,
 adding a pre-tool-dispatch gate, and slicing the `wait` tool's sleep.
 The cabinet also sees a `task_action: cancel_received` frame within
-<500 ms so the UI shows "Останавливаю задачу..." immediately.
+&lt;500 ms so the UI shows "Останавливаю задачу..." immediately.
 
 ## Files (with line refs)
 
@@ -96,9 +96,9 @@ worker loop sets state.busy = False → ready for next task
 pytest tests/test_run_task_cancel.py -v
 ```
 
-- `test_post_llm_cancellable_aborts_mid_stream_within_500ms` — asserts <0.5 s
-- `test_run_task_end_to_end_cancel_within_2s` — asserts <2 s
-- `test_wait_tool_aborts_within_300ms` — asserts <0.5 s
+- `test_post_llm_cancellable_aborts_mid_stream_within_500ms` — asserts &lt;0.5 s
+- `test_run_task_end_to_end_cancel_within_2s` — asserts &lt;2 s
+- `test_wait_tool_aborts_within_300ms` — asserts &lt;0.5 s
 
 Live test on enrolled device:
 
