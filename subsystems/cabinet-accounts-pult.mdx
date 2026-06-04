@@ -38,6 +38,12 @@ agents-service endpoints ship.
 | `agentflow-landing/src/components/accounts/ApprovalFeed.tsx:29` (`approvalsKey`) | `['accounts-pult-approvals', accountId]` — the shared query key CommandCenter invalidates; `null` = General cross-account feed |
 | `agentflow-landing/src/components/accounts/ApprovalFeed.tsx:46` | `useQuery({ queryKey, queryFn: getApprovals, refetchInterval: 8000 })` — the queue feed the invalidation refreshes immediately |
 | `agentflow-landing/src/lib/agentsApi/` (barrel, #652) | `agentsApi` is now a behavior-preserving barrel folder (`index.ts` re-exports `chat`/`accounts`/`approvals`/… modules); existing `import { X } from '.../agentsApi'` sites unchanged |
+| `agentflow-landing/src/components/accounts/browse/DialogComposer.tsx:40` (`DialogComposer`) | Standard dialog composer: auto-grow textarea, attach-file (📎), voice + video recording via `MediaRecorder` (`DialogComposer.tsx:144`), send button. Recorded clips + picked files become client-side `ComposerAttachment[]` previews. |
+| `agentflow-landing/src/components/accounts/browse/DialogView.tsx:94` (`attachLine`) | Names each attachment in the scoped command text (`composed`, `DialogView.tsx:98`) — the `/command` endpoint takes `{text,model}` only, so media is described, not uploaded (backend gap). |
+| `agentflow-landing/src/components/accounts/browse/DialogView.tsx:78` (`requestAnimationFrame`) | Thread autoscroll-to-latest; rAF lets bubbles paint before measuring `scrollHeight` so a long thread jumps to bottom on open. |
+| `agentflow-landing/src/styles/cabinet-accounts.css:1140` (`.capb-reader min-height:0`) | The scroll fix — without `min-height:0` the `.capb-thread` flex child can't shrink below its content, so `overflow:auto` never scrolled. |
+| `agentflow-landing/src/styles/cabinet-accounts.css:510` (`.cap-rtabs overflow-x:auto`) | RIGHT-zone tab strip scrolls horizontally with the scrollbar hidden so the four long Russian labels never clip later tabs off a narrow phone. |
+| `agentflow-landing/src/pages/CabinetDashboard.tsx:286` (removed) | The cabinet hero `cabinet.composer.headline` («Что собрать?») element was removed; the `.cab-cmp` flex `gap` keeps the wave + composer spacing intact (no empty box). |
 
 ## Data flow
 ```
@@ -109,6 +115,9 @@ The armed → confirm execution itself lives in the backend
 | Kwork gig/exchange detail shows raw `snake_case` keys | `EntityDetail` dumped `meta` verbatim | fixed by `humanizeKey`/`formatMetaValue` in `browse/DialogView.tsx` |
 | Armed draft doesn't appear in the Queue until the 8s poll | missing `invalidateQueries(approvalsKey(...))` on the `draft` frame | `src/components/accounts/CommandCenter.tsx:112` (#656) |
 | Blank 🪿 bubble replays after reload | tool-only history row passed the replay filter | `src/components/accounts/CommandCenter.tsx:62` (#656 — keep only text/draft/user turns) |
+| Dialog thread won't scroll | `.capb-reader` lacked `min-height:0` so the thread flex child couldn't shrink | `src/styles/cabinet-accounts.css:1140` (add `min-height:0`) |
+| Right-zone tabs clip on a phone («Интегра…» cut off) | `.cap-rtabs` had no `overflow-x` | `src/styles/cabinet-accounts.css:510` (`overflow-x:auto` + hidden scrollbar, `flex:1 0 auto` tabs) |
+| Recorded voice/video never reaches the chat | `/me/accounts/:id/command` accepts `{text,model}` only — no binary upload | backend: add a media-upload field to the command endpoint; `DialogComposer` already holds the `Blob` in `ComposerAttachment.blob` |
 
 ## Related
 - [Cabinet «Функции»](/subsystems/cabinet-functions)
