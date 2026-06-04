@@ -22,9 +22,9 @@ stream capped 1400px), so it cannot know the daemon's click resolution.
 | `agentflow-landing/src/components/cabinet-live/AgentScreen.tsx:201` | `handleMonitorClick` — letterbox-corrects the tap to a 0..1 fraction (client-side, correct) |
 | `agentflow-landing/src/components/cabinet-live/AgentScreen.tsx:230` | `devicesApi.click(deviceId, {x, y, button})` — now surfaces the outcome (sent / offline / failed) instead of swallowing it |
 | `agentflow-landing/src/lib/devicesApi.ts:298` | `click()` REST client — `POST /me/devices/:id/click` |
-| `agentflow-agents/src/routes/me-devices.ts:1550` | `POST /me/devices/:id/click` route — validate 0..1, scale, dispatch via tool RPC |
-| `agentflow-agents/src/routes/me-devices.ts:934` | `normalizedClickToPixels(x, y, screen)` — pure 0..1 → clamped pixel mapper (unit-tested) |
-| `agentflow-agents/src/routes/me-devices.ts:925` | `CLICK_DEFAULT_SCREEN = {w:1440,h:900}` — fallback = cloud Xvfb default |
+| `agentflow-agents/src/routes/me-devices/task-dispatch.ts:638` | `POST /me/devices/:id/click` route — validate 0..1, scale, dispatch via tool RPC |
+| `agentflow-agents/src/routes/me-devices/task-dispatch.ts:92` | `normalizedClickToPixels(x, y, screen)` — pure 0..1 → clamped pixel mapper (unit-tested) |
+| `agentflow-agents/src/routes/me-devices/task-dispatch.ts:83` | `CLICK_DEFAULT_SCREEN = {w:1440,h:900}` — fallback = cloud Xvfb default |
 | `agentflow-agents/src/services/devices-ws.ts:510` | hello handler reads + validates `screen` → `conn.screen` |
 | `agentflow-agents/src/services/device-registry.ts:34` | `DeviceConnection.screen?: {w,h}` — in-memory, no DB/migration |
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_client.py:38` | `_probe_screen_size()` — best-effort `pyautogui.size()`; omitted on headless probe failure |

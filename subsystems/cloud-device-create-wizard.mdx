@@ -34,7 +34,7 @@ This is a sibling of [device-create-wizard](/subsystems/device-create-wizard)
 | `agentflow-landing/src/pages/CabinetDevicePermissions.tsx:119` | `applyBundleToggle` (exported, reused) |
 | `agentflow-landing/src/lib/devicesApi.ts:79` | `updateScope(id, scope)` → `POST /me/devices/:id/scope` |
 | `agentflow-landing/src/main.tsx:741` | route `/cabinet/devices/hosted/new` (RequireAuth + AccessGate) |
-| `agentflow-agents/src/routes/me-devices.ts:545` | `POST /me/devices/:id/scope` — updates `user_devices` by id |
+| `agentflow-agents/src/routes/me-devices/crud.ts:360` | `POST /me/devices/:id/scope` — updates `user_devices` by id |
 | `agentflow-agents/src/routes/me-hosted-devices.ts:1395` | on-demand create returns `device.user_device_id` |
 | `agentflow-agents/src/routes/me-hosted-devices.ts:1323` | warm-pool claim returns `device.user_device_id` |
 

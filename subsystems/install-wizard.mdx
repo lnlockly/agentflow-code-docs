@@ -32,7 +32,7 @@ implemented yet.
 | `agentflow-landing/src/components/InstallWizardStepRow.tsx:1` | Single row UI: icon · label · status pill. |
 | `agentflow-landing/src/lib/installWizardSteps.ts:1` | Typed loader. |
 | `agentflow-landing/src/pages/CabinetHostedDeviceNew.tsx:154` | Now thin wrapper around `<InstallWizard mode='hosted' />`. |
-| `agentflow-agents/src/routes/me-devices.ts:7` | `POST /me/devices` — mints `enrollment_token` from `af_live_*`. Unchanged by this work. |
+| `agentflow-agents/src/routes/me-devices/crud.ts:160` | `POST /me/devices` — mints `enrollment_token` from `af_live_*`. Unchanged by this work. |
 | `agentflow-agents/src/routes/me-hosted-devices.ts:475` | Hosted provisioner; injects daemon env vars. Unchanged. |
 | `agentflow-agents/src/routes/me-hosted-devices.ts:850` | `POST /me/hosted-devices/:id/reenroll` — rotation. Unchanged. |
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/opencode_installer.py:163` | `install_opencode` MCP tool the wizard calls in step `install_opencode_cli`. |

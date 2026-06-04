@@ -22,10 +22,10 @@ paused + audit-trail of when the toggle flipped.
 | `agentflow-agents/src/services/bootstrap-schema.ts:467` | Idempotent in-process mirror of the migration |
 | `agentflow-agents/src/types/devices.ts:33` | `Device.paused?: boolean` field |
 | `agentflow-agents/packages/shared-types/devices.ts:60` | Same field on the canonical contract |
-| `agentflow-agents/src/routes/me-devices.ts:139` | `rowToDevice()` derives `paused` from `paused_at` |
-| `agentflow-agents/src/routes/me-devices.ts:399` | `POST /me/devices/:id/pause` |
-| `agentflow-agents/src/routes/me-devices.ts:421` | `POST /me/devices/:id/resume` |
-| `agentflow-agents/src/routes/me-devices.ts:910` | 409 `device_paused` gate in `dispatch_task` |
+| `agentflow-agents/src/routes/me-devices/shared.ts:175` | `rowToDevice()` derives `paused` from `paused_at` |
+| `agentflow-agents/src/routes/me-devices/crud.ts:395` | `POST /me/devices/:id/pause` |
+| `agentflow-agents/src/routes/me-devices/crud.ts:147` | `POST /me/devices/:id/resume` |
+| `agentflow-agents/src/routes/me-devices/task-dispatch.ts:483` | 409 `device_paused` gate in `dispatch_task` |
 | `agentflow-agents/src/routes/me-autonomous.ts:613` | `pickPrimaryDevice` adds `AND paused_at IS NULL` |
 | `agentflow-agents/tests/devices-pause.test.ts` | `rowToDevice` derivation contract |
 
@@ -95,7 +95,7 @@ already-queued tasks drain via the existing GET /queued_tasks path
 
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
-| Cabinet shows device as paused but dispatch_task still goes through | `device_paused` missing from response | `agentflow-agents/src/routes/me-devices.ts:910` — verify the SELECT pulls `paused_at` and the gate runs before `dispatchLiveDeviceTask` |
+| Cabinet shows device as paused but dispatch_task still goes through | `device_paused` missing from response | `agentflow-agents/src/routes/me-devices/task-dispatch.ts:483` — verify the SELECT pulls `paused_at` and the gate runs before `dispatchLiveDeviceTask` |
 | Autonomous worker keeps picking a paused device | (silent — no greppable string yet, look at `[autonomous] dispatching ...` lines and the device_id) | `agentflow-agents/src/routes/me-autonomous.ts:613` — confirm the SQL includes `AND paused_at IS NULL` |
 | Migration didn't run, column missing | `column "paused_at" does not exist` in agents-server startup | Re-deploy `agentflow-agents` so `bootstrapSchema()` runs the `ALTER TABLE ... ADD COLUMN IF NOT EXISTS paused_at` |
 | Resume returns 404 | `not_found` | Device is soft-deleted or not owned — pause/resume require `deleted_at IS NULL AND user_id = session.sub` |

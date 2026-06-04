@@ -18,8 +18,8 @@ The frozen `agentflow-desktop.exe` polls `github.com/lnlockly/agentflow-computer
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_client.py:200` | `_handle_check_update` — runs the probe on a worker thread + replies with `check_update_result`. |
 | `agentflow-agents/src/services/devices-ws.ts:447` | `check_update_result` route in the WS inbound switch. |
 | `agentflow-agents/src/services/devices-ws.ts:945` | `awaitCheckUpdateResult` + `deliverCheckUpdateResult` — in-memory awaiter registry keyed by correlation id. |
-| `agentflow-agents/src/routes/me-devices.ts:826` | `POST /me/devices/:id/check_update` — Hono route that wires `decideCheckUpdate` to the live WS. |
-| `agentflow-agents/src/routes/me-devices.ts:781` | `decideCheckUpdate` — pure dispatcher (unit-testable) returning the verdict envelope. |
+| `agentflow-agents/src/routes/me-devices/task-dispatch.ts:848` | `POST /me/devices/:id/check_update` — Hono route that wires `decideCheckUpdate` to the live WS. |
+| `agentflow-agents/src/routes/me-devices/task-dispatch.ts:795` | `decideCheckUpdate` — pure dispatcher (unit-testable) returning the verdict envelope. |
 | `agentflow-landing/src/pages/CabinetDeviceDetail.tsx:298` | «Проверить обновление» button wiring + toast renderer. |
 | `agentflow-landing/src/lib/devicesApi.ts:170` | `devicesApi.checkUpdate` REST client. |
 

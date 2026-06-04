@@ -30,7 +30,7 @@ around.
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_client.py:195` | `_handle_stream_subscription(True/False)` — handler dispatched by recv loop |
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/desktop_cli.py:91` | `on_stream_subscribe` — pulses `capture_wake` on subscribe |
 | `agentflow-computer-mcp/tests/test_streamer_toggle.py:1` | 10 tests covering idle/active gating, wake latency, local viewer ref-counting |
-| `agentflow-agents/src/routes/me-devices.ts:824` | `POST /me/devices/:id/stream` route + `decideStreamToggle` verdict helper |
+| `agentflow-agents/src/routes/me-devices/task-dispatch.ts:946` | `POST /me/devices/:id/stream` route + `decideStreamToggle` verdict helper |
 | `agentflow-agents/src/services/device-tasks.ts:130` | `acquireStream` / `releaseStream` — legacy ref-counter, still drives implicit subscribe via MJPEG open |
 | `agentflow-agents/src/services/devices-ws.ts:498` | `resyncStreamSubscription` — re-sends `subscribe_stream` on daemon reconnect when subscriber count > 0 |
 | `agentflow-agents/tests/me-devices-stream-toggle.test.ts:1` | 11 tests pinning schema + verdict matrix for the new endpoint |

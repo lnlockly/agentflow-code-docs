@@ -25,10 +25,10 @@ sub-section under the page header.
 
 | Path | Role |
 |---|---|
-| `agentflow-agents/src/routes/me-devices.ts:140` | `HostedDevicePayload`, `HostedJoinRow`, `UnifiedDeviceResponse` types |
-| `agentflow-agents/src/routes/me-devices.ts:180` | `buildHostedPayload` — pure helper, builds hosted sub-payload from JOIN row |
-| `agentflow-agents/src/routes/me-devices.ts:208` | `resolveDeviceForUser` — accepts either user_devices.id or hosted_devices.id, returns kind + matchedById |
-| `agentflow-agents/src/routes/me-devices.ts:240` | `GET /me/devices/:id` — unified handler with LEFT JOIN on hosted_devices |
+| `agentflow-agents/src/routes/me-devices/crud.ts:45` | `HostedDevicePayload`, `HostedJoinRow`, `UnifiedDeviceResponse` types |
+| `agentflow-agents/src/routes/me-devices/crud.ts:84` | `buildHostedPayload` — pure helper, builds hosted sub-payload from JOIN row |
+| `agentflow-agents/src/routes/me-devices/crud.ts:132` | `resolveDeviceForUser` — accepts either user_devices.id or hosted_devices.id, returns kind + matchedById |
+| `agentflow-agents/src/routes/me-devices/crud.ts:232` | `GET /me/devices/:id` — unified handler with LEFT JOIN on hosted_devices |
 | `agentflow-agents/tests/me-devices-unified.test.ts` | Pin: resolution + kind discriminator + preinstall normalisation |
 | `agentflow-landing/src/lib/devicesApi.ts:30` | `devicesApi.get` return shape now includes optional `kind` + `hosted` |
 | `agentflow-landing/src/types/devices.ts:72` | `HostedDevicePayload` mirror of backend type |

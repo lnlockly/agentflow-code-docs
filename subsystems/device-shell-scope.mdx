@@ -16,10 +16,10 @@ A device's `code_run_command` is gated by `shell_whitelist` (the program — arg
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/config.py:130` | `Scope.shell_whitelist` default = `DEFAULT_SHELL_WHITELIST` |
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/scope.py:50` | `check_shell` — daemon-side gate (baseline ∪ shell_whitelist) |
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/scope.py:61` | baseline-or-whitelist allow check |
-| `agentflow-agents/src/routes/me-devices.ts:101` | `DEFAULT_LOCAL_DEVICE_SCOPE` — seeded scope for new LOCAL devices |
-| `agentflow-agents/src/routes/me-devices.ts:122` | `withDefaultShellWhitelist` — backfills empty scope at dispatch |
-| `agentflow-agents/src/routes/me-devices.ts:425` | `POST /me/devices` seeds the default `scope_json` |
-| `agentflow-agents/src/routes/me-devices.ts:1377` | `dispatch_task` folds the default into the pushed scope |
+| `agentflow-agents/src/routes/me-devices/shared.ts:62` | `DEFAULT_LOCAL_DEVICE_SCOPE` — seeded scope for new LOCAL devices |
+| `agentflow-agents/src/routes/me-devices/shared.ts:83` | `withDefaultShellWhitelist` — backfills empty scope at dispatch |
+| `agentflow-agents/src/routes/me-devices/crud.ts:160` | `POST /me/devices` seeds the default `scope_json` |
+| `agentflow-agents/src/routes/me-devices/task-dispatch.ts:538` | `dispatch_task` folds the default into the pushed scope |
 | `agentflow-agents/src/services/device-registry.ts:178` | `SHELL_SAFE_BASELINE` — server-side mirror of the daemon baseline |
 | `agentflow-agents/src/services/device-registry.ts:256` | `checkScope` shell gate (defence in depth) |
 | `agentflow-agents/src/routes/me-hosted-devices.ts:248` | `HOSTED_DAEMON_DEFAULT_SCOPE` — hosted-pod counterpart |
