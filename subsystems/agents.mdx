@@ -15,7 +15,7 @@ An agent is one row in the `agents` table. Most agents are spawned through `prov
 
 The same rule applies to `agents.keywords`. If the input has no `category`, the column is explicitly `NULL` (not `undefined`, which drizzle would drop). If the input carries garbage (non-string, non-array), the row falls back to `NULL` / `[]` — defence-in-depth so a bogus preset cannot corrupt the column.
 
-`CharacterInput` (`src/services/character.ts:35`) does **not** list `category` or `keywords` as known fields — those are preset-level taxonomy, mirrored onto the DB row by the insert path. `buildCharacter` does not propagate them into its return value either; only `provisionAgent` and the per-insert path in `routes/agents.ts:1657` (hire-from-preset) handle the mirror.
+`CharacterInput` (`src/services/character.ts:35`) does **not** list `category` or `keywords` as known fields — those are preset-level taxonomy, mirrored onto the DB row by the insert path. `buildCharacter` does not propagate them into its return value either; only `provisionAgent` and the per-insert path in `routes/agents/limits-hire.ts:174` (hire-from-preset) handle the mirror.
 
 ## Files (with line refs)
 
@@ -27,13 +27,36 @@ The same rule applies to `agents.keywords`. If the input has no `category`, the 
 | `agentflow-agents/src/db/schema.ts:79` | `category text` column (no enum; validation in `services/agent-taxonomy.ts`). |
 | `agentflow-agents/src/db/schema.ts:80` | `keywords text[] NOT NULL DEFAULT '{}'`. |
 | `agentflow-agents/src/db/schema.ts:183` | `agents_category_idx` partial index (WHERE category IS NOT NULL) for taxonomy queries. |
-| `agentflow-agents/src/routes/agents.ts:1670` | Hire-from-preset path — independent insert (does NOT call `provisionAgent`); also mirrors `category` + `keywords`. |
+| `agentflow-agents/src/routes/agents/limits-hire.ts:162` | Hire-from-preset path — independent insert (does NOT call `provisionAgent`); also mirrors `category` + `keywords`. |
 | `agentflow-agents/src/routes/marketplace.ts:1009` | Fork path — mirrors `base.category`. |
 | `agentflow-agents/src/scripts/bootstrap-marketplace.ts:318` | Platform-owned bootstrap insert. (Does NOT set category — bootstrap rows are admin-curated post-hoc.) |
 | `agentflow-agents/src/services/template-showcase-seed.ts:75` | Showcase platform-owned seed insert. (Same as bootstrap — admin curates taxonomy after.) |
 | `agentflow-agents/src/routes/me.ts:94` | Maestro singleton — internal; no category. |
 | `agentflow-landing/src/components/agents/AgentWorkspace.tsx:151` | Frontend gate: `agent?.category === 'researcher'` → renders knowledge sidebar. **This is the gate the invariant unblocks.** |
 | `agentflow-agents/tests/unit/agent-provision-category.test.ts` | Source-contract regression suite for the mirror. |
+
+### `routes/agents.ts` is now a thin composer
+
+The marketplace AI-agents routes split out of the old 2,165-line god-file into
+cohesive sub-modules. `routes/agents.ts` keeps the same default export
+(`server.ts` mounts it unchanged via `app.route('/', agentsApp)`) and re-exports
+`summaryAgent`, `slugToMcpToolName`, `buildMcpToolDescription`,
+`buildMcpInputSchema`, `checkAgentLimits`. It registers each sub-module's
+`register(app)` in the original declaration order, so every path + method +
+middleware chain stays byte-identical.
+
+| Module | Routes |
+|---|---|
+| `routes/agents/shared.ts` | `publicAgent`, `summaryAgent`, `characterSchema`, `createSchema` (no routes — shared mappers). |
+| `routes/agents/crud.ts` | `POST /agents`, `POST /me/agents/import-from-github`, `POST /me/agents/fork`, `GET /agents`, `GET /agents/:slug`. |
+| `routes/agents/settings-state.ts` | `GET/POST /agents/:slug/settings`, `GET/PATCH /agents/:slug/state`, `DELETE /agents/:slug/state/:plugin`. |
+| `routes/agents/chat.ts` | `POST /agents/:slug/chat`, `POST /agents/:slug/chat/abort`. |
+| `routes/agents/invoke.ts` | `POST /agents/:slug/invoke`, `POST /agents/:slug/invoke_stream`. |
+| `routes/agents/messages.ts` | `GET /agents/:slug/messages`. |
+| `routes/agents/share.ts` | `POST /agents/:slug/share`, `GET /agents/:slug/shares`, `DELETE /agents/:slug/share/:shareSlug`, `GET /shared/:shareSlug`. |
+| `routes/agents/lifecycle.ts` | `POST /agents/:slug/redeploy`, `DELETE /agents/:slug`. |
+| `routes/agents/mcp-tools.ts` | `GET /me/agents/mcp-tools` + `slugToMcpToolName` / `buildMcpToolDescription` / `buildMcpInputSchema`. |
+| `routes/agents/limits-hire.ts` | `GET/PATCH /me/agents/:slug/limits`, `POST /me/agents/hire`, `GET /me/agents`. |
 
 ## Data flow — preset hire
 
@@ -104,10 +127,10 @@ Two routes return the caller's owned agents:
 Both filter `state != 'tombstoned'` and `owner_user_id = session.sub`. The hire endpoint (`POST /me/agents/hire`) stamps `ownerUserId = sub` on the new row, so "owned" and "hired" collapse into the same WHERE predicate — no JOIN against a separate namespace table.
 
 Files:
-- `agentflow-agents/src/routes/agents.ts:300` — `GET /agents` handler (`publicAgent` shape).
-- `agentflow-agents/src/routes/agents.ts:80` — `publicAgent(row, keyIds)` slim mapper.
-- `agentflow-agents/src/routes/agents.ts:107` — `summaryAgent(row)` rich mapper.
-- `agentflow-agents/src/routes/agents.ts:1595` — `GET /me/agents` handler.
+- `agentflow-agents/src/routes/agents/crud.ts:150` — `GET /agents` handler (`publicAgent` shape).
+- `agentflow-agents/src/routes/agents/shared.ts:48` — `publicAgent(row, keyIds)` slim mapper.
+- `agentflow-agents/src/routes/agents/shared.ts:107` — `summaryAgent(row)` rich mapper.
+- `agentflow-agents/src/routes/agents/limits-hire.ts:249` — `GET /me/agents` handler.
 - `agentflow-agents/tests/routes/me-agents-list.test.ts` — shape + filter contract tests (15 cases).
 - `agentflow-landing/src/pages/CabinetDashboard.tsx:119` — frontend consumer.
 
@@ -128,8 +151,8 @@ Both `publicAgent` (returned by `GET /agents`, `GET /agents/:slug`) and the `/ag
 
 Files:
 - `agentflow-agents/src/routes/me-agents-secrets.ts` — the upsert route.
-- `agentflow-agents/src/routes/agents.ts:107` — `publicAgent` carries `required_secrets`.
-- `agentflow-agents/src/routes/agents.ts:419` — `/agents/:slug/settings` carries `required_secrets` + `secret_keys`.
+- `agentflow-agents/src/routes/agents/shared.ts:94` — `publicAgent` carries `required_secrets`.
+- `agentflow-agents/src/routes/agents/settings-state.ts:25` — `/agents/:slug/settings` carries `required_secrets` + `secret_keys`.
 - `agentflow-agents/src/services/seal.ts:31` — `sealSecrets` envelope shared with the provision path.
 - `agentflow-agents/tests/unit/me-agents-secrets-route.test.ts` — 14 source-contract assertions.
 - `agentflow-landing/src/components/agents/AgentSettingsPanel.tsx:325` — frontend consumer.
@@ -176,7 +199,7 @@ The `data_url` is only populated on the optimistic just-sent bubble: the compose
 | Path | Role |
 |---|---|
 | `agentflow-agents/src/services/chat-attachments.ts` | Pure module: `parseAttachments`, `buildPersistedUserContent`, `buildUserMessageContent`. No I/O. |
-| `agentflow-agents/src/routes/agents.ts` (around the `POST /agents/:slug/chat` handler) | Zod `chatAttachmentSchema`, payload-size guard, route wiring into `runChatTurnNative`. |
+| `agentflow-agents/src/routes/agents/chat.ts` (the `POST /agents/:slug/chat` handler) | Zod `chatAttachmentSchema`, payload-size guard, route wiring into `runChatTurnNative`. |
 | `agentflow-agents/src/services/chat-tooluse.ts` | `ChatTurnParams.attachments` surface; first-user-message projection via `buildUserMessageContent`. |
 | `agentflow-agents/tests/unit/chat-attachments.test.ts` | 28 source-contract tests (parser, projections, route + tooluse wiring greps). |
 | `agentflow-landing/src/lib/chatAttachments.ts` | Frontend mirror: client-side staging + `FileReader` → base64. |
