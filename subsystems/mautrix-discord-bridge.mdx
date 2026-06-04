@@ -168,7 +168,7 @@ Returns **501 `mautrix_discord_not_configured`** until the env var is populated 
 | Dendrite CrashLoopBackOff after uncommenting `config_files` | `Invalid config file: open /etc/dendrite/appservices/discord.yaml: no such file or directory` | `mautrix-discord-registration` Secret not created. Re-run bootstrap step 3 in `k8s/mautrix-discord.yaml` header. |
 | Bridge pod logs `pq: connection refused` | `pq: connection refused` in `mautrix-discord` logs | Postgres connectivity / `mautrix_discord` user creds. Check `kubectl -n franchise-factory exec agentflow-postgres-… -- psql -U mautrix_discord -d mautrix_discord -c '\\du'` |
 | `/whoami` succeeds but `discord_username` stays null | (no log; cabinet card shows snowflake) | Best-effort fetch failed and bridge returned only `{id}` — retry by clicking «Обновить» in the cabinet, which re-hits `/status` and re-runs the reconcile path |
-| User pastes a token that's <50 chars | route returns 400 `discord_token_invalid_format` with `reason: too_short` | client-side validator should catch this first — check `agentflow-landing/src/lib/discordValidation.ts` |
+| User pastes a token that's &lt;50 chars | route returns 400 `discord_token_invalid_format` with `reason: too_short` | client-side validator should catch this first — check `agentflow-landing/src/lib/discordValidation.ts` |
 
 ## Operator bootstrap (one-time)
 

@@ -14,7 +14,7 @@ description: "POST /me/projects returns in <2s; foundation + kind + plan resolve
 `POST /me/projects` used to block 30-60s while the LLM-scored foundation
 recommender, kind classifier, and GitHub fetches all ran inline. As of
 2026-05-22 the row inserts with `status='preparing'` + a placeholder
-foundation, the response returns in <2s, and `runBackgroundProjectPrep`
+foundation, the response returns in &lt;2s, and `runBackgroundProjectPrep`
 fills in the real kind + foundation + plan via `setImmediate` after Hono
 flushes the response.
 
@@ -108,8 +108,8 @@ call anyway).
 
 | Path | Before | After |
 |---|---|---|
-| POST /me/projects (auto kind, no explicit foundation) | 30-60s | <2s |
-| POST /me/projects (explicit kind + explicit foundation) | 5-10s | <2s |
+| POST /me/projects (auto kind, no explicit foundation) | 30-60s | &lt;2s |
+| POST /me/projects (explicit kind + explicit foundation) | 5-10s | &lt;2s |
 | Time-to-`awaiting_approval` (auto kind) | 30-60s | ~30s (now async) |
 
 The total wall-clock time before the user can approve is unchanged; what
