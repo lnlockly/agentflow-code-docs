@@ -28,10 +28,10 @@ so the toggle survives a pod restart (the bridge re-pushes from the row).
 | `agentflow-agents/src/openclaw-shim/bridge.ts:116` | `AutopostConfigInbound` — server→bridge `autopost_config` WS frame shape |
 | `agentflow-agents/src/openclaw-shim/bridge.ts:128` | `isAutopostConfig` — frame guard |
 | `agentflow-agents/src/openclaw-shim/bridge.ts:444` | `handleAutopostConfig` — calls `applyAutopost` (errors logged, never crash the bridge) |
-| `agentflow-agents/src/routes/me-devices.ts:1803` | `autopostEnableSchema` — `{ brief, schedule?, channel?, target? }`, 5-field cron regex |
-| `agentflow-agents/src/routes/me-devices.ts:2000` | `GET /me/devices/:id/autopost` — saved config + `device_online` |
-| `agentflow-agents/src/routes/me-devices.ts:2035` | `POST /me/devices/:id/autopost` — persist row + push `autopost_config` (enabled) |
-| `agentflow-agents/src/routes/me-devices.ts:2092` | `DELETE /me/devices/:id/autopost` — flip row off + push disable frame |
+| `agentflow-agents/src/routes/me-devices/autopost.ts:27` | `autopostEnableSchema` — `{ brief, schedule?, channel?, target? }`, 5-field cron regex |
+| `agentflow-agents/src/routes/me-devices/autopost.ts:108` | `GET /me/devices/:id/autopost` — saved config + `device_online` |
+| `agentflow-agents/src/routes/me-devices/autopost.ts:143` | `POST /me/devices/:id/autopost` — persist row + push `autopost_config` (enabled) |
+| `agentflow-agents/src/routes/me-devices/autopost.ts:200` | `DELETE /me/devices/:id/autopost` — flip row off + push disable frame |
 | `agentflow-agents/migrations/2026-05-31b-openclaw-autopost.sql:15` | `openclaw_autopost` table (one row per device) |
 | `agentflow-agents/tests/openclaw-autopost.test.ts:1` | unit tests — builders + `applyAutopost` orchestration + enable schema |
 | `agentflow-landing/src/components/devices/DeviceFunctions.tsx:36` | «Функции» card — brief + schedule + channel + Включить/Сохранить/Выключить |
@@ -44,7 +44,7 @@ so the toggle survives a pod restart (the bridge re-pushes from the row).
 ```
 cabinet «Функции» (DeviceFunctions.tsx)
   POST /me/devices/:id/autopost { brief, schedule, channel, target? }
-    → me-devices.ts: validate (autopostEnableSchema) + UPSERT openclaw_autopost
+    → me-devices/autopost.ts: validate (autopostEnableSchema) + UPSERT openclaw_autopost
     → getConnection(id).send({ type:'autopost_config', enabled:true, ... })   (device WS)
         │  (offline → 409 { saved:true }; bridge re-pushes on reconnect)
         ▼
@@ -82,7 +82,7 @@ the row so re-enabling reuses it.
 | Enable accepted but no cron registered | `autopost apply failed:` | `src/openclaw-shim/bridge.ts:444` (gateway error from `applyAutopost`) |
 | Duplicate posts | two `af-autopost` cron jobs | `pickAutopostJobIds` removes ALL name matches before add — `src/openclaw-shim/autopost.ts:112` |
 | Post is generic / placeholder | n/a (content) | `openclaw-image/skills/af-autopost/SKILL.md` — brief is the only topic source |
-| `invalid_body` on enable | route 400 `invalid_body` | bad cron shape — `autopostEnableSchema` (`me-devices.ts:1803`) requires 5 fields |
+| `invalid_body` on enable | route 400 `invalid_body` | bad cron shape — `autopostEnableSchema` (`me-devices/autopost.ts:27`) requires 5 fields |
 
 ## Verify on a live pod
 

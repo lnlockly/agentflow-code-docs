@@ -37,7 +37,7 @@ collapses to the clean task feed when it stops.
 | `agentflow-agents/src/openclaw-shim/bridge.ts:307` | `onApproval` → `approval_request` task_action (detail = JSON id+command) |
 | `agentflow-agents/src/openclaw-shim/bridge.ts:154` | `encodeApprovalDetail` — serialize approval into the row detail |
 | `agentflow-agents/src/types/devices.ts:210` | `approval_resolve` server→daemon WS frame |
-| `agentflow-agents/src/routes/me-devices.ts:1885` | `POST /me/devices/:id/approval` → sends `approval_resolve` to the device |
+| `agentflow-agents/src/routes/me-devices/task-dispatch.ts:973` | `POST /me/devices/:id/approval` → sends `approval_resolve` to the device |
 | `agentflow-landing/src/components/cabinet-live/ApprovalBar.tsx:21` | `ExecApproval` shape (allow/deny) beside the legacy draft shape |
 | `agentflow-landing/src/pages/CabinetDeviceLive.tsx:347` | `applyApprovalRow` — intercept approval rows on the task SSE → ApprovalBar state |
 | `agentflow-landing/src/pages/CabinetDeviceLive.tsx:711` | `handleResolveApproval` → `devicesApi.resolveApproval` |
@@ -52,7 +52,7 @@ collapses to the clean task feed when it stops.
 | `agentflow-agents/openclaw-image/Dockerfile` | bakes Chromium (`playwright-core install --with-deps chromium`) so the browser tool can launch |
 | `agentflow-landing/src/components/cabinet-live/HeadlessLiveView.tsx` `BrowserScreenPane` | opens the device MJPEG, self-reveals on the first frame, hides ~6s after the last |
 | `agentflow-landing/src/pages/CabinetDeviceLive.tsx` (HeadlessLiveView call) | passes the canonical `deviceId` so the pane can open `live_stream` |
-| `agentflow-agents/src/routes/me-devices.ts:2178` | `GET /me/devices/:id/live_stream` MJPEG endpoint (reused, unchanged) |
+| `agentflow-agents/src/routes/me-devices/tasks.ts:372` | `GET /me/devices/:id/live_stream` MJPEG endpoint (reused, unchanged) |
 | `agentflow-agents/src/services/device-tasks.ts:130` | `acquireStream`/`releaseStream` send `subscribe_stream`/`unsubscribe_stream` to the device |
 
 ## Data flow

@@ -54,7 +54,7 @@ All wired in `agentflow-agents/src/services/auto-pinger.ts` (run under
 
 `stale-task-sweep` uses an atomic `UPDATE … RETURNING` so two pods can't
 double-issue a retry. `device_tasks` re-queue on failed WS send
-(`status='queued', dispatched_at=NULL`, `routes/me-devices.ts:970`).
+(`status='queued', dispatched_at=NULL`, `routes/me-devices/task-dispatch.ts:376`).
 
 ## Failure modes
 | Symptom | Log signature for grep | Where to fix |

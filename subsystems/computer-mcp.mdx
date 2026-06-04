@@ -27,10 +27,10 @@ task_error` to `device_action_log`, and proxies the daemon's local MJPEG capture
 | `agentflow-landing/src/pages/CabinetDeviceLive.tsx:TaskComposer` | 409 retry with 2/4/8s backoff + install-card on final failure |
 | `agentflow-landing/src/pages/CabinetDeviceLive.tsx:LiveScreenFeed` | "ожидаю первый кадр…" skeleton until `<img>.naturalWidth > 0` |
 | `agentflow-agents/src/services/device-registry.ts`  | connection pool + `computer.*` tool dispatch |
-| `agentflow-agents/src/routes/me-devices.ts:424`     | `POST /me/devices/:id/dispatch_task` |
-| `agentflow-agents/src/routes/me-devices.ts:489`     | `GET /me/devices/:id/tasks/stream` (device-wide SSE) |
-| `agentflow-agents/src/routes/me-devices.ts:549`     | `GET /me/devices/:id/tasks/:task_id/stream` (per-task SSE) |
-| `agentflow-agents/src/routes/me-devices.ts:613`     | `GET /me/devices/:id/live_stream` (MJPEG proxy) |
+| `agentflow-agents/src/routes/me-devices/task-dispatch.ts:483`     | `POST /me/devices/:id/dispatch_task` |
+| `agentflow-agents/src/routes/me-devices/tasks.ts:173`     | `GET /me/devices/:id/tasks/stream` (device-wide SSE) |
+| `agentflow-agents/src/routes/me-devices/tasks.ts:288`     | `GET /me/devices/:id/tasks/:task_id/stream` (per-task SSE) |
+| `agentflow-agents/src/routes/me-devices/tasks.ts:372`     | `GET /me/devices/:id/live_stream` (MJPEG proxy) |
 | `agentflow-agents/src/routes/me-telegram.ts` `resolveAccountId` | resolves the Telethon `account_id` from the System-A `list_accounts` list (NOT `chat_tg_links`); honors an explicit `account_id` for multi-account; defaults to first `status='active'`. |
 | `agentflow-agents/src/routes/me-telegram.ts` `dispatchSend/Dialogs/Messages/Search/React/Whoami/Accounts` | the `af_telegram_*` REST surface — back daemon's `af_send_telegram_message` + `af_telegram_*` |
 | `agentflow-agents/src/services/tg-account-source.ts` `listTelegramAccountsForOwner` / `pickUsableTelegramAccount` | System-A account list (MCP `list_accounts`) used by `resolveAccountId`. |
@@ -39,8 +39,8 @@ task_error` to `device_action_log`, and proxies the daemon's local MJPEG capture
 | `agentflow-agents/src/services/kind-registry.ts:24` | `desktop_agent` added to `USER_FACING_PROJECT_KINDS` |
 | `agentflow-agents/migrations/2026-05-22a-device-tasks.sql` | `task_id` + `kind` columns on `device_action_log` |
 | `agentflow-agents/migrations/2026-05-22d-device-task-queue.sql` | `device_tasks` queue table (dispatch during WS blackout) |
-| `agentflow-agents/src/routes/me-devices.ts:QUEUE_TRUST_WINDOW_MS` | 60s window during which queue-when-WS-gone is permitted |
-| `agentflow-agents/src/routes/me-devices.ts:shouldQueueForOfflineDevice` | pure helper — `last_seen` ≤60s old → queue, else 409 |
+| `agentflow-agents/src/routes/me-devices/shared.ts:QUEUE_TRUST_WINDOW_MS` | 60s window during which queue-when-WS-gone is permitted |
+| `agentflow-agents/src/routes/me-devices/shared.ts:shouldQueueForOfflineDevice` | pure helper — `last_seen` ≤60s old → queue, else 409 |
 | `agentflow-agents/packages/shared-types/devices.ts:132` | `WsMessage` task/stream variants |
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_client.py:171` | `_handle_task_dispatch` queues task into `DriverState` |
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_client.py:186` | `_handle_stream_subscription` toggles the capture-loop flag |
@@ -139,7 +139,7 @@ Cabinet                 agentflow-agents (pod)                  agentflow-deskto
 - **History replay** — `loadRecentEvents(deviceId, taskId | null, limit=100)` reads the last N rows of `kind IN ('task_action','task_complete','task_error')` from `device_action_log` joined through `device_sessions.device_id`. SSE handlers replay those before subscribing, so the cabinet timeline is non-empty on open.
 - **Unified payload** — `TaskStreamEvent` carries a `kind` discriminator (`task_action | task_complete | task_error`), `device_id`, `task_id`, `ts`. Action variant adds `action`, `detail?`, `screenshot_b64?`, `screenshot_url?`. Complete variant adds `answer`, `iterations?`, `tokens_used?`, `cost_usd?`. Error variant adds `error`.
 
-The SSE writer in `routes/me-devices.ts:writeTaskStreamEvent` emits each event twice: once as a named SSE event (`action` / `complete` / `error`) carrying the legacy camelCase shape the existing cabinet (`CabinetDeviceLive.tsx:319-322`) listens for, and once as a default `message` event carrying the unified `{kind, …}` payload for new consumers. Per-task subscriptions auto-close after `task_complete` or `task_error`.
+The SSE writer in `routes/me-devices/tasks.ts:writeTaskStreamEvent` emits each event twice: once as a named SSE event (`action` / `complete` / `error`) carrying the legacy camelCase shape the existing cabinet (`CabinetDeviceLive.tsx:319-322`) listens for, and once as a default `message` event carrying the unified `{kind, …}` payload for new consumers. Per-task subscriptions auto-close after `task_complete` or `task_error`.
 
 ## Auto-start guarantees (updated 2026-05-22)
 
