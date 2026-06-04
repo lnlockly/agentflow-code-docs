@@ -79,3 +79,18 @@ none recognised -> `400 nothing_to_update`.
 - [Approval queue](/subsystems/approval-queue) — the bulk fan-out target a group resolves into.
 - [Accounts Control Pult (backend)](/subsystems/accounts-pult) — the surface that renders the group pills.
 - [Connector core](/subsystems/connector-core) — the `${platform}:${ref}` account-ref shape stored in `account_refs[]`.
+
+## Frontend wiring (Пульт group pills + manage modal)
+
+The `/cabinet/accounts` Пульт consumes these routes through the app API client
+(no raw fetch):
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/lib/agentsApi/accounts.ts` | `getAccountGroups` / `createAccountGroup` / `renameAccountGroup` / `updateGroupMembers` (`{add,remove}`) / `setGroupMembers` (`{account_refs}`) / `deleteAccountGroup`; `ServerAccountGroup` type mirrors the server shape. Reads degrade to `[]` on 404/0/501. |
+| `agentflow-landing/src/components/accounts/GroupsPills.tsx` | Left-rail pills: `Все` -> server farms (`group:<id>`) -> status-derived (`status:<s>`), plus a trailing `+` manage pill. |
+| `agentflow-landing/src/components/accounts/GroupsManageModal.tsx` | Create farm by name, rename/delete, toggle each account in/out (one PATCH `{add\|remove}` per toggle). Invalidates the `['account-groups']` query. |
+| `agentflow-landing/src/pages/CabinetAccounts.tsx` | Fetches groups, filters the account list by the active `group:<id>` member refs, falls back to `all` when the active farm is deleted. |
+
+Membership writes use the existing PATCH delta slots — no new backend endpoint
+was needed.
