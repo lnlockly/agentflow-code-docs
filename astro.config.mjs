@@ -109,6 +109,7 @@ export default defineConfig({
             { label: 'Accounts Pult — Entities', slug: 'subsystems/accounts-pult-entities' },
             { label: 'Connector Core', slug: 'subsystems/connector-core' },
             { label: 'Kwork Connector (current HTML + reauth)', slug: 'subsystems/kwork-connector' },
+            { label: 'Proxied Cloud-Browser Connect (FE)', slug: 'subsystems/proxied-browser-connect' },
             { label: 'Approval Queue', slug: 'subsystems/approval-queue' },
             { label: 'Account Groups (farms)', slug: 'subsystems/account-groups' },
             { label: 'Account Automations', slug: 'subsystems/account-automations' },
