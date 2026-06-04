@@ -48,7 +48,10 @@ POST /me/approvals/:id/confirm ──▶ confirm():
     UPDATE … SET status='executing' WHERE id, user_id, status='armed' RETURNING *
       ├─ zero rows  → { alreadyHandled:true }   (idempotent no-op — replay / race / foreign owner)
       ├─ dry_run    → status='executed' (connector NOT called)
+      ├─ has attachments[] but connector.def.supportsMedia !== true
+      │             → status='failed' error_message='unsupported_media' (NOT sent)
       └─ else       → getConnector(platform).executeAction(action) ONCE
+                        (attachments[] → loadCommandMedia → tg-mcp send_voice|send_file)
                         → status='executed' (+external_id) | 'failed' (+error_message)
 ```
 
@@ -65,7 +68,8 @@ armed ──confirm──▶ executing ──ok──▶ executed
 - **Status enum (text):** `armed | executing | executed | failed | rejected | expired`. `expired` is a terminal status set in place when a confirm hits an `armed` row older than the confirmable window (`ARMED_TTL_SECONDS`, 24h, measured from `COALESCE(scheduled_at, created_at)`) — the connector is never called.
 - **Env:** none new (uses `DATABASE_URL`; auth via `requireSession` / `AUTH_JWT_SECRET`).
 - **Routes:** `GET /me/approvals`, `POST /me/approvals/:id/{confirm,edit,reject}`, `POST /me/approvals/confirm-all`. All `requireSession`, scoped by `session.sub`.
-- **Connector contract:** `getConnector(platform).executeAction(action, {ownerUserId})` is the ONLY side-effecting call. Registered via the connector registry — adding a platform is one row, no route/UI change.
+- **Connector contract:** `getConnector(platform).executeAction(action, {ownerUserId})` is the ONLY side-effecting call. Registered via the connector registry — adding a platform is one row, no route/UI change. A connector declares media capability with `def.supportsMedia` (telegram = true).
+- **Media on a draft:** the persisted `payload.attachments[]` holds `{ media_id, kind, filename, mime }` pointers only — the bytes live in `account_command_media` and are read at confirm time (no LLM-context bloat). See [accounts-pult](/subsystems/accounts-pult) § Composer media.
 
 ## Failure modes
 | Symptom | Log signature for grep | Where to fix |
@@ -78,6 +82,8 @@ armed ──confirm──▶ executing ──ok──▶ executed
 | Edit missing body | `payload_required` | `src/routes/me-approvals.ts:72` |
 | Confirm of an old draft fires a now-stale action | `stale_expired` in the route JSON (409); `confirm()` returns `staleExpired:true` and flips the row to `expired` | `src/approval/executor.ts:76` — TTL-bounded atomic claim (`ARMED_TTL_SECONDS`) |
 | Row stuck `executing` after a crash mid-`executeAction` | `status='executing'` with no `executed_at` (not re-claimable — claim needs `armed`) | (Wave 6) healer requeues `executing` rows older than N min back to `armed` or marks `failed` |
+| Media draft confirmed on a connector that cannot carry media | `unsupported_media` (row → failed, connector NOT called) | `src/approval/executor.ts` — set `def.supportsMedia` on the connector, or the platform defers media |
+| Approved voice/file draft fails to ship the bytes | `media_not_found` (connector returns it from `executeAction`) | clip expired (~24h TTL) / wrong owner — re-record; `src/services/account-command-media.ts` `loadCommandMedia` |
 
 ## Related
 - [accounts-pult](/subsystems/accounts-pult) — the Пульт UI this queue feeds.
