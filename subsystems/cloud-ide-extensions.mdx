@@ -1,0 +1,75 @@
+---
+title: "Cloud IDE — Extension Packs + Codex-via-flow"
+description: "Installable Open VSX extension packs for the Cloud IDE, and routing the OpenAI-compatible coding extension through the platform flow facade instead of api.openai.com."
+---
+
+# Cloud IDE — Extension Packs + Codex-via-flow
+
+## TL;DR
+The Cloud IDE (`code-server` at `ide.agentflow.website`) gains named, installable
+**extension packs** the user picks in the cabinet, and the OpenAI-compatible AI
+coding extension (`continue.continue`) is repointed at the platform **flow**
+facade (`<origin>/_agents/llm/v1`) instead of `api.openai.com`. The model is the
+`flow` alias (resolved server-side); the API key is a per-user `af_live_*` flow
+key minted server-side, never a real OpenAI key and never minted in the FE.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/ide-extension-packs.ts:67` | `EXTENSION_PACKS` catalog (Веб/Python/AI/Базовый), pure data |
+| `agentflow-agents/src/services/ide-extension-packs.ts:42` | `CODEX_EXTENSION_ID = 'continue.continue'` (the OpenAI-compatible coding extension) |
+| `agentflow-agents/src/services/ide-extension-packs.ts:131` | `buildInstallCommands` → `code-server --install-extension <id> --force` argv per id |
+| `agentflow-agents/src/services/ide-extension-packs.ts:145` | `flowOpenAiBaseUrl` → `<origin>/_agents/llm/v1` (single source: `openclaw-shim/config.ts` `flowBaseUrl`) |
+| `agentflow-agents/src/services/ide-extension-packs.ts:165` | `renderFlowSettings` → Continue `models[0]` with `apiBase`=flow, `model`='flow' |
+| `agentflow-agents/src/services/ide-extension-packs.json:1` | mirror catalog for the k8s entrypoint (non-TS consumer) |
+| `agentflow-agents/src/services/cloud-ide-flow-key.ts:48` | `ensureCloudIdeFlowKey` — mint-or-rotate per-user `af_live_*` flow key |
+| `agentflow-agents/src/routes/me-cloud-ide-extensions.ts:69` | `POST /me/cloud-ide/extensions { pack }` — install + flow settings |
+| `agentflow-agents/src/routes/me-cloud-ide-extensions.ts:64` | `GET /me/cloud-ide/extensions/packs` — catalog for the picker |
+| `agentflow-agents/src/server.ts` (`meCloudIdeExtensionsApp`) | route registration (additive) |
+| `agentflow-agents/k8s/cloud-ide/15-bootstrap.yaml:1` | bootstrap ConfigMap: default pack + flow settings on first start |
+| `agentflow-agents/k8s/cloud-ide/10-deployment.yaml` (`bootstrap-extensions` initContainer) | runs `bootstrap.sh` on boot |
+
+## Data flow
+```
+cabinet picker → POST /me/cloud-ide/extensions { pack }   (requireSession: cookie OR x-api-key)
+  → getExtensionPack(pack)            (unknown → 400 unknown_pack, no exec)
+  → for each id: kubectl exec deployment/cloud-ide -c code-server --
+        code-server --install-extension <id> --force   (one exec per id; a single failure never aborts)
+  → ensureCloudIdeFlowKey(userId)     (mint af_live_* flow key, server-side)
+  → write settings.json (merge):
+        continue.models[0] = { provider:"openai", model:"flow",
+                               apiBase:"<origin>/_agents/llm/v1", apiKey:<af_live_*> }
+  → 200 { installed[], failed[], flowSettingsWritten }   (never 500 on a single failure)
+
+k8s boot: initContainer bootstrap-extensions → bootstrap.sh
+  → installs DEFAULT pack (basic) + (when CLOUD_IDE_FLOW_KEY set) AI pack + flow settings
+```
+
+The coding extension then sends OpenAI `/chat/completions` to
+`<origin>/_agents/llm/v1/chat/completions` with `Authorization: Bearer af_live_*`.
+`pickFlowUpstream` (`public-llm-upstream.ts`) resolves the `flow` alias to the
+live concrete model per request — no model id is hardcoded.
+
+## DB / Env / API
+- Tables: `api_keys` (per-user `cloud-ide:flow` row holds the flow key hash).
+- Env (pod): `AF_API_URL` (origin for the flow baseURL), `CLOUD_IDE_FLOW_KEY`
+  (optional boot-time flow key from Secret `cloud-ide-auth.flow_key`).
+- Routes: `POST /me/cloud-ide/extensions`, `GET /me/cloud-ide/extensions/packs`.
+- Flow OpenAI baseURL: `https://agentflow.website/_agents/llm/v1` (the extension
+  appends `/chat/completions`). Model: the `flow` alias. NEVER `api.openai.com`.
+- Codex/OpenAI extension id: `continue.continue` (Open VSX). Claude companion:
+  `anthropic.claude-code`.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Pack not applied, 400 | response `unknown_pack` | client sent an unknown slug — list via `GET /me/cloud-ide/extensions/packs`, `me-cloud-ide-extensions.ts:79` (`getExtensionPack` miss) |
+| One extension missing, others OK | `failed:[{id,detail}]` in the 200 body | bad Open VSX id or registry hiccup; re-run is a no-op (`--force`), `ide-extension-packs.ts:120` |
+| AI assistant talks to OpenAI, not flow | `apiBase` is `api.openai.com` in settings.json | `renderFlowSettings` must set `apiBase` to `flowOpenAiBaseUrl` — `ide-extension-packs.ts:159` |
+| Boot AI pack skipped | `[cloud-ide-bootstrap] CLOUD_IDE_FLOW_KEY unset` | create Secret key `cloud-ide-auth.flow_key`; otherwise per-user mint at runtime, `15-bootstrap.yaml` |
+| Flow call 403 | upstream WAF blocks default `OpenAI/JS` UA | the editor extension UA differs; if blocked, mirror `FLOW_USER_AGENT`, `openclaw-shim/config.ts:45` |
+
+## Related
+- [Cloud IDE](/subsystems/cloud-ide) — base `code-server` deployment
+- Flow facade base: `openclaw-shim/config.ts` `flowBaseUrl` (single source of truth)
+- Per-user flow aliases: PRs #807 (per-user aliases) + #850 (alias resolution on the OpenAI endpoint)
