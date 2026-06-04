@@ -1,0 +1,71 @@
+---
+title: "JSON App Manifests"
+description: "Every platform feature is a JSON app: schema + on-disk registry + read-only /me/apps HTTP surface + CLI, consumed by the generic FE renderer."
+---
+
+# JSON App Manifests
+
+## TL;DR
+A feature on AgentFlow is declared as a JSON `AppManifest` (modes, panels,
+composer, pricing, CLI commands, MCP/engine `uses`) rather than bespoke code.
+`app-manifests/*.json` ship in the image; `src/app-manifests/registry.ts` loads
+them into a slug→manifest map; `GET /me/apps` + `GET /me/apps/:slug` expose them
+read-only; the `agentflow-apps` CLI renders the SAME registry. The frontend draws
+any manifest generically (see [Generic App Renderer](/subsystems/generic-app-renderer)).
+Examples: `accounts-pult.json` (Пульт) and `cloud-ide.json`
+([Cloud IDE](/subsystems/cloud-ide)).
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/app-manifests/schema.ts:124` | `appManifestSchema` (zod) — top-level manifest shape |
+| `agentflow-agents/src/app-manifests/schema.ts:46` | `modeSchema` — composer modes |
+| `agentflow-agents/src/app-manifests/schema.ts:74` | `panelSchema` — generic UI panel (`type` is open) |
+| `agentflow-agents/src/app-manifests/schema.ts:92` | `composerSchema` — input box + `routes` (match→mode) |
+| `agentflow-agents/src/app-manifests/schema.ts:112` | `cliCommandSchema` — CLI commands a manifest exposes |
+| `agentflow-agents/src/app-manifests/schema.ts:147` | `export type AppManifest` |
+| `agentflow-agents/src/app-manifests/schema.ts:162` | `validateManifest()` → `{ok,manifest}` / typed error |
+| `agentflow-agents/src/app-manifests/registry.ts:40` | `findManifestsDir()` — first candidate dir with `.json` |
+| `agentflow-agents/src/app-manifests/registry.ts:58` | `loadManifestsFromDir()` — `.json` → slug map, skips bad files |
+| `agentflow-agents/src/app-manifests/registry.ts:111` | `registry()` — cached map (`resetRegistryCache()` at :117) |
+| `agentflow-agents/src/app-manifests/registry.ts:122` | `listManifests()` / `getManifest()` (:127) |
+| `agentflow-agents/src/routes/me-apps.ts:25` | `GET /me/apps` (requireSession) — list |
+| `agentflow-agents/src/routes/me-apps.ts:30` | `GET /me/apps/:slug` — one, 404 when unknown |
+| `agentflow-agents/src/cli/agentflow-apps.ts:105` | `runApps(argv,print)` — `list` / `show` / `run` verbs |
+| `agentflow-agents/src/cli/agentflow-apps.ts:37` | `renderList()` reads the registry (GUI + CLI share it) |
+| `agentflow-agents/app-manifests/accounts-pult.json` | First example manifest (Пульт) |
+| `agentflow-agents/app-manifests/cloud-ide.json` | Cloud IDE manifest |
+
+## Data flow
+```
+app-manifests/*.json (in image)
+   │  readdirSync + validateManifest (zod)
+   ▼
+registry.ts  slug→AppManifest (cached)
+   ├─ HTTP: GET /me/apps        → listManifests()
+   ├─ HTTP: GET /me/apps/:slug  → getManifest(slug)   (404 if absent)
+   └─ CLI:  agentflow-apps list|show|run → same registry
+   ▼
+FE: /apps grid + /apps/:slug renderer (generic panel map)
+```
+
+## DB / Env / API
+- Tables: none — manifests are on-disk JSON (DB-backed/user-authored apps are a later phase, see `routes/me-apps.ts:8`).
+- Env: none required; disk resolution mirrors `services/preset-store.ts` candidate-dir list (`registry.ts:7`).
+- Routes: `GET /me/apps`, `GET /me/apps/:slug` (both `requireSession`).
+- CLI: `agentflow-apps list | show <slug> | run <slug> <cmd>`.
+- Manifest `uses`: free-string `engine` + `mcp_tools` (engine selection still routes through `useModel`, never a hardcoded model).
+
+## Failure modes
+| Symptom | Log signature / response for grep | Where to fix |
+|---|---|---|
+| Manifest absent → 404 on app page | response `{ ok:false, error:'app_not_found' }` (FE: «Апп … не найден») | `agentflow-agents/src/routes/me-apps.ts:33` |
+| A bad `.json` silently skipped from registry | `loadManifestsFromDir` collects `errors[]` (file kept out of map) | `agentflow-agents/src/app-manifests/registry.ts:58` |
+| No candidate dir found at boot | `findManifestsDir()` returns `null` → empty registry | `agentflow-agents/src/app-manifests/registry.ts:40` |
+| CLI unknown verb | prints `unknown command: <verb>` + USAGE | `agentflow-agents/src/cli/agentflow-apps.ts:121` |
+
+## Related
+- [Generic App Renderer](/subsystems/generic-app-renderer) — the FE that draws any manifest
+- [Cloud IDE](/subsystems/cloud-ide) — `cloud-ide.json` example manifest
+- [Accounts Pult](/subsystems/accounts-pult) — `accounts-pult.json` example manifest
+- [AgentFlow CLI](/subsystems/agentflow-cli)

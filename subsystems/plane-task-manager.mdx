@@ -1,0 +1,59 @@
+---
+title: "Plane Task Manager"
+description: "Self-hosted Plane stack on k8s at tasks.agentflow.website — the project/issue backend behind the tasks MCP server."
+---
+
+# Plane Task Manager
+
+## TL;DR
+A self-hosted [Plane](https://plane.so) instance (open-source project/issue
+tracker) runs on the cluster at `tasks.agentflow.website` and is the backend for
+the [tasks MCP server](/subsystems/tasks-mcp). The k8s manifests under
+`k8s/plane/` deploy postgres + redis + rabbitmq + minio + the Plane api / worker
+/ beat / web / space / admin / live processes. `scripts/plane-bootstrap.sh`
+seeds the admin user, the `AgentFlow` workspace, and a workspace API token, then
+prints `PLANE_API_TOKEN` / `PLANE_WORKSPACE` to paste into the agents secret.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/k8s/plane/kustomization.yaml` | Plane stack kustomize entrypoint |
+| `agentflow-agents/k8s/plane/00-config.yaml:73` | `plane-env` ConfigMap (`NEXT_PUBLIC_API_BASE_URL`, etc.) |
+| `agentflow-agents/k8s/plane/30-api.yaml` | Django api `plane-api:8000` |
+| `agentflow-agents/k8s/plane/36-live.yaml:66` | Hocuspocus live server — needs `API_BASE_URL` |
+| `agentflow-agents/k8s/plane/40-ingress.yaml:33` | ingress host `tasks.agentflow.website` |
+| `agentflow-agents/k8s/plane/SETUP.md` | bring-up runbook |
+| `agentflow-agents/scripts/plane-bootstrap.sh:90` | seeds workspace + token, prints `PLANE_API_TOKEN`/`PLANE_WORKSPACE` (:163) |
+
+## Data flow
+```
+k8s/plane/*  → postgres + redis + rabbitmq + minio
+             → plane-api (Django, :8000) ← worker / beat / live / web / space / admin
+ingress tasks.agentflow.website → web/space/admin + /api → plane-api
+
+scripts/plane-bootstrap.sh
+   kubectl exec into a Running plane-api pod
+   → create admin + AgentFlow workspace + workspace API token
+   → prints PLANE_API_TOKEN= / PLANE_WORKSPACE=  → paste into agents secret
+   → tasks MCP reads PLANE_API_BASE/TOKEN/WORKSPACE
+```
+REST shape (`plane-bootstrap.sh:177`): base `https://tasks.agentflow.website/api/v1/`,
+header `X-API-Key: $PLANE_API_TOKEN`, `…/workspaces/$PLANE_WORKSPACE/projects/…`.
+
+## DB / Env / API
+- Env (consumed by tasks MCP): `PLANE_API_BASE` (e.g. `https://tasks.agentflow.website/api/`), `PLANE_API_TOKEN` (workspace API token, `X-API-Key`), `PLANE_WORKSPACE` (workspace slug).
+- Env (live server): `API_BASE_URL` → `http://plane-api:8000` (in-cluster Service).
+- Bootstrap env: `PLANE_ADMIN_EMAIL`, `PLANE_ADMIN_PASSWORD`, `PLANE_WORKSPACE_NAME` (default `AgentFlow`), `PLANE_WORKSPACE_SLUG` (default `agentflow`), `PLANE_TOKEN_LABEL` (default `agentflow-mcp`).
+- Host: `tasks.agentflow.website`.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `plane-live` CrashLoopBackOff at boot | `API_BASE_URL must be a valid URL` | declare `API_BASE_URL` in `agentflow-agents/k8s/plane/36-live.yaml:66` |
+| bootstrap finds no api pod | `ERROR: no Running plane-api pod found in ns` | `agentflow-agents/scripts/plane-bootstrap.sh:67` |
+| bootstrap printed nothing usable | grep guard fails on `^PLANE_API_TOKEN=`/`^PLANE_WORKSPACE=` | `agentflow-agents/scripts/plane-bootstrap.sh:171` |
+| tasks MCP returns `tasks_not_configured` | env unset after bootstrap | re-run bootstrap, paste token into agents secret |
+
+## Related
+- [Tasks MCP](/subsystems/tasks-mcp) — the MCP server that calls this Plane workspace
+- [JSON App Manifests](/subsystems/json-app-manifests)
