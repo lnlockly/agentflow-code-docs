@@ -110,6 +110,7 @@ ProxiedBrowserLoginService.startLogin(ownerUserId, 'kwork')
 | status never flips to `connected` | `hint:'no_ready_probe'` | `services/proxied-browser-login.ts:90` — registry row has no `logged_probe_js`; owner must use explicit confirm |
 | chromium fails to launch in pod | playwright launch error (no `--no-sandbox` parity) | `services/proxied-browser-login-driver.ts:125` — pod needs the `--no-sandbox` / `--disable-dev-shm-usage` args |
 | pod cold-start pulls playwright unnecessarily | n/a (perf) | `services/proxied-browser-login-driver.ts:31` — `loadChromium` is lazy; keep imports `import type` only |
+| `403 navigate_blocked` on a navigate action | `navigate_blocked` | `services/proxied-browser-login.ts` `isSafeNavigateUrl` refused the target — financial domain (`FINANCIAL_DOMAIN_DENYLIST`), internal/private/metadata host (`169.254.169.254`, `10.x`, bare cluster name, `.svc`/`.internal`/`.local`), or a non-http(s) scheme. Guards SSRF (browser egresses DIRECT from the pod when NodeMaven proxy is unset) + financial-cookie capture that would bypass the `start` denylist. |
 
 ## Related
 - [Proxied cloud-browser connect (FE)](/subsystems/proxied-browser-connect) — the connect-drawer that drives this contract
