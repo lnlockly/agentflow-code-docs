@@ -1,0 +1,81 @@
+---
+title: "Task Sources"
+description: "Pulls WORK from real sources (kwork orders, watched Telegram chats) into the mapped Plane projects so agents pick it up, idempotent per source item."
+---
+
+# Task Sources
+
+## TL;DR
+A generic source→task ingester. Each configured source is polled per tick; every
+new item becomes a [Plane task](/subsystems/projects-tasks-binding) in a mapped
+project, idempotent on a source-item key so the same order/message never
+double-creates. Two sources ship: kwork inbox orders → the "Kwork" Plane
+project, and a configurable list of watched Telegram chats (seeded with
+"победители 777") → a "Лиды" (Leads) project, with `useModel` filtering noise.
+A failing source never breaks the others.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/task-sources.ts:215` | `ingestKworkSource` — kwork orders → "Kwork" Plane tasks |
+| `agentflow-agents/src/services/task-sources.ts:300` | `ingestTelegramSource` — watched-chat leads → "Лиды" tasks |
+| `agentflow-agents/src/services/task-sources.ts:418` | `runTaskSourcesTick` — runs every source, each isolated |
+| `agentflow-agents/src/services/task-sources.ts:93` | `DEFAULT_WATCHED_CHATS` — the watched-chats config (data list) |
+| `agentflow-agents/src/services/task-sources.ts:463` | `liveReadKworkOrders` — reuses `callKworkInboxTool('list_dialogs')` |
+| `agentflow-agents/src/services/task-sources.ts:500` | `liveReadWatchedChatMessages` — reuses telegram MCP `get_dialogs`/`get_messages` |
+| `agentflow-agents/src/services/task-sources.ts:591` | `liveClassifyLead` — `invokeAI(TEXT_SMALL)` over the routed `flow` model |
+| `agentflow-agents/src/routes/internal-task-sources.ts:49` | `POST /internal/task-sources/tick` (x-agentflow-secret) |
+| `agentflow-agents/src/routes/internal-task-sources.ts:89` | `startTaskSourcesInterval` — optional self-tick |
+| `agentflow-agents/src/db/schema/task-sources.ts:30` | `task_source_items` — the idempotency ledger |
+| `agentflow-agents/migrations/2026-06-05b-task-sources.sql:13` | table migration |
+
+## Data flow
+```
+POST /internal/task-sources/tick {owner_user_id}
+  → runTaskSourcesTick(owner, liveIngestDeps())
+     ├─ ingestKworkSource
+     │    callKworkInboxTool('list_dialogs')   ← existing kwork connector (vault cred + proxy)
+     │    per NEW dialog → createTaskIssue(KWORK_PLANE_PROJECT_ID=b6d694da)
+     │    markIngested(owner, 'kwork', <dialogId>)
+     └─ ingestTelegramSource
+          resolveLeadsProjectId()  ← findTaskProjectByName('Лиды') or createTaskProject
+          per watched chat:
+            get_dialogs → resolve peer → get_messages   ← telegram MCP
+            per NEW message → classifyLead (useModel YES/NO)
+              actionable → createTaskIssue(leadsProjectId)
+              noise      → skipped 'not_actionable'
+            markIngested(owner, 'telegram:<handle>', '<handle>:<msgId>')
+  → { ingested:[…], skipped:[…] }
+```
+
+Each source is wrapped in its own guard: a kwork read failure is recorded in
+`skipped` and `ingestTelegramSource` still runs (and vice versa). The Plane
+client, the kwork connector, the telegram MCP, and the classifier are all
+injected through `IngestDeps`, so the unit tests run with no Plane / kwork /
+telegram / LLM / Postgres.
+
+## DB / Env / API
+- Tables: `task_source_items (owner_id, source_key, item_key UNIQUE)` — idempotency ledger.
+- Env:
+  - `KWORK_PLANE_PROJECT_ID` (default `b6d694da` — the "Kwork" Plane project)
+  - `KWORK_SESSION_SECRET_KEY` (default `KWORK_SESSION_JSON` — the vault session-secret row)
+  - `TASK_SOURCES_DEFAULT_OWNER` — owner the tick/interval defaults to
+  - `TASK_SOURCES_INTERVAL_MS` — self-tick cadence (≥ 10000, else disabled)
+  - `INTERNAL_API_SECRET` — gates the tick route (`x-agentflow-secret`)
+- Routes: `POST /internal/task-sources/tick {owner_user_id?}`
+- Plane projects: "Kwork" (`b6d694da`), "Лиды" (resolved/created by name), workspace `agentflow`.
+- Watched chats: `DEFAULT_WATCHED_CHATS` data list — extend by appending `{handle, title, messageLimit?}` rows. NOT a hardcoded branch; the tick loop iterates the list with no per-chat code.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| kwork source produced nothing | `read_failed: kwork_connector` | session-secret vault row / `liveReadKworkOrders` |
+| watched chat never matched | `watched_chat_not_found` | the `handle` in `DEFAULT_WATCHED_CHATS` vs the dialog's @username/title |
+| leads never created, telegram skipped | `leads_project: tasks_not_configured` | Plane env (`resolvePlaneConfig`) |
+| every message filtered out | `not_actionable` | classifier prompt in `liveClassifyLead` (fails CLOSED on LLM error) |
+| same item created twice | (should not happen) | `uq_task_source_owner_source_item` + `markIngested` ON CONFLICT |
+
+## Related
+- [Projects ↔ Plane binding](/subsystems/projects-tasks-binding)
+- [Agent Task Loop](/subsystems/agent-task-loop)
+- [Freelance conveyor](/subsystems/freelance-jobs)

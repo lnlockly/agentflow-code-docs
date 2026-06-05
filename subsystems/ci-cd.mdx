@@ -10,6 +10,8 @@ GitHub Actions runs build+deploy on push to `main` for both `agentflow-agents`
 and `agentflow-landing`. On `pull_request`, `agentflow-landing` runs a
 Playwright E2E smoke against prod `agentflow.website` to catch P0
 regressions (auth, autonomous-goal POST, NaN cards) before merge.
+`agentflow-agents` PRs run `typecheck` + `build` (blocking) and a
+`node --test` job over `tests/` (non-blocking, `continue-on-error: true`).
 
 ## Files (with line refs)
 | Path | Role |
@@ -20,6 +22,52 @@ regressions (auth, autonomous-goal POST, NaN cards) before merge.
 | `agentflow-landing/tests/e2e/autonomous-flow.spec.ts:1` | Spec: login → device → Autonomous tab → set goal |
 | `agentflow-landing/tests/e2e/__helpers/anti-nan.ts:1` | `assertNoNaN(page)` — fails if DOM has NaN/undefined/null/Invalid Date |
 | `agentflow-landing/playwright.auth-config.ts:1` | Older 12-journey suite — kept for token-based runs |
+| `agentflow-agents/.github/workflows/pr-check.yml:67` | `test` job — runs `npm test` over all of `tests/` (non-blocking) |
+| `agentflow-agents/package.json:18` | `test` script — `node --import tsx --test "tests/*.test.ts" "tests/**/*.test.ts"` |
+| `agentflow-agents/.github/workflows/deploy.yml:363` | `Apply manifest + rollout` step — `kubectl apply` + `set image` both deploys, then `rollout status … --timeout=8m` (raised from 3m, 2026-05-29) under `set -e` |
+
+## agentflow-agents test glob (the `**` quirk)
+
+`npm test` runs via `sh -c`, where `sh` has no `globstar`, so an unquoted
+`tests/**/*.test.ts` collapses `**` to a single `*` — it matches nested
+`tests/<dir>/*.test.ts` but silently DROPS top-level `tests/*.test.ts`. For a
+long time ~109 top-level suites never ran in CI (and the `test` job is
+`continue-on-error: true`, so nobody noticed). Real totals jumped 3042 → 4434
+tests once fixed.
+
+Fix: quote BOTH patterns so the shell passes them literally to node, whose
+`--test` glob handles `**` correctly and de-dupes overlapping file args:
+
+```
+"test": "node --import tsx --test \"tests/*.test.ts\" \"tests/**/*.test.ts\""
+```
+
+`pr-check.yml` `detect_tests` counts with `find tests -name '*.test.ts'` for the
+same reason.
+
+### Remaining failure buckets (2026-05-29, after dead-test cleanup)
+
+The 4 dead graph-executor test files were deleted (they only exercised the
+unwired executor — registry coverage of seeded boilerplate node ids, deterministic
+handler retry contracts, coder-delegate brief envelopes, `substituteTemplates`):
+`tests/unit/graph-executor/handlers/{coder-delegate,deterministic,registry-coverage}.test.ts`
+and `tests/unit/graph-executor/templates.test.ts`. The graph-executor SOURCE stays
+(still referenced by `src/services/projects.ts` + `src/routes/me-graph-prompts.ts`);
+removal is Phase 3 / P8.
+
+Full local run (no migrated DB): 4448 tests, 30 fail, 125 skip. Buckets:
+
+| Bucket | Files | Fix path |
+|---|---|---|
+| DB-integration (need migrated Postgres in CI) | `courses` (2), `self-mcp` (2), `teams` (1), `teams-recurring` (1), `usage` (1), `character.snapshot` (1) | provision + migrate a Postgres service in the `test` job |
+| missing committed artifact | `mautrix-discord-config` (10) | commit `k8s/mautrix-discord-config.yaml` + `k8s/mautrix-discord.yaml` to main |
+| preview-gate / reconciler logic drift | `services/pool-worker/preview-gate` (8), `unit/pingers/preview-reconciler-watchdog` (1) | separate audit of `checkPreviewGate` strict/healthPath/backend-health branches + cool-down skip window |
+| known / expected | `unit/request-platform-resources` (2) | `FF_PLATFORM_AGENT_DRIVEN` / `FF_PLATFORM_RESOURCES` guards |
+| flaky under concurrency | `unit/graph-executor/walker` (1) | `parallel roots fan-in` passes in isolation, fails under full-suite timing |
+
+The `test` job stays non-blocking until the DB-in-CI item lands. Once the only
+reds left are DB-integration + the 2 known `request-platform-resources`, flip
+`continue-on-error: true` to blocking.
 
 ## Data flow
 
@@ -58,6 +106,7 @@ PR opened
 | Login redirect broken | `Test timeout … waiting for navigation to /cabinet` | `agentflow-landing/src/pages/LoginPage.tsx` redirect handler |
 | Autonomous tab missing | `expected locator … "Автономно" to be visible` | `agentflow-landing/src/pages/DevicePage.tsx` tab registration |
 | Prod under deploy | Flaky on first run, green on retry | `retries: 1` covers; if both fail, investigate `agentflow.website` |
+| agentflow-agents deploy goes RED but the image still rolled (pods healthy 2/2) | `error: timed out waiting for the condition` on the `Apply manifest + rollout` step | `agentflow-agents/.github/workflows/deploy.yml:363` — `set image` already happened before the wait, so the deploy DID land; the `rollout status` wait timed out because a surge pod couldn't SCHEDULE fast on the CPU-tight node. Timeout raised 3m→8m (2026-05-29). Do NOT `\|\| true` it — a genuine never-completing rollout must still fail. Root capacity fix: reduce warm-pool count (see [workspace-provisioning](./workspace-provisioning) Pod CPU-request sizing). |
 
 ## Related
 - [Autonomous goals subsystem](./autonomous-goals)

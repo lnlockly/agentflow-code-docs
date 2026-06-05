@@ -1,0 +1,121 @@
+---
+title: "Social session-replay posting (cross-poster) — Instagram"
+description: "Post to social networks by replaying the owner's OWN session/cookies through real app emulation behind a sticky residential proxy. SessionPoster pattern + the Instagram adapter."
+---
+
+# Social session-replay posting
+
+## TL;DR
+The cross-poster fans one message out across networks. Each network is a
+`SessionPoster` that posts by **replaying the owner's own session/cookies**
+(not an official OAuth app — product ruled those out). The Instagram adapter
+posts an image + caption to the owner's feed via the real Instagram Android-app
+emulator (`instagram-private-api`), behind a **per-account sticky residential
+proxy** (Nodemaven), with a stable device fingerprint, human-delay + daily-cap
+guards, and checkpoint-aware error handling. IG can still flag — proxies +
+warmed accounts are an operational requirement, not a guarantee.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/cross-poster/types.ts:76` | `SessionPoster` shape + `PostPayload` / `PostMedia` |
+| `agentflow-agents/src/services/cross-poster/dispatcher.ts:55` | `SESSION_POSTERS` registry + `dispatchPost` fan-out |
+| `agentflow-agents/src/services/cross-poster/ig.ts:107` | `postToInstagram` — IG SessionPoster orchestration |
+| `agentflow-agents/src/services/cross-poster/ig.ts:322` | `igPoster` registered SessionPoster |
+| `agentflow-agents/src/services/cross-poster/ig-client.ts:68` | `realIgClientFactory` — wraps `instagram-private-api` (device + proxy + cookie restore + `publish.photo`) |
+| `agentflow-agents/src/services/cross-poster/ig-client.ts:153` | `mapIgError` — IG error class → outcome code |
+| `agentflow-agents/src/services/cross-poster/ig-session.ts:86` | `loadIgSession` — load+decrypt cookies from `project_secrets.INSTAGRAM_SESSION_JSON` |
+| `agentflow-agents/src/services/cross-poster/nodemaven-proxy.ts:69` | `nodemavenProxyForAccount` — sticky residential URL (primary egress) |
+| `agentflow-agents/src/services/cross-poster/nodemaven-proxy.ts:45` | `injectStickySession` — per-account `-sid-` username token |
+| `agentflow-agents/src/services/cross-poster/social-accounts.ts:66` | `loadOrCreateAccount` — stable device seed per account |
+| `agentflow-agents/src/services/cross-poster/social-accounts.ts:122` | `bindProxy` — sticky pool binding (fallback path) |
+| `agentflow-agents/src/services/proxy-pool.ts:73` | `pickProxy` — manual-proxy pool (slot-2) |
+| `agentflow-agents/src/services/integration-providers.ts:164` | `instagram` cookie_export provider (capture side) |
+| `agentflow-agents/src/routes/me-integrations.ts:406` | stores IG cookies as sealed Playwright `storage_state` |
+
+## Data flow
+```
+dispatchPost({ ownerUserId, text, targets, media })   dispatcher.ts
+  └─ SESSION_POSTERS[network].post(payload)
+       └─ igPoster.post → postToInstagram(ownerUserId, text, { media })
+            1. require image (IG rejects text-only)
+            2. loadIgSession → unseal project_secrets.INSTAGRAM_SESSION_JSON
+                 → { sessionid, csrftoken, ds_user_id, mid?, ig_did?, rur? }
+            3. loadOrCreateAccount(owner,'ig',ds_user_id) → stable device_seed
+            4. daily-cap gate (no bursts)
+            5. resolve egress proxy:
+                 (a) nodemavenProxyForAccount('ig:'+igUserId)  ← PRIMARY
+                 (b) pickProxy(owner,'ig:account:'+igUserId)   ← pool fallback
+                 (c) else → honest "нет residential-прокси" error (NEVER dc IP)
+            6. sharp → JPEG ; randomized human delay
+            7. realIgClientFactory({ deviceSeed, proxyUrl, cookies })
+                 → ig.state.generateDevice(seed) + ig.state.proxyUrl
+                 → deserializeCookieJar(captured cookies) (NO re-login)
+                 → ig.publish.photo({ file, caption })
+            8. outcome → NetworkResult ; persist social_post_accounts.status
+```
+
+## DB / Env / API
+- Tables:
+  - `social_post_accounts` (migration `0082_social_post_accounts.sql`) — one row
+    per `(owner_user_id, network, remote_user_id)`. Columns: `proxy_id`
+    (sticky pool binding), `device_seed` (stable fingerprint, never rotated),
+    `posts_today` / `posts_day_stamp` (daily cap), `status`
+    (`active|challenge|expired|flagged`), `last_error`.
+  - `project_secrets.key = 'INSTAGRAM_SESSION_JSON'` — sealed Playwright
+    `storage_state` cookies in the owner's `integration_hub` project.
+  - `proxies` — manual-proxy pool (fallback egress).
+- Env:
+  - `NODEMAVEN_PROXY_URL` — `http://<baseuser>:<pass>@gate.nodemaven.com:8080`.
+    Empty/unset = Nodemaven path dormant (account not funded) → pool/error
+    fallback. Set+funded → IG posts through a per-account sticky residential IP
+    with zero code change.
+  - `AGENTS_MASTER_KEY` — AES-256-GCM key for `seal.ts` (cookie unseal).
+- Sticky-IP binding: Nodemaven `-sid-<id>` username token. `id` is a
+  deterministic 8-char hash of `ig:<igUserId>` (`sessionIdForAccount`), so the
+  same account always egresses through the same residential IP (anti IP-drift).
+- IG endpoints (via `instagram-private-api`, real-app emulation, NOT raw web):
+  `POST https://i.instagram.com/rupload_igphoto/...` (upload) then
+  `POST /api/v1/media/configure/` (configure), with `X-IG-App-ID`, device
+  headers, signed payload, and the restored session cookies. We do **not**
+  hand-roll these — the package emulates the Android app.
+- MCP tools: none (the cross-poster talks to IG directly through the proxy;
+  TG still routes through tg-mcp via `postToTelegram`).
+
+## Failure modes
+| Symptom | Log signature / user line for grep | Where to fix |
+|---|---|---|
+| No residential proxy (Nodemaven unfunded + empty pool) | `нет residential-прокси (Nodemaven не пополнен)` | `services/cross-poster/ig.ts` step 4 |
+| IG checkpoint / challenge | `Instagram требует переподтверждение (checkpoint)` | `ig.ts` `finalize` `challenge_required` |
+| Session expired / logged out | `IG: сессия истекла — переподключи Instagram` | `finalize` `session_expired` |
+| Action-block / feedback_required (account flagged) | `Instagram временно заблокировал действия аккаунта` | `finalize` `action_blocked` |
+| Rate limited | `IG: Instagram ограничил частоту` | `finalize` `rate_limited` |
+| Daily cap hit (anti-burst) | `IG: дневной лимит постов исчерпан` | `ig.ts` `withinDailyCap` |
+| Text-only post (no image) | `IG: нужна картинка` | `ig.ts` step 0 |
+| Stored cookies missing required names | `в сохранённой сессии нет нужных cookie` | `ig-session.ts` `parseIgStorageState` |
+| Proxy connection error (pool path) | `prox` + repick once then fail | `ig.ts` step 7 + `proxy-pool.ts` `markProxyUnhealthy` |
+
+## Reality / ban-risk (be honest)
+Instagram actively fights non-official automation. Sessions expire, checkpoints
+and rate limits fire, and accounts can be banned. This adapter is **anti-ban
+aware** (sticky residential IP + real-app emulation + stable device + human
+delays + no auto-retry on challenge), **not bulletproof**. Operationally it
+needs a funded Nodemaven residential plan and warmed accounts. A challenge
+surfaces to the user as "переподключи Instagram" via `dispatchPost`'s status
+line; we never auto-retry a challenge (that escalates the flag).
+
+## Adding the NEXT network (TikTok / X)
+1. Add a `*-client.ts` wrapping the network's app-emulation lib (proxy +
+   stable device + session restore + post), mapping its errors to outcome codes.
+2. Add a `*-session.ts` that loads+decrypts the stored cookies for that
+   provider's `secret_key` (mirror `ig-session.ts`).
+3. Write the poster module exporting a `SessionPoster`; reuse
+   `social-accounts.ts` (`loadOrCreateAccount` + `bindProxy` + daily cap) and
+   `nodemavenProxyForAccount('<net>:'+remoteId)` for the sticky IP.
+4. Register it in `SESSION_POSTERS` (`dispatcher.ts`) and add the network to
+   `PostNetwork` in `types.ts`. Done — fan-out, autoposter, matrix handler
+   need no change.
+
+## Related
+- [Generic integrations](/subsystems/generic-integrations) — how cookies are captured + stored.
+- [Matrix IG bridge](/subsystems/matrix-ig-bridge) — the separate DM-bridge IG path (not posting).
