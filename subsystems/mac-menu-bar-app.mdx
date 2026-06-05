@@ -64,7 +64,7 @@ daemon socket every 10s and the cloud REST API every 30s. Ships inside the
 | Cloud sections show 401 errors | `RestError.http(401, …)` | api_key in auth.json expired; re-run `agentflow login` |
 | Gatekeeper refuses first launch | macOS "cannot verify developer" dialog | right-click .app → Open until codesign #77 ships |
 | No menu-bar icon after launch | `LSUIElement` missing from Info.plist | check `Sources/AgentFlow/Resources/Info.plist:14` |
-| Bundle > 5 MB | CI step "Verify bundle size <= 5 MB" fails | inspect what was added; SwiftUI dynamically links stdlib so binary should stay < 1 MB |
+| Bundle > 5 MB | CI step `Verify bundle size <= 5 MB` fails | inspect what was added; SwiftUI dynamically links stdlib so binary should stay `< 1 MB` |
 
 ## Build + run
 

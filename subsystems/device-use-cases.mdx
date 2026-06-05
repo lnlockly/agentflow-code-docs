@@ -1,0 +1,80 @@
+---
+title: "Device use-cases — recipes + cabinet picker"
+description: "Outcome picker on the device page that runs/schedules Goose recipes; local devices show L*, cloud devices show C*."
+---
+
+# Device use-cases — recipes + cabinet picker
+
+## TL;DR
+Devices get real jobs via a "What should this device do?" picker on the device page.
+The owner picks an **outcome**, not a raw prompt. Each outcome is a Goose recipe in the
+fork (`agentflow-goose/recipes/devices/<id>.yaml`). Local desktop agents show the L*
+catalog (leverages YOU — logged-in sessions/files), cloud pods show C* (leverages TIME —
+always-on, scheduled). The picker dispatches through the existing device path with
+`tool: 'agent_run_recipe'`; the goose device-bridge turns that into `goose run --recipe`
+(or schedules cloud recipes by cron). Anything outbound is approval-gated by default.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-goose/recipes/devices/manifest.json:1` | single source for the picker — id, home, draft, approval, icon, params per recipe |
+| `agentflow-goose/recipes/devices/l1-inbox-triage.yaml:1` | L1 (local, verified) — triage Kwork+Telegram, draft reply, Telegram approval-pause before send |
+| `agentflow-goose/recipes/devices/c2-morning-digest.yaml:1` | C2 (cloud, verified) — scrape niche sources on cron → Telegram brief |
+| `agentflow-goose/recipes/devices/{l2..l6,c1,c3..c6}.yaml` | L2–L6, C1, C3–C6 — validated draft scaffolds (`metadata.draft: true`) |
+| `agentflow-goose/recipes/devices/README.md:1` | catalog table + run/extension notes |
+| `agentflow-landing/src/data/deviceUseCases.ts:1` | TS mirror of manifest.json; `useCasesForHome(home)` filter |
+| `agentflow-landing/src/components/devices/DeviceUseCasePicker.tsx:1` | the gallery + params form; dispatches `agent_run_recipe` |
+| `agentflow-landing/src/pages/CabinetDeviceDetail.tsx:140` | `'usecases'` tab + `useCaseHome` (hosted → cloud) wiring |
+| `agentflow-landing/src/lib/devicesApi.ts:220` | `dispatchTask(deviceId, { task, tool, scope })` — the dispatch call |
+
+## Data flow
+```
+device page → DeviceUseCasePicker (filters DEVICE_USE_CASES by hosted flag)
+  → owner picks outcome + fills params
+  → devicesApi.dispatchTask(id, { task:<title>, tool:'agent_run_recipe',
+       scope:{ recipe:'l1-inbox-triage', params:{...}, cron?:'0 8 * * *' } })
+  → POST /me/devices/:id/dispatch_task        (me-devices.ts, unchanged)
+  → coder-shim / goose bridge: goose run --recipe recipes/devices/<id>.yaml --params k=v
+       (cloud: manage_schedule with metadata.cron / scope.cron)
+  → recipe runs with developer + computercontroller + af_* (stdio) + kwork-inbox exts
+  → outbound steps pause for Telegram approval (draft → Saved Messages → wait 'ok')
+```
+
+## DB / Env / API
+- Tables: none new. Uses the existing `user_devices` dispatch path.
+- Dispatch: `POST /me/devices/:id/dispatch_task { task, tool:'agent_run_recipe',
+  scope:{ recipe, params, cron? } }`. Tool name regex `^[a-z][a-z0-9_]*$`.
+- Recipe LLM: `flow` via the platform gateway — `OPENAI_HOST=https://agentflow.website`,
+  `OPENAI_BASE_PATH=/_agents/llm/v1/chat/completions`, owner `af_live_*` key. No
+  hardcoded model.
+- af_* extension (stdio): `node /opt/agentflow-mcp-server/dist/index.js` with
+  `AGENTFLOW_API_KEY` / `AGENTFLOW_BASE_URL=https://agentflow.website/_agents`. Built by
+  the agentflow-mcp-server agent; consumed here, not edited.
+- kwork-inbox (streamable_http): `/internal/mcp/kwork-inbox` (`list_dialogs`,
+  `get_dialog`, `send_message`) — internal-only host.
+
+## Approval gate
+No interactive `request_approval` MCP tool exists in af_*. Outbound recipes implement
+approval as a Telegram round-trip: `af_telegram_whoami` → send the `DRAFT →` preview to
+the owner's Saved Messages → poll `af_telegram_messages` for `ok`/`отправь`/`send` (or an
+edit) up to `approval_wait_seconds` → send only on approval. `manifest.json` marks these
+`approval: true`; the picker badges them. Verified: L1 drafted a reply, sent it for
+approval, and did NOT auto-send when the window elapsed.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Recipe rejects a declared param | `Unnecessary parameter definitions: <key>` | every declared param must be `{{used}}` in the prompt; cron is `metadata.cron`, not a param |
+| Recipe rejects an extension URI var | `Missing definitions for parameters in the recipe file: <key>` | declare any `{{var}}` used in an extension `uri` as a parameter |
+| Memory step errors mid-run | `AgentFlow service error (HTTP 500)` (af_recall/af_remember) | af_* memory needs a real device id, not `default`; recipes treat it as non-blocking |
+| Kwork source skipped | `Failed to start extension 'kwork_inbox' ... HTTP 404` | kwork-inbox is internal-only; the public host 404s — bridge reaches it on the internal net |
+| Dispatch refused | `device_paused` (409) / `not_found` (404) | resume the device / bring it online before running a use-case |
+| Outbound recipe (c1/c2/c3/c5/c6 Telegram/memory) `status=done` but ZERO effect — no message, no `device_memories` row | pod `ls /opt/agentflow-mcp-server/dist/index.js` → present after the rebuild; if still no-op, goose log `Failed to start extension 'agentflow'` / `AGENTFLOW_API_KEY … Refusing to start` | **FIXED (PR #1027):** `coder-shim-image/Dockerfile` now COPYs the vendored `agentflow-mcp-server` dist to `/opt/agentflow-mcp-server` (deps resolve from `/app/node_modules` via `NODE_PATH`), and `bridge.ts recipeEnv()` injects `AGENTFLOW_API_KEY=AF_API_KEY` + `AGENTFLOW_BASE_URL=<apiUrl>/_agents` into every recipe run. AF_API_KEY must be `af_live_*`. Read-only recipes (l4-research-brief) always worked — `developer`+`computercontroller` builtins (verified: 5957-byte brief on device 31eb3b59). **Needs the image rebuilt + a live af_* send to fully verify.** |
+| Scheduled cloud recipe registers but never fires (`goose schedule list` → `Last Run: Never` after many ticks) | with `FF_BRIDGE_SCHEDULER` ON: `[coder-shim] scheduler fired <id>` + `scheduler ran <id> ok=true` and the entry's `lastRunAt` updates | **FIXED (PR #1027, flag `FF_BRIDGE_SCHEDULER`):** `goose schedule add` only wrote the job to the store; the headless pod runs no goose scheduler loop. Fix = an in-process cron in the long-lived bridge (`scheduler.ts BridgeScheduler`) that fires `buildRecipeRunArgs` (with persisted params) on each due minute, re-hydrated from `<workspace>/.coder-shim-schedules.json`. Off by default (legacy register-only). See `coder-shim-goose-bridge.mdx` |
+| Scheduled recipe fires without its params (required params empty) | recipe run with empty `{{var}}` substitutions | **FIXED (PR #1027):** the in-process fire uses `buildRecipeRunArgs` (params included), and the params are captured + persisted in the `ScheduleEntry` at schedule time. `buildScheduleArgs`'s `--params` drop is now moot for firing |
+
+## Related
+- [coder-shim — Goose device-bridge](/subsystems/coder-shim-goose-bridge) — the bridge that runs `goose run` for dispatched work
+- [presets](/subsystems/presets) — the low-level task preset library in CabinetDeviceLive (distinct from these outcomes)
+- [devices-unified](/subsystems/devices-unified) — local vs hosted device model
+- [device-task-lifecycle](/subsystems/device-task-lifecycle) — dispatch → task_complete path
