@@ -1,0 +1,77 @@
+---
+title: "Desktop platform backends (mac / linux / windows)"
+description: "Cross-platform abstraction layer for agentflow-desktop screen capture, input, windows, clipboard."
+---
+
+# Desktop platform backends
+
+## TL;DR
+The `agentflow-desktop` daemon used to be Mac-only (Quartz, AppleScript, pyobjc). It now
+routes every OS-specific call through a `PlatformBackend` Protocol with three
+implementations: `mac` (Quartz/CoreGraphics + AppleScript), `linux` (mss + xdotool/wmctrl
++ xclip/wl-clipboard; falls back to grim on Wayland), `windows` (mss + pywin32 + pyperclip).
+Backend selection happens at import time based on `sys.platform`; nothing else in the
+codebase branches on OS.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/platform/base.py:11` | `PlatformBackend` runtime-checkable Protocol |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/platform/__init__.py:22` | `_detect()` selects backend by `sys.platform` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/platform/mac.py:89` | `MacBackend` (Quartz capture, AppleScript activate, pbcopy/pbpaste) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/platform/linux.py:69` | `LinuxBackend` (mss + grim + wmctrl/xdotool + xclip/wl-clipboard + tmux read) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/platform/windows.py:21` | `WindowsBackend` (mss + pywin32 EnumWindows + pyperclip + PowerShell history) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/screen.py:81` | `capture()` delegates to `backend.capture_screen` (keeps Mac dual-path for tests) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/mouse.py:11` | `click/move/scroll` delegate to backend |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/keyboard.py:7` | `type_text/key/shortcut` delegate to backend |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/clipboard.py:14` | async clipboard wrappers over backend (uses `asyncio.to_thread`) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/window.py:13` | `list_windows / focus` delegate to backend |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/streamer.py:21` | MJPEG `fast_capture_jpeg` → `backend.capture_screen_fast` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/desktop_cli.py:137` | `cmd_selftest` — `agentflow-desktop selftest` OK/FAIL grid |
+| `agentflow-computer-mcp/scripts/install.sh` | macOS + Linux installer (detects OS, sets launchd/systemd unit) |
+| `agentflow-computer-mcp/scripts/install.ps1` | Windows installer (Task Scheduler entry on logon) |
+| `agentflow-computer-mcp/.github/workflows/ci.yml` | 3-platform matrix: macos-latest + ubuntu-latest + windows-latest |
+
+## Data flow
+```
+                          tools/screen.py
+                          tools/mouse.py
+caller                    tools/keyboard.py            platform/__init__.py
+  │                       tools/window.py                  │
+  ├──── public API ───────► tools/clipboard.py             ├── sys.platform
+  │                              │                         │
+  │                              ▼                         ▼
+  │                          PlatformBackend ◄──── selects mac.py | linux.py | windows.py
+  │                              │
+  │                              ▼
+  │                  OS-specific primitives
+  │                  (Quartz / mss+grim / mss+pywin32)
+  ▼
+streamer.py CaptureLoop
+desktop_tools.py grab_full_png
+desktop_cli.py selftest
+```
+
+## DB / Env / API
+- No DB rows specific to backends — daemon-local only.
+- Env vars consumed: `XDG_SESSION_TYPE`, `WAYLAND_DISPLAY` (linux backend Wayland detection).
+- New CLI: `agentflow-desktop selftest` — no API key, no network, prints OK/FAIL per backend method.
+- Dependencies (`pyproject.toml`):
+  - Always: `mss`, `pyautogui`, `Pillow`, `websockets`, `mcp[cli]`
+  - macOS-only: `pyobjc-framework-Quartz`
+  - Windows-only: `pywin32`, `pyperclip`, `psutil`
+  - Linux runtime tools (apt): `wmctrl`, `xdotool`, `xclip`; on Wayland add `grim`, `wl-clipboard`
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `selftest` reports `FAIL: no backend for this platform` | `no backend for this platform` | `platform/__init__.py:_detect` — unsupported `sys.platform` |
+| Linux capture fails on Wayland with `grim failed: ...` | `grim failed:` | `platform/linux.py:_grim_capture` — install `grim` or fall back to mss |
+| Linux window_list returns `[]` even with windows open | (no error) | install `wmctrl`: `apt-get install wmctrl xdotool` |
+| Linux clipboard read returns `""` on Wayland | (no error) | install `wl-clipboard`: `apt-get install wl-clipboard` |
+| Windows window_list `[]` despite open apps | `pywin32 not installed` | `pip install pywin32` (auto on Win via marker) |
+| Pyautogui on Linux raises `Xlib.error.DisplayNameError` | `DisplayNameError` | run under a real X session or `xvfb-run -a` in CI |
+
+## Related
+- [Desktop / Computer-Agent bridge](/subsystems/computer-mcp) — server-side WS tunnel + dispatcher
+- [Workspace provisioning](/subsystems/workspace-provisioning)

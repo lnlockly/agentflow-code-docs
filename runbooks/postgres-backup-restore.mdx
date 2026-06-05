@@ -1,0 +1,93 @@
+---
+title: "Postgres backup & restore"
+description: "How AgentFlow backs up Postgres, and the verified step-by-step to RESTORE a dump into a scratch DB and confirm integrity."
+---
+
+# Postgres backup & restore
+
+## TL;DR
+Hourly + daily CronJobs `pg_dump` the `agentflow` DB to a gzipped plain-SQL file
+and ship it OFF-HOST to a Telegram group. A real restore was verified 2026-05-30:
+a prod dump restored into a fresh scratch DB with **0 errors** and all counts
+matching prod. This runbook is the exact, reproducible restore procedure.
+
+## How backups are produced
+| Path | Role |
+|---|---|
+| `agentflow-agents/k8s/*` CronJob `agentflow-postgres-backup` (`0 * * * *`) | hourly — `pg_dump -d agentflow --format=plain --clean --if-exists \| gzip -9` → `agentflow-<TS>.sql.gz` |
+| CronJob `agentflow-postgres-backup-full` (`0 4 * * *`) | daily — `pg_dumpall --no-role-passwords \| gzip -9` → `agentflow-all-<TS>.sql.gz` |
+| ConfigMap `agentflow-backup-script` → `/scripts/backup.sh` | dumps, gzips, and `curl … sendDocument` to `$TG_CHAT_ID`. Files > 49 MB are `split -b 48M` and sent as N parts. |
+
+Off-site target = **Telegram only** (the script has no MinIO/S3 copy; MinIO's
+`agentflow-files` bucket holds user files, not backups). Format = **plain SQL,
+gzipped** (restore with `gunzip | psql`, NOT `pg_restore`).
+
+## RESTORE — verified procedure (do OFF-PROD)
+
+> Restore into a SEPARATE scratch DB, never the live `agentflow` DB. The dump
+> carries `DROP … IF EXISTS` (`--clean`); running it against prod would wipe prod.
+
+### 1. Get a dump
+- **From Telegram:** download the `agentflow-<TS>.sql.gz` document(s) from the
+  backup group. If split, download every `…part-aa, …part-ab, …` and reassemble
+  in order: `cat agentflow-<TS>.sql.gz.part-* > agentflow-<TS>.sql.gz`.
+- **Or reproduce from prod (read-only, what this runbook verified):**
+  ```bash
+  ssh ff-france 'kubectl -n franchise-factory exec <postgres-pod> -- \
+    bash -c "PGPASSWORD=$PW pg_dump -h 127.0.0.1 -U agentflow -d agentflow \
+      --format=plain --clean --if-exists | gzip -9"' > restore-test.sql.gz
+  gunzip -t restore-test.sql.gz   # integrity check
+  ```
+
+### 2. Restore into a fresh scratch DB
+```bash
+# pgvector/pg17 (the dump declares `vector` columns + uses PG17 \restrict syntax)
+createdb -h localhost -U postgres agentflow_restore_test
+gunzip -c restore-test.sql.gz | psql -h localhost -U postgres \
+  -d agentflow_restore_test -v ON_ERROR_STOP=0 > restore.log 2>&1
+grep -c '^ERROR:' restore.log    # expect 0
+```
+
+### 3. Verify integrity vs prod
+```bash
+psql -U postgres -d agentflow_restore_test -tAc "
+  SELECT 'tables', count(*) FROM information_schema.tables WHERE table_schema='public'
+  UNION ALL SELECT 'users', count(*) FROM users
+  UNION ALL SELECT 'projects', count(*) FROM projects
+  UNION ALL SELECT 'agents', count(*) FROM agents
+  UNION ALL SELECT 'flow_ledger', count(*) FROM flow_ledger;"
+```
+Compare to prod (same query against the live DB). Expect a match; high-write
+tables (`flow_ledger`) may be off by a few rows if the prod snapshot was taken a
+little before/after the dump — that's timing, not loss.
+
+### Verified baseline (2026-05-30)
+| metric | prod | restored |
+|---|---|---|
+| tables (public) | 217 | 217 |
+| users | 173 | 173 |
+| projects | 47 | 47 |
+| agents | 1105 | 1105 |
+| flow_ledger | 24990 | 24994 (+4 timing) |
+
+74.5 MB dump, restored with **0 errors**. Tear down: `dropdb agentflow_restore_test`.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Restore aborts on a missing extension | `ERROR:  type "vector" does not exist` | use the `pgvector/pgvector:pg17` image (or `CREATE EXTENSION vector` first) |
+| `\restrict`/`\unrestrict` errors on old psql | `unrecognized command \restrict` | restore with PG17 `psql` (the dump is from PG17 `pg_dump`) |
+| No backup files in the TG group | (none — TG send failed) | check the CronJob pod logs for the `sendDocument` curl response; `TG_BOT_TOKEN`/`TG_CHAT_ID` env |
+
+## Gaps (owner/ops — not yet closed)
+- **`k8s/backup-verify-cronjob.yaml` is NOT deployed** (never ran) AND
+  format-mismatched: it `pg_restore`s a `.pgdump` from a PVC, but real backups
+  are `.sql.gz` (plain) → Telegram. To automate weekly restore-verify: have
+  `backup.sh` also drop a copy where the job can read it (PVC/MinIO) and change
+  the job to `gunzip | psql`.
+- **Off-site is single-channel (Telegram only)** — a MinIO/S3 copy would add
+  redundancy + a clean source for the automated verify.
+
+## Related
+- [pg-flapping](/runbooks/pg-flapping)
+- Test report: `plans/autonomous/_backup-restore-test-2026-05-30.md`

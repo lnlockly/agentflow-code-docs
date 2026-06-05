@@ -1,0 +1,92 @@
+---
+title: "Matrix Sliding Sync"
+description: "matrix-org/sliding-sync proxy в front of Dendrite — даёт Element X (iOS/Android) совместимый MSC3575 wire-протокол."
+---
+
+# Matrix Sliding Sync
+
+## TL;DR
+
+Element X (мобильные клиенты Element для iOS/Android) общается с homeserver через MSC3575 sliding-sync, а не классический `/sync`. Dendrite не реализует MSC3575 нативно, поэтому ставим upstream `matrix-org/sliding-sync` proxy: он поллит Dendrite по обычному CSAPI и отдаёт sliding-sync wire-протокол. Ingress на `matrix.agentflow.website` ловит `/_matrix/client/unstable/org.matrix.msc3575/*` и роутит в proxy; `.well-known/matrix/client` теперь возвращает `org.matrix.msc3575.proxy.url` для auto-discovery.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/k8s/sliding-sync.yaml:1` | Deployment + Service (`ghcr.io/matrix-org/sliding-sync:v0.99.19`, порт 8009) |
+| `agentflow-agents/k8s/matrix-wellknown.yaml:1` | Static nginx, отдаёт `/.well-known/matrix/client` с msc3575 полем |
+| `agentflow-agents/k8s/dendrite.yaml:240` | Ingress patch: routes `msc3575` → sliding-sync, `.well-known/matrix/client` → matrix-wellknown |
+
+## Data flow
+
+```
+Element X (iOS/Android)
+   │
+   │   GET https://matrix.agentflow.website/.well-known/matrix/client
+   │      ↓
+   │   matrix-wellknown nginx → JSON {
+   │      "m.homeserver": {...},
+   │      "org.matrix.msc3575.proxy": { "url": "https://matrix.agentflow.website" }
+   │   }
+   │
+   │   POST /_matrix/client/v3/login   (классика, в Dendrite напрямую)
+   │      ↓
+   │   nginx-ingress → dendrite:8008
+   │
+   │   POST /_matrix/client/unstable/org.matrix.msc3575/sync
+   │      ↓
+   │   nginx-ingress → sliding-sync:8009
+   │      │
+   │      │   (proxy поллит /sync /rooms /state /messages у Dendrite)
+   │      │       ↓
+   │      │   dendrite:8008
+   │      ↓
+   │   возвращает sliding-sync ответ Element X
+```
+
+## DB / Env / API
+
+- **Tables**: новая БД `sliding_sync` на existing `agentflow-postgres`. Role `sliding_sync` владелец. Прокси сам создаёт схему при первом старте (libpq-style connection string).
+- **Env** (`agentflow-agents/k8s/sliding-sync.yaml`):
+  - `SYNCV3_SERVER` — `http://dendrite.franchise-factory.svc.cluster.local:8008`
+  - `SYNCV3_DB_PASSWORD` — из Secret `sliding-sync-secrets/db_password`
+  - `SYNCV3_SECRET` — из Secret `sliding-sync-secrets/secret` (64-hex, sign tokens proxy↔клиент)
+  - `SYNCV3_BINDADDR` — `:8009`
+  - `SYNCV3_LOG_LEVEL` — `info`
+- **Routes (public)**:
+  - `GET /.well-known/matrix/client` → matrix-wellknown
+  - `* /_matrix/client/unstable/org.matrix.msc3575/*` → sliding-sync:8009
+  - всё остальное `/_matrix/*` → dendrite:8008 (без изменений)
+
+### Bootstrap (one-time, ff-france)
+
+```bash
+DB_PASS=$(openssl rand -hex 24)
+kubectl -n franchise-factory exec agentflow-postgres-97fb67469-69298 -- \
+  psql -U agentflow -c "CREATE USER sliding_sync WITH PASSWORD '$DB_PASS';
+                        CREATE DATABASE sliding_sync OWNER sliding_sync;
+                        GRANT ALL ON DATABASE sliding_sync TO sliding_sync;"
+
+kubectl -n franchise-factory create secret generic sliding-sync-secrets \
+  --from-literal=db_password=$DB_PASS \
+  --from-literal=secret=$(openssl rand -hex 32)
+
+kubectl apply -f k8s/sliding-sync.yaml -f k8s/matrix-wellknown.yaml
+```
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Element X висит на «Loading...» после логина | `404` на `/_matrix/client/unstable/org.matrix.msc3575/sync` в nginx-ingress access log | Проверить ingress route в `k8s/dendrite.yaml:240` + `kubectl get svc sliding-sync` |
+| Proxy крашится при старте | `cannot connect to postgres` в `kubectl logs deploy/sliding-sync` | Проверить secret `sliding-sync-secrets/db_password`, что DB+role созданы |
+| `.well-known/matrix/client` не имеет `org.matrix.msc3575.proxy` | `curl .../.well-known/matrix/client` → старый Dendrite-формат | Ingress не перехватывает path — проверить `matrix-wellknown` Service+Deployment Ready, ingress paths order |
+| Proxy отвечает 502 на /sync | `failed to call homeserver` в proxy logs | Dendrite Service unreachable (см. `kubectl get endpoints dendrite -n franchise-factory`) |
+| Element X жалуется на CORS на well-known | `No 'Access-Control-Allow-Origin'` в Safari/Chrome devtools | nginx.conf в `k8s/matrix-wellknown.yaml` добавляет CORS, проверить mount ConfigMap |
+
+## Related
+
+- [Matrix Chat](/subsystems/matrix-chat) — Dendrite homeserver + SSO bridge.
+- [Element Web](/subsystems/element-web) — desktop клиент (не использует sliding-sync, идёт по классике).
+- Upstream proxy: https://github.com/matrix-org/sliding-sync
+- MSC3575 spec: https://github.com/matrix-org/matrix-spec-proposals/blob/main/proposals/3575-sync.md

@@ -1,0 +1,106 @@
+---
+title: "Home landing (HomeV3)"
+description: "The main marketing landing served at / — Apple-tier presentation page with oversized type, gradient mesh hero, and reveal-on-scroll motion."
+---
+
+# Home landing (HomeV3)
+
+## TL;DR
+
+`HomeV3.tsx` is the main marketing landing for `/`. As of 2026-05-15 it
+ships an Apple-keynote tier visual treatment: oversized hero type
+(`clamp(44px, 8.4vw, 112px)`), soft gradient mesh background, single
+primary CTA, and six sections that each earn their row (hero → 3-step
+explainer → showcase tiles → numbers → pull quote → final CTA → footer).
+Styling lives under `.v3.home-apple` in `home-apple.css`, layered on top
+of the existing `.v3-*` token system from `landing-v3.css` so V3Header
+keeps working without changes.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/pages/HomeV3.tsx:23` | Page component — six `<section>` blocks + `V3Header` + footer. |
+| `agentflow-landing/src/pages/HomeV3.tsx:38` | IntersectionObserver reveal-on-scroll hook. Opt-in via `.has-reveal` root class so SSR / no-JS / fullPage screenshots stay visible. |
+| `agentflow-landing/src/styles/home-apple.css:1` | Apple-tier stylesheet. Defines `.apple-hero`, `.apple-how`, `.apple-showcase`, `.apple-numbers`, `.apple-quote`, `.apple-final`, `.apple-cta`, `.apple-reveal`. |
+| `agentflow-landing/src/styles/landing-v3.css:1` | Base v3 token system (`--v3-bg`, `--v3-line`, `--v3-lime`, `--v3-ink-*`). Imported BEFORE `home-apple.css`. |
+| `agentflow-landing/src/main.tsx:53` | CSS import order — `landing-v3.css` then `home-apple.css`. |
+| `agentflow-landing/src/main.tsx:282` | Route — `<Route path="/" element={<HomeV3 />}>`. Legacy launchpad page available at `/legacy`. |
+| `agentflow-landing/src/components/v3/V3Header.tsx:38` | Sticky header reused as-is. |
+
+## Data flow
+
+```
+Browser → /  → React Router → lazy(HomeV3)
+   ↓
+HomeV3 mounts under <div class="v3 home-apple">
+   ↓
+useEffect adds .has-reveal to root
+   ↓
+IntersectionObserver toggles .is-in on each .apple-reveal
+   ↓
+CSS fade + slide-up via cubic-bezier(0.22, 1, 0.36, 1) @ 700ms
+```
+
+## Sections (top → bottom)
+
+| Section | Class | What it does |
+|---|---|---|
+| Hero | `.apple-hero` | Oversized headline, kicker pill, lead paragraph, two CTAs, meta row. Background = two blurred radial gradients (`::before` lime, `::after` blue) + grain SVG. |
+| How it works | `.apple-how` + `.apple-steps` | 3 numbered steps in a flush border grid. Step 01 gets the lime accent number. |
+| Showcase | `.apple-showcase` | 1.4fr / 1fr grid — wide tile (Mini App + biller) + two stacked tiles (Bot, Landing). |
+| Numbers | `.apple-numbers` | 4-column flush stat strip with `clamp(48px, 6.6vw, 88px)` values. |
+| Quote | `.apple-quote` | Single pull quote with lime «...» glyphs and gradient avatar. |
+| Final CTA | `.apple-final` | Centered, radial-gradient floor glow, two CTAs. |
+| Footer | `.apple-footer` | Mono row, links to Telegram + Docs + email. |
+
+## Reveal motion
+
+The reveal animation is **opt-in**, not opt-out. By default `.apple-reveal`
+elements are fully opaque. Only after JS adds `.has-reveal` to the page
+root does CSS switch them to `opacity:0; translateY(28px)`. The
+`IntersectionObserver` then adds `.is-in` per element when it enters
+viewport. This means:
+
+- SSR / no-JS / pre-hydration render = content visible
+- Headless `fullPage: true` screenshots = content visible (no scroll race)
+- `prefers-reduced-motion: reduce` = no `.has-reveal` ever applied, content visible
+
+## DB / Env / API
+
+**DB:** none — landing is fully static.
+**Env:**
+- `VITE_ALLOW_NO_TONCENTER_KEY=1` — required for local builds without a TonCenter key (baked in prod Dockerfile per `projects-frontend.mdx`).
+**Routes:** `GET /` → renders `HomeV3`. Legacy launchpad-style home archived to `/legacy` and `/v3-archive`.
+**MCP tools:** none.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Sections below fold stay invisible | (visual only — no log) | `HomeV3.tsx:38` reveal logic; verify `.has-reveal` opt-in is in place so non-JS renders stay visible. |
+| Headline wraps awkwardly on iPhone SE (375px) | (visual only) | `home-apple.css` `.apple-hero h1 { font-size: clamp(40px, 11vw, 56px) }` in `@media (max-width: 640px)` block. |
+| Lime gradient blob clips into header | (visual only) | `.apple-hero { overflow: hidden; isolation: isolate }` already prevents this; verify if header gets `position: sticky` removed. |
+| `/` shows old AGENTFLOW launchpad page | route falls back to `<App />` | `agentflow-landing/src/main.tsx:282` — route for `/` must point at `HomeV3`, not `App`. |
+| Build fails with TonCenter error | `VITE_TONCENTER_API_KEY ... is required for production builds` | Set `VITE_ALLOW_NO_TONCENTER_KEY=1` (already in prod Dockerfile). |
+
+## Copy rules
+
+The Russian copy on this page follows the AgentFlow workspace rule
+(`/Users/a1/Code/unimax_projects/fransh/agentflow/CLAUDE.md`): plain human
+language, no jargon. Banned in this page and any future copy edits:
+
+- казна, саплай, operator, protocol (use the Russian word or skip the section)
+- «just», «simply», «really», «actually», «literally» (and Russian equivalents like «просто», «буквально»)
+- em-dash as divider (use comma, period, or restructure)
+- «Не X. Y.» antithesis pattern
+- Throat-clearing openers («Стоит отметить», «Если коротко»)
+- Three-item lists in every paragraph
+
+If the owner-facing message changes, edit `HomeV3.tsx` inline strings —
+the page does not use the `useT` translation layer for any headlines.
+
+## Related
+
+- [Projects frontend](/subsystems/projects-frontend) — the `/projects` dashboard the hero CTA points at.
+- [Caddy preview](/subsystems/caddy-preview) — the `*.proj.agentflow.website` URLs the showcase tile references.

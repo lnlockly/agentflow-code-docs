@@ -1,0 +1,215 @@
+---
+title: "Verify AgentFlow Desktop (packaged, Mode A + Mode B)"
+description: "One-pass packaged verification of the forked AgentFlow Desktop — build, enrol, then confirm standalone + platform-driven runs on the flow LLM."
+---
+
+# Verify AgentFlow Desktop (packaged)
+
+## TL;DR
+After the feature PRs land (rebrand → device-bridge → flow engine →
+computercontroller/af_* → af_* bundle), this is the one-shot acceptance pass on
+a real built artifact. Everything below the build step is owner/infra: it needs
+a packaged (ideally signed) app, a real machine, and the live gateway. The CI
+gate already proves the app typechecks + packages on every PR — this proves it
+actually *runs* both modes.
+
+**PR #10 (`agentflow-goose`) changes the launch contract:** flow-LLM +
+device-bridge are now **default-on when `~/.agentflow/auth.json` is enrolled**
+(opt out with `FF_FLOW_LLM=0` / `FF_DEVICE_BRIDGE=0`) — fixes the double-click
+401 "Missing API key". Same PR finished the user-visible de-brand
+(`Goose`/`goose` → `AgentFlow` across ~43 `ui/desktop/src` files; engine
+internals `goosed`/`GOOSE_*`/`goose://`/`.goosehints` kept) and regenerated the
+app + tray icons from the AgentFlow brand mark
+(`agentflow-landing/brand/logos/mark-only.svg` → `ui/desktop/src/images/icon.{icns,ico,png}`,
+`icon-light.*`, `iconTemplate*`).
+
+## 0. Build the artifact
+
+**`pnpm run package` alone produces an app that CANNOT run** — it builds only the
+JS/Electron side, not the Rust `goosed` engine the app spawns. Launching it pops
+`AgentFlow Desktop Error: Goosed binary not found in any of the possible paths:
+…/resources/bin/goosed, …/src/bin/goosed, …`. You MUST build + stage `goosed`
+first (mirrors `bundle-desktop-linux.yml` steps "Build goosed binary" +
+"Copy binaries into Electron folder"):
+
+```bash
+cd agentflow-goose
+source ./bin/activate-hermit            # hermit pins rust 1.92 + node 24 + pnpm
+
+# 1. Build goosed (the goose-server binary the desktop spawns).
+#    NOTE: default features pull `local-inference` → `llama-cpp-sys-2`, whose
+#    bindgen needs clang C headers (`stdbool.h`). On a host without clang the
+#    build dies: `ggml.h: fatal error: 'stdbool.h' file not found`. Either
+#    install clang/libclang, OR drop local inference (irrelevant to flow):
+cargo build --release -p goose-server \
+  --no-default-features --features portable-default,code-mode
+#    (same recipe builds the CLI: `-p goose-cli --bin goose`)
+
+# 2. Stage goosed where the app looks for it, THEN package.
+cd ui/desktop && pnpm install --no-frozen-lockfile
+mkdir -p src/bin && cp ../../target/release/goosed src/bin/goosed && chmod +x src/bin/goosed
+pnpm run package          # unsigned app bundle under out/
+# or: pnpm run make       # installers — BUT only zip(darwin/win32/linux) +
+#                           deb/rpm/flatpak(linux) makers exist; NO dmg/msi.
+#                           signing needs APPLE_TEAM_ID / WINDOWS_CERTIFICATE_FILE
+# If you already packaged without goosed, stage into the bundle directly:
+#   cp ../../target/release/goosed "out/AgentFlow Desktop-linux-x64/resources/bin/goosed"
+```
+Output: `out/AgentFlow Desktop-<platform>-<arch>/`. Launch that binary. With
+goosed staged it boots a real window (menu bar, no error dialog) and spawns
+`resources/bin/goosed agent`.
+
+Headless smoke (Linux CI / server): `xvfb-run -a "out/AgentFlow Desktop-linux-x64/AgentFlow Desktop" --no-sandbox --disable-gpu` → window renders, `pgrep -af goosed` shows `…/resources/bin/goosed agent`.
+
+## 0b. CLI quick-verify (Mode A, no desktop) — fully agent-doable
+```bash
+export GOOSE_PROVIDER=openai GOOSE_MODEL=flow \
+  OPENAI_HOST=https://agentflow.website OPENAI_BASE_PATH=_agents/llm/v1/chat/completions \
+  OPENAI_API_KEY=af_live_… GOOSE_DISABLE_KEYRING=true
+./target/release/goose run --no-profile -t "Reply with one word: PONG"
+#   → session header `● new session · openai flow`, output `PONG`.
+#   af_live key + agentflow.website host → success proves it routed through the
+#   flow gateway, NOT api.openai.com. (NB: the `goose` CLI is STOCK upstream —
+#   `goose --version`=1.36.0, no "AgentFlow" branding; the rebrand is the
+#   Electron app only. AgentFlow-ness = env wiring + device-bridge + bundled exts.)
+./target/release/goose run --no-profile --with-builtin computercontroller -t "list your computercontroller tools"   # 7 tools
+./target/release/goose run --no-profile \
+  --with-extension "AGENTFLOW_API_KEY=af_live_… AGENTFLOW_BASE_URL=https://agentflow.website/_agents node ui/desktop/resources/agentflow-mcp/server.cjs" \
+  -t "Call list_projects; report the count"   # af_* MCP loads, returns real count
+```
+
+## 1. Enrol the device (for Mode B)
+The bridge reads `~/.agentflow/auth.json` — same format the retired daemon used,
+so an already-provisioned device just works. To enrol fresh, add a device in
+`/cabinet` (or write auth.json) with:
+```json
+{ "api_key": "af_live_…", "device_id": "<uuid>",
+  "enrollment_token": "<token>", "ws_url": "wss://agentflow.website/_agents/_devices/connect" }
+```
+**Default-on since PR #10 (`agentflow-goose`).** Flow-LLM and device-bridge now
+activate from `auth.json` alone — a double-clicked packaged app needs **no env
+vars**. The 401 "Missing API key" double-click bug was caused by the old gates
+(`FF_FLOW_LLM=1` / `FF_DEVICE_BRIDGE=1`), which a double-click never set, so the
+`af_live_*` key was never injected. Gating now:
+- `ui/desktop/src/device-bridge/gating.ts:21` `flowLlmEnabled()` → on whenever
+  `flowGatewayEnvFromAuth()` (`ui/desktop/src/device-bridge/index.ts:36`) returns
+  non-null (auth.json carries a key). Keyless launch → keeps the user's own provider.
+- `ui/desktop/src/device-bridge/gating.ts:31` `deviceBridgeEnabled()` → on whenever
+  `isEnrolled(auth)` (`ui/desktop/src/device-bridge/auth.ts:87`).
+- Opt-out (developer pins stock-goose): `FF_FLOW_LLM=0` / `FF_DEVICE_BRIDGE=0`
+  (also `false`) force-disable, via `isOptedOut()`
+  (`ui/desktop/src/device-bridge/gating.ts:12`).
+- Wired in `ui/desktop/src/main.ts:80` (bridge gate) +
+  `ui/desktop/src/main.ts:864` (flow gate).
+
+```bash
+# Enrolled double-click: zero env vars needed.
+"out/AgentFlow Desktop-darwin-arm64/AgentFlow Desktop.app/Contents/MacOS/AgentFlow Desktop"
+# Force the stock-goose path (own provider, no bridge):
+FF_FLOW_LLM=0 FF_DEVICE_BRIDGE=0 "out/.../AgentFlow Desktop"
+```
+On macOS grant Screen Recording + Accessibility when prompted (computercontroller needs them).
+
+## 2. Confirm engine wiring
+- `~/.config/goose/config.yaml` now has `extensions.computercontroller` (+ `agentflow` if the bundle resolved) and the app log shows `[engine] routing goosed through the AgentFlow flow gateway` + `[engine] enabled goose extensions: …`.
+- Grep the app log for `[device-bridge]` to confirm the WS connected (look for the absence of `device bridge skipped: … not enrolled`).
+
+## 2b. Local provider detection (Rust half — PR #12)
+
+The desktop offers the user's own locally-installed AI tools (Claude Code, Codex,
+Cursor, Gemini, Ollama, LM Studio, env keys) one-click alongside `flow`. The
+engine already implements every provider — this is detection only.
+
+- Lib: `crates/goose/src/providers/detect.rs` →
+  `detect_local_providers() -> Vec<DetectedProvider>`. Read-only; nothing spawned.
+- Three signals (strongest first): `binary` (catalog `binary_name` on PATH) →
+  `local-server` (Ollama `:11434/api/tags`, OpenAI-compatible `:1234/v1/models`,
+  400 ms budget) → `env-key` (a required secret `ProviderMetadata.config_keys`
+  entry set in the env, e.g. `ANTHROPIC_API_KEY`). De-dupes to the strongest.
+- Source of truth = `catalog.rs` `binary_name` (so it tracks the catalog):
+
+  | provider_id | binary_name | how it authenticates |
+  |---|---|---|
+  | `claude-acp` | `claude-agent-acp` | uses your Claude login (no key) |
+  | `codex-acp` | `codex-acp` | uses your Codex/OpenAI login |
+  | `copilot-acp` | `copilot` | GitHub Copilot login |
+  | `cursor-agent` | `cursor-agent` | Cursor login |
+  | `ollama` | (local server) | local, no key |
+  | `lmstudio` | (local server) | local OpenAI-compatible |
+
+- Verify: `cargo test -p goose providers::detect` → `8 passed`. (goose crate
+  `default = []`, so this needs no clang/llama-cpp.)
+- **Wired (Parts 2–3, PR #13):**
+  - goosed route `GET /config/detected-providers` →
+    `detect_local_providers()` (`crates/goose-server/src/routes/config_management.rs`
+    `get_detected_providers`). Plain route, **not** in the OpenAPI doc —
+    `LocalInferenceApiDoc` is `#[cfg(feature="local-inference")]`-gated, so a
+    schema regen would need the llama-cpp/clang build to match CI; the renderer
+    calls it via the shared `client` (`client.get({ url: '/config/detected-providers' })`).
+  - UI `DetectedProvidersSection` renders a "Found on your computer" row atop
+    `ProviderGrid.tsx`; each detected provider that also exists in the picker
+    list launches through the existing flow. `flow` stays the default card.
+  - Verify in the app: open the provider picker → the section lists your local
+    tools (Claude Code / Cursor / Codex / Ollama / env-keyed providers); the
+    section is hidden when none match. Quick check without the UI:
+    `curl -s localhost:<goosed-port>/config/detected-providers` (the desktop
+    knows the port/secret) → JSON array of `{provider_id, display_name, source, detail}`.
+
+## 3. Mode A — standalone (matrix b3)
+In the app chat, give a build + control task ("create a small Next.js page and
+take a screenshot of it in the browser"). PASS when:
+- goose makes `developer` write/editor tool calls that put real files on disk, AND
+- a `computercontroller` call screenshots/drives the machine,
+- all on the `flow` model (no other provider key needed; the gateway sees the af key).
+
+## 4. Mode B — platform-driven (matrix b4)
+From `/cabinet` (device online), dispatch a task to the device. PASS when a
+`task_complete` arrives with a **real, content-specific answer** (not a
+placeholder). Pull the artifact server-side (the public device API hides result
+text):
+```bash
+ssh ff-france 'kubectl -n franchise-factory exec agentflow-postgres-97fb67469-69298 -- \
+  psql -U agentflow -d agentflow -c "SELECT kind, created_at, LEFT(payload::text,250) \
+  FROM device_action_log WHERE device_id=<ID> ORDER BY id DESC LIMIT 10;"'
+```
+Look for `task.task_complete` with `answer` describing the real screen/result +
+non-zero `tokens_used`/`cost_usd`. Also verify drain-on-reconnect: dispatch while
+the app is closed, reopen → the queued task runs (`draining N queued task(s)` in the log).
+
+## 5. Live screen (matrix b6) — partial
+`subscribe_stream` is routed but the capture-frame publisher is not yet ported
+(see the fork page follow-ups). Cabinet "watch live" will not show frames until
+that lands — expected; do not fail the pass on b6 yet.
+
+## Failure modes
+| Symptom | Log / response signature for grep | Where to fix |
+|---|---|---|
+| Packaged app dies on launch | `Goosed binary not found in any of the possible paths` | stage goosed → `src/bin/goosed` before package (§0). FIXED in `desktop-ci.yml` (PR: build goose-server → stage → package → headless smoke-launch asserts goosed spawns) — the gate now proves a runnable app |
+| CLI/goosed build aborts | `ggml.h: fatal error: 'stdbool.h' file not found` (llama-cpp-sys-2) | install clang/libclang OR `--no-default-features --features portable-default[,code-mode]` |
+| Mode-B dispatch never runs | dispatch returns `{queued:true, session_id:null}` and `GET …/tasks/<id>` stays `status:queued, dispatched_at:null` | per-pod in-memory WS registry + multi-replica agents; device drains only on WS reconnect (`device-bridge/index.ts onConnected → fetchQueuedTasks`). Fix: fan-out dispatch by device id (pub/sub) or interval-poll `/queued_tasks` |
+| Benign cmd refused on device | `command not in shell_whitelist: <cmd>` | expected — daemon scope `shell_whitelist` enforced; add the cmd via `PUT /me/devices/:id/scope` |
+| CI red on every PR (Live Provider Tests) | `Authentication failed for https://api.anthropic.com/v1/messages. Status: 401` (`x-api-key header is required`) | `pr-smoke-test.yml` drives a live Anthropic provider but the org has no `ANTHROPIC_API_KEY` (LLM routes via the `flow` alias). FIXED: `check-fork` publishes `has_secrets`; `build-binary` + the 4 provider jobs skip when absent. Do NOT inject an Anthropic key |
+| Double-clicked app 401s on the model | `Missing API key` / `invalid_session` though `~/.agentflow/auth.json` has `api_key` | FIXED PR #10: flow-LLM gate was `FF_FLOW_LLM=1`-only; a double-click set no env var. Now default-on via `gating.ts:flowLlmEnabled` (`ui/desktop/src/main.ts:864`). If it recurs, confirm `flowGatewayEnvFromAuth()` (`device-bridge/index.ts:36`) reads a non-empty `api_key` and `FF_FLOW_LLM` is not pinned to `0` |
+
+## Verified by reality (2026-05-30, ref e346d7d)
+CLI on ff-france: build ✅ (portable-default), Mode-A `PONG` via flow ✅,
+computercontroller loads (7 tools) + REALLY executes ✅ (`automation_script`
+wrote `/tmp/cc_proof.txt`), af_* bundle `list_projects`→18 ✅.
+Electron: packages ✅ (rebranded productName), boots headless + spawns goosed ✅
+(only after staging goosed). Mode-B headless connect ✅ — throwaway device +
+`FF_DEVICE_BRIDGE=1` + auth.json → device `online` in `GET /me/devices`, enroll
+handshake rotated a `device_secret`. Mode-B on the owner's real Mac ✅ — live session
+trace `task_dequeued → thinking(flow) → code_run_command cwd=/Users/a1 →
+scope-whitelist blocked uname → task_complete`. Pod-race: 2/4 dispatches stuck
+queued. CLI is NOT rebranded (stock goose 1.36.0). No dmg/msi makers; Windows CI
+on `windows-latest` (can't run on ff-france). Full report:
+`agentflow/plans/autonomous/_desktop-test-2026-05-30.md`.
+
+## Pass criteria
+- b3: Mode A produced real files + a real screenshot on `flow`.
+- b4: Mode B `task_complete` with a content-specific answer artifact + usage; queued-drain works.
+- One install, both modes, same goosed.
+
+## Related
+- [AgentFlow Desktop (Goose fork)](/subsystems/agentflow-desktop-fork)
+- Plan: `agentflow/plans/goose-desktop-fork.md`

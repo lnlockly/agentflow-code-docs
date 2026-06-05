@@ -1,0 +1,282 @@
+---
+title: "Hosted-device warm pool"
+description: "Pre-warmed hosted_devices pool so new users get a daemon device in < 2 s instead of waiting ~60-90 s for kubectl apply."
+---
+
+# Hosted-device warm pool
+
+## TL;DR
+
+`POST /me/hosted-devices` with `kind=daemon` claims a pre-warmed row from
+the `af-pool` namespace and returns in under two seconds, instead of
+applying a fresh StatefulSet on the user's hot path. `DELETE` recycles
+the device back to the pool — pod stays running, `/workspace` is wiped,
+DB row flips `is_warm=true` for the next claim. A 30-second refill
+ticker in `auto-pinger` keeps the pool topped up to
+`HOSTED_WARM_POOL_TARGET` (default 5).
+
+:::caution[Pool PAUSED in prod since 2026-05-30 — `HOSTED_WARM_POOL_TARGET=0`]
+The warm pool is currently disabled (`HOSTED_WARM_POOL_TARGET=0` in the
+`agentflow-agents` deployment env / `k8s/agentflow-agents.yaml`). Builds are
+NOT affected — project approve falls back to **on-demand** daemon provisioning
+(see below). The pool stays paused until the warm daemon image idles instead of
+exiting on a credential-less selftest. See "Incident 2026-05-30" + the new
+failure-mode rows. The `af-pool` namespace + agents RBAC ARE restored
+(`k8s/af-pool.yaml`), so flipping the target back to `5` re-enables refill once
+the image is fixed.
+:::
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/hosted-pool/config.ts:1` | Env knobs (target, tick ms, namespace, recycle flag) |
+| `agentflow-agents/src/services/hosted-pool/manifest.ts:1` | Warm-pod YAML (Service + STS, no enrollment env) |
+| `agentflow-agents/src/services/hosted-pool/refill.ts:1` | `runHostedPoolRefillTick()` + `warmStsName()` + audit emit |
+| `agentflow-agents/src/services/hosted-pool/claim.ts:1` | `claimWarmDevice()` with `FOR UPDATE SKIP LOCKED` |
+| `agentflow-agents/src/services/hosted-pool/recycle.ts:1` | `recycleDeviceToPool()` — wipe + restart + flip row |
+| `agentflow-agents/src/services/hosted-pool/drain.ts:1` | `drainWarmPool()` + stats counters |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:796` | POST handler — tries claim before on-demand fallback |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:1602` | DELETE handler — recycle-or-hard-delete + orphan ingress |
+| `agentflow-agents/src/routes/me-hosted-pool.ts:1` | `GET /me/hosted-pool` (wizard banner) |
+| `agentflow-agents/src/routes/internal-hosted-pool.ts:1` | Ops: stats / refill / drain |
+| `agentflow-agents/src/services/auto-pinger.ts` | 30 s `runHostedPoolRefillTick` interval |
+| `agentflow-agents/migrations/2026-05-27b-hosted-devices-warm-pool.sql:1` | Schema migration |
+| `agentflow-agents/k8s/af-pool.yaml:1` | **af-pool namespace + agents-SA Role/RoleBinding** (sts/svc/pods/exec in af-pool) — restored 2026-05-30 |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:provisionDaemonOnDemand` | Exported on-demand provision helper (warm-claim → this) — reused by the project clone fallback |
+| `agentflow-agents/src/services/project-clone.ts:pickDaemonDevice` | Approve/clone fallback: no owned + no warm daemon → `provisionDaemonOnDemand` (no more hard `no_hosted_daemon`) |
+
+## Data flow
+
+```
+                            ┌──────────────────────────────────┐
+                            │ auto-pinger 30 s tick            │
+                            │  runHostedPoolRefillTick()       │
+                            └─────────────┬────────────────────┘
+                                          │ COUNT(is_warm AND user_id IS NULL)
+                                          │   < HOSTED_WARM_POOL_TARGET ?
+                                          ▼
+                            ┌──────────────────────────────────┐
+                            │ INSERT hosted_devices            │
+                            │   (is_warm=true, user_id=NULL,   │
+                            │    kind=daemon, status=prov)     │
+                            │ kubectl apply STS → af-pool      │
+                            │ hosted_pool_events 'refill_*'    │
+                            └─────────────┬────────────────────┘
+                                          │ pod Ready in ~30 s
+                                          ▼
+                            ┌──────────────────────────────────┐
+                            │ pool: 5 warm rows, all Ready     │
+                            └─────────────┬────────────────────┘
+                                          │
+            POST /me/hosted-devices       │
+            (kind=daemon, no preset) ─────┤
+                                          ▼
+                            ┌──────────────────────────────────┐
+                            │ claimWarmDevice() BEGIN          │
+                            │  SELECT FOR UPDATE SKIP LOCKED   │
+                            │  INSERT user_devices             │
+                            │  UPDATE hosted_devices SET       │
+                            │    user_id=:u, is_warm=false,    │
+                            │    claimed_at=NOW(),             │
+                            │    rotation_secret_hash=rotated  │
+                            │ COMMIT                           │
+                            └─────────────┬────────────────────┘
+                                          │ < 2 s
+                                          ▼
+                            ┌──────────────────────────────────┐
+                            │ 201 { device, from_pool: true }  │
+                            └──────────────────────────────────┘
+
+      DELETE /me/hosted-devices/:id  (HOSTED_POOL_RECYCLE_ENABLED=true)
+                                          │
+                                          ▼
+                            ┌──────────────────────────────────┐
+                            │ recycleDeviceToPool():           │
+                            │  1. tx: mark user_devices del,   │
+                            │     flip row is_warm=true,       │
+                            │     rotate secret, rename        │
+                            │  2. kubectl exec rm -rf workspace│
+                            │  3. scale STS 0 → 1              │
+                            │  4. wait Ready (≤30 s)           │
+                            │  5. delete franchise-factory     │
+                            │     ingress/svc/endpoints with   │
+                            │     label af-hosted-device-id    │
+                            └─────────────┬────────────────────┘
+                                          │
+                          recycle.recycled? ──► true → 200 { recycled: true }
+                                          │
+                                          └──► false → hard-delete fallback
+                                                       hosted_pool_events
+                                                       'recycle_fallback_*'
+```
+
+## DB / Env / API
+
+### Tables
+- `hosted_devices` (existing) gains:
+  - `user_id INTEGER NULL` (was NOT NULL)
+  - `is_warm BOOLEAN NOT NULL DEFAULT FALSE`
+  - `claimed_at TIMESTAMPTZ NULL`
+  - Partial index `idx_hosted_devices_warm_unclaimed` on `created_at WHERE is_warm AND user_id IS NULL`
+- `hosted_pool_events` (new):
+  - `id BIGSERIAL`, `hosted_device_id UUID NULL`, `kind TEXT`, `detail TEXT`, `created_at TIMESTAMPTZ`
+  - Indexes on `created_at DESC` and `(hosted_device_id, created_at DESC) WHERE hosted_device_id IS NOT NULL`
+
+### Env
+| Variable | Default | Purpose |
+|---|---|---|
+| `HOSTED_WARM_POOL_TARGET` | `5` (prod: **`0` = paused**, see Incident 2026-05-30) | Unclaimed warm rows the reconciler maintains. `0` ⇒ refill tick is a no-op. Clamped `[1, 50]` when ≥1. |
+| `HOSTED_POOL_TICK_MS` | `30000` | Refill loop cadence (min 5 s). |
+| `HOSTED_POOL_NAMESPACE` | `af-pool` | k8s namespace warm pods live in. |
+| `HOSTED_POOL_RECYCLE_ENABLED` | `true` | Set `false` to opt back into hard-delete on DELETE. |
+
+### Routes
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| GET | `/me/hosted-pool` | session | `{target, available}` for wizard banner |
+| GET | `/internal/hosted-pool/stats` | internal-secret | `{target, unclaimed, claimed_today, errors_recent}` |
+| POST | `/internal/hosted-pool/refill` | internal-secret | Force a refill tick, returns `{target, kept, created, errors}` |
+| POST | `/internal/hosted-pool/drain` | internal-secret | Body `{count}` — tears down N unclaimed warm pods |
+
+## Architecture decisions
+
+1. **Pool lives in `af-pool`, not per-tenant vclusters.** Single quota,
+   one place to debug, no cross-tenant warm-pod proliferation. The
+   per-user `Ingress` (in `franchise-factory`) keeps pointing at the
+   pod IP across user namespaces, just like the existing
+   per-project bridge service does.
+2. **`SELECT FOR UPDATE SKIP LOCKED LIMIT 1`** — two parallel claims
+   never grab the same row. Concurrent callers either get DIFFERENT
+   rows or `PoolEmptyError`.
+3. **Recycle instead of hard-delete on `DELETE`.** Pod stays running,
+   `/workspace` is wiped, secret rotated, row flips `is_warm=true`.
+   Saves ~60–90 s of `kubectl apply` per next user. Falls back to
+   hard-delete if recycle fails partway (auditable via
+   `hosted_pool_events.kind='recycle_fallback_hard_delete'`).
+4. **Preset-bound devices skip the pool** (for now). Marketplace preset
+   injection rewrites the daemon env at create-time; the recycle path
+   doesn't re-render those env vars, so preset claims fall through to
+   the existing on-demand provision path. Revisit when we add a
+   "preset attach" step to recycle.
+
+## Lifecycle: claim → use → recycle
+
+```
+              ┌───────────┐
+              │  refill   │  (every 30 s, top up to TARGET)
+              └─────┬─────┘
+                    │ INSERT is_warm=true + kubectl apply
+                    ▼
+              ┌───────────┐    POST /me/hosted-devices    ┌───────────┐
+              │  warm     │ ──────────────────────────►   │  claimed  │
+              │ is_warm=t │   SELECT FOR UPDATE SKIP      │  user_id=u│
+              │ user_id=∅ │   SKIP LOCKED                 │ is_warm=f │
+              └─────▲─────┘                               └─────┬─────┘
+                    │                                           │
+                    │      DELETE /me/hosted-devices/:id        │
+                    │      (HOSTED_POOL_RECYCLE_ENABLED)        │
+                    │      wipe + restart + rotate secret       │
+                    └───────────────────────────────────────────┘
+                    │
+                    │ recycle failure (wipe/restart/db error)
+                    ▼
+              ┌───────────┐
+              │   gone    │  hard-delete path: STS+SVC+PVC delete,
+              │ deleted_at│  hosted_devices.deleted_at=NOW()
+              └───────────┘
+```
+
+## Incident 2026-05-30 — empty pool blocked ALL daemon-less builds (P0)
+
+Root cause chain:
+1. The **`af-pool` namespace was never created** on ff-france, and the
+   `agentflow-agents` SA had **no RBAC** to create StatefulSets there. Every
+   refill tick since 2026-05-26 failed with `namespaces "af-pool" not found`
+   (`hosted_pool_events.refill_apply_failed` ×5). The 5 warm rows stuck at
+   `status='error'`, pool permanently empty.
+2. `claimWarmDevice` found nothing → `PoolEmptyError`. The project approve path
+   (`project-clone.ts:pickDaemonDevice`) only returns a daemon ALREADY owned by
+   the user, so a user with no pre-existing daemon got a hard
+   `no_hosted_daemon` → could not approve → could not build.
+3. `countWarmUnclaimed` counts ALL `is_warm` rows regardless of status, so the
+   5 stuck `error` rows ALSO blocked refill from creating replacements.
+
+Two-part fix:
+- **Code (primary):** `triggerProjectClone` now falls back to
+  `provisionDaemonOnDemand` (the proven `POST /me/hosted-devices` kind=daemon →
+  tenant-vcluster `kubectl apply` path) when there is no owned daemon AND no
+  claimable warm row. The `user_devices` + `hosted_devices` rows are written
+  synchronously, so the next `pickDaemonDevice` finds them; the clone task
+  queues and the daemon drains it on first WS connect (~60 s pod boot). An
+  empty/dead warm pool NEVER hard-blocks a build again. Generic, no per-slug.
+- **Infra (secondary):** `k8s/af-pool.yaml` (re)creates the `af-pool` namespace
+  + a namespaced `Role`/`RoleBinding` granting the agents SA sts/svc/pods/
+  pods-exec in af-pool. After apply, `kubectl auth can-i create statefulsets
+  -n af-pool --as=…agentflow-agents` = `yes`; refill emits `refill_created`
+  (no more `refill_apply_failed`). The 5 stuck `error` rows were soft-deleted.
+
+Remaining gap (separate repo): warm pods still **CrashLoopBackOff** — the warm
+daemon image runs its selftest, finds no `auth.json`/`computer-scope.toml`
+(warm pods are credential-less by design) and **exits 1**. `claimWarmDevice`
+would hand a user that dead pod. So the pool is **paused** (`HOSTED_WARM_POOL_TARGET=0`)
+until `agentflow-computer-mcp` ships a "warm idle" entrypoint that idles instead
+of exiting when `AF_POOL_WARM=true` and no creds are present. (Note also:
+`claim.ts` never re-credentials the claimed pod — the `manifest.ts` comment
+"patch the pod env / restart at claim time" was never implemented; both must be
+addressed before re-enabling.)
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| New device takes 60 s+ even though pool target = 5 | `hosted-pool: count query failed` | `services/hosted-pool/refill.ts:countWarmUnclaimed` — DB pool exhaustion |
+| `runHostedPoolRefillTick` ticks but no rows appear | `hosted-pool: refill apply failed` in `hosted_pool_events` | `af-pool` namespace missing or ResourceQuota exhausted |
+| Refill apply fails with `namespaces "af-pool" not found` / Forbidden on statefulsets | `refill_apply_failed` detail `exit=1 stderr=…af-pool…` | Apply `k8s/af-pool.yaml` (namespace + agents-SA Role/RoleBinding) |
+| Warm pods CrashLoopBackOff, never Ready | pod log `auth_file FAIL: …auth.json not found` + `FAIL: 2 required check(s) failed` | warm daemon image (`agentflow-computer-mcp` entrypoint) must idle when `AF_POOL_WARM=true` — keep `HOSTED_WARM_POOL_TARGET=0` meanwhile |
+| Daemon-less user can't approve a project | `no_hosted_daemon` in approve response (`project-clone.ts`) | Fixed: on-demand fallback in `triggerProjectClone`; if it ALSO fails, see event `log` msg `on-demand daemon provision failed: …` |
+| Recycle silently falls back to hard-delete | `hosted_pool_events.kind = 'recycle_fallback_hard_delete'` | wipe exec failed — pod was already CrashLoop. Check `me-hosted-devices.ts:DELETE` audit row's `detail` |
+| Pool grows unbounded | Manual: `SELECT COUNT(*) FROM hosted_devices WHERE is_warm` | `HOSTED_WARM_POOL_TARGET` env mis-set; clamp is 50 but a drift row outside reconciler still adds |
+| Claim returns empty pool for hours | `PoolEmptyError` in route log; `hosted_pool_events.kind='refill_apply_failed'` count up | Inspect `af-pool` namespace events; check `kubectl get sts -n af-pool` |
+
+## Manual ops commands
+
+```bash
+# Read current pool state (admin)
+curl -sH "x-agentflow-secret: $INTERNAL_API_SECRET" \
+  https://agentflow.website/_agents/internal/hosted-pool/stats | jq
+
+# Force a refill (eg. after a quota expand)
+curl -sX POST -H "x-agentflow-secret: $INTERNAL_API_SECRET" \
+  https://agentflow.website/_agents/internal/hosted-pool/refill | jq
+
+# Drain N warm pods (eg. before redeploying daemon image)
+curl -sX POST -H "x-agentflow-secret: $INTERNAL_API_SECRET" \
+  -H "content-type: application/json" \
+  -d '{"count": 3}' \
+  https://agentflow.website/_agents/internal/hosted-pool/drain | jq
+
+# Read recent audit
+ssh ff-france 'kubectl -n franchise-factory exec agentflow-postgres-97fb67469-69298 -- \
+  psql -U agentflow -d agentflow -c "
+    SELECT kind, LEFT(detail, 80) AS detail, created_at
+    FROM hosted_pool_events
+    ORDER BY created_at DESC LIMIT 20;
+  "'
+
+# Tune the target (then redeploy or wait for env reload on next pod restart)
+export HOSTED_WARM_POOL_TARGET=10
+```
+
+### Apply migration
+
+```bash
+ssh ff-france 'kubectl -n franchise-factory exec agentflow-postgres-97fb67469-69298 -- \
+  psql -U agentflow -d agentflow -c "$(cat migrations/2026-05-27b-hosted-devices-warm-pool.sql)"'
+```
+
+## Related
+
+- [Hosted device](/subsystems/hosted-device) — on-demand provision flow this pool front-runs.
+- [Hosted daemon](/subsystems/hosted-daemon) — the image warm pods run.
+- [Devices unified](/subsystems/devices-unified) — wizard / cabinet UX that calls these routes.
