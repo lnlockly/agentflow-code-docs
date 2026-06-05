@@ -1,0 +1,190 @@
+---
+title: "Session rotation — JWT + refresh"
+description: "Short af_session JWT (1h) backed by a 30-day rolling af_refresh cookie. The browser never sees a logout while the refresh chain is alive. Plus emergency revoke-all and zombie-cookie cleanup."
+---
+
+# Session rotation — JWT + refresh
+
+## TL;DR
+
+Two cookies carry session state:
+
+- `af_session` — short JWT (1h, HS256, `AUTH_JWT_SECRET`)
+- `af_refresh` — opaque 32-byte hex, sha256-hashed in DB, 30-day rolling
+
+When the JWT expires (or is missing), `requireSession` looks up `af_refresh`,
+rotates it via `auth_refresh_tokens`, mints a fresh JWT, and writes both
+cookies on the same response. The user never re-logs in while the refresh
+chain is alive.
+
+A used-token replay (someone presented an already-rotated refresh) revokes
+the entire user's refresh chain — the legitimate browser is forced through
+re-login on its next refresh attempt. Standard theft-mitigation.
+
+Emergency revoke-all: `POST /internal/auth/revoke-all` bumps
+`auth_settings.jwt_revision`. Every JWT carries the `rev` it was minted
+with; cookies with stale `rev` get 401 `session_revoked`.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/cookie.ts:25` | `SESSION_COOKIE_NAME`, `REFRESH_COOKIE_NAME`, `CANONICAL_COOKIE_OPTS`, two TTL constants |
+| `agentflow-agents/src/services/cookie.ts:84` | `setSessionCookie` — the only af_session writer |
+| `agentflow-agents/src/services/cookie.ts:113` | `setRefreshCookie` — the only af_refresh writer |
+| `agentflow-agents/src/services/cookie.ts:208` | `clearAllSessionCookies` — zombie sweep (both names × 3 paths × 3 domain variants = 18 headers) |
+| `agentflow-agents/src/services/cookie.ts:181` | `maybeReissueSessionCookie` — expire legacy + write fresh |
+| `agentflow-agents/src/services/refresh-tokens.ts:44` | `mintRefreshToken` — INSERT INTO auth_refresh_tokens |
+| `agentflow-agents/src/services/refresh-tokens.ts:80` | `rotateRefreshToken` — atomic claim, theft detection |
+| `agentflow-agents/src/services/refresh-tokens.ts:135` | `revokeRefreshToken` — single-row revoke on logout |
+| `agentflow-agents/src/services/jwt-revision.ts:24` | `getCurrentJwtRevision` — 5s cached read of `auth_settings.jwt_revision` |
+| `agentflow-agents/src/services/jwt-revision.ts:48` | `bumpJwtRevision` — emergency revoke-all increment |
+| `agentflow-agents/src/middleware/auth.ts:171` | `tryRefreshRotation` — middleware's silent re-mint path |
+| `agentflow-agents/src/middleware/auth.ts:213` | `requireSession` — accepts api-key / bearer / cookie + refresh |
+| `agentflow-agents/src/routes/internal.ts` (bottom) | `POST /internal/auth/revoke-all`, `GET /internal/auth/revoke-status` |
+| `agentflow-agents/src/routes/auth-magic-link.ts:413` | Magic-link verify — mints both cookies |
+| `agentflow-agents/src/routes/auth-password.ts:334` | Password register — mints both cookies |
+| `agentflow-agents/src/routes/auth-password.ts:390` | Password login — mints both cookies |
+| `agentflow-agents/src/routes/auth-password.ts:560` | `POST /auth/logout` — revokes refresh row + clears jar |
+| `agentflow-agents/src/routes/auth-tg-callback.ts:399` | TG widget callback — mints both with SameSite=None |
+| `agentflow-agents/src/routes/auth-tg-callback.ts:614` | TG Mini App auth — mints both with SameSite=None |
+| `agentflow-agents/migrations/2026-05-25c-auth-refresh-tokens.sql` | Migration for `auth_refresh_tokens` |
+| `agentflow-agents/tests/auth-rotation.test.ts` | 10 scenarios for the cookie + rotation pipeline |
+
+## Data flow
+
+```
+              Login (any of magic-link / password / TG widget / TG Mini App)
+                       │
+                       ▼
+              mintSessionAndSetCookies
+                       │
+                       ├─► sign JWT (1h, rev claim)  ──► Set-Cookie: af_session
+                       └─► mintRefreshToken (30d)    ──► Set-Cookie: af_refresh
+
+              ─── Authenticated request 1h later ───
+
+  Browser sends:  Cookie: af_session=<expired-jwt>; af_refresh=<opaque>
+                       │
+                       ▼
+              requireSession
+                       │
+              jwt.verify → TokenExpiredError
+                       │
+              tryRefreshRotation
+                       │
+              rotateRefreshToken
+                       ├─ valid + not used ─► UPDATE used_at = NOW()
+                       │                       INSERT fresh row
+                       │                       return new raw token
+                       ▼
+              signSessionJwtForUser
+                       │
+              Set-Cookie: af_session=<new-jwt> (1h)
+              Set-Cookie: af_refresh=<new-opaque> (30d)
+                       │
+              next()  ← user never sees a logout
+```
+
+## DB / Env / API
+
+### Tables
+
+```sql
+auth_refresh_tokens (
+  id          BIGSERIAL PK,
+  user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash  TEXT NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  used_at     TIMESTAMPTZ,
+  expires_at  TIMESTAMPTZ NOT NULL,
+  revoked_at  TIMESTAMPTZ,
+  ip          TEXT,
+  user_agent  TEXT
+)
+
+auth_settings (
+  id INT PRIMARY KEY DEFAULT 1,
+  jwt_revision INT NOT NULL DEFAULT 0,
+  last_revoked_at TIMESTAMPTZ,
+  last_revoked_reason TEXT
+)
+```
+
+### Env
+
+- `AUTH_JWT_SECRET` — HS256 signing key. Rotation no longer invalidates
+  sessions: any cookie that still has a valid refresh chain re-mints
+  silently on next request. Sessions with an old-secret-signed JWT but a
+  fresh refresh row still work after rotation.
+- `SESSION_COOKIE_DOMAIN` — `.agentflow.website` in prod so chat / preview
+  subdomains share both cookies.
+- `INTERNAL_API_SECRET` — gates `/internal/auth/revoke-all`.
+
+### Routes
+
+- `POST /auth/login`, `POST /auth/register`, `POST /auth/magic-link/verify`,
+  `GET/POST /auth/telegram/callback`, `POST /auth/telegram` — mint both
+  cookies.
+- `POST /auth/logout` — revoke refresh row + clear jar.
+- `POST /internal/auth/revoke-all` — bump `jwt_revision`, kill every
+  cookie-based session on the next request. `x-agentflow-secret` required.
+- `GET /internal/auth/revoke-status` — read current revision + audit.
+
+### Metrics
+
+- `auth_401_total{reason}` — labels: `jwt_expired`, `jwt_invalid_signature`,
+  `jwt_malformed`, `jwt_not_before`, `jwt_unknown`, `bad_session_shape`,
+  `session_revoked`, `no_token`, `invalid_api_key`,
+  `refresh_unknown_token`, `refresh_token_used`, `refresh_token_revoked`,
+  `refresh_token_expired`.
+- `auth_refresh_rotations_total` — successful silent re-mints. Should match
+  the pre-PR rate of `jwt_expired` 401s.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| User logged out unexpectedly | `[auth-401] reason=jwt_expired ... refresh=unknown_token` | Check `auth_refresh_tokens` — row missing means cookie was minted before rotation shipped; user has to log in once |
+| Theft signal — chain killed | `[auth-401] reason=jwt_expired ... refresh=token_used` | Legitimate. Inspect `ip` columns on the user's recent refresh rows; if two different IPs, theft happened |
+| All sessions dropped after deploy | `auth_401_total{reason="session_revoked"}` spike | `auth_settings.jwt_revision` bumped — check `last_revoked_reason` |
+| Cookie jar full of zombies | `[auth-401] reason=no_token cookies=8 hint=no_refresh_cookie` | `/auth/logout` failed to run; user opens `/auth/login` which runs `clearAllSessionCookies` |
+| JWT secret rotated, users not affected | none — silent re-mint | This is the intended behaviour. `auth_refresh_rotations_total` counter ticks |
+
+## What the browser sees
+
+After login:
+
+```
+HTTP/1.1 200 OK
+Set-Cookie: af_session=eyJ...; Path=/; Max-Age=3600;  HttpOnly; SameSite=Lax; Secure; Domain=.agentflow.website
+Set-Cookie: af_refresh=aabb...; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax; Secure; Domain=.agentflow.website
+```
+
+1h later, any authenticated request:
+
+```
+HTTP/1.1 200 OK     (request succeeded — middleware silently rotated)
+Set-Cookie: af_session=eyJ.NEW.JWT...; Path=/; Max-Age=3600;  HttpOnly; SameSite=Lax; Secure; Domain=.agentflow.website
+Set-Cookie: af_refresh=ccdd.NEW...; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax; Secure; Domain=.agentflow.website
+```
+
+After logout:
+
+```
+HTTP/1.1 200 OK
+Set-Cookie: af_session=; Path=/;        Max-Age=0; ...   (3 domain variants)
+Set-Cookie: af_session=; Path=/cabinet; Max-Age=0; ...
+Set-Cookie: af_session=; Path=/account; Max-Age=0; ...
+Set-Cookie: af_refresh=; Path=/;        Max-Age=0; ...   (3 domain variants)
+Set-Cookie: af_refresh=; Path=/cabinet; Max-Age=0; ...
+Set-Cookie: af_refresh=; Path=/account; Max-Age=0; ...
+```
+
+18 Set-Cookie headers total (2 names × 3 paths × 3 domain variants). RFC 6265
+§4.1.2 explicitly allows multiple headers on one response.
+
+## Related
+
+- [auth-and-access](/subsystems/auth-and-access) — JWT shape, api-key auth, brute-force guard.
+- [matrix-monitoring](/subsystems/matrix-monitoring) — prom registry shared with `auth_401_total`.
