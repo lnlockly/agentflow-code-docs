@@ -1,0 +1,152 @@
+---
+title: "Dependency Map (browsable)"
+description: "Self-hosted module dependency graph of the agentflow-agents backend — open in a browser, see which folders and files import which. Generated with dependency-cruiser + graphviz, no external SaaS."
+---
+
+# Dependency Map
+
+## TL;DR
+
+Это **карта импортов бэкенда `agentflow-agents`** — открываешь в браузере и видишь, какая папка тянет какую, и какой файл от какого зависит. Две картинки: сначала крупный план на уровне папок (18 узлов — легко окинуть взглядом), потом полная карта всех 658 файлов. Граф собран локально через `dependency-cruiser` + `graphviz`; **код никуда не уходит**, картинки лежат прямо в этом сайте как обычные SVG.
+
+Эта страница — для просмотра связей в браузере. Если нужен высокоуровневый «кто с кем общается» (контейнеры, потоки данных), смотри [C4 Architecture Map](/architecture/c4-overview); тут — механический import-граф из реального кода.
+
+## Что показывают картинки
+
+### Уровень папок (top-level)
+
+Каждый прямоугольник — это папка первого уровня внутри `src/`. Стрелка `A → B` значит «файлы в A импортируют что-то из B». Всего **18 узлов, 51 стрелка** между папками.
+
+<a href="/agentflow-code-docs/dep-graph/dep-graph-collapsed.svg" target="_blank" rel="noopener">
+  <img
+    src="/agentflow-code-docs/dep-graph/dep-graph-collapsed.svg"
+    alt="agentflow-agents module dependency graph collapsed to top-level src/ folders"
+    style="width:100%;max-width:880px;border:1px solid var(--sl-color-gray-5);border-radius:6px;background:#fff;"
+  />
+</a>
+
+> Клик по картинке открывает SVG на весь экран (браузерный зум работает — это вектор, не растр).
+
+Самые нагруженные направления (число файловых импортов между папками):
+
+| Откуда → Куда | Импортов | Что это значит |
+|---|---|---|
+| `mcp-servers → services` | 443 | MCP-тулы дёргают доменные сервисы — главная ось бэкенда |
+| `routes → services` | 315 | HTTP-роуты делегируют в сервисы (тонкий контроллер, толстый сервис) |
+| `services → db` | 275 | Сервисы пишут/читают Postgres |
+| `routes → db` | 176 | Часть роутов ходит в БД напрямую, минуя сервис |
+| `routes → middleware` | 140 | Auth / валидация на каждом роуте |
+| `server.ts → routes` | 135 | Корневой бутстрап монтирует все роуты |
+
+### Уровень файлов (full)
+
+Полный граф: **658 узлов (файлов), 2978 рёбер (импортов)**, сгруппированных в кластеры по папкам. Граф плотный — это рабочая карта «найти, кто импортит этот файл», а не плакат на стену. Открой на весь экран и пользуйся браузерным поиском (Ctrl/Cmd+F по тексту SVG ищет имена файлов).
+
+<a href="/agentflow-code-docs/dep-graph/dep-graph-full.svg" target="_blank" rel="noopener">
+  <img
+    src="/agentflow-code-docs/dep-graph/dep-graph-full.svg"
+    alt="agentflow-agents full file-level module dependency graph, 658 nodes"
+    style="width:100%;max-width:980px;border:1px solid var(--sl-color-gray-5);border-radius:6px;background:#fff;"
+  />
+</a>
+
+> Файл большой (~3.5 MB вектор). Если страница тормозит — открывай по ссылке выше отдельной вкладкой.
+
+## Findings (architectural smells)
+
+`dependency-cruiser` нашёл **140 циклических зависимостей** (circular imports) среди 658 модулей. Это реальные смеллы: цикл означает, что два-три файла нельзя загрузить независимо, и рефактор одного тянет остальные. Распределение по папкам (сколько раз файл папки участвует в цикле):
+
+| Папка | Участий в циклах |
+|---|---|
+| `services` | 628 |
+| `mcp-servers` | 387 |
+| `routes` | 56 |
+| `ui-templates` | 9 |
+| `scripts` / `ai-router` | 2 каждая |
+
+Два характерных примера:
+
+- **Короткий, чинится барьерным файлом** — `ui-templates/index.ts` ↔ `ui-templates/telegram-mcp.ts` (и так же `self-mcp.ts`, `knowledge-mcp.ts`). Барреля `index.ts` ре-экспортит модуль, который импортит сам барель. Фикс: импортить конкретный файл, а не `./index`.
+- **Длинный, через всю спину** — `services/projects.ts → mcp-servers/code-exec → … → services/runtime-supervisor → services/pool-worker → … → services/projects.ts`. Десяток файлов в одном кольце между `services/` и `mcp-servers/code-exec`. Это та самая ось `mcp-servers ↔ services` с 443+60 рёбрами — её стоит разрезать интерфейсом (порт), а не прямыми импортами.
+
+Полный список циклов воспроизводится командой из раздела ниже (`--output-type err`).
+
+## How it was generated (reproducible)
+
+Граф собран из репозитория `agentflow-agents` (read-only, ничего не правилось). `agentflow-agents` использует NodeNext-резолюцию с `.js`-расширениями в импортах, поэтому нужен `enhancedResolveOptions`, иначе `.js` не мапятся на исходные `.ts` и граф выходит без рёбер.
+
+Временный конфиг (`/tmp/dc-config.cjs`, **не** коммитится в `agentflow-agents`):
+
+```js
+module.exports = {
+  forbidden: [
+    { name: 'no-circular', severity: 'warn', from: {}, to: { circular: true } },
+  ],
+  options: {
+    doNotFollow: { path: 'node_modules' },
+    includeOnly: '^src',
+    tsPreCompilationDeps: true,
+    tsConfig: { fileName: 'tsconfig.json' },
+    enhancedResolveOptions: {
+      extensions: ['.ts', '.tsx', '.js', '.jsx', '.json'],
+      mainFields: ['module', 'main', 'types', 'typings'],
+      conditionNames: ['import', 'require', 'node', 'default', 'types'],
+    },
+  },
+};
+```
+
+Команды (из корня `agentflow-agents`, без глобальной установки):
+
+```bash
+# 1. Full file-level graph → dot. -Gnewrank=true нужен, иначе dot
+#    падает с "trouble in init_rank" на 140 циклах.
+npx --yes dependency-cruiser@latest --config /tmp/dc-config.cjs \
+  --output-type dot "src/**/*.ts" \
+  | dot -Tsvg -Gnewrank=true \
+  > ../agentflow-code-docs/public/dep-graph/dep-graph-full.svg
+
+# 2. Collapsed top-level-folder graph → dot → SVG.
+npx --yes dependency-cruiser@latest --config /tmp/dc-config.cjs \
+  --collapse "^src/[^/]+" --output-type dot "src/**/*.ts" \
+  | dot -Tsvg \
+  > ../agentflow-code-docs/public/dep-graph/dep-graph-collapsed.svg
+
+# 3. Cycle report (the Findings above).
+npx --yes dependency-cruiser@latest --config /tmp/dc-config.cjs \
+  --output-type err "src/**/*.ts"
+```
+
+Картинки самодостаточны: единственные `http://`-ссылки в SVG — это W3C XML namespace и DTD URI (стандартный SVG-бойлерплейт, не CDN, не грузятся в рантайме). `<script>`-тегов нет.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-code-docs/architecture/dependency-map.mdx` | This page |
+| `agentflow-code-docs/public/dep-graph/dep-graph-collapsed.svg` | Folder-level graph (18 nodes / 51 edges) |
+| `agentflow-code-docs/public/dep-graph/dep-graph-full.svg` | File-level graph (658 nodes / 2978 edges) |
+| `agentflow-agents/src/server.ts` | Backend entry — root of the import tree |
+| `agentflow-agents/src/services/projects.ts` | Node inside the longest `services ↔ mcp-servers` cycle |
+| `agentflow-agents/src/ui-templates/index.ts` | Barrel that re-exports a module which imports it back (short cycle) |
+
+## DB / Env / API
+
+- **Tables / Env / Routes:** none. This is a static analysis artifact — no runtime surface.
+- **Tooling:** `dependency-cruiser` (via `npx`, not installed globally), `graphviz` `dot` for rendering.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `dependency-cruiser` cruises 0 dependencies | `0 modules, 0 dependencies cruised` | Pass a glob target `"src/**/*.ts"` (not a bare `src` dir) and `--no-config` or `--config` |
+| Graph has nodes but no edges | edges count 0 in the `.dot` | NodeNext `.js` imports unresolved — add `enhancedResolveOptions.extensions` so `.js` maps to `.ts` |
+| `dot` aborts rendering the full graph | `trouble in init_rank` | The 140 cycles break strict ranking — render with `dot -Gnewrank=true` |
+| SVG renders as a force-directed hairball | n/a (visual) | Don't fall back to `sfdp`; `dot -Gnewrank=true` keeps the readable hierarchical clusters |
+
+## Related
+
+- [C4 Architecture Map](/architecture/c4-overview) — context / container / component view (intent-level)
+- [Architecture Overview](/architecture/overview) — the 5-minute tour
+- [LLM Router](/subsystems/llm-router) — `ai-router/` folder, target of the `services → ai-router` edges
+- [Code Exec MCP](/subsystems/code-exec-mcp) — `mcp-servers/code-exec`, hub of the longest cycle

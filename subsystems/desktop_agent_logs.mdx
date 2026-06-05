@@ -27,9 +27,9 @@ frames. The cabinet reads them via `GET /me/devices/:id/logs`.
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/desktop_cli.py:133` | `cmd_run` wires `init_logging` + WS handler |
 | `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_client.py:155` | `_connect_once` binds the publisher post-hello, drops it on disconnect |
 | `agentflow-agents/src/db/migrations/0071_device_logs.sql:1` | `device_logs` table + `idx_device_logs_device_time` |
-| `agentflow-agents/src/services/devices-ws.ts:478` | `device_log` frame → `persistDeviceLog` → INSERT |
-| `agentflow-agents/src/services/devices-ws.ts:880` | `normaliseDeviceLog` — level whitelist + 4 KB truncate |
-| `agentflow-agents/src/routes/me-devices.ts:1132` | `GET /me/devices/:id/logs` |
+| `agentflow-agents/src/services/devices-ws.ts:1030` | `persistDeviceLog` — `device_log` frame → INSERT (binds `ts.toISOString()`) |
+| `agentflow-agents/src/services/devices-ws.ts:1000` | `normaliseDeviceLog` — level whitelist + 4 KB truncate + ±24h ts clamp |
+| `agentflow-agents/src/routes/me-devices/logs.ts:95` | `GET /me/devices/:id/logs` |
 | `agentflow-agents/tests/me-devices-logs.test.ts:1` | Pure-helper tests (parse + normalise) |
 | `agentflow-computer-mcp/tests/test_logging_setup.py:1` | log_dir + rotation + mkdir-failure tests |
 | `agentflow-computer-mcp/tests/test_ws_log_uploader.py:1` | Drop-oldest + drain-on-attach + truncation tests |
@@ -97,6 +97,7 @@ root logger fan-out
 | Disk full — rotation did not save us | (no log) | `daemon.log` + 5 backups cap at ~30 MB. If the volume is full anyway, the OS denies the write and the file handler stays quiet (stderr keeps going). User has to free space on the host. |
 | WS blocking on log upload | (would be `[stream] capture err` cascading) | `ws_log_uploader.py:_drain` — bounded queue (500) + drop-oldest means the emitting thread never blocks. If queue keeps draining slowly, look at `dropped_count()` via `get_handler()`. |
 | Cabinet shows zero logs even after a crash | `persist_device_log_failed` | `devices-ws.ts:persistDeviceLog` — INSERT failed (FK / connection blip). Re-check `device_logs` table exists; verify migration `0071_device_logs.sql` ran (see `_app_migrations`). |
+| Cabinet shows zero logs; daemon connected fine | `persist_device_log_failed The "string" argument must be of type string ... Received an instance of Date` | `normaliseDeviceLog` returns `ts: Date`; under postgres-js `prepare: false` the driver has no date serializer registered for the inferred OID at Bind time, so it tried to write the raw `Date` to the wire buffer and threw — every device-log INSERT silently failed. Fixed by binding `row.ts.toISOString()` (Postgres casts the ISO text → `timestamptz`); `agentflow-agents/src/services/devices-ws.ts:1047`. |
 | Backlog never flushes after reconnect | `set_publisher` never called | `ws_client.py:_connect_once` — handler is bound right after hello. If WS reconnects but `set_publisher` is not hit, hello was never sent. |
 | INFO records flooding the table | `level = 'INFO'` in `SELECT level, count(*) FROM device_logs GROUP BY level` | `WsLogHandler.__init__` default `min_level=logging.WARNING` was overridden somewhere. Backend also rejects via `normaliseDeviceLog`. |
 | Log ts is in 2099 | `level = 'ERROR' AND ts > now()` | Clock skew on the daemon host. `normaliseDeviceLog` clamps ±24 h skew; further drift falls back to server `now()`. |

@@ -1,0 +1,117 @@
+---
+title: "Code-agent backend registry (swappable code-editing CLI)"
+description: "Strategy pattern for the CLI the hosted daemon spawns to edit a project from a brief. CODE_AGENT_BACKEND picks aider / opencode / cli without code changes."
+---
+
+# Code-agent backend registry
+
+## TL;DR
+
+The hosted daemon used to hardcode `aider` in `_default_spawn_aider`.
+After PR #125 (`feat/swappable-code-agents-backend`) the spawn delegates
+to a `CodeAgentBackend` looked up by slug, so flipping the editor
+between `aider`, `opencode`, `goose`, or a generic CLI is one env var
+(`CODE_AGENT_BACKEND`). Adding a new backend = one new file in
+`code_agents/` + one registry line; `agent_brief.py` never changes.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/tools/code_agents/__init__.py:28` | Registry + `get_backend()` factory keyed on `CODE_AGENT_BACKEND` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/tools/code_agents/base.py:35` | `CodeAgentBackend` ABC — `slug`, `build_command`, `healthcheck` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/tools/code_agents/aider.py:24` | Default backend — `aider --message <brief>` with the production flag set |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/tools/code_agents/opencode.py:23` | Legacy fallback — `opencode run <brief>` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/tools/code_agents/goose.py:62` | block/goose Rust binary — `goose run --with-builtin developer --no-session -t <brief>`; sidesteps litellm payload-blocked failures |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/tools/code_agents/cli_generic.py:42` | Env-driven escape hatch using `CODE_AGENT_CLI_CMD` template |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/tools/agent_brief.py:171` | `_resolve_backend_for_spawn` wires kwargs + env into a backend instance |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/tools/agent_brief.py:217` | `_default_spawn_aider` calls `backend.build_command` then `Popen` |
+| `agentflow-computer-mcp/tests/test_code_agents.py:1` | Contract tests for every backend + legacy-kwarg routing |
+
+## Data flow
+
+```
+agent_dev_brief(brief, slug, project_id, ...)
+    │
+    ▼
+_default_spawn_aider(brief, cwd, env, opencode_bin=, backend=)
+    │
+    ▼
+_resolve_backend_for_spawn(backend, aider_bin, opencode_bin)
+    │  precedence: explicit instance > slug arg > legacy opencode_bin
+    │             > CODE_AGENT_BACKEND env > AiderBackend default
+    ▼
+backend.build_command(brief, project_dir, api_key, api_base, model)
+    │  returns (argv, env_overrides)
+    ▼
+spawn_env.update(env_overrides)
+subprocess.Popen(argv, env=spawn_env, cwd=project_dir, ...)
+```
+
+## DB / Env / API
+
+- **Env (daemon pod):**
+  - `CODE_AGENT_BACKEND` — `aider` (default) / `opencode` / `goose` / `cli`
+  - `GOOSE_PROVIDER` / `GOOSE_MODEL` / `OPENAI_HOST` / `OPENAI_BASE_PATH`
+    — set automatically by `GooseBackend.build_command`. Goose uses its
+    own Rust HTTP client, not OpenAI's Python SDK, so the env shape
+    differs from `aider`/`opencode` (host + base path, not a single base
+    URL).
+  - `CODE_AGENT_CLI_CMD` — template string for `cli` backend, supports
+    `{brief}` `{project_dir}` `{api_key}` `{api_base}` `{model}` slots.
+    `{brief}` MUST be quoted because `shlex.split` runs on the rendered
+    template.
+  - `CODE_AGENT_CLI_ENV` — optional `KEY=VAL;KEY=VAL` extra env. Same
+    slot substitution.
+  - `AF_API_KEY` — owner-key for the AgentFlow gateway, layered onto
+    `OPENAI_API_KEY` by the aider + opencode backends.
+  - `AF_API_URL` — normalised to `…/_agents` and used as the OpenAI
+    base.
+- **No DB tables touched.**
+- **No new API routes.** Existing `agent_dev_brief` MCP tool is the
+  only public surface.
+
+## Flipping the backend in production
+
+Edit `agentflow-agents/k8s/agentflow-agents-env` secret (the daemon
+inherits its env from the agents pod manifest):
+
+```yaml
+data:
+  CODE_AGENT_BACKEND: opencode      # base64-encoded in the real secret
+```
+
+then `kubectl rollout restart deploy/agentflow-agents`. New daemons
+spawned for new projects pick up the change; in-flight projects keep
+running whatever backend they started with.
+
+## Adding a new backend (eg Continue)
+
+1. `code_agents/continue_backend.py` — subclass `CodeAgentBackend`,
+   implement `build_command` + `healthcheck`. Pin `slug = "continue"`.
+2. `code_agents/__init__.py` — add `"continue": ContinueBackend` to
+   `_REGISTRY`.
+3. Ship the binary in the daemon image (eg `docker/Dockerfile.coder`).
+4. Set `CODE_AGENT_BACKEND=continue` in the daemon env.
+
+`agent_brief.py` is not modified.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Spawn returns `backend_unconfigured` | `[code-agent:cli] starting cmd=<empty>` + `CODE_AGENT_CLI_CMD required` | Set `CODE_AGENT_CLI_CMD` or change `CODE_AGENT_BACKEND` |
+| Spawn returns `backend_unconfigured` with `unknown code agent backend` | `unknown code agent backend: 'foo'` | Typo in `CODE_AGENT_BACKEND`; valid slugs in error message |
+| Brief got word-split into many argv slots | `shlex` split on whitespace in rendered template | Quote `'{brief}'` in `CODE_AGENT_CLI_CMD` |
+| Aider hits gateway 401 | `OPENAI_API_KEY` missing in spawn env | `AF_API_KEY` env not injected into daemon pod |
+| Goose 404 on `/llm/v1/chat/completions` | `OPENAI_HOST` includes a path segment | `api_base` parsing — `goose.py:_split_host_from_api_base` strips path so host stays scheme+netloc |
+| Goose runs as chat-only, no file edits | `--with-builtin developer` missing from argv | Image lacks goose update — rebuild with `Dockerfile.coder` |
+
+## Related
+
+- [hosted-daemon](/subsystems/hosted-daemon) — pod image graph,
+  daemon-base/coder/universal variants
+- [llm-aliases](/subsystems/llm-aliases) — `openai/flow` model alias
+  resolved by the gateway, shared by every backend
+- [projects](/subsystems/projects) — `/me/projects/:id/approve` →
+  `agent_dev_brief` MCP tool that drives this code path

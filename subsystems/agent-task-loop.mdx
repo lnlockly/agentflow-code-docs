@@ -1,0 +1,111 @@
+---
+title: "Agent Task Loop"
+description: "How a working agent makes its work visible on the project's Plane board: claim, ETA, status, split, and read owner feedback."
+---
+
+# Agent Task Loop
+
+## TL;DR
+A spawned agent makes its work VISIBLE on the project's [Plane board](/subsystems/projects-tasks-binding):
+it sets itself as assignee, posts a comment with an ETA, posts status updates as
+it goes, splits a big task into sub-tasks, and reads the owner's comments each
+tick to revise. The loop runs through five project-scoped tasks-MCP tools that
+reuse the same Plane client as the native board — no new auth, no Plane UUIDs in
+the agent's hands.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/me-apps-tasks.ts:533` | `listTaskComments` — read the thread |
+| `agentflow-agents/src/services/me-apps-tasks.ts:554` | `addTaskComment` — post a status/reply comment |
+| `agentflow-agents/src/services/me-apps-tasks.ts:597` | `setTaskAssignee` — member UUID → Plane `assignees`; agent label → marker comment |
+| `agentflow-agents/src/services/me-apps-tasks.ts:643` | `createSubtask` — child issue with `parent` set (re-asserts on POST drop) |
+| `agentflow-agents/src/services/me-apps-tasks.ts:697` | `listSubtasks` — children of a parent issue |
+| `agentflow-agents/src/services/me-apps-tasks.ts:736` | `getTaskDetail` — aggregate issue + state + comments + sub-tasks + agent_assignee |
+| `agentflow-agents/src/services/me-apps-tasks.ts:108` | `AGENT_ASSIGNEE_MARKER` + `latestAgentAssignee` — agent-assignee convention |
+| `agentflow-agents/src/services/me-apps-tasks.ts:386` | `updateTaskIssue` — now also `target_date` (ETA), `assignee_ids`, `parent` |
+| `agentflow-agents/src/routes/projects.ts:5438` | `PATCH /me/projects/:id/tasks/:taskId` — state/name/target_date/assignee |
+| `agentflow-agents/src/routes/projects.ts:5527` | `GET /me/projects/:id/tasks/:taskId` — aggregated activity detail |
+| `agentflow-agents/src/routes/projects.ts:5554` | `GET /me/projects/:id/tasks/:taskId/comments` — list |
+| `agentflow-agents/src/routes/projects.ts:5572` | `POST /me/projects/:id/tasks/:taskId/comments` — add |
+| `agentflow-agents/src/routes/projects.ts:5600` | `POST /me/projects/:id/tasks/:taskId/subtasks` — split |
+| `agentflow-agents/src/mcp-servers/tasks.ts:603` | `read_task_comments` agent tool |
+| `agentflow-agents/src/mcp-servers/tasks.ts:624` | `comment_on_task` agent tool |
+| `agentflow-agents/src/mcp-servers/tasks.ts:648` | `set_task_due` agent tool |
+| `agentflow-agents/src/mcp-servers/tasks.ts:683` | `set_task_assignee` agent tool |
+| `agentflow-agents/src/mcp-servers/tasks.ts:707` | `create_subtask` agent tool |
+
+## Data flow
+```
+Spawned agent (Eliza runtime, tasks-MCP mount ?project=<af_id>)
+   │
+   │  on pickup
+   ├─ set_task_assignee(self)   ──┐
+   ├─ comment_on_task("взял…")    │  resolveProjectBoard → ensureProjectPlaneBinding
+   ├─ set_task_due("YYYY-MM-DD")  ├─►  → Plane UUID → me-apps-tasks Plane client
+   │  on progress                 │       → Plane REST (tasks.agentflow.website)
+   ├─ comment_on_task("status")   │
+   │  for a big task              │
+   ├─ create_subtask("piece") ×N ─┘
+   │  each tick
+   └─ read_task_comments → owner left a comment? → revise + comment_on_task(reply)
+
+Owner / FE                         The same board, same issues
+   GET  /me/projects/:id/tasks/:taskId            → getTaskDetail (one activity feed)
+   GET/POST .../comments  ·  PATCH ... {target_date, assignee}  ·  POST .../subtasks
+```
+
+## DB / Env / API
+- Tables: none new — reuses `projects.plane_project_id` (from
+  [task binding](/subsystems/projects-tasks-binding)).
+- Env: `PLANE_API_BASE`, `PLANE_API_TOKEN`, `PLANE_WORKSPACE` (same as the tasks
+  MCP). Unset → every route answers `{ ok:true, configured:false }`, every tool
+  answers `{ ok:false, error:'tasks_not_configured' }`.
+- Routes (owner/team auth via `loadOwnedProject`):
+  - `GET /me/projects/:id/tasks/:taskId` — aggregated detail.
+  - `GET /me/projects/:id/tasks/:taskId/comments` · `POST` (add).
+  - `PATCH /me/projects/:id/tasks/:taskId` — `{ state?, name?, target_date?, assignee? }`.
+  - `POST /me/projects/:id/tasks/:taskId/subtasks` — `{ name, description? }`.
+- MCP tools (project-scoped, mount `?project=<af_id>`): `read_task_comments`,
+  `comment_on_task`, `set_task_due`, `set_task_assignee`, `create_subtask`.
+- Plane endpoints used (via `buildPlaneRequest`):
+  - comments: `GET/POST {base}/workspaces/agentflow/projects/{pid}/issues/{iid}/comments/`
+    (body `{ comment_html }`).
+  - due/ETA: `PATCH .../issues/{iid}/` `{ target_date: "YYYY-MM-DD" | null }`.
+  - assignee (member): `PATCH .../issues/{iid}/` `{ assignees: [uuid] }`.
+  - sub-task: `POST .../issues/` `{ name, parent }`, re-asserted via `PATCH { parent }`.
+
+## Agent task protocol
+The cloud-builder + project agents follow this on a task they pick up:
+
+1. **On pickup** — `set_task_assignee(self)` (your agent label, e.g. `coder`),
+   then `comment_on_task("взял в работу, ETA ~<x>")`, then
+   `set_task_due("<YYYY-MM-DD>")`.
+2. **On progress** — `comment_on_task("<what changed, what is next>")` at each
+   meaningful step so the owner sees movement.
+3. **For a big task** — `create_subtask` per piece, then work each child. The
+   parent stays the umbrella; children carry the unit-of-work.
+4. **Each tick** — `read_task_comments`; if the owner left a new comment, act on
+   it (revise the work) and `comment_on_task` a reply confirming the change.
+5. **On done** — `update_project_task(state_id=<Done>)` and a final
+   `comment_on_task` summarising the result.
+
+Agent-assignee convention: Plane `assignees` only accepts workspace member
+UUIDs, and the agents share one workspace token, so an agent label is stored as
+a marker comment (`[[af:assignee:<label>]]`) and surfaced as `agent_assignee` in
+the aggregated detail. A real owner/member assignee (a UUID) still flows through
+Plane `assignees`.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Tool refuses with no project | `project_scope_required` | mount the tasks MCP with `?project=<id>` |
+| Route/tool no-ops | `tasks_not_configured` / `configured:false` | set `PLANE_*` in the agents secret |
+| Due date rejected | `bad_target_date` | pass `YYYY-MM-DD` (or `null` to clear) |
+| Sub-task not linked to parent | `parent` dropped on POST | `createSubtask` re-asserts via `PATCH { parent }` |
+| Card shows no agent owner | no `[[af:assignee:` marker on thread | call `set_task_assignee(self)` on pickup |
+
+## Related
+- [Projects ↔ Plane Task Binding](/subsystems/projects-tasks-binding) — the bind + the base routes/tools
+- [Tasks MCP](/subsystems/tasks-mcp) — the generic workspace-wide tasks tools
+- [Plane Task Manager](/subsystems/plane-task-manager) — the Plane backend
