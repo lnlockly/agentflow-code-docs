@@ -1,0 +1,120 @@
+---
+title: "Proxy Pool"
+description: "Generic proxy pool that soft-binds a single proxy row per (owner, resource) so VK / Reddit / IG sessions get a stable egress IP."
+---
+
+# Proxy Pool
+
+> **Status: shipped 2026-05-22.** Backs the new VK cookie-paste login (`chat_vk_links.auth_kind='cookies'`) and future Reddit / Avito flows. One DB table, one service module, one owner-facing route file, one cabinet page. Nodemaven auto-sync is wired in the table (`provider='nodemaven'`, `session_key`) but the sync worker is not yet implemented — see Failure modes.
+
+## TL;DR
+
+VK and other anti-bot networks ban accounts whose source IP drifts between requests. We keep one `proxies` row per individual proxy, encrypt the password with `sealString`, and soft-bind a row to a `(bound_owner_user_id, bound_resource)` pair on first use. The same resource string (e.g. `vk:link:42:1234567`) hands back the same proxy until something flips `healthy=false`, at which point the binding is dropped and `pickProxy` allocates a fresh row.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/migrations/2026-05-23a-proxies-pool.sql:14` | `CREATE TABLE proxies` + indexes + `chat_vk_links` cookie/proxy columns |
+| `agentflow-agents/src/services/proxy-pool.ts:73` | `pickProxy(ownerUserId, resource, {country})` |
+| `agentflow-agents/src/services/proxy-pool.ts:135` | `releaseProxy(resource)` |
+| `agentflow-agents/src/services/proxy-pool.ts:148` | `markProxyUnhealthy(id, error)` |
+| `agentflow-agents/src/services/proxy-pool.ts:168` | `getProxy(id)` — decrypted handle by id |
+| `agentflow-agents/src/services/proxy-pool.ts:52` | `proxyUrl(handle)` — undici / fetch-compatible URL |
+| `agentflow-agents/src/services/proxy-pool.ts:230` | `addManualProxy(input)` — owner-supplied row |
+| `agentflow-agents/src/routes/me-proxies.ts:89` | `GET /me/proxies` |
+| `agentflow-agents/src/routes/me-proxies.ts:124` | `POST /me/proxies` |
+| `agentflow-agents/src/routes/me-proxies.ts:140` | `POST /me/proxies/:id/release` |
+| `agentflow-agents/src/routes/me-proxies.ts:166` | `POST /me/proxies/:id/test` |
+| `agentflow-agents/src/routes/me-proxies.ts:214` | `DELETE /me/proxies/:id` |
+| `agentflow-landing/src/pages/AccountProxies.tsx` (verify line) | Cabinet UI at `/account/proxies` |
+| `agentflow-landing/src/main.tsx:661` | Route mount `/account/proxies` |
+
+## Data flow
+
+```
+Owner cabinet  POST /me/proxies {type,host,port,username,password,country}
+   │                       │
+   │                       ▼
+   │              addManualProxy → sealString(password) → INSERT proxies
+   │                       │
+   │              bound_owner_user_id = self, bound_resource = NULL
+   ▼
+VK cookie-paste  POST /me/chat/vk/start-from-cookies {vk_user_id, cookies, proxy_id?}
+   │                       │
+   │              pickProxy(ownerUserId, 'vk:link:<af>:<vk>', {country:'RU'})
+   │                       │
+   │   ┌─ already bound to this resource? → return row
+   │   └─ else: SELECT healthy=true AND bound_resource IS NULL
+   │            AND (bound_owner_user_id IS NULL OR = self)
+   │            AND (country=opts.country if set)
+   │            ORDER BY last_check_at ASC LIMIT 50  → pick first
+   │            UPDATE proxies SET bound_owner_user_id=self, bound_resource=resource
+   ▼
+chat_vk_links.proxy_id = picked.id
+
+Worker side (vk-bridge-loop, cookie poller TODO)
+   │
+   ▼
+getProxy(id) → unsealString(password_encrypted) → ProxyHandle
+proxyUrl(handle) → 'http://user:pass@host:port' → undici ProxyAgent
+```
+
+## DB / Env / API
+
+### Table `proxies`
+- `id BIGSERIAL PK`
+- `provider TEXT` — `'manual'` | `'nodemaven'` (future) | …
+- `type TEXT CHECK IN ('http','https','socks5')`
+- `host TEXT`, `port INT` (1-65535)
+- `username TEXT`, `password_encrypted TEXT` (sealString output)
+- `country TEXT`, `city TEXT` — ISO-3166-1 alpha-2
+- `sticky BOOLEAN` — true for fixed IP rows, false for rotating-residential
+- `session_key TEXT` — Nodemaven sticky-session id; `UNIQUE (provider, session_key) WHERE session_key IS NOT NULL`
+- `bound_owner_user_id INT REFERENCES users(id) ON DELETE SET NULL`
+- `bound_resource TEXT` — e.g. `vk:link:42:1234567`
+- `healthy BOOLEAN DEFAULT true`
+- `last_check_at TIMESTAMPTZ`, `last_error TEXT`
+- `added_at TIMESTAMPTZ DEFAULT now()`, `expires_at TIMESTAMPTZ`, `notes TEXT`
+
+Indexes: `idx_proxies_owner_healthy (bound_owner_user_id, healthy)`, `idx_proxies_resource (bound_resource)`.
+
+### `chat_vk_links` additions (same migration)
+- `cookies_encrypted TEXT` — sealed JSON `{remixsid, remixnsid?, remixflash?, p?}`
+- `proxy_id BIGINT REFERENCES proxies(id) ON DELETE SET NULL`
+- `auth_kind TEXT DEFAULT 'token'` — `'token'` (legacy) or `'cookies'` (new path)
+- `access_token` NOT NULL constraint dropped (cookie-only rows have NULL token)
+
+### Env
+- `SEAL_KEY` / `SEAL_MASTER_KEY` (verify with: `kubectl -n franchise-factory exec deploy/agentflow-agents -- env | grep -i seal`) — required so `sealString` / `unsealString` can encrypt the password column.
+- `NODEMAVEN_API_KEY` (planned — not yet read by any code; `proxy-nodemaven-sync.ts` is TODO).
+
+### Routes
+- `GET    /me/proxies` — own + global-pool rows (200 cap)
+- `POST   /me/proxies` — add manual row, returns `{id}` 201
+- `POST   /me/proxies/:id/release` — drop the resource binding
+- `POST   /me/proxies/:id/test` — stub probe (registers `last_check_at`, real probe lives in the planned health-loop)
+- `DELETE /me/proxies/:id` — only `provider='manual'` + own rows
+
+### Soft-bind contract
+`bound_resource` is the caller-chosen stable string. VK uses `vk:link:<af_user_id>:<vk_user_id>`. Future flows MUST namespace their own prefix (`reddit:link:…`, `ig:link:…`) so resources can't collide cross-network. The pair `(bound_owner_user_id, bound_resource)` is unique by construction (only one row at a time can claim a `bound_resource` — first writer wins).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `pickProxy` returns `null` immediately | (no log — caller logs `proxy_required:true` in response) | Pool empty / no healthy row matches `country`. Add a row via `POST /me/proxies` or fix the country filter |
+| VK account banned for IP drift | (external — VK side) | Verify `chat_vk_links.proxy_id` is set and unchanged between sessions; check `proxies.healthy=true` and `last_error IS NULL` |
+| `addManualProxy` fails on insert | Postgres `column "password_encrypted" violates constraint` or sealString throws | `SEAL_KEY` env missing or rotated — re-add row after key is set |
+| Probe endpoint returns `unhealthy_or_missing` | response `{"error":"unhealthy_or_missing"}` | Row was marked unhealthy by a previous worker call. Manual recovery: `UPDATE proxies SET healthy=true, last_error=NULL WHERE id=…` after verifying the upstream |
+| `DELETE /me/proxies/:id` returns `not_found_or_not_manual` | response `{"error":"not_found_or_not_manual"}` | Provider-managed rows (e.g. `provider='nodemaven'`) are protected — they'd come back on next sync. Release the binding instead, or change `provider` manually if you really mean it |
+| Nodemaven rows never appear | (no log — sync worker doesn't exist) | TODO: `src/services/proxy-nodemaven-sync.ts` is not yet implemented. Until then, `provider='manual'` rows are the only path |
+| Sealed payload corrupted after key rotation | `toHandle` returns `password: null` silently | `proxy-pool.ts:189` swallows the decrypt error; the proxy is effectively dead. Recreate the row with the current `SEAL_KEY` |
+| Resource binding leaks after race | Two rows share the same `bound_resource` | Should not happen — there's no DB unique constraint, but `pickProxy` checks `bound_resource IS NULL` before claiming. If you see duplicates, audit recent writers and add a unique partial index |
+
+## Related
+
+- [Matrix Bots](/subsystems/matrix-bots) — `@af-poster` reads `chat_vk_links` rows for cross-posting
+- [Social Network](/subsystems/social-network) — public profile presence uses Matrix homeserver, not proxy pool
+- [Element Web](/subsystems/element-web) — separate concern (no proxy egress)
+- VK cookie-paste login: `POST /me/chat/vk/start-from-cookies` (see this file's Data flow)

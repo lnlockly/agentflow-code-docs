@@ -1,0 +1,94 @@
+---
+title: "Prometheus Stack"
+description: "In-cluster Prometheus pod that scrapes annotated first-party Deployments. Pairs with k8s/monitoring.yaml + chat-stack Grafana dashboards."
+---
+
+# Prometheus Stack
+
+## TL;DR
+
+Audit-4 + Audit-7 found Grafana dashboards + scrape annotations committed, but no Prometheus pod actually running. `k8s/prometheus.yaml` is the intended fix — a single-replica `prom/prometheus:v3.0.1` in the `monitoring` namespace, ClusterRole + ServiceAccount for service/pod discovery, two scrape jobs (`kubernetes-pods` and `kubernetes-services`). Phase 5 also wires three new metric families on the existing `/metrics` route so billing-loss incidents (`recordusage_failures_total`) and upstream LLM regressions (`llm_request_duration_seconds`, `llm_retry_attempts_total`) become alertable.
+
+:::caution[DEPLOYMENT STATUS — NOT LIVE (verified 2026-05-30)]
+The manifest is **committed but not deployed**. On ff-france there is **no `monitoring` namespace** and **no Prometheus/Grafana pod anywhere** (`kubectl get pods -A | grep -iE 'prometheus|grafana'` → none). Root cause: `agentflow-agents/.github/workflows/deploy.yml` never `kubectl apply`s `k8s/prometheus.yaml` or `k8s/monitoring.yaml` (it applies only the minio + remotion manifests). On top of that, `MATRIX_METRICS_AUTH_TOKEN` is unset on the agents Deployment, so even a scrape would get `404 metrics_disabled`. To go live (owner-gated — costs CPU/RAM on the capacity-constrained box): (1) wire both manifests into `deploy.yml` + create the `monitoring` ns, (2) set `MATRIX_METRICS_AUTH_TOKEN` (32-byte hex) on the agents Secret and match it in the scrape job's `bearer_token`. See `plans/autonomous/_observability-audit-2026-05-30.md`.
+:::
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/k8s/prometheus.yaml:1` | Namespace + SA + ClusterRole + ConfigMap + Deployment + Service for Prometheus |
+| `agentflow-agents/k8s/agentflow-agents.yaml:152` | Pod-template `prometheus.io/scrape` annotations on the api Deployment |
+| `agentflow-agents/k8s/agentflow-agents.yaml:464` | Same annotations on the workers Deployment |
+| `agentflow-agents/k8s/monitoring.yaml:1` | Pre-existing sibling Services `*-metrics` (also picked up by `kubernetes-services` job) |
+| `agentflow-agents/src/services/matrix-bots/metrics.ts:111` | `recordUsageFailuresTotal` counter |
+| `agentflow-agents/src/services/matrix-bots/metrics.ts:125` | `llmRequestDurationSeconds` histogram |
+| `agentflow-agents/src/services/matrix-bots/metrics.ts:137` | `llmRetryAttemptsTotal` counter |
+| `agentflow-agents/src/services/matrix-bots/metrics.ts:149` | `classifyRecordUsageError` low-cardinality reason helper |
+| `agentflow-agents/src/services/public-llm-billing.ts:154` | `recordUsageFailuresTotal` increment on `chargeLlmUsage` failure |
+| `agentflow-agents/src/services/public-llm-billing.ts:184` | `recordUsageFailuresTotal` increment on audit-insert failure |
+| `agentflow-agents/src/services/public-llm-upstream.ts:427` | Retry counter increment on fallback attempt |
+| `agentflow-agents/src/services/public-llm-upstream.ts:436` | Histogram observation in `callUpstreamWithFallback` |
+| `agentflow-agents/tests/metrics-counters.test.ts:1` | Unit tests for the four new surfaces |
+
+## Data flow
+
+```
+Prometheus (monitoring/prometheus)
+  │
+  ├──[kubernetes-pods]──> any pod with prometheus.io/scrape=true
+  │      ├── agentflow-agents (api)    :4100/metrics  (bearer)
+  │      └── agentflow-workers         :4100/metrics  (bearer)
+  │
+  └──[kubernetes-services]──> any Service with prometheus.io/scrape=true
+         ├── mautrix-telegram-metrics   :8001/metrics
+         ├── dendrite-metrics           :8008/_dendrite/metrics
+         └── agentflow-agents-metrics   :4100/metrics  (bearer)
+```
+
+Scraped series:
+- `recordusage_failures_total{reason}` — billing-loss canary.
+- `llm_request_duration_seconds{upstream, status}` — per-upstream latency + outcome.
+- `llm_retry_attempts_total{reason}` — fallback rate.
+- `matrix_bots_events_total{bot, kind}` — chat-stack activity.
+- `matrix_bots_handler_duration_seconds{bot}` — bot handler latency.
+- `matrix_bots_ready{bot}` — readiness gauge.
+- `node_*` — prom-client default node metrics.
+
+## DB / Env / API
+
+- **Env:** `MATRIX_METRICS_AUTH_TOKEN` — bearer required by `/metrics` on the agentflow-agents pod. When empty the endpoint returns 404 and Prom marks the target DOWN (acceptable until ops sets the secret).
+- **Routes:** `GET /metrics` on `:4100`, `GET :9090/targets` for the Prometheus UI.
+- **Namespaces:** `monitoring` (prom), `franchise-factory` (everything else).
+- **No MCP tools.** Operate via standard kubectl from `ssh ff-france`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Prom target DOWN with 404 on `:4100/metrics` | `metrics_disabled` in agents pod logs | Set `MATRIX_METRICS_AUTH_TOKEN` env on `agentflow-agents` + matching `bearer_token` in Prom scrape config |
+| Prom pod CrashLoopBackOff | `parsing YAML file /etc/prometheus/prometheus.yml` | Validate `prometheus-config` ConfigMap, kubectl rollout restart |
+| No metrics at all / `monitoring` ns missing — Prometheus never deployed | `kubectl get ns` shows no `monitoring`; `kubectl get pods -A \| grep prometheus` → empty | `deploy.yml` does not apply `k8s/prometheus.yaml`/`k8s/monitoring.yaml`. Add the `kubectl apply -f` steps + create the `monitoring` ns (owner-gated: resource cost). Verified not-deployed 2026-05-30. |
+| RBAC denied on discovery | `forbidden: User "system:serviceaccount:monitoring:prometheus"` | Re-apply ClusterRole + ClusterRoleBinding from `k8s/prometheus.yaml` |
+| Cardinality blow-up on `recordusage_failures_total` | n/a (silent — visible in `/metrics` size) | `classifyRecordUsageError` collapses unknowns to `other`; reject any new `reason` value not enumerated in `services/matrix-bots/metrics.ts` |
+| Histogram missing the `error` bucket label | `llm_request_duration_seconds_count` series with only `2xx`/`5xx` | Catch path in `callUpstreamWithFallback` must call `.observe()` with `status: 'error'` before `continue` |
+
+## Operational runbook
+
+```bash
+# Apply once
+ssh ff-france "kubectl apply -f k8s/prometheus.yaml"
+
+# Verify
+ssh ff-france "kubectl get pods -n monitoring"
+ssh ff-france "kubectl port-forward -n monitoring svc/prometheus 9090:9090 &"
+# Browse http://localhost:9090/targets — kubernetes-pods + kubernetes-services jobs should list discovered pods.
+
+# Enable the bearer-gated /metrics path on agents
+ssh ff-france "kubectl set env deploy/agentflow-agents -n franchise-factory MATRIX_METRICS_AUTH_TOKEN=<token>"
+```
+
+## Related
+
+- [Matrix Monitoring](./matrix-monitoring.mdx) — original chat-stack metrics; this page is the prom-side counterpart.
+- [Billing](./billing.mdx) — context for the `recordUsage` failure counter.
