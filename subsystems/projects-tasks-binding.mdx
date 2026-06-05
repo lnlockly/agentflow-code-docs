@@ -74,7 +74,12 @@ per-project pod.
 | Plane project duplicated on re-bind | (none — reuse-by-name) | `findTaskProjectByName` in `services/project-tasks-binding.ts` |
 | Platform project missing from `/me/projects` | row absent for owner 1 | `ensurePlatformProjectForOwner` + migration `0091` |
 
+The per-task activity surface (comments, ETA/due, assignee, sub-tasks, and the
+aggregated detail feed) plus the agent-facing loop tools live in
+[Agent Task Loop](/subsystems/agent-task-loop).
+
 ## Related
+- [Agent Task Loop](/subsystems/agent-task-loop) — comments/ETA/assignee/sub-tasks + agent tools
 - [Plane Task Manager](/subsystems/plane-task-manager) — the Plane backend
 - [Tasks MCP](/subsystems/tasks-mcp) — the generic workspace-wide tasks tools
 - [Projects](/subsystems/projects) — the projects lifecycle + routes
