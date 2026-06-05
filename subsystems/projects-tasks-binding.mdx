@@ -1,0 +1,85 @@
+---
+title: "Projects ↔ Plane Task Binding"
+description: "Every project (including AgentFlow itself) binds to one Plane board the owner and agents share."
+---
+
+# Projects ↔ Plane Task Binding
+
+## TL;DR
+Every AgentFlow project binds to one [Plane](/subsystems/plane-task-manager)
+project — its task board, read/written by both the owner (session/owner-key
+routes) and the project's agents (project-scoped tasks-MCP tools). The bind is
+lazy + idempotent: on first task access a Plane project is created-or-reused and
+its UUID cached on `projects.plane_project_id`. AgentFlow itself is now a project
+row (`is_platform=true`, owner 1) so `/me/projects` lists the platform and the
+owner opens it in the standalone Cloud IDE.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/db/migrations/0091_project_plane_binding.sql` | adds `projects.plane_project_id`; re-asserts the platform project for owner 1 |
+| `agentflow-agents/src/db/schema/projects.ts:234` | `planeProjectId` column on the `projects` drizzle table |
+| `agentflow-agents/src/services/project-tasks-binding.ts:95` | `ensureProjectPlaneBinding(projectId)` — create-or-reuse + cache, idempotent |
+| `agentflow-agents/src/services/project-tasks-binding.ts:86` | `planeProjectNameFor` — deterministic `<title> [<slug>]` board name |
+| `agentflow-agents/src/services/me-apps-tasks.ts:263` | `createTaskProject` — POST a Plane project (reuses the native-board Plane client) |
+| `agentflow-agents/src/services/me-apps-tasks.ts:245` | `findTaskProjectByName` — reuse-by-name guard |
+| `agentflow-agents/src/services/me-apps-tasks.ts:231` | `planeIdentifierFromSlug` — derive a valid Plane identifier |
+| `agentflow-agents/src/routes/projects.ts:5347` | `resolveBoundPlaneProject` — bind helper shared by the three task routes |
+| `agentflow-agents/src/routes/projects.ts:5385` | `GET /me/projects/:id/tasks` (issues grouped by state) |
+| `agentflow-agents/src/routes/projects.ts:5405` | `POST /me/projects/:id/tasks` (create) |
+| `agentflow-agents/src/routes/projects.ts:5429` | `PATCH /me/projects/:id/tasks/:taskId` (move/rename) |
+| `agentflow-agents/src/mcp-servers/tasks.ts:529` | `list_project_tasks` / `create_project_task` / `update_project_task` agent tools |
+| `agentflow-agents/src/mcp-servers/tasks.ts:597` | `resolveProjectBoard` — binds `?project=<id>` → Plane UUID for the agent tools |
+| `agentflow-agents/src/routes/internal-mcp.ts:462` | tasks-MCP mount reads optional `?project=<af_id>` |
+| `agentflow-agents/src/services/platform-project.ts:35` | `ensurePlatformProjectForOwner` — backstop seed of the platform project |
+| `agentflow-agents/src/routes/projects.ts:1527` | `/me/projects` ensures the platform project for the owner |
+| `agentflow-agents/src/routes/projects.ts:1928` | `/me/projects/:id/ide` points the platform project at the Cloud IDE |
+
+## Data flow
+```
+Owner (session / owner-key)            Agent (Eliza runtime, MCP)
+   │                                      │  tasks MCP mount carries ?project=<af_id>
+   ▼                                      ▼
+GET/POST/PATCH /me/projects/:id/tasks   list/create/update_project_task
+   │                                      │
+   └──────────────┬───────────────────────┘
+                  ▼
+   ensureProjectPlaneBinding(projectId)
+     plane_project_id set? → return it
+     else create-or-reuse Plane project → cache UUID on projects row
+                  ▼
+   me-apps-tasks Plane client → Plane REST (tasks.agentflow.website)
+     listTaskIssues (grouped by state) / createTaskIssue / updateTaskIssue
+```
+AgentFlow-as-a-project: the `is_platform=true` row (owner 1) lists in
+`/me/projects`; its `/ide` answer returns `{ ready:true, ideUrl: CLOUD_IDE_URL }`
+(the standalone code-server, repos at `/home/coder/workspace`) since it has no
+per-project pod.
+
+## DB / Env / API
+- Tables: `projects` (new column `plane_project_id text`, nullable).
+- Env: `PLANE_API_BASE`, `PLANE_API_TOKEN`, `PLANE_WORKSPACE` (same as the tasks
+  MCP); `CLOUD_IDE_URL` (default `https://ide.agentflow.website`).
+- Routes: `GET /me/projects/:id/tasks`, `POST /me/projects/:id/tasks`,
+  `PATCH /me/projects/:id/tasks/:taskId` (owner/team auth via `loadOwnedProject`).
+- MCP tools: `list_project_tasks`, `create_project_task`, `update_project_task`
+  (project-scoped, mount `?project=<af_id>`); the generic
+  `list_tasks`/`create_task`/`update_task` stay workspace-wide.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Tasks routes return `{configured:false}` | Plane env unset | set `PLANE_*` in the agents secret |
+| Agent tool refuses | `project_scope_required` | mount the tasks MCP with `?project=<id>` for that agent |
+| Plane project duplicated on re-bind | (none — reuse-by-name) | `findTaskProjectByName` in `services/project-tasks-binding.ts` |
+| Platform project missing from `/me/projects` | row absent for owner 1 | `ensurePlatformProjectForOwner` + migration `0091` |
+
+The per-task activity surface (comments, ETA/due, assignee, sub-tasks, and the
+aggregated detail feed) plus the agent-facing loop tools live in
+[Agent Task Loop](/subsystems/agent-task-loop).
+
+## Related
+- [Agent Task Loop](/subsystems/agent-task-loop) — comments/ETA/assignee/sub-tasks + agent tools
+- [Plane Task Manager](/subsystems/plane-task-manager) — the Plane backend
+- [Tasks MCP](/subsystems/tasks-mcp) — the generic workspace-wide tasks tools
+- [Projects](/subsystems/projects) — the projects lifecycle + routes

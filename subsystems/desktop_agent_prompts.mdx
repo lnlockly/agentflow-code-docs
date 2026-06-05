@@ -1,0 +1,85 @@
+---
+title: "Desktop daemon — driver prompts"
+description: "Per-concern system-prompt blocks composed into the AI loop for agentflow-desktop."
+---
+
+# Desktop daemon — driver prompts
+
+## TL;DR
+The daemon's AI loop (`driver/loop.py`) builds its system prompt from a set of focused blocks under
+`src/agentflow_computer_mcp/driver/prompts/`. Each block teaches the model how to use one slice of
+the tool surface (browser, terminal, cabinet, element, integrations, …). Track 4 of the generic-
+integrations spec replaced the kwork-only 3-step cookie flow with a single canonical tool
+`connect_integration(provider)` driven by a live backend registry.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/prompts/__init__.py:33` | `build_system_prompt` composes all blocks in order |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/prompts/integrations.py:16` | `_PROVIDERS` snapshot table (slug + emoji + name + use-case) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/prompts/integrations.py:34` | `INTEGRATIONS_BLOCK` — generic `connect_integration(provider)` doc |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/prompts/lolzteam.py:1` | `LOLZTEAM_BLOCK` — Russian-voice template for vertical playbooks |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/prompts/cabinet.py:1` | `CABINET_MAP` — owner-cabinet URL → action mapping |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/tools/integrations.py` | Track 2: the daemon-side `connect_integration` tool impl |
+| `agentflow-computer-mcp/tests/test_integrations_prompt.py:1` | Track 4 contract test for `INTEGRATIONS_BLOCK` |
+
+## Data flow
+
+```
+build_system_prompt(window_summary, af_tools_present)
+  └─ concatenates blocks (os_context, KNOWLEDGE, PITFALLS, AF_TOOLS,
+                          intent_map, BROWSER_EFFICIENCY, MEMORY,
+                          CODING_WORKFLOW, TERMINAL_PLAYBOOK,
+                          CABINET_MAP, ELEMENT_BLOCK, LOLZTEAM_BLOCK,
+                          INTEGRATIONS_BLOCK, TASK_EFFICIENCY, VISIBILITY)
+  └─ returned to driver/loop.py as the prompt for every step
+```
+
+For integrations specifically:
+
+```
+user: "подключи мой VK"
+  → model sees INTEGRATIONS_BLOCK, picks slug='vk'
+  → calls connect_integration(provider='vk')          (tools/integrations.py, Track 2)
+       ├─ GET /integrations/registry (5-min cache)
+       ├─ chrome_open_url(login_url) + 2s wait
+       ├─ probe_js eval → if logged=false → not_logged_in
+       ├─ chrome_export_cookies(domain=cookie_domain)
+       └─ POST /me/integrations/vk { cookies: [...] }
+  → model relays summary verbatim, never prints cookie values
+```
+
+## DB / Env / API
+- Backend registry: `GET /integrations/registry` (Track 1, agentflow-agents)
+- Generic ingest: `POST /me/integrations/:provider` (Track 1, agentflow-agents)
+- Storage: `integration_hub` project under `project_secrets`, key from registry (`secret_key`)
+- Env (daemon): `AF_OWNER_API_KEY` — owner-key header for the POST above
+- MCP tools the prompt exposes: `connect_integration(provider)`
+
+## Provider registry snapshot (embedded in prompt)
+| Slug | Emoji | Display name | Use-case |
+|---|---|---|---|
+| `kwork` | 💼 | Kwork | биржа фриланса, отклики и заказы |
+| `vk` | 👥 | ВКонтакте | соцсеть, посты и личка от имени юзера |
+| `lolzteam` | 🎮 | Lolzteam | форум, маркет аккаунтов и услуг |
+| `instagram` | 📸 | Instagram | ленты, сторис, директ |
+| `linkedin` | 💼 | LinkedIn | B2B outreach, вакансии, нетворк |
+| `telegram_app` | ✈️ | Telegram | MTProto через приложение, не cookies |
+
+Live source of truth is the backend registry; the embedded list keeps the model from inventing
+slug names (e.g. `twitter`, `sberbank`) between registry fetches.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Model invents a provider slug, tool returns 404 | `provider_not_found` | Add to registry in `agentflow-agents/src/services/integration-providers.ts` |
+| Model runs `chrome_export_cookies` directly instead of generic tool | `chrome_export_cookies` call without prior `connect_integration` | Prompt regression — fix `prompts/integrations.py` |
+| Cookie values leak into `task_action` text payload | `cookie_value=` substring in `device_action_log` | Security regression — re-tighten "Cookie values НЕ выводить" rule in the block |
+| Probe always reports `not_logged_in` for a working session | `not_logged_in` repeated for one provider | `logged_probe_js` selector stale in registry, not a prompt issue |
+| Backend deny-list bypass attempt via alt slug | `domain_denied` | Backend reject is authoritative; block already forbids workaround attempts |
+
+## Related
+- [Computer-MCP bridge](/subsystems/computer-mcp)
+- [Cabinet — onboarding](/subsystems/cabinet-onboarding)
+- [Kwork auto-earn](/subsystems/kwork-auto-earn) — vertical playbook on top of the kwork integration
+- Spec: `agentflow/docs/specs/2026-05-25-generic-integrations.md`

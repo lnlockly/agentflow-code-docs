@@ -1,0 +1,83 @@
+---
+title: "Device setup wizard + calm manage view"
+description: "Step-by-step create funnel (Local vs Cloud → setup → first task → done) and the progressively-disclosed device manage view."
+---
+
+# Device setup wizard + calm manage view
+
+## TL;DR
+`/cabinet/devices/new` (alias `/cabinet/devices/setup`) is a four-step funnel
+for non-technical owners: choose where the agent runs → set it up → pick a
+first task → done. It replaces the old 4-card chooser (`CabinetDeviceNew`,
+still reachable at `/cabinet/devices/new/cards`). The device manage view
+(`CabinetDeviceDetail`) now opens on a calm status card + three actions
+(Дать задачу / Пауза / Живой просмотр); everything technical (scope, app
+whitelist, autonomous goals, history) collapses under ONE «Дополнительно»
+disclosure — no `scope_json` editor in the user's face.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/pages/CabinetDeviceSetup.tsx:355` | `StepWhere` — Local vs Cloud 24/7 (two big outcome cards). |
+| `agentflow-landing/src/pages/CabinetDeviceSetup.tsx:498` | `StepLocalInstall` — OS pick + one copy-paste install command + live device poll. |
+| `agentflow-landing/src/pages/CabinetDeviceSetup.tsx:749` | `StepCloudProvision` — plain-language size → `POST /me/hosted-devices`. |
+| `agentflow-landing/src/pages/CabinetDeviceSetup.tsx:899` | `StepFirstTask` — outcome gallery → `dispatch_task` (SEAM for full picker). |
+| `agentflow-landing/src/pages/CabinetDeviceSetup.tsx:1042` | `StepDone` — success + celebration + one next action. |
+| `agentflow-landing/src/pages/CabinetDeviceSetup.tsx:167` | `OUTCOMES` — minimal self-contained first-task catalog (SEAM). |
+| `agentflow-landing/src/pages/CabinetDeviceSetup.tsx:126` | `CLOUD_SIZES` — Лёгкий/Обычный/Мощный → small/medium/large. |
+| `agentflow-landing/src/pages/CabinetDeviceSetup.tsx:96` | `buildInstallCmd` — mirrors `CabinetDeviceLive.buildInstallCmd` (`AGENTFLOW_API_KEY=<key> curl … \| bash`). |
+| `agentflow-landing/src/pages/CabinetDeviceDetail.tsx:328` | `nowDoing` — human "что делает сейчас" string from active session. |
+| `agentflow-landing/src/pages/CabinetDeviceDetail.tsx:89` | `spentToday` — sum of today's session `cost_usd` ("потрачено сегодня"). |
+| `agentflow-landing/src/pages/CabinetDeviceDetail.tsx:847` | `Disclosure` — one collapsible per «Дополнительно» panel. |
+| `agentflow-landing/src/main.tsx` | Routes: `/cabinet/devices/new` + `/cabinet/devices/setup` → `CabinetDeviceSetup`; `/cabinet/devices/new/cards` → legacy `CabinetDeviceNew`. |
+
+## Data flow
+
+```
+/cabinet/devices/new (CabinetDeviceSetup)
+  Step 1 StepWhere → 'local' | 'cloud'
+  Step 2a local:
+    devicesApi.mintInstallToken()  → raw af_live_* key
+    buildInstallCmd(os, key)       → one copy-paste line
+    poll devicesApi.list() every 3s → first NEW online device → advance
+  Step 2b cloud:
+    agentsPost('/me/hosted-devices', { size, kind:'daemon', preinstall:[] })
+    → { device:{ id } }  (readable готовлю → подключаю → готово states)
+  Step 3 StepFirstTask:
+    devicesApi.dispatchTask(deviceId, {
+      task, tool:'agent_run_recipe', scope:{ recipe, params, cron? } })
+    ── SEAM: identical shape to DeviceUseCasePicker (PR #543) ──
+  Step 4 StepDone → link to /cabinet/devices/:id/live
+```
+
+The manage view (`CabinetDeviceDetail`) reads `GET /me/devices/:id` +
+`/me/devices/:id/sessions`, derives `nowDoing` + `spentToday`, and exposes
+pause/resume, dispatch (via /live), scope, app whitelist, autonomous panel,
+session history, check-update and revoke — all reachable, progressively
+disclosed.
+
+## DB / Env / API
+- Routes used: `POST /me/api-keys/install-token` (agentflow-api), `POST /me/hosted-devices`, `GET /me/devices`, `GET /me/devices/:id`, `GET /me/devices/:id/sessions`, `POST /me/devices/:id/dispatch_task`, `/pause`, `/resume`, `/check_update`, `DELETE /me/devices/:id`.
+- Env: none new (reuses `af_session` cookie auth via `agentsApi` / `apiPost`).
+- Tables: reads `user_devices`, `hosted_devices`, device sessions (unchanged).
+
+## SEAM — full use-case picker
+Step 3 ships a minimal `OUTCOMES` list inline so it does NOT depend on the
+unmerged `src/data/deviceUseCases.ts` + `DeviceUseCasePicker` (PR #543). The
+dispatch payload is byte-for-byte the picker's (`tool:'agent_run_recipe',
+scope:{ recipe, params, cron? }`), so swapping `OUTCOMES` for the full
+catalog needs no other change to the wizard.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Local step never advances | (no log — client poll) device never reaches `status:'online'` in `GET /me/devices` | `CabinetDeviceSetup.tsx:520` poll loop |
+| Install command shows `— не удалось получить ключ —` | `mintInstallToken` rejects (401 / network) | `CabinetDeviceSetup.tsx:519`; «Обновить ключ» retry |
+| Cloud provision soft-fails | `AgentsApiError` 404 from `/me/hosted-devices` | `CabinetDeviceSetup.tsx:778` (shows "сейчас недоступно") |
+| First task refused | `dispatch_task` 404 (offline) / 409 (paused) | `CabinetDeviceSetup.tsx:938` |
+
+## Related
+- [Windows installer wizard](/subsystems/desktop-installer-wizard)
+- [Device use-cases](/subsystems/device-use-cases)
+- [Devices unified](/subsystems/devices-unified)
+- [Device pause](/subsystems/device-pause)

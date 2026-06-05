@@ -1,0 +1,158 @@
+---
+title: "Foundation Bridge"
+description: "Per-project step that turns a cloned GitHub foundation into a runnable Procfile, with defensive env / config / package-manager fixups."
+---
+
+# Foundation Bridge
+
+:::caution[Deprecated — старая архитектура]
+Этот раздел про старую архитектуру с kind-классификатором (`landing` / `spa` / `tg_bot` / etc.). Новый flow создания проектов (brief → GitHub template search → hosted daemon git clone) описан в [`subsystems/projects`](/subsystems/projects/) (approved 2026-05-25). Bridge-механика остаётся релевантной для legacy-проектов на foundation_mode=github_repo.
+:::
+
+## TL;DR
+
+When a user picks a GitHub repo as their project foundation (`foundation_mode=github_repo`),
+the SPA `admin_panel` handler runs a one-shot bash bridge inside the workspace pod:
+clone is already there, the bridge prepares it to run via `Procfile` under the
+runtime-supervisor. Includes defensive fixups for the most common boot blockers:
+`next.config.ts` on Next < 15, `.env` placeholder substitution, `bun`-only
+package.json scripts, missing Prisma schema, t3-env validators.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/graph-executor/handlers/spa.ts:560` | Main bridge — bash command executed inside the workspace pod |
+| `agentflow-agents/src/services/foundation-rebrand.ts:1` | Brand-string substitution (site_name → brief title) before the bridge runs. Patches `config/site.ts`, `package.json`, `README.md`, `app/layout.tsx`, `app/page.tsx`, `components/Navbar.tsx`, `.env`. Returns `brief_tokens_landed` count for the gate. |
+| `agentflow-agents/src/services/graph-executor/handlers/spa.ts:580` | Rebrand recovery loop — re-invokes `coder-spa` when `brief_tokens_landed===0` while `brief_tokens_total>=2`. |
+| `agentflow-agents/src/services/foundation-env-stub.ts:1` | Pure helpers — parse `.env.example` keys, derive sensible defaults (`defaultForEnvKey`), compute idempotent diff against existing `.env` (`deriveEnvStubLines`). The bridge mirrors the same defaults in shell for the inline step. |
+| `agentflow-agents/tests/unit/foundation-rebrand.test.ts:1` | Tests for all rebrand patchers + token gate helpers (29 cases). |
+| `agentflow-agents/tests/unit/foundation-env-stub.test.ts:1` | Tests for env-stub parser + defaults + idempotency. |
+| `agentflow-agents/tests/unit/foundation-bridge-subdir-monorepo.test.ts:1` | Tests for APP_DIR resolution — subdir + workspace walks. |
+| `agentflow-agents/tests/unit/curated-foundations-env-flag.test.ts:1` | Pins the four foundations marked `requires_env_setup: true`. |
+| `agentflow-agents/src/services/foundation-structural-filter.ts:370` | `MARKETING_CURATED_LIST` — ordered marketing/landing pick list |
+| `agentflow-agents/src/services/curated-foundations.ts:46` | `CURATED_FOUNDATIONS` — full curated catalogue with kind/keyword routing + optional `requires_env_setup` flag |
+| `agentflow-agents/tests/unit/foundation-bridge-nextconfig.test.ts:1` | Tests for next.config.ts transpile (Fix A historical) |
+| `agentflow-agents/tests/unit/foundation-bridge-env-fixup.test.ts:1` | Tests for .env placeholders + HAS_PRISMA_SCHEMA probe |
+| `agentflow-agents/tests/unit/foundation-bridge-next-config-stub.test.ts:1` | Tests for next.config.mjs stub when missing |
+| `agentflow-agents/tests/unit/foundation-bridge-bun-fallback.test.ts:1` | Tests for bun → npm/pnpm rewrite |
+
+## Data flow
+
+```
+project status=approved
+  → graph-executor walks kind=spa
+  → admin_panel handler (spa.ts:489)
+     → foundation-rebrand applies brand strings
+         · probes site.ts, package.json, README, layout.tsx, page.tsx,
+           Navbar.tsx, .env / .env.local
+         · derives {site_name, site_description, hero_title, hero_subtitle}
+           via one TEXT_LARGE call from project.brief + project.title
+         · rewrites template defaults in place; never rewrites custom values
+         · returns brief_tokens_landed / brief_tokens_total
+     → If brief_tokens_landed === 0 while brief_tokens_total >= 2:
+         · re-invoke coder-spa with a tight rebrand brief
+         · coder greps for foundation defaults + write_file's the swaps
+     → bridge bash runs:
+         1. Detect APP_DIR (priority — see "APP_DIR resolution" below)
+         2. Transpile next.config.ts → next.config.mjs (Fix nextconfig)
+         3. Ensure next.config.mjs stub exists (Fix B)
+         4. Strip bun from package.json scripts + prisma.seed (Fix C)
+         5. Probe HAS_PRISMA_SCHEMA (Fix D)
+         6. Write generous .env with placeholders (Fix A)
+         7. Neutralise t3-env / createEnv validators
+         7.5. Merge .env.example → .env (foundation-env-stub semantics)
+         8. Best-effort Postgres DB create via raw protocol
+         9. Detect package manager (pnpm > yarn > bun > npm)
+         10. Write Procfile that supervisor will exec
+     → runtime-supervisor starts `web:` service
+     → Caddy reverse-proxies p-<slug>.proj.agentflow.website → localhost:$PORT
+```
+
+## DB / Env / API
+
+- Tables: `projects.foundation_mode`, `projects.foundation_repo_full_name`, `projects.foundation_snapshot`
+- Env: bridge runs inside workspace-pod's `tools` container; reads project's `.ports.env`
+- Routes: none — internal step of the graph executor
+- MCP tools: none — bash exec via `ctx.codeExec`
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `next.config.ts` on Next 14 throws at boot | `Configuring Next.js via 'next.config.ts' is not supported` | `spa.ts:610` `_transpile_next_config_ts` |
+| No `next.config.*` at all and boot warns | (no clear signature) | `spa.ts` `_ensure_next_config_stub` |
+| Clerk publishable-key validation throws at SSR | `@clerk/nextjs: The publishableKey passed to Clerk is invalid` | **Switch foundation** — `MARKETING_CURATED_LIST` defaults to `cruip/open-react-template` (no Clerk) |
+| `bun: not found` during install | `bun: command not found` or `prisma db seed` exit non-zero | `spa.ts` `_strip_bun_runtime` |
+| `Required: DATABASE_URL` Zod throw on first import | `Invalid environment variables` | `spa.ts` `_write_placeholder_env` + `createEnv` neutraliser |
+| `prisma: schema not found` distracting log | `Could not find a schema.prisma file` | `spa.ts` `HAS_PRISMA_SCHEMA` gates Procfile chain |
+| Monorepo `apps/*` foundation picked despite filter | `foundation_structural_rejected: monorepo_apps` | `foundation-structural-filter.ts` MONOREPO_REJECT_RX |
+| Repo has Next.js in `frontend/` (Hamster-Kombat-style) and bridge wrote Procfile from repo root → no Next, 502 | `[foundation] no runnable package.json found` or `[foundation] subdir-detect:` missing | `spa.ts` subdir walk — extend `for _sub in frontend web app client site` |
+| pnpm-workspace foundation (`Agueria/durak-online`) picked but bridge built from repo root | absent `[foundation] monorepo-detect:` log line | `spa.ts` workspace walk — fix `pnpm-workspace.yaml` / `turbo.json` / `package.json.workspaces` probe |
+| Foundation declares its own `NEXT_PUBLIC_*` / Convex / PostHog key in `.env.example` → app boots but widget renders empty | absent `[foundation] env-stub: appended N keys` log line | `spa.ts` `_merge_env_example` shell helper — and mirror the canonical default in `foundation-env-stub.ts:defaultForEnvKey` |
+| Preview shows raw foundation brand ("Next MarketPlace", "Acme") instead of brief title | `admin_panel: rebrand skipped (no_brand_strings_matched)` + `brief_tokens_landed: 0` | `foundation-rebrand.ts` — extend `TEMPLATE_DEFAULT_FRAGMENTS` or `BRAND_FILES` list to cover the new pattern |
+| Foundation reads `SITE_NAME` from env (e.g. `vercel/commerce`) and renders empty title | `<title></title>` in curl head | `foundation-rebrand.ts:rebrandEnvFile` writes `SITE_NAME` to `.env` |
+
+## APP_DIR resolution (priority order)
+
+The bridge picks one of these as `APP_DIR` for the install/build/start chain:
+
+1. Explicit monorepo paths: `apps/storefront` → `apps/admin` → `apps/web` → `apps/frontend` (first hit wins).
+2. Single-package subdir walk — gated on `package.json` MISSING at repo root. Probes `frontend/`, `web/`, `app/`, `client/`, `site/` and accepts the first one whose `package.json` declares `"next"`. Logs `[foundation] subdir-detect: …`.
+3. Generic workspace walk — gated on `pnpm-workspace.yaml`, `turbo.json`, or root `package.json.workspaces`. Iterates every `apps/<x>/` and accepts the first with `"next"` in package.json. Logs `[foundation] monorepo-detect: …`.
+4. Root `package.json` → `APP_DIR='.'`.
+5. None of the above → exit 2 with `[foundation] no runnable package.json found`.
+
+## Env stub from `.env.example`
+
+After the broad `.env` placeholder heredoc (Step 6 above), the bridge merges keys from
+`.env.example` / `.env.local.example` into `.env` for both `WORKSPACE_ROOT` and `$APP_DIR`.
+Strict idempotency: a key already in `.env` is left alone.
+
+Canonical defaults live in `services/foundation-env-stub.ts:defaultForEnvKey`. The bridge's
+shell stanza mirrors them. When you add a new default, update BOTH:
+
+| Pattern | Default |
+|---|---|
+| `NEXTAUTH_URL`, `AUTH_URL`, `NEXT_PUBLIC_APP_URL`, `BASE_URL` | `http://localhost:$PORT` |
+| `NEXTAUTH_SECRET`, `AUTH_SECRET` | `preview-dev-secret-not-for-production-use` |
+| `AUTH_TRUST_HOST` | `true` |
+| `DATABASE_URL`, `DIRECT_URL`, `POSTGRES_PRISMA_URL`, `POSTGRES_URL_NON_POOLING`, `POSTGRES_URL`, `PRISMA_DATABASE_URL` | `postgresql://postgres:preview@127.0.0.1:5432/<slug>` |
+| `CLERK_SECRET_KEY`, `CLERK_API_KEY` | `sk_test_preview_placeholder_clerk` |
+| `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_PUBLISHABLE_KEY` | `pk_test_preview_placeholder_clerk` |
+| `STRIPE_API_KEY`, `STRIPE_SECRET_KEY` | `sk_test_preview_placeholder_stripe` |
+| `STRIPE_WEBHOOK_SECRET` | `whsec_preview_placeholder` |
+| `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` | `pk_test_preview_placeholder_stripe` |
+| `SKIP_ENV_VALIDATION`, `NEXT_SKIP_ENV_VALIDATION` | `1` |
+| `CONVEX_DEPLOYMENT`, `NEXT_PUBLIC_CONVEX_URL` | `http://localhost:0` |
+| `NEXT_PUBLIC_POSTHOG_HOST` | `https://app.posthog.com` |
+| `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY` | `sk-preview-placeholder` |
+| `NODE_ENV` | `development` |
+| `SENTRY_DSN`, `NEXT_PUBLIC_SENTRY_DSN`, `SENTRY_AUTH_TOKEN` | `` (empty) |
+| `*_URL`, `*_ENDPOINT` | `http://localhost:0` |
+| `*_SECRET`, `*_KEY`, `*_TOKEN` | `preview_placeholder` |
+| `NEXT_PUBLIC_*` (no other match) | `preview_placeholder` |
+| Unknown shape | skipped — foundation's own validator decides |
+
+## `requires_env_setup` flag
+
+`CuratedFoundation.requires_env_setup?: boolean` — optional metadata for the foundation
+scout. Set to `true` when the foundation's auth / billing flows will be inert until the
+user replaces stubs with real secrets. Currently flagged: `steven-tey/precedent`,
+`kiranism/next-shadcn-dashboard-starter`, `mickasmt/next-saas-stripe-starter`,
+`vercel/nextjs-subscription-payments`. The preview still boots (placeholders cover the
+boot path) but auth/checkout/etc. will reject until real keys land.
+
+## Curated foundation selection rules
+
+- Marketing-intent brief (`MARKETING_INTENT_RX` matches OR `kind=landing`) → bypass LLM scorer, use `MARKETING_CURATED_LIST`.
+- Lead pick: **`cruip/open-react-template`** (Next 15.1.11, zero risky deps, no `.env`, single-package).
+- Backup: `cruip/tailwind-landing-page-template` (same author).
+- MLM brief (`isMlmBrief`) → `MLM_CURATED_LIST` (golden-connect only).
+- All other SPA briefs → LLM scorer over `CURATED_FOUNDATIONS` + open-internet proposer.
+
+## Related
+
+- [projects-create-flow](/subsystems/projects-create-flow) — how a brief becomes a graph
+- [runtime-supervisor](/subsystems/runtime-supervisor) — what consumes the Procfile
+- QA audit: `qa-reports/2026-05-22-trusted-foundations.md`

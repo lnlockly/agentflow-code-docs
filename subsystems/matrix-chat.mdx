@@ -94,6 +94,75 @@ Browser /chat
 | `.well-known/matrix/server` 404 | `404 GET /.well-known/matrix/server` в landing logs | `agentflow-landing/public/.well-known/matrix/` не задеплоен или Vite plugin не копирует |
 | User auto-provision 409 conflict | `M_USER_IN_USE` в bridge logs | Race condition при первом одновременном логине — добавить retry на GET после 409 |
 | Voice/video не работает | `WebRTC: no ICE candidates` | Phase 2+, TURN не настроен (coturn out of scope MVP) |
+| Dendrite CrashLoopBackOff после bridge PR | `Invalid config file: open /etc/dendrite/appservices/<bridge>.yaml: no such file or directory` | `app_service_api.config_files` в `k8s/dendrite-config.yaml` ссылается на bridge registration, но Secret `mautrix-<bridge>-registration` не создан. `optional: true` на projected volume позволяет поду стартовать БЕЗ Secret'а, но Dendrite фаталит на отсутствующий файл. Fix: либо закончить bootstrap bridge (см. `k8s/mautrix-<bridge>.yaml` header — создать DB, secrets, apply manifest), либо убрать строку из `config_files` до bootstrap. **Никогда не добавляй новую строку в `config_files` пока `kubectl get secret mautrix-<bridge>-registration` не вернёт ресурс.** Инцидент 2026-05-22: whatsapp.yaml |
+
+## Lobby room (`#lobby:agentflow.website`)
+
+> **Shipped 2026-05-21.** Public chat where every authenticated user lands on first SSO bounce. Element renders it in the sidebar; users can write messages, see other AF users, and tag the platform bots.
+
+### Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/matrix-onboarding.ts:223` | `ensureLobbyRoom` — alias-resolve → createRoom from af-helper, race-safe |
+| `agentflow-agents/src/services/matrix-onboarding.ts:323` | `ensureLobbyRoomAtBoot` — wrapper that loads bot roster + calls `ensureLobbyRoom` |
+| `agentflow-agents/src/services/matrix-onboarding.ts:82` | `ensureLobbyJoin` — per-bounce idempotent `/join` with the user's own token |
+| `agentflow-agents/src/server.ts:405` | Boot-time call (60s delay so bots runner seeds `matrix_bots` first) |
+| `agentflow-agents/src/routes/element-sso.ts:323` | Bounce-time `ensureLobbyJoin` call gated by `chat_lobby_joined_at` |
+| `agentflow-agents/src/services/env.ts:175` | `MATRIX_LOBBY_ALIAS` (default `#lobby`), `MATRIX_LOBBY_ENABLED` (default `1`) |
+| `agentflow-agents/migrations/2026-05-21e-chat-lobby-joined.sql:1` | `users.chat_lobby_joined_at TIMESTAMPTZ NULL` |
+| `agentflow-agents/tests/matrix-onboarding.test.ts:381` | `ensureLobbyRoom` tests (idempotency, create, race, override) |
+
+### Idempotency model
+
+Two layers:
+
+1. **Room provisioning.** `ensureLobbyRoom` GETs `/_matrix/client/v3/directory/room/<alias>` first. On 200 → return room_id, no further calls. On 404 → POST `/createRoom`. On `M_ROOM_IN_USE` race (concurrent pod cold-starts winning the same alias) → re-resolve. Steady-state cost: one GET per boot.
+2. **Per-user join.** The bounce handler reads `users.chat_lobby_joined_at` — if NULL, POSTs `/join/<alias>` as the user, then flips the column. Matrix's `/join` is a server-side no-op on already-member, so a missed DB write just costs one redundant round-trip on the next bounce.
+
+### Room shape
+
+| Setting | Value | Why |
+|---|---|---|
+| `preset` | `public_chat` | Joinable by alias without invite |
+| `visibility` | `public` | Surfaced in the homeserver's room directory |
+| `room_alias_name` | `lobby` | Canonical alias `#lobby:agentflow.website` |
+| `name` | `Lobby` | Element sidebar label |
+| `topic` | `Общий чат всех пользователей AgentFlow. Делитесь идеями, спрашивайте, общайтесь.` | Plain Russian, no «бесплатно», no jargon |
+| `history_visibility` | `invited` | Members see history only from the moment they joined — keeps the timeline private to logged-in users, prevents anonymous archive crawls |
+| `invite` (creator only) | `af-claude`, `af-research`, `af-image`, `af-spec` | Bot roster present from the start; bots' `/sync` runner auto-accepts. `af-helper` is the creator (already in). `af-tg-poster` stays out (DM-only by design). |
+
+### Env
+
+| Var | Default | Purpose |
+|---|---|---|
+| `MATRIX_LOBBY_ALIAS` | `#lobby` | Alias local-part with leading `#`. Set to `#general` etc. to relocate without redeploy |
+| `MATRIX_LOBBY_ENABLED` | `1` | Master switch. `0` disables boot-time provisioning AND per-bounce `/join` (staging Dendrites that should not have a shared room) |
+
+### Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Lobby never appears in sidebar | `[chat-onboard] lobby create failed` | `MATRIX_REGISTRATION_SHARED_SECRET` mismatched or af-helper bot row absent; restart `agentflow-agents` so `ensureAllBots` re-seeds |
+| Bounce returns 200 but user not joined | `[element-sso] lobby join failed` with `lobby_join_failed_404` | Room not provisioned yet. Manual recovery: `curl https://matrix.agentflow.website/_matrix/client/v3/directory/room/%23lobby%3Aagentflow.website` — if 404, restart agentflow-agents to trigger `ensureLobbyRoomAtBoot` |
+| Cold-start race creates duplicate rooms | `[chat-onboard] lobby create failed` with `M_ROOM_IN_USE` | Expected on concurrent boots; the re-resolve branch handles it. Only a problem if the retry GET also fails |
+| User can read history they shouldn't | (no log) | `history_visibility` got set to `world_readable`. Verify state event: `kubectl -n franchise-factory exec dendrite -- ...` |
+| Lobby provisioning runs every boot | `[chat-onboard] lobby alias resolve unexpected` with non-404 status | Dendrite returning 5xx on directory lookup — separate Dendrite issue |
+| `MATRIX_LOBBY_ENABLED=0` but still joining | (no log) | Verify env was set on the deployment — `kubectl -n franchise-factory exec deploy/agentflow-agents -- env | grep MATRIX_LOBBY` |
+
+### Verify
+
+```
+# Room exists (matrix endpoint, public)
+curl -s 'https://matrix.agentflow.website/_matrix/client/v3/directory/room/%23lobby%3Aagentflow.website'
+# → {"room_id":"!....:agentflow.website","servers":["agentflow.website"]}
+
+# Force-create from a fresh DB by removing the alias (recover path)
+kubectl -n franchise-factory rollout restart deploy/agentflow-agents
+# Then watch the boot log
+kubectl -n franchise-factory logs -l app=agentflow-agents --tail=200 | grep '\[chat-onboard\] lobby'
+# → [chat-onboard] lobby room ready {"room_id":"!...","created":true,"invited":["af-claude",...]}
+```
 
 ## Non-goals (MVP)
 
@@ -102,7 +171,65 @@ Browser /chat
 - Voice/video calls (требует TURN-сервера)
 - Mobile apps (phase 6, отдельный repo)
 - Telegram/Discord/WhatsApp bridges (phase 5, `mautrix-*`)
-- Spaces hierarchies
+
+## AgentFlow Space (Discord-style folder)
+
+Element renders a `creation_content.type=m.space` room as a top-level sidebar icon. Clicking it pops out a panel with every child room — same UX shape as a Discord server.
+
+### Files
+
+| Path | Role |
+|---|---|
+| `src/services/bootstrap-channels.ts:bootstrapAgentflowSpace` | Boot-time entry point. Creates Space room, links children, invites all existing users. |
+| `src/services/bootstrap-channels.ts:inviteUserToAgentflowSpace` | Per-user invite called from `/me/chat/element-sso` on first bounce. |
+| `src/services/bootstrap-channels.ts:getAgentflowSpaceRoomId` | Cached room id helper; falls back to alias resolve. |
+| `src/server.ts` | Calls `bootstrapAgentflowSpace` after `bootstrapPublicChannels` on the 60s delay. |
+| `src/routes/element-sso.ts` | Invites the user to the Space after lobby join. |
+
+### Children
+
+| Alias | Role |
+|---|---|
+| `#agentflow-news` | release notes |
+| `#agentflow-tutorials` | walkthroughs |
+| `#agentflow-marketplace` | new agent listings |
+| `#agentflow-bridges` | bridge status |
+| `#agentflow-lobby` | общий чат — gets welcome message on first creation |
+| `#agentflow-voice` | voice room (Element Call URL configured in `k8s/element-web-config.yaml`) |
+
+### Wire shape
+
+- Space room: `POST /_matrix/client/v3/createRoom` with `creation_content: { type: 'm.space' }`, `preset: public_chat`, `room_alias_name: agentflow-space`.
+- Linking children: paired state events
+  - On the Space: `m.space.child` `state_key=<child>` content `{ via: ['agentflow.website'], suggested: true }`.
+  - On the child: `m.space.parent` `state_key=<space>` content `{ via: ['agentflow.website'], canonical: true }`.
+- Auto-invite: at boot the af-helper bot invites every `users` row (cap 5 concurrent); on bounce the SSO route invites the freshly-provisioned user. Existing-member 403 is tolerated.
+
+### Avatar
+
+Skipped in v1. The Space renders with Element's default initial-letter avatar. TODO: ship a 256x256 PNG via `POST /_matrix/media/v3/upload` + a `m.room.avatar` state event once `@napi-rs/canvas` or a precomputed base64 buffer is in the build.
+
+### Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Space icon missing from sidebar | `[bootstrap-channels] space createRoom failed` | af-helper bot row missing or Dendrite reachability — restart agentflow-agents |
+| Child room shows in main sidebar instead of inside Space | `[bootstrap-channels] state event PUT failed` event_type=`m.space.child` | af-helper lost PL100 on the Space — re-create Space or grant PL |
+| Child has no breadcrumb back to Space | `[bootstrap-channels] space.parent PUT failed` | Child was created by a different bot; m.space.parent half needs PL>=50 on the child |
+| New user doesn't see Space until second bounce | `[element-sso] space invite failed` | bootstrapAgentflowSpace hasn't run yet on this pod restart — wait 60s |
+| Voice room is just a normal chat | (no log) | Element Call not wired in `k8s/element-web-config.yaml`; v1 ships voice as a plain room |
+
+### Verify
+
+```bash
+# Space exists
+curl -s 'https://matrix.agentflow.website/_matrix/client/v3/directory/room/%23agentflow-space%3Aagentflow.website'
+# → {"room_id":"!...:agentflow.website","servers":[...]}
+
+# Children linked
+kubectl -n franchise-factory logs -l app=agentflow-agents --tail=400 | grep '\[bootstrap-channels\] space bootstrap done'
+# → ... children_linked: 6, invites_sent: <N>, users_total: <N>
+```
 
 ## Related
 
@@ -110,3 +237,5 @@ Browser /chat
 - [Auth and access](/subsystems/auth-and-access) — AF JWT источник identity для SSO
 - [MinIO storage](/subsystems/farm) — переиспользуется для Dendrite media repo
 - [Matrix Telegram Bridge](/subsystems/matrix-tg-bridge) — `mautrix-telegram` мостит TG в Dendrite
+- [Matrix Bots](/subsystems/matrix-bots) — five platform service bots running on the same homeserver
+- [Matrix Monitoring](/subsystems/matrix-monitoring) — Prometheus metrics + Grafana dashboard for Dendrite + bridge + bot runner

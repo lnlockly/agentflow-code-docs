@@ -1,0 +1,61 @@
+---
+title: "Multi-agent project chat (`POST /me/projects/:id/chat`)"
+description: "How project_chat dispatches to the per-tenant Maestro Виртуоз runtime, and the 405-base-URL bug that returned empty_reply for every user until 2026-05-23."
+---
+
+# Multi-agent project chat
+
+## TL;DR
+
+`POST /me/projects/:id/chat` funnels every project chat turn through the per-tenant Eliza runtime (Maestro «Виртуоз»). The runtime invokes Anthropic via `@elizaos/plugin-anthropic`, which posts to `${ANTHROPIC_BASE_URL}/messages`. If `ANTHROPIC_BASE_URL` lacks a `/v1` suffix the proxy returns HTTP 405, plugin-bootstrap surfaces it as `Error processing message (error=Method Not Allowed)`, the stream closes without a REPLY, and the route returns `502 empty_reply`. The fix normalises the URL before it is base64-encoded into the `runtime-env` Secret.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/workspace-chat.ts:63-137` | Hono handler. Validates project ownership, runs `runMaestroProjectChat`, and surfaces empty replies as `502 empty_reply`. |
+| `agentflow-agents/src/services/project-maestro-chat.ts:1-100` | Drives the Eliza session for project_chat — composes the project context delta, runs the auto-continue loop, persists `project_event` rows. |
+| `agentflow-agents/src/services/agent-runner.ts:27-65` | Shared SSE pump + auto-continue loop. Re-prompts Eliza when a `done` frame lands without a `REPLY` action so multi-tool chains complete. |
+| `agentflow-agents/src/services/eliza-world-bootstrap.ts:121-197` | `ensureMaestroWorld()` writes a `worlds` row in `eliza_user_<id>` so plugin-bootstrap's SETTINGS provider can locate ownership. Idempotent via deterministic `worldId`. |
+| `agentflow-agents/src/services/tenant-bootstrap.ts:312-345` | `renderRuntimeEnvSecret()` builds the per-tenant runtime-env Secret. Calls `ensureAnthropicV1Suffix()` so `ANTHROPIC_BASE_URL` always ends with `/v1` regardless of how the platform env is shaped. |
+| `agentflow-agents/src/services/tenant-bootstrap.ts:310-335` | `ensureAnthropicV1Suffix()` — the normaliser. Strips trailing slashes, appends `/v1` when no `/v\d+` segment is present. Forward-compatible with `/v2` / `/v3`. |
+
+## Data flow
+
+```
+POST /me/projects/:id/chat
+  → routes/workspace-chat.ts          (auth, ownership, body parse)
+  → project-maestro-chat.ts           (compose state, persist event)
+  → agent-runner.ts                   (Eliza SSE pump + auto-continue)
+  → POST {ANTHROPIC_BASE_URL}/messages  (plugin-anthropic via @ai-sdk)
+  ← stream chunks
+  ← parse REPLY / tool calls
+  → 200 { reply, delegated_to? }      OR
+  → 502 { error: 'empty_reply' }      (no text + no tool calls)
+```
+
+The runtime pod (`runtime-<hash>-x-default-x-user-<id>` in `af-tenant-<id>`) receives `ANTHROPIC_BASE_URL` via the `runtime-env` Secret rendered by `renderRuntimeEnvSecret`. The Secret is reapplied on every tenant bootstrap, so editing the platform env + rolling agentflow-agents propagates to all tenants on next reconcile.
+
+## DB / Env / API
+
+- Tables (host `agentflow` DB): `projects`, `project_events`, `project_agents`, `agents` (`eliza_agent_id` column).
+- Tables (per-tenant `eliza_user_<id>` DB): `worlds` (needs `metadata.ownership.ownerId` matching `userUuidForOwner(<id>)`).
+- Env (agentflow-agents): `ANTHROPIC_BASE_URL`, `PLATFORM_ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, `PLATFORM_ANTHROPIC_API_KEY`. Either platform-specific or shared is propagated to runtime; the platform pair takes precedence.
+- Env (runtime pod): `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, `ANTHROPIC_SMALL_MODEL`, `ANTHROPIC_LARGE_MODEL`, `DATABASE_URL`.
+- Routes: `POST /me/projects/:id/chat` (this page), `POST /me/projects` (creates project), `POST /me/projects/:id/approve` (gates auto-coder).
+- LLM proxy: `https://api.east-api-3.org/v1/messages` (Anthropic-compatible). HTTP 405 on `/messages` without `/v1`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `project_chat` returns `502 {"error":"empty_reply"}` for every user | `[SERVICE:MESSAGE] Error processing message (error=Method Not Allowed)` in runtime pod logs | `agentflow-agents/src/services/tenant-bootstrap.ts:310-345` — ensure `ensureAnthropicV1Suffix()` runs before base64 → Secret. Roll agentflow-agents, then `kubectl -n af-tenant-<id> rollout restart deploy <runtime-deploy>` per tenant. |
+| Settings provider reports `No server ownership found for user after recovery attempt` | `[PLUGIN:BOOTSTRAP:PROVIDER:SETTINGS] No server ownership found for user after recovery attempt` | `agentflow-agents/src/services/eliza-world-bootstrap.ts:121` — `ensureMaestroWorld()` must run on `ensureMaestroForOwner` / `reviveAgent`. Re-run `scripts/backfill-eliza-onboarding-worlds.ts` for legacy tenants. |
+| Runtime returns `429` to platform calls, chat hangs | `[HTTP] Rate limit exceeded (ip=144.217.65.94)` in runtime pod | `@elizaos/server` rate-limit is 1000 req / 15 min per IP. If the platform spawns more parallel sessions than that, increase the cap via Eliza config or split traffic by per-agent base URLs. |
+| `project_chat` returns `502 empty_reply` with no 405 in logs | Maestro session was created against an old prompt version; `maestro_empty_reply: stream ended with no text.` in `project_events` | `agentflow-agents/src/services/project-maestro-chat.ts:1009` — reset the Maestro session for that project + retry. |
+
+## Related
+
+- [Runtime supervisor](/subsystems/runtime-supervisor)
+- [Foundation Scout](/subsystems/foundation-scout)
+- [Projects create flow](/subsystems/projects-create-flow)

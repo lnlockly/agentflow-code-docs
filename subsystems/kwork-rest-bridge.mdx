@@ -1,0 +1,125 @@
+---
+title: "kwork-rest-bridge — REST→MCP shim + its CI/deploy"
+description: "Standalone pod that exposes the kwork-inbox + tg-mcp MCP servers as plain HTTP for Activepieces/studio flows. Now has a git home (lnlockly/agentflow-kwork-bridge) and a self-hosted CI that ships to ghcr → kubectl set image."
+---
+
+# kwork-rest-bridge
+
+## TL;DR
+
+`kwork-rest-bridge` is a single pod in the `franchise-factory` namespace that
+turns AgentFlow's in-process MCP servers (`kwork-inbox`, `tg-bot`'s sibling
+`tg-mcp`) into plain HTTP so Activepieces workers and studio-flow steps — which
+can't open MCP-protocol sessions — can drive the owner's Kwork account. As of
+v0.4 it has its own private repo `lnlockly/agentflow-kwork-bridge` and a
+`[self-hosted, ff-france]` Actions workflow (build → ghcr → `kubectl set image`),
+replacing the hand-built PoC pod that had no deploy path. v0.4 added the
+seller-gig routes (`create-gig`, `list-my-gigs`, `categories`) that previously
+only existed on the running pod's disk.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-kwork-bridge/server.mjs:207` | `ROUTES` table — every HTTP route maps to an MCP tool call |
+| `agentflow-kwork-bridge/server.mjs:276` | `POST /kwork/create-gig` handler — `dry_run` returns prepared payload without posting |
+| `agentflow-kwork-bridge/server.mjs:254` | `POST /kwork/list-my-gigs` → `list_my_kworks` |
+| `agentflow-kwork-bridge/server.mjs:263` | `POST /kwork/categories` → `list_categories` |
+| `agentflow-kwork-bridge/server.mjs:217` | `POST /kwork/scan-projects` (path-1 отклики, LIVE) → `list_wants` |
+| `agentflow-kwork-bridge/server.mjs:362` | handler lookup runs **before** the `x-bridge-secret` check → unknown route = 404, known route + bad secret = 401 |
+| `agentflow-kwork-bridge/server.mjs:77` | `getKworkClient` — MCP client to `${AGENTFLOW_AGENTS_URL}/internal/mcp/kwork-inbox?owner=<id>` with `x-mcp-auth: INTERNAL_API_SECRET` |
+| `agentflow-kwork-bridge/k8s.yaml` | Service + Deployment; `imagePullSecrets: ghcr-pull`, `maxUnavailable:0` so the old pod serves path-1 until the new pod is Ready |
+| `agentflow-kwork-bridge/.github/workflows/deploy.yml` | CI: build+push ghcr → apply k8s.yaml → set image :sha → rollout → no-side-effect route smoke test |
+| `agentflow-agents/src/routes/internal-mcp.ts:184` | `KWORK_INBOX_PATHS` route the bridge calls (`/internal/mcp/kwork-inbox`) |
+| `agentflow-agents/src/routes/internal-mcp.ts:203` | `TG_BOT_PATHS` (`/internal/mcp/tg-bot`) — `send_card` for the owner approval card |
+| `agentflow-agents/src/mcp-servers/tg-bot.ts:390` | `send_card` tool (resolves owner bot token + chat id from sealed `project_secrets`) |
+
+## Data flow
+
+```
+AP HTTP piece / studio step
+  │  POST /kwork/<route>   (x-bridge-secret: AP_BRIDGE_SECRET,
+  │                         Authorization: Bearer af_live_*  OR  ownerUserId)
+  ▼
+kwork-rest-bridge pod  (franchise-factory ns, svc :8000)
+  │  MCP StreamableHTTP (x-mcp-auth: INTERNAL_API_SECRET)
+  ▼
+agentflow-agents :4100  /internal/mcp/kwork-inbox?owner=<id>
+  │  kwork-inbox MCP tool (list_wants / create_kwork / list_my_kworks / list_categories …)
+  ▼
+owner's Kwork session  (project_secrets.KWORK_SESSION_JSON, sealed)
+
+create-gig approval card path:
+bridge → /internal/mcp/tg-bot?owner=1 → send_card → @agentflow_e2e_verify_bot DM (chat 1361064246)
+```
+
+## DB / Env / API
+
+- **Repo:** `lnlockly/agentflow-kwork-bridge` (private). Recovered from the
+  running PoC pod + given CI.
+- **Image:** `ghcr.io/lnlockly/agentflow-kwork-bridge:<sha>` (+ `:latest`). v0.4
+  first ship = commit `76972fa`.
+- **Routes** (all `POST application/json`, `x-bridge-secret` required; `GET /health`):
+  `/kwork/scan-dialogs`, `/kwork/scan-projects` (path-1; each want carries
+  `responses_count` = Kwork offers count, R1), `/kwork/send-message`,
+  `/kwork/respond-to-project`, `/kwork/list-my-gigs` (v0.4), `/kwork/categories`
+  (v0.4), `/kwork/create-gig` (v0.4, `dry_run`-safe; accepts `work_examples[]` +
+  `delivery_days`, R2), `/kwork/draft` (v0.4.1 → MCP `draft_reply`),
+  `/kwork/gen-examples` (v0.4.1 → MCP `gen_work_examples`), `/tg/send-message`,
+  `/tg/list-dialogs`, `/tg/get-user`.
+- **Automation contract (R1 + R2):**
+  - **Respond flow:** `scan-projects` → filter `responses_count != null &&
+    responses_count <= N` (default 5; `null` = unknown → skip) → `/kwork/draft
+    {want_id}` (flow-alias draft, never posts) → approval card → on ✅
+    `/kwork/respond-to-project`.
+  - **Create-gig flow:** `categories` + `list-my-gigs` (dedupe) →
+    `/kwork/gen-examples {topic,count}` (designapi images + flow text) → assemble
+    + `create-gig {…, work_examples, dry_run:true}` (card renders the full gig,
+    nothing published) → on ✅ same call `dry_run:false`. Kwork moderation
+    rejects gigs with no portfolio, so `work_examples` is required.
+  - `/kwork/draft` + `/kwork/gen-examples` need the agentflow-agents kwork-inbox
+    MCP tools `draft_reply` / `gen_work_examples` (return `tool_not_found` until
+    that PR deploys). `responses_count` + `work_examples` dry-run assembly work
+    standalone. There is NO native LLM AP piece — drafting/image-gen run
+    server-side via `flow` + designapi (a native AgentFlow-LLM AP piece is a
+    cleaner long-term follow-up, not built yet).
+- **Env:** `PORT` (8000), `AGENTFLOW_AGENTS_URL`
+  (`http://agentflow-agents.franchise-factory.svc:4100`), `TG_MCP_URL`,
+  `INTERNAL_API_SECRET` (secret `agentflow-agents-env`), `AP_BRIDGE_SECRET`
+  (secret `activepieces-env`), `TG_MCP_AUTH_SECRET` (secret `agentflow-tg-mcp-env`
+  key `MCP_AUTH_SECRET`). No secret in the repo.
+- **Deploy:** push to `main` → `[self-hosted, ff-france]` runner
+  (`ff-france-kwork-bridge-runner`, dedicated systemd service, same pattern as
+  the per-repo agentflow-* runners) builds + pushes ghcr, `kubectl apply -f
+  k8s.yaml`, `kubectl -n franchise-factory set image deploy/kwork-rest-bridge
+  bridge=...:<sha>`, `rollout status`, route smoke test.
+- **AP flows that call it:** `lhCT2kR7aBLydc4SMQFjH` (отклики, path-1),
+  `4mZToJUQqhMqymTGVy4PG` (`kwork-create-gig-ap`). They reach the bridge at
+  `http://kwork-rest-bridge.franchise-factory.svc:8000`.
+
+## Approval-gate + owner safety
+
+`create-gig` is approval-gated upstream — the AP/studio flow only calls it after
+the owner taps "Создать" on the Telegram card. `dry_run: true` assembles and
+validates the payload **without** posting (`server.mjs:303`), so no public gig is
+ever created during testing. The owner's Kwork session never leaves the sealed
+`project_secrets` store; the bridge holds no plaintext.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `/kwork/{create-gig,list-my-gigs,categories}` returns `404 not_found` | `not_found` | running image predates the route — redeploy (push to main) |
+| `/kwork/draft` or `/kwork/gen-examples` → 400 | `tool_not_found:draft_reply` / `tool_not_found:gen_work_examples` | agentflow-agents kwork-inbox MCP tool not deployed yet — merge/deploy that PR |
+| `responses_count` is `null` on a want | (not in listing envelope) | flow treats null as "skip"; or fetch the want detail |
+| Route hit with missing/wrong header | `invalid_bridge_secret` | send `AP_BRIDGE_SECRET` as `x-bridge-secret` |
+| No owner identity on the call | `missing_owner_or_api_key` | supply `Authorization: Bearer af_live_*` or `ownerUserId` |
+| `/tg/*` called but secret unset | `tg_mcp_auth_secret_not_configured` | set `TG_MCP_AUTH_SECRET` env (`tg-bot.ts:116` analog) |
+| Pod crashes on boot | `FATAL: INTERNAL_API_SECRET env not set` | secret `agentflow-agents-env` not mounted |
+| CI smoke step false-fails on a 404 during the roll | `ROUTE MISSING` | smoke selects the new-RS pod by image — see `deploy.yml` smoke step |
+
+## Related
+
+- [Kwork Integration](/agentflow-code-docs/subsystems/kwork-integration)
+- [Kwork marketplace respond + gigs flow](/agentflow-code-docs/flows/kwork-marketplace-respond-and-gigs)
+- [Activepieces marketplace](/agentflow-code-docs/subsystems/activepieces-marketplace)
