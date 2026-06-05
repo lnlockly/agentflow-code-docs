@@ -31,6 +31,9 @@ There is an older parallel CryptoBot integration in `agentflow-api/src/routes/su
 | `agentflow-agents/src/services/cryptobot-billing.ts:533` | `recordPendingInvoice` — INSERT `cryptobot_payments` row pre-pay |
 | `agentflow-agents/src/services/cryptobot-billing.ts:563` | `getActiveSubscription(userId)` — returns `{tier, expires_at, started_at}` or null |
 | `agentflow-agents/src/routes/billing-cryptobot.ts:56` | `GET /me/billing/cryptobot/pricing` — public matrix the landing reads on mount |
+| `agentflow-agents/src/routes/billing-cryptobot.ts:84` | `POST /me/billing/cryptobot/create-invoice` — auth'd, zod-validated, mints payload + creates invoice + records pending row |
+| `agentflow-agents/src/routes/billing-cryptobot.ts:187` | `GET /me/subscription` — auth'd, returns active subscription or `{active:false, tier:null}` |
+| `agentflow-agents/src/routes/billing-cryptobot.ts:206` | `POST /webhooks/cryptobot` — public, raw-body signature verify before parse, calls `applyInvoicePaid` |
 | `agentflow-agents/src/routes/billing-cryptobot.ts:84` | `POST /me/billing/cryptobot/create-invoice` — auth'd, zod-validated, mints subscription payload + creates invoice + records pending row |
 | `agentflow-agents/src/routes/billing-cryptobot.ts` | `POST /me/billing/cryptobot/create-topup-invoice` — auth'd, zod-validated `{amount_usd 1..10000, asset?}`, mints **free-form top-up** payload `topup:u<id>:c<cents>:v1` + creates invoice + records pending row. Owner-shipped 2026-05-17 (PR #418) for `/account/billing` free-form input flow. |
 | `agentflow-agents/src/routes/billing-cryptobot.ts:187` | `GET /me/subscription` — auth'd, returns active subscription or `{active:false, tier:null}` |
@@ -139,12 +142,16 @@ There is an older parallel CryptoBot integration in `agentflow-api/src/routes/su
 
 - `CRYPTO_BOT_TOKEN` — Crypto Pay API token from @CryptoBot dashboard. **Required for create-invoice + webhook verify.** Missing ⇒ `cryptobot_not_configured` 503 + fail-closed signature reject.
 - `CRYPTO_BOT_API_BASE` — optional, defaults `https://pay.crypt.bot/api`. Testnet: `https://testnet-pay.crypt.bot/api`.
+- `CRYPTO_BOT_PRESTART_DISCOUNT` — optional, default `1.0` (no extra discount). Set to e.g. `0.5` for the −50% academy pre-start window. Applied **after** the period discount: `round(round(base × (1 − period_discount)) × months × prestart_factor)`. Validated `0 < n ≤ 1`; anything else falls back to 1.0. See `services/cryptobot-billing.ts:getPrestartFactor` (PR #249).
 
 ### Routes
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/me/billing/cryptobot/pricing` | public | Tier + period matrix the landing reads on mount |
+| POST | `/me/billing/cryptobot/create-invoice` | session cookie | Mints invoice, returns `{pay_url, invoice_id, amount_usd, credits_usdf}` |
+| GET | `/me/subscription` | session cookie | Active subscription or `{active:false, tier:null}` |
+| POST | `/webhooks/cryptobot` | HMAC-SHA256 (header `crypto-pay-api-signature`) | Idempotent invoice_paid handler |
 | POST | `/me/billing/cryptobot/create-invoice` | session cookie | Subscription path. Mints `sub:` payload, returns `{pay_url, invoice_id, amount_usd, credits_usdf}` |
 | POST | `/me/billing/cryptobot/create-topup-invoice` | session cookie | Free-form top-up. Body `{amount_usd 1..10000, asset?}`, mints `topup:` payload, returns `{pay_url, invoice_id, amount_usd}`. Backs the new `/account/billing` page (owner directive 2026-05-17). |
 | GET | `/me/subscription` | session cookie | Active subscription or `{active:false, tier:null}` |
@@ -186,6 +193,14 @@ Token used for HMAC must match `CRYPTO_BOT_TOKEN` in pod env.
 | Business| $300     | $300 | $765       | $1350      | $2340       | 700 USDF             |
 
 Per-month price is `Math.round(base × (1 - discount))` then `× months`. The same constants live in landing `PricingPageV2.tsx` — `tests/unit/cryptobot-billing.test.ts:53` guards drift.
+
+### Pre-start factor (PR #249)
+
+`GET /me/billing/cryptobot/pricing` now returns each tier with a `prices: [{months, amount_usd, regular_usd}, ...]` array plus a top-level `prestart: {active, factor, discount_percent}` block. `regular_usd` is the would-be price ignoring the prestart factor — frontend renders it strike-through next to `amount_usd` so users see what they save. When `CRYPTO_BOT_PRESTART_DISCOUNT` is unset (or 1.0), `active=false` and the two prices are equal.
+
+Frontend consumers:
+- `agentflow-landing/src/pages/AccountBilling.tsx` — tier cards on `/account/billing` (PR #178)
+- `agentflow-landing/src/pages/PricingPageV2.tsx` — public pricing page
 
 ## Runbook — apply migration
 
