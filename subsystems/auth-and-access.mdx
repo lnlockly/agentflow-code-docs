@@ -23,10 +23,41 @@ description: "Три пути auth: x-api-key (af_live_, HMAC-SHA256), Bearer JW
 | `agentflow-agents/src/middleware/auth.ts:151` | `requireSession` — main gate. Tries x-api-key → Bearer JWT → cookie. Brute-force ban: 429 после порога. |
 | `agentflow-agents/src/middleware/auth.ts:241` | `requireAdmin` — wraps requireSession + isPlatformAdmin. |
 | `agentflow-agents/src/middleware/auth.ts:253` | `requireInternalSecret` — sole check для internal endpoints (compare с `INTERNAL_API_SECRET`). |
+| `agentflow-agents/src/middleware/auth.ts:256` | Emergency-revoke gate — после `jwt.verify` сравнивает `claims.rev` с `getCurrentJwtRevision()`; stale → 401 `session_revoked`. Missing claim → trakteтся как 0 (backward-compat). |
+| `agentflow-agents/src/services/jwt-revision.ts` | `getCurrentJwtRevision()` (5s cache), `bumpJwtRevision(reason)`, `readRevocationStatus()` — singleton row `auth_settings WHERE id=1`. |
+| `agentflow-agents/src/routes/internal.ts` (`/internal/auth/revoke-all` + `/revoke-status`) | Owner emergency-logout knob — `POST` bumps `jwt_revision++`, `GET` reads audit fields. Guard: `requireInternalSecret`. |
+| `agentflow-agents/migrations/2026-05-25c-auth-jwt-revision.sql` | `auth_settings` singleton table (PK=1, CHECK constraint) + seed row. Also applied idempotently from `bootstrap-schema.ts`. |
 | `agentflow-agents/src/services/access.ts:26` | `isPlatformAdmin` — DB lookup с 60s in-process cache. |
 | `agentflow-agents/src/services/access.ts:39` | `userCanAccessProject` — owner OR platform_admin. |
 | `agentflow-agents/src/services/access.ts:56` | `userCanDispatchAgent` — analogous для agent-trigger / cron. |
 | `agentflow-agents/src/middleware/api-key-rate-limit.ts:114` | `defaultLimitFor` — читает `API_KEY_RPM_PRO=300`, `API_KEY_RPM_FREE=60`. Feature flag `FF_API_KEY_TIERS=1`. Возвращает 429 `rate_limited`. |
+| `agentflow-agents/src/middleware/ip-rate-limit.ts:166` | `ipRateLimitAuth()` — strict per-IP sliding-window for the **public** auth endpoints (`/auth/login`, `/auth/register`, `/auth/password-reset/request`). These have no `requireSession`, so the api-key brute-force gate in `auth.ts:151` never covers them. Isolated `auth` bucket, default 5 req / rolling 60s (`IP_RATE_LIMIT_AUTH_PER_MIN`) + burst 3 / 5s (`IP_RATE_LIMIT_AUTH_BURST`). Returns 429 `{ok:false,error:'rate_limited',window:'ip'}` + `retry-after`. Built on `ipRateLimit({bucket,perMinute,burst})`. |
+| `agentflow-agents/src/routes/auth-magic-link.ts:206` | `POST /auth/magic-link/request` + alias `/auth/magic-link` — insert hashed nonce, send email via Resend, fall back to `dev_link` only when `ALLOW_DEV_MAGIC_LINK=1 && NODE_ENV!=production`. |
+| `agentflow-agents/src/routes/auth-magic-link.ts:316` | `GET\|POST /auth/magic-link/verify` + aliases `/auth/verify` — hash incoming token, look up unused unexpired row, find-or-create user by email, mint 7-day JWT, set `af_session` cookie. |
+| `agentflow-landing/src/pages/AuthEmailPage.tsx:46` | `/auth/email` page — **dual-mode** (password tab default + magic-link tab fallback). Password tab posts to `/auth/login` via `agentsPost`, hard-navigates to `redirect_to` (or `?next=`) so AuthProvider re-bootstraps with the fresh `af_session` cookie. Magic-link tab kept as fallback so any working SMTP path still works. |
+| `agentflow-landing/src/pages/AuthForgotPassword.tsx` | `/auth/forgot-password` page — posts to `/auth/password-reset/request`. Always shows success state (privacy posture). |
+| `agentflow-landing/src/pages/AuthResetPassword.tsx` | `/auth/reset-password?token=…` page — posts to `/auth/password-reset/confirm`. |
+| `agentflow-landing/src/pages/AuthVerifyPage.tsx:36` | `/auth/verify?token=…` page — posts to `/auth/magic-link/verify` via `agentsPost`, then invalidates `ME_QUERY_KEY` and redirects to `?next=`. Reachable via inbox links (magic-link tab on `/auth/email`). |
+| `agentflow-landing/src/main.tsx:322` | Router mount for `/auth/email`, `/auth/verify`, `/auth/forgot-password`, `/auth/reset-password`. |
+| `agentflow-agents/src/routes/auth-password.ts:313` | `POST /auth/register` (gated by `PUBLIC_REGISTRATION_OPEN=1`). |
+| `agentflow-agents/src/routes/auth-password.ts:362` | `POST /auth/login` — bcrypt verify (cost 12), constant-time compare with dummy hash on miss, mints same `af_session` JWT cookie as magic-link path. Returns `{ok, user_id, redirect_to}`. |
+| `agentflow-agents/src/routes/auth-password.ts:364` | `GET /auth/me` — primary AuthProvider bootstrap. Verifies `af_session` (via `requireSession`), returns `{ok, user: {id, email, ref_code, tg_id, tg_username, is_admin, access_granted_at, joined_at}, wallet:null, balance_micro:0, invited_by:null}`. Added 2026-05-14 because `agentflow-api /me` returning 5xx silently logged users out — bootstrapping from the cookie-issuing service decouples session validity from agentflow-api uptime. Landing enriches wallet/balance/invited_by via `apiGet('/me')` afterwards, treating its failure as non-fatal. |
+| `agentflow-landing/src/lib/auth.tsx:63` | `AuthProvider` queryFn — calls `agentsGet('/auth/me')` first; only treats `AgentsApiError` 401 as anonymous. Then enriches with `apiGet('/me')` for wallet/balance/invited_by; any failure there is non-fatal as long as agents authed us. |
+| `agentflow-agents/src/routes/auth-password.ts:368` | `POST /auth/logout` — clears the `af_session` cookie. |
+| `agentflow-agents/src/routes/auth-password.ts:476` | `POST /auth/password-reset/request` — HMAC-SHA256 hashes the reset token with `API_KEY_HMAC_SECRET`/`AUTH_JWT_SECRET`. |
+| `agentflow-agents/src/routes/auth-password.ts:566` | `POST /auth/password-reset/confirm` — verifies hashed token, bcrypts new password. |
+| `agentflow-agents/src/routes/auth-tg-callback.ts:129` | `verifyErrorStatus(error)` — maps `verifyTelegramAuth`/`verifyMiniAppInitData` failure codes to HTTP status: malformed payload → 400, bad signature / stale auth_date → 401, bot-token-unset → 503. Both `handleCallback` (widget) and `handleMiniAppAuth` (Mini App) route through this so `POST /auth/telegram` returns 400 for bad bodies (no looping "session expired" redirect on the client). |
+| `agentflow-agents/src/routes/auth-tg-callback.ts:401` | `verifyMiniAppInitData(botToken, initData, now?)` — Mini App HMAC verifier (`createHmac('sha256', 'WebAppData').update(botToken)` as secret key, sorted data_check_string excluding `hash`, parses embedded `user` JSON). |
+| `agentflow-agents/src/routes/auth-tg-callback.ts:595` | `POST /auth/telegram` mount — Mini App `init_data` auth (distinct from `/auth/telegram/callback` Login Widget). |
+| `agentflow-agents/migrations/2026-05-11e-password-auth.sql` | Adds `users.password_hash` nullable + `auth_password_resets` table. |
+| `agentflow-agents/migrations/2026-05-16d-users-deleted-at-and-slug-backfill.sql` | Adds `users.deleted_at` + backfills `users.slug = 'user_' \|\| id` for legacy NULL rows. **Side-effect:** `users.slug` is now `text NOT NULL UNIQUE` with no DEFAULT — every INSERT must supply a slug or the row rejects with `23505`/`23502`. |
+| `agentflow-api/src/db/schema.ts:32` | `slug: text('slug').notNull().unique()` — drizzle column added 2026-05-17 to match the prod DDL after fresh signups began 500ing. |
+| `agentflow-api/src/repos/slugs.ts` | Slug derivation per identity (`slugForTgId`, `slugForWallet`, `slugForRefCode`, `slugFromEmail`) + `withSlugRetry` wrapper that catches `23505` on `users.slug` and retries with a fresh hex suffix. |
+| `agentflow-api/src/repos/users.ts:99` | Bot/internal-users insert — uses `slugForTgId(input.tg_id)`. |
+| `agentflow-api/src/services/users.ts:53` | SIWE wallet signup — uses `slugForWallet(addr)`. |
+| `agentflow-api/src/services/users.ts:106` | TG-link signup — uses `slugForTgId(tgId)`. |
+| `agentflow-api/src/services/users.ts:149` | email/password signup — uses `slugFromEmail(email)` (deterministic local-part + random suffix). |
+| `agentflow-api/src/services/users.ts:189` | `ensureAdminUser` — uses `slugForRefCode(ADMIN_REF_CODE)`. |
 
 ## Data flow
 
@@ -67,6 +98,7 @@ Optional: FF_API_KEY_TIERS=1 →
 **DB:**
 - `users` — `id`, `email`, `is_platform_admin` boolean.
 - `api_keys` — `{ id, user_id, hash (HMAC-SHA256 hex), prefix, label, tier?, revoked_at?, last_used_at }`.
+- `auth_settings` — singleton row (PK=1) `{ jwt_revision INT, last_revoked_at, last_revoked_reason }`. Bumped by `POST /internal/auth/revoke-all`; baked into every minted session JWT as the `rev` claim. См. emergency-revoke section ниже.
 - (см. `src/db/schema.ts`)
 
 **Env:**
@@ -81,6 +113,46 @@ Optional: FF_API_KEY_TIERS=1 →
 - `requireSession` mounted на all `/me/*`, `/admin/*` routes (`server.ts:428` mount table).
 - `requireAdmin` — `/admin/*` strict.
 - `requireInternalSecret` — `/internal/*` (см. `routes/internal.ts:49+`).
+- `POST /internal/auth/revoke-all` `{reason}` — emergency-logout всех cookie-сессий (см. ниже).
+- `GET /internal/auth/revoke-status` — observability для current jwt_revision.
+
+## Emergency revoke-all (kill every cookie session at once)
+
+Owner-only knob для случаев, когда юзеры зацикливаются в re-auth (stale legacy cookies, partial deploys, suspected token leak). Один HTTP call → `auth_settings.jwt_revision++` → каждый `requireSession` с `claims.rev < current` отвечает `401 session_revoked` → landing'овский AuthProvider treat'ит как logged-out → юзер на `/login` → обычный login flow.
+
+**Что НЕ ломается:**
+- `x-api-key` auth (`af_live_*`) — валидируется через `api_keys` table, не trip'ает `rev`.
+- Device tokens (`/me/devices/*`) — отдельная таблица.
+- Internal-secret routes — никакой JWT involved.
+
+**Mint-сайты, которые штампуют `rev`:**
+- `agentflow-agents/src/routes/auth-magic-link.ts:174` — `mintSessionJwt` (магик-линк).
+- `agentflow-agents/src/routes/auth-password.ts:161` — `mintSessionJwt` (пароль login + reset + register).
+- `agentflow-agents/src/routes/auth-password.ts:525` — `/me/auth/mint-session` (короткоживущие daemon-tokens).
+- `agentflow-agents/src/routes/auth-tg-callback.ts:82` — `mintSessionJwt` (Telegram widget + Mini App).
+
+**Сервис:**
+- `agentflow-agents/src/services/jwt-revision.ts` — `getCurrentJwtRevision()` (5s in-memory cache per pod), `bumpJwtRevision(reason)`, `readRevocationStatus()`.
+- `agentflow-agents/src/middleware/auth.ts:256` — verify-then-rev-check, returns `401 session_revoked` when stale.
+- Multi-replica: каждый под self-heal'ится в течение `CACHE_TTL_MS` (5s) от revoke-call.
+
+**Owner curl:**
+```bash
+curl -X POST \
+  -H "x-agentflow-secret: $INTERNAL_API_SECRET" \
+  -H "content-type: application/json" \
+  https://agentflow.website/_agents/internal/auth/revoke-all \
+  -d '{"reason":"emergency-logout 2026-05-25"}'
+# → {"ok":true,"new_revision":1}
+
+curl -H "x-agentflow-secret: $INTERNAL_API_SECRET" \
+  https://agentflow.website/_agents/internal/auth/revoke-status
+# → {"ok":true,"jwt_revision":1,"last_revoked_at":"…","last_revoked_reason":"…"}
+```
+
+**Backward-compat:** cookies минтенные до этого PR не имеют `rev` claim — `requireSession` трактует missing как `rev=0`. Default `jwt_revision=0` → никто не теряет сессию пока owner не дёрнет endpoint. После первого revoke все legacy cookies приходят `< current` и тоже инвалидируются (это и есть требуемое поведение).
+
+**Bootstrap-schema** (`src/services/bootstrap-schema.ts`) гарантирует table+seed row at pod start. Дедикейтед SQL: `migrations/2026-05-25c-auth-jwt-revision.sql`.
 
 **Error codes (HTTP):**
 - 401 `unauthenticated` — нет креденшла.
@@ -90,16 +162,37 @@ Optional: FF_API_KEY_TIERS=1 →
 - 500 `jwt_not_configured` — `AUTH_JWT_SECRET` отсутствует в env.
 - 403 `forbidden` — ACL deny.
 
+**Telegram callback / Mini App contract** (`POST /auth/telegram` + `/auth/telegram/callback`):
+
+`verifyErrorStatus()` at `agentflow-agents/src/routes/auth-tg-callback.ts:110` decides the HTTP status from the verdict error. Clients distinguish "fix your payload" (400) from "fix your session" (401) from "platform broken" (503).
+
+- **400** (malformed body / payload — client bug):
+  `missing_init_data`, `invalid_body`, `invalid_init_data`, `missing_hash`,
+  `missing_id`, `missing_auth_date`, `invalid_id`, `invalid_auth_date`,
+  `missing_user`, `invalid_user_json`, `invalid_user_id`.
+- **401** (valid shape, untrusted signature): `invalid_hash`, `auth_date_expired`.
+- **503** `login_bot_not_configured` — `TELEGRAM_LOGIN_BOT_TOKEN` / `AGENTFLOW_BOT_TOKEN` unset in env.
+
 ## Failure modes
 
 | Симптом | Лог-строка для grep | Где починить |
 |---|---|---|
+| /auth/email молча редиректит обратно на /login | (visual) `<Navigate to="/login" replace />` в `main.tsx` для `/auth/email` | `agentflow-landing/src/main.tsx:322` — mount `<AuthEmailPage />` напрямую. |
+| /auth/email shows only magic-link tab (no password input) | `mode === 'link'` stuck without segmented control | `AuthEmailPage.tsx:46` — default `mode` state should be `'password'`; tab toggle wired to `setMode`. |
+| Login returns 401 even with right creds | `invalid_credentials` from `POST /auth/login` | `agentflow-agents/src/routes/auth-password.ts:362` — `password_hash` is NULL for users created via Telegram OAuth or magic-link. Set one with `/auth/password-reset/confirm` or via admin bootstrap. |
+| Password-reset email never arrives | `[auth-password] reset_mail_failed: mailer_not_configured` | Wire `RESEND_API_KEY` в `agentflow-agents` Secret. Until then `/auth/forgot-password` silently no-ops; only Telegram login or pre-set passwords work. |
+| User has `password_hash IS NULL` and cannot log in (mailer dead) | `SELECT password_hash FROM users WHERE email=$1` → NULL | Bootstrap via SQL: `UPDATE users SET password_hash = '$2b$12$…' WHERE email=$1;` then notify user to reset on first login. Use `node -e "console.log(require('bcrypt').hashSync('temp_pw', 12))"`. |
 | Лавинообразные 401 от одного IP | `too_many_auth_failures` | `middleware/auth.ts:151` (brute-force gate) |
 | Все api-keys внезапно отвергаются | `jwt_not_configured` или `AGENTS_MASTER_KEY missing` | env config; `middleware/auth.ts:86` |
 | Platform admin не виден | `is_platform_admin_cache_stale` | `services/access.ts:26` — invalidate / restart pod |
 | Owner не может открыть свой project | `acl_owner_mismatch` | `services/access.ts:39` (userCanAccessProject) |
 | 429 rate_limited при низкой нагрузке | `api_key_rpm_exceeded` | `middleware/api-key-rate-limit.ts:114` — поднять `API_KEY_RPM_*` |
+| Legit user hits 429 on `/auth/login` after a few quick password retries | `{"error":"rate_limited","window":"ip"}` from `/auth/login`/`/auth/register`/`/auth/password-reset/request` | `middleware/ip-rate-limit.ts:166` (`ipRateLimitAuth`) — `auth` bucket is 5/min + burst 3/5s per IP. Raise `IP_RATE_LIMIT_AUTH_PER_MIN` / `IP_RATE_LIMIT_AUTH_BURST` if a shared NAT egress trips it; do not raise so high it re-opens brute-force. |
 | Internal endpoint не пускает (свой сервис) | `internal_secret_mismatch` | check `INTERNAL_API_SECRET` aligned между API-pod и runtime-supervisor / tg-mcp |
+| Все юзеры получают `401 session_revoked` после `requireSession` | `session_revoked` в `logAuthReject` | Owner недавно дёрнул `POST /internal/auth/revoke-all`. Юзеры залогинятся заново. Verify: `GET /internal/auth/revoke-status` → `jwt_revision > 0`. Cache: 5s per pod (`services/jwt-revision.ts:CACHE_TTL_MS`). |
+| Successful login → /my/agents всё равно показывает «Нужен вход / Войти через Telegram» | curl `/_api/me` returns 503 while `/_agents/auth/me` returns 200 | `agentflow-api` service down. Now non-fatal: `AuthProvider` (`agentflow-landing/src/lib/auth.tsx:63`) bootstraps from `agentflow-agents` `/auth/me` first; agentflow-api `/me` is only an enrichment call. If both fail, user is anonymous. Fix root cause by reviving the `agentflow-api` deployment. |
+| `POST /internal/users` 500 for every new TG `/start`; all SIWE/email/TG-link signups also broken | `null value in column "slug" of relation "users" violates not-null constraint` | Drizzle schema in `agentflow-api/src/db/schema.ts` was missing the `slug` column after migration `2026-05-16d-users-deleted-at-and-slug-backfill.sql` added `users.slug text NOT NULL UNIQUE` to prod. Fixed 2026-05-17 by adding the column to the schema and routing every `db.insert(users)` through `src/repos/slugs.ts::withSlugRetry` with a per-identity derivation (`slugForTgId`, `slugForWallet`, `slugFromEmail`, `slugForRefCode`). |
+| Mini App `POST /auth/telegram` returns 401 for malformed `init_data`; clients treat it as "session expired" and loop instead of surfacing the validation bug | `[auth-tg-miniapp] verify_failed status=401 error=missing_hash` (or `error=missing_init_data`/`invalid_init_data`/`missing_user`/...) on payload with no hash, no user, or missing fields | `agentflow-agents/src/routes/auth-tg-callback.ts:110` — `verifyErrorStatus(error)` maps malformed-payload codes to **400**, signature/expiry codes (`invalid_hash`, `auth_date_expired`) to **401**, `login_bot_not_configured` to **503**. Both `handleCallback` (widget) and `handleMiniAppAuth` (mini app) now route the verdict error through this helper instead of hard-coding 401. Fixed 2026-05-17 per qa-issue `2026-05-16-auth-tg-401-vs-400-contract.md`. |
 
 ## Related
 

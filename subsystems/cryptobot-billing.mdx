@@ -1,0 +1,219 @@
+---
+title: "CryptoBot billing"
+description: "USDT/TON/BTC/ETH payment rail for paid subscription tiers via @CryptoBot Crypto Pay API. HMAC-verified webhook, idempotent invoice processing, subscription expiry stacking."
+---
+
+# CryptoBot billing
+
+## TL;DR
+
+Buyer clicks Start/Pro/Business on `/pricing` → backend mints a server-side payload `sub:u<id>:t<tier>:p<period>:c<credits>:v1`, calls `pay.crypt.bot/createInvoice` with token in `Crypto-Pay-API-Token` header, returns `pay_url`. User pays inside @CryptoBot, CryptoBot fires `invoice_paid` webhook signed with `HMAC-SHA256(rawBody, secret=SHA256(token))`. We verify hex header in constant time, parse the payload we minted, then in a single TX with `pg_advisory_xact_lock(hashtextextended('cryptobot:<invoice_id>'))`: flip `cryptobot_payments.status='completed'`, bump `user_credits.balance_cents`, and upsert `cryptobot_subscriptions` with `expires_at = GREATEST(existing, now()) + period_days × INTERVAL '1 day'` so renewals stack. Idempotency is enforced by UNIQUE `invoice_id` — webhook redelivery is a no-op.
+
+## Heads-up — duplication with agentflow-api
+
+There is an older parallel CryptoBot integration in `agentflow-api/src/routes/subscriptions.ts` + `agentflow-api/src/services/cryptobot.ts` that writes to the canonical `public.subscriptions` + `public.flow_payments` tables with a **different tier vocabulary** (`plus`/`pro`/`max` at $20/$100/$200/mo via `agentflow-api/src/services/flow-credits.ts:138`) and a **different surface** (`POST /subscriptions/checkout`, `POST /payments/cryptobot/webhook`). The current landing (PricingPageV2.tsx) advertises `start/pro/business` at $30/$90/$300 and hits `agents.agentflow.website` — i.e. this new service. Until a workspace-wide decision picks one as canonical, the new agents-side rail uses its own `cryptobot_payments` + `cryptobot_subscriptions` tables to avoid cross-crediting. Follow-up: pick a winner + retire the loser.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/cryptobot-billing.ts:78` | `TIER_BASE_USD` — pricing matrix source of truth (start:30, pro:90, business:300) |
+| `agentflow-agents/src/services/cryptobot-billing.ts:85` | `PERIOD_DISCOUNT` — 1/3/6/12mo discount ladder (0 / 15% / 25% / 35%) |
+| `agentflow-agents/src/services/cryptobot-billing.ts:94` | `TIER_MONTHLY_CREDITS_USDF` — credit grant per tier per month (start:50, pro:200, business:700) |
+| `agentflow-agents/src/services/cryptobot-billing.ts:108` | `computeUsdPrice(tier, periodMonths)` — `Math.round(base × (1 - discount)) × periodMonths` |
+| `agentflow-agents/src/services/cryptobot-billing.ts:133` | `encodeSubscriptionPayload` — server-mint opaque payload `sub:u42:tpro:p3:c60000:v1` |
+| `agentflow-agents/src/services/cryptobot-billing.ts:153` | `parseSubscriptionPayload` — strict regex; null on any malformed input |
+| `agentflow-agents/src/services/cryptobot-billing.ts:190` | `verifyCryptoBotSignature(rawBody, headerSig, token)` — HMAC-SHA256, `timingSafeEqual` on hex buffers, fail-closed |
+| `agentflow-agents/src/services/cryptobot-billing.ts:263` | `createCryptoBotInvoice` — POST `<base>/createInvoice` with `Crypto-Pay-API-Token` header |
+| `agentflow-agents/src/services/cryptobot-billing.ts:367` | `applyInvoicePaid` — TX with advisory lock, status flip, credit bump, subscription upsert |
+| `agentflow-agents/src/services/cryptobot-billing.ts:408` | `pg_advisory_xact_lock(hashtextextended('cryptobot:<invoice_id>', 0))` — serialises concurrent webhook delivery for the same invoice |
+| `agentflow-agents/src/services/cryptobot-billing.ts:486` | `cryptobot_subscriptions` upsert with `expires_at = GREATEST(existing, now()) + period_days × INTERVAL '1 day'` — renewals stack |
+| `agentflow-agents/src/services/cryptobot-billing.ts:533` | `recordPendingInvoice` — INSERT `cryptobot_payments` row pre-pay |
+| `agentflow-agents/src/services/cryptobot-billing.ts:563` | `getActiveSubscription(userId)` — returns `{tier, expires_at, started_at}` or null |
+| `agentflow-agents/src/routes/billing-cryptobot.ts:56` | `GET /me/billing/cryptobot/pricing` — public matrix the landing reads on mount |
+| `agentflow-agents/src/routes/billing-cryptobot.ts:84` | `POST /me/billing/cryptobot/create-invoice` — auth'd, zod-validated, mints subscription payload + creates invoice + records pending row |
+| `agentflow-agents/src/routes/billing-cryptobot.ts` | `POST /me/billing/cryptobot/create-topup-invoice` — auth'd, zod-validated `{amount_usd 1..10000, asset?}`, mints **free-form top-up** payload `topup:u<id>:c<cents>:v1` + creates invoice + records pending row. Owner-shipped 2026-05-17 (PR #418) for `/account/billing` free-form input flow. |
+| `agentflow-agents/src/routes/billing-cryptobot.ts:187` | `GET /me/subscription` — auth'd, returns active subscription or `{active:false, tier:null}` |
+| `agentflow-agents/src/routes/billing-cryptobot.ts:206` | `POST /webhooks/cryptobot` — public, raw-body signature verify before parse, calls `applyInvoicePaid` which now dispatches on payload prefix: `sub:` → subscription credit, `topup:` → flow_balances USDT credit |
+| `agentflow-agents/src/services/cryptobot-billing.ts` | `encodeTopupPayload({userId, amountCents})` / `parseTopupPayload` — free-form top-up payload format. Strict regex on parse; rejects negative / non-integer. |
+| `agentflow-agents/src/services/cryptobot-billing.ts` | `applyTopupInvoicePaid` — webhook handler for top-up payloads. Idempotent (advisory lock + cryptobot_payments status flip). Credits `flow_balances.balance` (USDT pool) via `flow_ledger kind='topup_cryptobot'`. No subscription side-effect. |
+| `agentflow-agents/src/services/cryptobot-billing.ts` | `recordPendingTopup({userId, invoiceId, asset, amountString, usdCents})` — INSERT cryptobot_payments with `kind='topup'`, tier+period NULL. |
+| `agentflow-agents/src/server.ts:438` | Router mount: `app.route('/', billingCryptoBotApp)` |
+| `agentflow-agents/migrations/2026-05-14p-cryptobot-payments.sql` | DDL for `cryptobot_payments` + `cryptobot_subscriptions` (manual psql apply, see Runbook below) |
+| `agentflow-agents/tests/unit/cryptobot-billing.test.ts` | 18 unit tests — pricing matrix, payload round-trip + 9 rejection cases, HMAC happy/sad paths, `createInvoice` fetch stub |
+| `agentflow-landing/src/pages/PricingPageV2.tsx:208` | `buyTier(tier)` — redirects unauth → `/auth/email?next=/pricing`, POSTs `/me/billing/cryptobot/create-invoice`, opens `pay_url` with popup-block fallback |
+
+## Data flow
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Buy flow (online, user-driven)                                           │
+└──────────────────────────────────────────────────────────────────────────┘
+
+  Browser                Hono (agents)              CryptoBot API
+  /pricing                                          pay.crypt.bot
+     │                                                    │
+     │ click "Start/Pro/Business"                         │
+     ├──► POST /me/billing/cryptobot/create-invoice ──────┤
+     │   {tier, period_months}                            │
+     │                  │                                 │
+     │                  │ computeUsdPrice                 │
+     │                  │ encodeSubscriptionPayload       │
+     │                  │   ⇒ "sub:u42:tpro:p3:c60000:v1" │
+     │                  │                                 │
+     │                  ├─► POST /createInvoice ──────────►
+     │                  │  hdr Crypto-Pay-API-Token       │
+     │                  │  body {amount, payload, …}      │
+     │                  │                                 │
+     │                  │◄─── {invoice_id, bot_invoice_url}
+     │                  │                                 │
+     │                  │ INSERT cryptobot_payments       │
+     │                  │   status='pending'              │
+     │                  │                                 │
+     │◄─── {pay_url, invoice_id, amount_usd}              │
+     │                                                    │
+     │ window.open(pay_url) ────────────────────────────► @CryptoBot dialog
+     │                                                    │ user pays USDT
+     │                                                    │
+┌─────────────────────────────────────────────────────────┴─────────────────┐
+│  Webhook flow (CryptoBot-driven, idempotent)                              │
+└───────────────────────────────────────────────────────────────────────────┘
+                                                          │
+  Hono (agents)                                           │
+     ◄── POST /webhooks/cryptobot ─────────────────────────
+     │  hdr crypto-pay-api-signature: <hex>
+     │  body { update_type:'invoice_paid', payload:{ invoice_id, payload, … } }
+     │
+     │  rawBody = c.req.text()        ← BEFORE JSON.parse
+     │  verifyCryptoBotSignature(rawBody, sigHeader)
+     │   ├─ secret = SHA256(CRYPTO_BOT_TOKEN)
+     │   ├─ expect = HMAC-SHA256(rawBody, secret).hex
+     │   └─ timingSafeEqual(actual, expect)  → fail-closed
+     │  applyInvoicePaid(update)
+     │   ├─ TX BEGIN
+     │   ├─ SELECT pg_advisory_xact_lock(hashtextextended('cryptobot:'||id, 0))
+     │   ├─ SELECT row FROM cryptobot_payments WHERE invoice_id = …
+     │   ├─ if row.status='completed' ⇒ return {credited:false}    ← idempotent no-op
+     │   ├─ if row.user_id ≠ payload.userId ⇒ throw                ← attribution guard
+     │   ├─ UPDATE cryptobot_payments SET status='completed', paid_at=now()
+     │   ├─ UPDATE user_credits SET balance_cents += creditsCents  ← atomic bump
+     │   └─ INSERT INTO cryptobot_subscriptions (user_id, tier, expires_at)
+     │      ON CONFLICT (user_id) DO UPDATE SET
+     │        expires_at = GREATEST(cryptobot_subscriptions.expires_at, now())
+     │                       + period_months × INTERVAL '30 days'    ← stack on renewal
+     │
+     ├──► 200 {credited:true, tier, expires_at}
+```
+
+## DB / Env / API
+
+### Tables (migration `2026-05-14p-cryptobot-payments.sql`)
+
+- **`cryptobot_payments`** — invoice journal
+  - `id bigserial PRIMARY KEY`
+  - `user_id integer NOT NULL`
+  - `invoice_id bigint NOT NULL UNIQUE` — idempotency key
+  - `currency_type text NOT NULL` — `crypto`
+  - `asset text NOT NULL` — USDT/TON/BTC/ETH
+  - `amount numeric(38,18) NOT NULL`
+  - `usd_cents bigint NOT NULL`
+  - `status text NOT NULL CHECK (status IN ('pending','completed','refunded'))`
+  - `kind text NOT NULL CHECK (kind IN ('topup','subscription'))`
+  - `tier text NULL` — start/pro/business when kind='subscription'
+  - `period_months smallint NULL`
+  - `metadata jsonb NOT NULL DEFAULT '{}'::jsonb`
+  - `created_at timestamptz NOT NULL DEFAULT now()`
+  - `paid_at timestamptz NULL`
+
+- **`cryptobot_subscriptions`** — one row per user (NOT `public.subscriptions` — see "Heads-up" above)
+  - `id bigserial PRIMARY KEY`
+  - `user_id integer NOT NULL UNIQUE`
+  - `tier text NOT NULL CHECK (tier IN ('start','pro','business'))`
+  - `status text NOT NULL CHECK (status IN ('active','cancelled','expired'))`
+  - `started_at timestamptz NOT NULL DEFAULT now()`
+  - `expires_at timestamptz NOT NULL` — set via `GREATEST(existing, now()) + period_days`
+  - `last_invoice_id bigint NULL`
+  - `updated_at timestamptz NOT NULL DEFAULT now()`
+
+### Env
+
+- `CRYPTO_BOT_TOKEN` — Crypto Pay API token from @CryptoBot dashboard. **Required for create-invoice + webhook verify.** Missing ⇒ `cryptobot_not_configured` 503 + fail-closed signature reject.
+- `CRYPTO_BOT_API_BASE` — optional, defaults `https://pay.crypt.bot/api`. Testnet: `https://testnet-pay.crypt.bot/api`.
+
+### Routes
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| GET | `/me/billing/cryptobot/pricing` | public | Tier + period matrix the landing reads on mount |
+| POST | `/me/billing/cryptobot/create-invoice` | session cookie | Subscription path. Mints `sub:` payload, returns `{pay_url, invoice_id, amount_usd, credits_usdf}` |
+| POST | `/me/billing/cryptobot/create-topup-invoice` | session cookie | Free-form top-up. Body `{amount_usd 1..10000, asset?}`, mints `topup:` payload, returns `{pay_url, invoice_id, amount_usd}`. Backs the new `/account/billing` page (owner directive 2026-05-17). |
+| GET | `/me/subscription` | session cookie | Active subscription or `{active:false, tier:null}` |
+| POST | `/webhooks/cryptobot` | HMAC-SHA256 (header `crypto-pay-api-signature`) | Idempotent invoice_paid handler. Dispatches on payload prefix (`sub:` / `topup:`). |
+
+### Webhook registration
+
+Set on @CryptoBot dashboard ➜ My Apps ➜ Webhooks:
+
+```
+URL: https://agents.agentflow.website/webhooks/cryptobot
+Updates: invoice_paid
+```
+
+Token used for HMAC must match `CRYPTO_BOT_TOKEN` in pod env.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Frontend gets 503 on tier click | `cryptobot_not_configured` | Set `CRYPTO_BOT_TOKEN` on `deploy/agentflow-agents` (see `routes/billing-cryptobot.ts:144`) |
+| Frontend gets 502 on tier click | `cryptobot_upstream` | CryptoBot API down or rate-limited; check `pay.crypt.bot` status (`routes/billing-cryptobot.ts:144`) |
+| Webhook 401 spam in logs | `[cryptobot] webhook signature rejected` | Token mismatch between dashboard + pod env, or CryptoBot probing wrong endpoint (`routes/billing-cryptobot.ts:214`) |
+| User paid but no credits | `applyInvoicePaid: unrecognised payload format` | Forged or legacy webhook with our prefix; ignored, return 200; check `cryptobot_payments` row (`services/cryptobot-billing.ts:384`) |
+| User paid but wrong account credited | `applyInvoicePaid: user mismatch` | Pending row vs payload userId disagree — payload was tampered or pending row crossed wires. Block + investigate (`services/cryptobot-billing.ts:436`) |
+| Invoice paid but status still pending | `applyInvoicePaid: invoice not paid` | CryptoBot sent update with status≠paid; check `update.payload.status` (`services/cryptobot-billing.ts:378`) |
+| Subscription expires_at drift | (silent — verify against `cryptobot_subscriptions.expires_at`) | `GREATEST(existing, now())` clause at `services/cryptobot-billing.ts:495` — stacks on top of remaining time |
+| Pending row missing on webhook | (defensive INSERT — no error) | Covered by `INSERT INTO cryptobot_payments` at `services/cryptobot-billing.ts:458` when SELECT returns 0 rows |
+| Customer paid but TG bot says "🔒 Доступ к AgentFlow закрытый бета. Запроси приглашение @avsee4" | (visual; `/internal/tg/whoami` returns `in_beta:false` for paid user) | `agentflow-agents/src/routes/internal-tg.ts` whoami handler now ORs `tg_beta_allowlist` with `cryptobot_subscriptions.status='active' AND expires_at > now()` via `isPayingSubscriber()`. CryptoBot webhook intentionally does NOT write `tg_beta_allowlist`; the gate must read the subscription row instead. See `subsystems/beta-gate.mdx`. |
+| Top-up `amount_usd` outside 1..10000 | `invalid_body` with detail `amount_usd must be between 1 and 10000` | Zod range guard on `POST /me/billing/cryptobot/create-topup-invoice`. Client must clamp before submit. |
+| User paid free-form top-up but balance unchanged | Look for `flow_ledger` row `kind='topup_cryptobot' meta->>'invoice_id'=<id>` — missing ⇒ webhook never landed; present + correct amount ⇒ `flow_balances.balance` upsert race | `applyTopupInvoicePaid` re-uses subscription path's advisory lock + cryptobot_payments status flip. Ledger NOT EXISTS guard greps `meta->>'invoice_id'` to dedupe redeliveries. |
+
+## Pricing matrix (single source of truth)
+
+| Tier   | Base $/mo | 1mo  | 3mo (-15%) | 6mo (-25%) | 12mo (-35%) | Monthly USDF credits |
+|--------|-----------|------|------------|------------|-------------|----------------------|
+| Start  | $30       | $30  | $78        | $135       | $234        | 50 USDF              |
+| Pro    | $90       | $90  | $231       | $405       | $702        | 200 USDF             |
+| Business| $300     | $300 | $765       | $1350      | $2340       | 700 USDF             |
+
+Per-month price is `Math.round(base × (1 - discount))` then `× months`. The same constants live in landing `PricingPageV2.tsx` — `tests/unit/cryptobot-billing.test.ts:53` guards drift.
+
+## Runbook — apply migration
+
+CI does not run drizzle migrations (see `feedback_agentflow_migrations.md`). Apply by hand:
+
+```bash
+kubectl -n franchise-factory exec -i deploy/postgres -- \
+  psql -U postgres -d agentflow \
+  < agentflow-agents/migrations/2026-05-14p-cryptobot-payments.sql
+
+# Verify
+kubectl -n franchise-factory exec deploy/postgres -- \
+  psql -U postgres -d agentflow -c '\d cryptobot_payments' -c '\d cryptobot_subscriptions'
+```
+
+The migration is wrapped in a top-level `pg_advisory_xact_lock(2026051401)` so concurrent cold-start applies serialise.
+
+## Runbook — verify token in pod
+
+```bash
+kubectl -n franchise-factory exec deploy/agentflow-agents -- \
+  sh -c 'echo "len=$(echo -n $CRYPTO_BOT_TOKEN | wc -c) prefix=$(echo $CRYPTO_BOT_TOKEN | cut -c1-8)"'
+```
+
+Expected: `len=44 prefix=<app_id>:` (CryptoBot tokens are `<app_id>:<32-hex-secret>`).
+
+## Related
+
+- [Billing UX v2 (usage dashboard)](../subsystems/billing-usage.mdx) (if added)
+- Stars rail (Telegram Stars) — `agentflow-agents/src/services/stars-billing.ts` (pattern mirror)
+- [LLM router (budget gate before paid LLM calls)](/subsystems/llm-router)

@@ -1,0 +1,90 @@
+---
+title: "Funnel analytics"
+description: "Event tracking via /me/events, per-user /me/stats, and the admin /admin/funnel-stats endpoint."
+---
+
+# Funnel analytics
+
+## TL;DR
+
+Track A of the analytics workstream shipped 2026-05-15. The landing
+fires events into `user_events` (auth or anon), the homepage widget
+reads `/me/stats` for a per-user farm summary, and admins pull the
+platform funnel + 30-day signup trend via `/admin/funnel-stats`.
+
+Spec: `agentflow-landing/docs/specs/2026-05-15-analytics-funnel-reminders-v2.md`.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/db/schema.ts:2534` | `userEvents` Drizzle table definition |
+| `agentflow-agents/src/db/migrations/0065_user_events.sql` | SQL migration — `user_events` + `reminder_sends_v2` |
+| `agentflow-agents/src/routes/events.ts:53` | `POST /me/events` (session auth) |
+| `agentflow-agents/src/routes/events.ts:95` | `POST /events` (anon, accepts `anon_id`) |
+| `agentflow-agents/src/routes/stats.ts:31` | `GET /me/stats` (session auth) |
+| `agentflow-agents/src/routes/stats.ts:82` | `GET /admin/funnel-stats` (admin only) |
+| `agentflow-agents/src/server.ts:519` | Mounts `eventsApp` |
+| `agentflow-agents/src/server.ts:521` | Mounts `statsApp` |
+| `agentflow-landing/src/lib/track.ts:46` | `track(kind, props)` — fire-and-forget, swallow all errors |
+| `agentflow-landing/src/components/dashboard/UserStatsStrip.tsx:29` | `/me/stats` widget on `/projects` |
+| `agentflow-landing/src/pages/AdminStatsPage.tsx:1` | `/admin/stats` page — funnel bars + daily chart |
+
+## Data flow
+
+```
+                     ┌─ session cookie present ─► POST /me/events ─┐
+landing track(kind) ─┤                                              ├─► user_events row
+                     └─ 401/403 or fetch fail   ─► POST /events  ──┘   (user_id NULL → anon_id)
+
+user_events ─┐
+             ├─► /admin/funnel-stats  (admin session)  → 7-stage funnel
+users ───────┤                                          + 30-day daily chart
+             │                                          + totals
+user_farms ──┘
+
+users JOIN user_farms ──► /me/stats (session)
+                          → { contacts, sent_total, referrals, flow_earned,
+                              farm_status, joined_days_ago }
+```
+
+The funnel stages are queried independently with `safeCount()`, so a
+missing table (eg `user_events` not yet migrated) zeros that stage
+rather than failing the entire endpoint.
+
+## DB / Env / API
+
+- Tables: `user_events` (id, user_id NULL, anon_id, kind, props jsonb, created_at)
+- Indexes:
+  - `idx_user_events_user_kind_time(user_id, kind, created_at)`
+  - `idx_user_events_kind_time(kind, created_at)`
+- Validation: `kind` matches `/^[a-z_][a-z0-9_]*$/`, length ≤ 64; `anon_id` length 1-128
+- Routes:
+  - `POST /me/events` — session auth, body `{ kind, props? }`
+  - `POST /events` — no auth, body `{ kind, props?, anon_id }`
+  - `GET /me/stats` — session auth
+  - `GET /admin/funnel-stats` — session + `users.is_admin=true`
+- Funnel stages (in response order): `registered`, `onboarding_started`,
+  `onboarding_completed`, `tg_connect_clicked`, `tg_connected`,
+  `farm_activated`, `academy_paid`
+- Bot-funnel kinds (2026-05-24): `funnel_step` (one row per question
+  answered in `@agentflowbot`) and `funnel_pitch` (one row per scenario
+  shown). Written via `POST /funnel-events` from agentflow-bot. See
+  [funnel-bot](/subsystems/funnel-bot).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `/me/events` returns `{ ok: true, skipped: 'not_migrated' }` | `skipped: 'not_migrated'` | Migration 0065 not applied — restart pod so the migrations-runner picks it up |
+| `/admin/funnel-stats` returns 403 for caller | `error: 'admin only'` | Set `users.is_admin=true` for the caller in the DB |
+| Stages frozen at 0 even with traffic | safeCount catches `42P01` | `user_events` table missing — confirm migration 0065 applied via `\d user_events` in psql |
+| `POST /me/events` returns 400 | `invalid_kind` | Caller violates `/^[a-z_][a-z0-9_]*$/` — rename the kind string |
+| Funnel counts look inflated | n/a (correct behaviour) | All stages except `registered`/`farm_activated`/`academy_paid` use `COUNT(DISTINCT user_id)` so duplicate same-kind events from one user do not inflate |
+| Events silently disappear in browser console | network tab shows `track()` swallow | By design — tracking never breaks UX; check `/me/events` response in DevTools to debug |
+
+## Related
+
+- [Reminders v2](/subsystems/reminders-v2) — uses the same `user_events` table to derive funnel state
+- [Farm](/subsystems/farm) — `user_farms.status='active'` feeds the `farm_activated` stage
+- Spec: `agentflow-landing/docs/specs/2026-05-15-analytics-funnel-reminders-v2.md`

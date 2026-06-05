@@ -1,0 +1,114 @@
+---
+title: "OpenClaw /live wrapper: agent stream + approvals over the device SSE"
+description: "How the cabinet /live page wraps an in-pod OpenClaw Gateway — humanized timeline, chat input, and exec-approvals — without new infra, by binding the Gateway WS to the existing device task protocol."
+---
+
+# OpenClaw /live wrapper
+
+## TL;DR
+
+An OpenClaw pod runs a loopback Gateway (`ws://127.0.0.1:18789`). The
+`openclaw-shim` bridge speaks the SAME devices-ws task protocol the goose
+coder-shim + desktop daemon speak, so `/live` (`CabinetDeviceLive.tsx`) needs no
+new transport. The bridge forwards OpenClaw `agent` events (reasoning/tool
+steps) as humanized `task_action` rows («Думаю…», «Открываю сайт…», «Готово»),
+surfaces `exec.approval.requested` as an `approval_request` row that drives the
+cabinet ApprovalBar, and relays the owner's allow/deny back to
+`exec.approval.resolve`. Chat input stays `dispatch_task` → `chat.send`. The
+**live screen** binds the agent's browser: while a cabinet tab watches
+(`subscribe_stream`), the bridge polls OpenClaw `browser.request POST /screenshot`
+and pushes each JPEG as a `stream_frame` into the SAME `live_stream` MJPEG the
+desktop daemon uses, so the `/live` screen pane shows the agent browsing and
+collapses to the clean task feed when it stops.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/openclaw-shim/gateway-client.ts:83` | connect requests `operator.read/write/approvals` scope so approval events are delivered |
+| `agentflow-agents/src/openclaw-shim/gateway-client.ts:173` | `parseApprovalRequest` — normalize `exec.approval.requested` event → `{id,command,warning}` |
+| `agentflow-agents/src/openclaw-shim/gateway-client.ts:370` | fan out `agent` events to `listeners.onAgentEvent` |
+| `agentflow-agents/src/openclaw-shim/gateway-client.ts:375` | `exec.approval.requested` → `onApproval`; `exec.approval.resolved` → `onApprovalResolved` |
+| `agentflow-agents/src/openclaw-shim/gateway-client.ts:438` | `resolveApproval(id, decision)` → `exec.approval.resolve` |
+| `agentflow-agents/src/openclaw-shim/humanize.ts:60` | `humanizeTool` — tool name+args → plain RU verb |
+| `agentflow-agents/src/openclaw-shim/humanize.ts:114` | `humanizeAgentEvent` — thinking/tool stream → one timeline step (assistant deltas/heartbeats dropped) |
+| `agentflow-agents/src/openclaw-shim/bridge.ts:175` | `activeTaskId` — agent events attach to the in-flight device task (main session is sequential) |
+| `agentflow-agents/src/openclaw-shim/bridge.ts:293` | `onAgentEvent` → `task_action` on the active task |
+| `agentflow-agents/src/openclaw-shim/bridge.ts:307` | `onApproval` → `approval_request` task_action (detail = JSON id+command) |
+| `agentflow-agents/src/openclaw-shim/bridge.ts:154` | `encodeApprovalDetail` — serialize approval into the row detail |
+| `agentflow-agents/src/types/devices.ts:210` | `approval_resolve` server→daemon WS frame |
+| `agentflow-agents/src/routes/me-devices/task-dispatch.ts:973` | `POST /me/devices/:id/approval` → sends `approval_resolve` to the device |
+| `agentflow-landing/src/components/cabinet-live/ApprovalBar.tsx:21` | `ExecApproval` shape (allow/deny) beside the legacy draft shape |
+| `agentflow-landing/src/pages/CabinetDeviceLive.tsx:347` | `applyApprovalRow` — intercept approval rows on the task SSE → ApprovalBar state |
+| `agentflow-landing/src/pages/CabinetDeviceLive.tsx:711` | `handleResolveApproval` → `devicesApi.resolveApproval` |
+| `agentflow-landing/src/lib/devicesApi.ts:274` | `resolveApproval` REST client |
+| `agentflow-agents/src/openclaw-shim/gateway-client.ts` `buildConnectFrame` | connect scopes now include `operator.admin` (required for `browser.request`) |
+| `agentflow-agents/src/openclaw-shim/gateway-client.ts` `buildBrowserRequestFrame` | `browser.request` WS proxy frame to the loopback browser-control API |
+| `agentflow-agents/src/openclaw-shim/gateway-client.ts` `extractScreenshotPath` | pull the saved JPEG file path from a `POST /screenshot` response |
+| `agentflow-agents/src/openclaw-shim/gateway-client.ts` `captureScreenshotPath` | take a screenshot, resolve with the local file path (null = no active tab) |
+| `agentflow-agents/src/openclaw-shim/bridge.ts` `startScreenPoll`/`captureAndPushFrame` | on `subscribe_stream`, poll `/screenshot` (~1.5fps), read the file, push `stream_frame` |
+| `agentflow-agents/src/coder-shim/protocol.ts` `buildStreamFrame` | base64 JPEG → MJPEG `stream_frame` wire frame |
+| `agentflow-agents/src/openclaw-shim/config.ts` `renderOpenclawConfig` | adds `browser:{enabled,headless}` **and `plugins.entries.browser.enabled:true`** — the latter is what actually registers `browser.request` at gateway boot |
+| `agentflow-agents/openclaw-image/Dockerfile` | bakes Chromium (`playwright-core install --with-deps chromium`) so the browser tool can launch |
+| `agentflow-landing/src/components/cabinet-live/HeadlessLiveView.tsx` `BrowserScreenPane` | opens the device MJPEG, self-reveals on the first frame, hides ~6s after the last |
+| `agentflow-landing/src/pages/CabinetDeviceLive.tsx` (HeadlessLiveView call) | passes the canonical `deviceId` so the pane can open `live_stream` |
+| `agentflow-agents/src/routes/me-devices/tasks.ts:372` | `GET /me/devices/:id/live_stream` MJPEG endpoint (reused, unchanged) |
+| `agentflow-agents/src/services/device-tasks.ts:130` | `acquireStream`/`releaseStream` send `subscribe_stream`/`unsubscribe_stream` to the device |
+
+## Data flow
+
+```
+OpenClaw Gateway (loopback)          openclaw-shim bridge            agentflow-agents              cabinet /live
+  agent{stream:tool,...}    ──▶  humanizeAgentEvent ──▶ task_action ──▶ task SSE  ──▶ RunTimeline «Открываю сайт…»
+  exec.approval.requested   ──▶  onApproval ──▶ task_action            ──▶ task SSE  ──▶ ApprovalBar (allow/deny)
+                                                  action:approval_request
+  exec.approval.resolve     ◀──  resolveApproval ◀── approval_resolve  ◀── POST /me/devices/:id/approval ◀── allow/deny click
+  chat.send                 ◀──  sendChat        ◀── task_dispatch     ◀── POST /me/devices/:id/dispatch_task ◀── chat input
+  chat{state:final}         ──▶  task_complete                         ──▶ task SSE  ──▶ result panel
+
+Live screen (only while a cabinet tab watches):
+  subscribe_stream          ◀──  (server acquireStream on GET live_stream) ◀── BrowserScreenPane mounts <img src=live_stream>
+  browser.request           ◀──  captureAndPushFrame (poll ~1.5fps)
+    POST /screenshot         ──▶  { path } ──▶ readFile(path) ──▶ stream_frame{frame:base64}
+  stream_frame              ──▶  live_stream MJPEG ──▶ BrowserScreenPane reveals the agent's browser
+  unsubscribe_stream        ◀──  (server releaseStream on last tab close) ──▶ stopScreenPoll → pane collapses
+```
+
+## DB / Env / API
+
+- Tables: none new — `device_action_log` already persists `task_action` rows.
+- Env: `OPENCLAW_GATEWAY_TOKEN`, `AGENTFLOW_FLOW_KEY`, `AF_API_KEY`,
+  `AF_DEVICE_ID`, `AF_API_URL` (pod-scoped, fail-closed at gateway start).
+- Routes: `POST /me/devices/:id/approval` (new),
+  `POST /me/devices/:id/dispatch_task`, `GET /me/devices/:id/tasks/stream`.
+- OpenClaw WS methods used: `chat.send`, `exec.approval.resolve`,
+  `browser.request` (needs `operator.admin`); events consumed: `agent`, `chat`,
+  `exec.approval.requested/resolved`.
+- Device WS frames for the screen: `subscribe_stream` / `unsubscribe_stream`
+  (server→bridge), `stream_frame` (bridge→server).
+- Reused MJPEG route: `GET /me/devices/:id/live_stream` (no change).
+- Image: Chromium baked via `playwright-core install --with-deps chromium`;
+  `PLAYWRIGHT_BROWSERS_PATH=/home/node/.cache/ms-playwright`. Config:
+  `browser.enabled=true`, `browser.headless=true`, AND
+  `plugins.entries.browser.enabled=true` (REQUIRED — see failure modes).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Approval never reaches cabinet | `approval requested id=` absent in pod logs | `agentflow-agents/src/openclaw-shim/bridge.ts:307` |
+| Allow/Deny does nothing | `approval resolve id=... sent=false` | gateway WS closed — `gateway-client.ts:438` returns false |
+| Approval events not delivered to shim | connect rejected / no `exec.approval.*` events | missing `operator.approvals` scope — `gateway-client.ts:83` |
+| Timeline shows raw tool ids | step renders `Работаю: <name>` | unmapped tool — extend `humanize.ts:60` |
+| Steps land on wrong/no task | rows with no bucket | `activeTaskId` null between runs — `bridge.ts:175` |
+| `browser.request` → `unknown method` | `errorCode=INVALID_REQUEST errorMessage=unknown method: browser.request`; gateway boot log shows `1 plugin: memory-core` | browser plugin not registered — config needs `plugins.entries.browser.enabled:true`, NOT just the root `browser` block (`config.ts renderOpenclawConfig`). Live-verified: that flips boot to `7 plugins: browser, …` and exposes `browser.request` |
+| Screen pane never appears while browsing | `live screen: screenshot skipped` repeats; or no `subscribe_stream` | browser plugin missing (see row above); or Chromium missing — `openclaw-image/Dockerfile`; or scope — `gateway-client.ts buildConnectFrame` |
+| `browser.request` rejected | `request rejected` in pod logs | missing `operator.admin` scope — `gateway-client.ts buildConnectFrame` |
+| Screenshot returns no path | `live screen: screenshot skipped (no active tab)` | agent has no open browser tab yet — expected; pane stays idle |
+| Pane flickers shut between frames | pane toggles rapidly | raise `FRAME_IDLE_HIDE_MS` — `HeadlessLiveView.tsx` |
+
+## Related
+
+- [Device task lifecycle](/subsystems/device-task-lifecycle)
+- [Desktop daemon live stream](/subsystems/desktop-agent-live-stream)
+- Plan: `.artifacts/openclaw-pod-engine-plan.md` (Surface A)

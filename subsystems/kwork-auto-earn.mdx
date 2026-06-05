@@ -1,0 +1,86 @@
+---
+title: "Kwork auto-earn DM loop"
+description: "Cron-driven bid monitor that scans /projects, classifies wants, drafts personalised offers, and DMs buyers — with closed-inbox skip + confidence gating."
+---
+
+# Kwork auto-earn DM loop
+
+## TL;DR
+Every 30 minutes the `kwork-bid-monitor-basic` flow reads the public Kwork
+wants feed, classifies each want into one of our gig kinds, writes a
+per-want LLM pitch, and DMs the buyer via `/sendmessage`. Closed-inbox
+buyers and low-confidence classifications get filtered BEFORE the send so
+we don't burn the daily DM quota on guaranteed rejections.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/studio-flow-templates.ts:841` | `kworkBidMonitorFlow` graph (cron → scan_wants → classify → draft_offer → send_offer → send_card). |
+| `agentflow-agents/src/services/graph-executor/handlers/kwork-scan-wants.ts` | `kwork.scan_wants` — reads `/projects` feed via `kwork-inbox.list_wants`. |
+| `agentflow-agents/src/services/graph-executor/handlers/ai-classify-wants.ts` | `ai.classify_wants` — buckets each want into `{ai_agent_tg, kwork_parser, remotion_video, skip}` with a 0-1 confidence + `why`. |
+| `agentflow-agents/src/services/graph-executor/handlers/ai-draft-offer.ts` | `ai.draft_offer` — per-want LLM pitch generation with anti-slop sanitisation. Owner reversed AgentFlow promo 2026-05-22: drafts now open with the action ("Соберу JSON-выгрузку по вашему списку…"), name one detail from the brief, close with a specific next step ("скиньте список — пришлю sample за полчаса"). ≤500 chars, exactly one external URL (gig URL), no AgentFlow/agentflow.website mentions. |
+| `agentflow-agents/src/services/graph-executor/handlers/ai-draft-offer.ts:stripAgentFlowMentions` | Sanitiser pass that strips `AgentFlow` brand mentions + `https://agentflow.website` URLs. Idempotent. |
+| `agentflow-agents/src/services/graph-executor/handlers/ai-draft-offer.ts:stripRecapOpener` | Sanitiser pass that drops banned recap openers (`Видел задачу`, `Заметил`, `По вашему`, `Здравствуйте, видел`). Buyer already knows what they posted; recap reads as AI-generated. |
+| `agentflow-agents/src/services/graph-executor/handlers/kwork-send-offer.ts` | `kwork.send_offer` — pre-skip closed inboxes, gate by confidence ≥ 0.6, send via `kwork-inbox.send_message`. DM fallback boilerplate in `renderOfferText` opens with action, no AgentFlow mention. |
+| `agentflow-agents/src/services/graph-executor/handlers/kwork-respond-to-want.ts:98` | `DEFAULT_CANON_CONFIDENCE_THRESHOLD = 0.75` — tightened 2026-05-22 from 0.7. Owner wants best matches only, not borderline. |
+| `agentflow-agents/src/mcp-servers/kwork-inbox.ts` | `kwork-inbox` MCP: `list_wants`, `get_want` (surfaces `buyer_inbox_open`), `send_message`. |
+| `agentflow-agents/src/mcp-servers/kwork-inbox.ts:submitOfferViaCandidates` | Candidate-loop dispatcher for `respond_to_want`. Canonical: `POST /api/offer/createoffer` (multipart FormData, `offerType=kwork`, `kwork_id=<PID>`, `kwork_count=1`). Legacy fallbacks: `/new_offer/save`, `/new_offer`, `/offers/save`, `/projects/<id>/offer`. Tagged via `shape: 'createoffer_multipart' | 'legacy_urlencoded'`. |
+| `agentflow-agents/src/mcp-servers/kwork-inbox.ts:isAntiBotShieldHtml` | Pure detector for `<title>Технические работы</title>` maintenance HTML. Used by the dispatcher to continue past shielded candidates instead of returning `unexpected_response`. |
+| `agentflow-agents/src/mcp-servers/kwork-inbox.ts:withActionLog` | **Choke point.** Wraps every tool handler in `kworkInboxToolsRaw` so each invocation writes one `kwork_action_log` row. The exported `kworkInboxTools` IS the wrapped registry, so both the JSON-RPC dispatch (`handleKworkInboxMcp`) and the direct path (`callKworkInboxTool`) are audited — no trigger source (goose agent, cron, bridge, direct call) can bypass it. Best-effort: `logKworkAction` swallows all failures so a log error never breaks the Kwork action. |
+| `agentflow-agents/src/mcp-servers/kwork-inbox.ts:ACTION_KIND_BY_TOOL` | Tool→kind map (`scan`/`read`/`reply`/`bid`/`offer`/`deliver`). `classifyStatus` maps the `{ok}`/`{error}`/`{pre_skipped}`/`{awaiting_approval}` envelope → `ok`/`failed`/`skipped`/`awaiting_approval`. `extractTarget` pulls `dialog_id`/`want_id`/`kwork_id`. All three exported for unit coverage. |
+| `agentflow-agents/src/routes/me-integrations-kwork.ts:/me/integrations/kwork/actions` | Owner-scoped reader of `kwork_action_log` (`?limit=50`, max 200). Data source for the cabinet action-log UI. |
+| `agentflow-agents/src/routes/me-integrations-kwork.ts:/me/integrations/kwork/start` | **Cabinet launch entry.** Ensures a `kwork-account-replier` agent exists for the owner (slug `kwork-account-replier-<uid>`, idempotent) and arms its `agent_triggers` cron from the preset's `auto_triggers` — without the Activepieces/flow path. Requires a connected session (`400 kwork_not_connected` otherwise). Reuses `getPreset` + `seedAutoTriggersForAgent`. Gates stay OFF (`KWORK_AUTO_SEND`/`KWORK_AUTO_BID` not flipped; bid cron seeded `enabled:false`) → draft-then-approve. |
+
+## Data flow
+```
+cron 30m
+  └─> kwork.scan_wants (list_wants @ /projects feed)
+        └─> ai.classify_wants (TEXT_LARGE, 1 call per tick)
+              └─> ai.draft_offer (TEXT_LARGE, 1 call per non-skip want, fan-out 4)
+                    └─> kwork.send_offer (closed-inbox pre-skip + conf >= 0.6, max_send=3)
+                          └─> tg-bot.send_card (summary to owner bot)
+```
+
+## DB / Env / API
+- Tables:
+  - `kwork_action_log` — **unified per-action audit of record** (migration
+    `2026-06-02a-kwork-action-log.sql`). One row per kwork-inbox tool call:
+    `owner_user_id`, `account_ref`, `kind`, `target`, `status`,
+    `detail_json`, `created_at`. Idx `(owner_user_id, created_at)` +
+    `(owner_user_id, kind, created_at)`. Written at the `withActionLog` choke
+    point regardless of trigger. `kwork_want_responses` is the conversion
+    view layered on top, not the audit. **CI does NOT run migrations — apply
+    `2026-06-02a` manually via the postgres pod after merge.**
+  - `kwork_want_responses` — anti-double-send ledger. Unique on
+    `(owner_user_id, want_id, buyer_user_id)`. Columns: `ok`, `error`,
+    `pre_skipped`, `confidence` (forensics — migration
+    `2026-05-23a-kwork-want-responses-forensics.sql`).
+- Routes:
+  - `GET /me/integrations/kwork/actions?limit=50` — read the action log
+    (owner-scoped, requireSession).
+  - `POST /me/integrations/kwork/start` — cabinet launch entry; ensure the
+    replier agent + arm cron (owner-scoped, flow-independent).
+- Env: none new. `KWORK_SESSION_JSON` continues to live in
+  `project_secrets` keyed by `owner_user_id`.
+- MCP tools: `kwork-inbox.list_wants`, `kwork-inbox.get_want` (now returns
+  `buyer_inbox_open: boolean | null`), `kwork-inbox.send_message`,
+  `kwork-inbox.list_my_kworks`.
+- Gig PIDs (hard-coded in `kwork-send-offer.ts`):
+  `ai_agent_tg=52123577`, `kwork_parser=52123887`,
+  `remotion_video=52124069`.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Tick burns send quota on closed-inbox buyers | `pre_skipped_closed_inbox` in `kwork_want_responses.error` | `kwork-send-offer.ts:resolveBuyer` — verify `buyer_inbox_open` extractor still fires against current kwork HTML. |
+| Boilerplate template instead of LLM draft | `drafts[i].text === ''` + `llm_ok=false` in `ai.draft_offer` output | `ai-draft-offer.ts:generateDraftForWant` — LLM error path; check `useModel(ModelType.TEXT_LARGE)` is healthy. |
+| Low-fit pitches sent (poor reply rate) | `confidence < 0.6` rows with `ok=true` in ledger | Raise `confidence_threshold` in flow node or tighten classifier prompt in `ai-classify-wants.ts`. |
+| All wants skipped (`sent_count=0`, `skipped_count=N`) | `pre_skipped_count + skipped_count === wants.length` | Expected when every buyer's inbox is closed for the tick; not a bug. |
+| Sent DM contains AgentFlow brand or link | grep `kwork_want_responses` row text — any `agentflow` / `agentflow.website` substring | `ai-draft-offer.ts:stripAgentFlowMentions` — sanitiser must strip both the bare brand and the URL before send. Owner reversed promo policy 2026-05-22. |
+| Sent DM opens with "Видел задачу…" / "Заметил…" / "По вашему…" recap | grep ledger text starts with `Видел` / `Заметил` / `По вашему` / `Здравствуйте, видел` | `ai-draft-offer.ts:stripRecapOpener` — extend the banned-opener regex list if a new variant slips through. Buyer already knows what they posted; recap reads as AI-generated. |
+| `respond_to_want` returns `anti_bot_html` — kwork returned `<title>Технические работы</title>` on authenticated POST | grep step output for `anti_bot_html` or `shielded_paths` in flow_runs `kwork.respond_to_want` result | `kwork-inbox.ts:submitOfferViaCandidates` — every candidate (canonical `/api/offer/createoffer` + 4 legacy) was shielded. Body still contains `window.unreadDialogCount` proving session valid → it's an anti-bot rate-limit on the seller IP / profile, NOT `auth_expired`. Options: rotate egress IP (warmup-pool), slow the bid cadence, or back off until the shield window expires. |
+| `respond_to_want` legacy `unexpected_response` on `/new_offer/save` (PRE-FIX 2026-05-22) | grep flow_runs output for `endpoint: "/new_offer/save"` + `"unexpected_response"` | Fixed by `kwork-inbox.ts:submitOfferViaCandidates` — handler now tries `/api/offer/createoffer` (the live Vue SPA endpoint) FIRST and only falls back to `/new_offer/save` etc. for older A/B rollouts. Old kwork form path is no longer the SPA's submit URL — bundle grep of `new-offer_*.js` confirms `axios.post('/api/offer/createoffer', formData)`. |
+
+## Related
+- [Graph handlers](/subsystems/graph-handlers)
+- [LLM router](/subsystems/llm-router)

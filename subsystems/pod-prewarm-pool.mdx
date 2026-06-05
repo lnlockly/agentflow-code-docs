@@ -1,0 +1,132 @@
+---
+title: "Pod Pre-Warm Pool"
+description: "Per-tenant pool of N idle workspace pods so project approve skips the cold-start image-pull (~7 min → seconds)."
+---
+
+# Pod Pre-Warm Pool
+
+## TL;DR
+
+Per tenant (`af-tenant-<userId>` vcluster) we keep `TARGET_WARM_COUNT` idle pods (default **1** since the 2026-05-29 capacity right-size; was 3) running the project image with `/workspace` already scaffolded. When the user approves a project the code-exec MCP attempts to claim a warm pod via a k8s label patch; on success the StatefulSet provision skips image-pull because the layer is cached on the same node. State lives in pod labels (`agentflow-pool=warm`, `agentflow-claimed=false|true`) — no DB table needed. Refill cron in `pingers/pod-pool-refill.ts` tops up the pool every 60s but never beyond a **cluster-wide cap** `POD_POOL_GLOBAL_MAX` (default 8) so per-tenant × N tenants can't blow up node CPU. Gated by `POD_POOL_ENABLED=1` (production-on as of 2026-05-14).
+
+## Files
+
+| Repo / path | Что делает |
+|---|---|
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/pod-pool.ts:62` | `TARGET_WARM_COUNT` — per-tenant pool depth, override via `POD_POOL_TARGET_WARM`. Default **1** (was 3; lowered 2026-05-29 capacity right-size). |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/pod-pool.ts:78` | `getPodPoolGlobalMax()` — cluster-wide hard cap on total unclaimed warm pods across ALL tenants. Env `POD_POOL_GLOBAL_MAX`, default 8, clamped [0, 200]. Set 0 to keep the pool drained without flipping `POD_POOL_ENABLED`. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/pod-pool.ts:51` | `isPodPoolEnabled` — reads `POD_POOL_ENABLED === '1'`. Every API in this module no-ops when false. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/pod-pool.ts:92` | `warmPodManifest` — Pod (not StatefulSet) with `emptyDir` workspace, 25m CPU / 128Mi mem requests, labels `agentflow-pool=warm,agentflow-claimed=false,agentflow-tenant=<ns>`. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/pod-pool.ts:159` | `claimWarmPod` — lists `agentflow-pool=warm,agentflow-claimed=false` + `status.phase=Running`, atomic `kubectl label --overwrite` to flip `agentflow-claimed=true` + `agentflow-project=<id>`. Returns `null` on empty pool (cold-path fallback). |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/pod-pool.ts:226` | `spawnWarmPodAsync` — fire-and-forget refill after a successful claim. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/pod-pool.ts:245` | `spawnWarmPod` — `kubectl apply` + `wait --for=condition=ready --timeout=60s`. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/pod-pool.ts:289` | `countWarmPods` — `kubectl get` count of unclaimed Running warm pods (used by refill cron). |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/pod-pool.ts:321` | `returnPodToPool` — on `destroy_project` of a warm-claimed pod: wipe `/workspace/*`, reset `agentflow-claimed=false`, drop `agentflow-project=` label. Pod immediately available to next claim — faster than delete+respawn. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/pod-pool.ts:370` | `sweepStalePods` — deletes warm pods in non-Running phase (Failed/Succeeded/Unknown) to free quota. |
+| `agentflow-agents/src/services/pingers/pod-pool-refill.ts:54` | `runPodPoolRefillTick` — every 60s: per active tenant (users with `tenant_status='ready'` + sealed kubeconfig) sweep stale → count warm → spawn `min(TARGET - count, remaining global budget)` new pods. A shared `GlobalBudget` carries `POD_POOL_GLOBAL_MAX` across tenants; lower-id tenants get first claim on the budget. |
+| `agentflow-agents/src/server.ts:248` | Pinger registration: initial tick on boot + `setInterval(POD_POOL_REFILL_TICK_MS)`. |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts:160` | Claim integration — `create_project` tries `claimWarmPod` before falling through to cold kubectl-apply of the StatefulSet. |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts:398` | Return integration — `destroy_project` checks `agentflow-claimed=true` label and calls `returnPodToPool` instead of deleting. |
+| `agentflow-agents/k8s/agentflow-agents.yaml:225` | `POD_POOL_ENABLED=1` env var on the deployment. |
+
+## Data flow
+
+```
+Boot
+  server.ts → setInterval(60s, runPodPoolRefillTick)
+
+Refill tick (every 60s)
+  pingers/pod-pool-refill.ts
+    SELECT id FROM users WHERE tenant_status='ready' AND tenant_kubeconfig_sealed IS NOT NULL
+      ↓ for each tenant id
+    loadTenantKubeconfig(ownerUserId)                    helpers/tenant.ts
+      ↓
+    sweepStalePods(kubeconfigYaml)                       → delete agentflow-pool=warm, phase!=Running
+    countWarmPods(kubeconfigYaml)                         → existing warm pods consume the shared GlobalBudget
+      ↓ if count < TARGET and budget.remaining > 0
+    spawnWarmPod() × min(TARGET - count, budget.remaining) → kubectl apply warm Pod, wait 60s ready
+      ↓ budget hits 0 (POD_POOL_GLOBAL_MAX reached) → skip remaining tenants' spawns
+
+Project approve / create_project
+  code-exec/index.ts:160
+    claimWarmPod(kubeconfig, tenantNs, projectId)
+      ├─ kubectl get pods -l agentflow-pool=warm,agentflow-claimed=false,phase=Running
+      │     ↓ empty → return null → caller does cold StatefulSet apply
+      │     ↓ non-empty → pick first candidate
+      ├─ kubectl label pod <name> agentflow-claimed=true agentflow-project=<id> --overwrite
+      │     ↓ conflict → retry with next candidate
+      │     ↓ success
+      ├─ delete claimed pod (image is now cached on the same node)
+      ├─ kubectl apply StatefulSet (image pulled from local cache, <5s)
+      └─ spawnWarmPodAsync() — refill pool depth in background
+
+Project destroy
+  code-exec/index.ts:398
+    if pod has agentflow-claimed=true:
+      returnPodToPool(kubeconfig, podName)
+        ├─ kubectl exec — rm -rf /workspace/* /workspace/.[^.]*
+        ├─ kubectl label pod <name> agentflow-claimed=false agentflow-project- --overwrite
+        └─ pod is now back in the warm pool, claimable by next create_project
+```
+
+## DB / Env / API
+
+- **Tables:** none (state lives in pod labels for atomic claim semantics — no DB roundtrip on hot path).
+- **Env:**
+  - `POD_POOL_ENABLED` — feature flag, must equal `"1"` to activate.
+  - `POD_POOL_TARGET_WARM` — pool depth **per tenant**, default `1` (was 3 pre-2026-05-29).
+  - `POD_POOL_TARGETS` — JSON per-kind per-tenant override, e.g. `{"generic":1}`. In prod currently `{"generic":0,"tg_profile_bundle":0}` (pool intentionally drained).
+  - `POD_POOL_GLOBAL_MAX` — **cluster-wide** ceiling on total unclaimed warm pods across all tenants, default `8`. The refill cron stops spawning once the running total hits this, regardless of per-tenant targets. `0` = drained.
+- **K8s labels (per warm pod, default ns of `af-tenant-<userId>`):**
+  - `agentflow-pool=warm`
+  - `agentflow-claimed=false|true`
+  - `agentflow-tenant=af-tenant-<userId>`
+  - `agentflow-project=<projectId>` (only when claimed)
+- **Routes / MCP tools:** none — the pool is internal to `code-exec` MCP `create_project` / `destroy_project`.
+
+## Pool size & quota
+
+Each warm pod requests `15m CPU + 128Mi RAM` (CPU right-sized 25m→15m on 2026-05-29; the burst at claim time is bounded by the unchanged `500m` limit). Warm pods are `emptyDir` (no PVC), so they don't consume PVC quota.
+
+**Capacity blocker (2026-05-29):** the old `TARGET_WARM_COUNT=3` × ~11 active tenants = ~32 idle warm pods, a top CPU-request consumer that pushed the single 8-core ff-france node to ~96% requests and blocked new-pod scheduling (`FailedScheduling: Insufficient cpu`). Warm pods are an **optional pre-launch optimization** — slower FIRST concurrent create per tenant is acceptable for sustained node headroom. Fix: per-tenant default 3→1 **and** a cluster-wide cap `POD_POOL_GLOBAL_MAX` (default 8 ≈ one warm pod per busy tenant on an 8-core node, ≤120m CPU total). Existing over-cap pods are immutable so they're left running and drain as they're claimed; the cap only throttles NEW spawns.
+
+Tune `POD_POOL_TARGET_WARM` (per tenant) or `POD_POOL_GLOBAL_MAX` (cluster ceiling) up once a 2nd node lands. Reversible: raise either env, no redeploy needed (`kubectl set env`).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Approve still cold-starts | `pod-pool: pool empty, cold path` | `pod-pool.ts:186` — refill cron isn't keeping up or `POD_POOL_ENABLED` is off. Check `kubectl -n franchise-factory get deploy/agentflow-agents -o yaml \| grep POD_POOL_ENABLED`. |
+| Two approvals race for same warm pod | `pod-pool: claim race, trying next` | `pod-pool.ts:212` — expected. The optimistic label patch picks the first writer; losers fall through to the next candidate or cold path. No action. |
+| Warm pods never appear | `pod-pool: spawn apply failed` / `pod-pool: spawn wait failed` | `pod-pool.ts:260` / `pod-pool.ts:277` — usually tenant ResourceQuota (`feedback_agentflow_pod_quota.md`). Lift via `expand-quota` internal endpoint. |
+| Pool empty even though refill ran | `pod-pool-refill: kubeconfig unavailable` | `pod-pool-refill.ts:70` — `tenant_kubeconfig_sealed` missing for that user. Their vcluster wasn't provisioned cleanly; rerun tenant provisioning. |
+| Warm pod stuck in Failed phase | `pod-pool: swept stale warm pods` | `pod-pool.ts:392` — sweep step runs before count step, so next tick respawns. Investigate the Failed reason via `kubectl describe pod warm-pod-<hex>`. |
+| Returned pod still has leftover files | `pod-pool: workspace wipe failed, abandoning pod` | `pod-pool.ts:337` — `returnPodToPool` deliberately refuses to recycle a pod it couldn't wipe; pod is left for the next sweep to clean. No data leak between projects. |
+| Warm pool not refilling / approve cold-starts on a high-tenant cluster | `pod-pool-refill: global warm-pod cap reached, skipping spawn` | `pod-pool-refill.ts:145` — `POD_POOL_GLOBAL_MAX` (default 8) is throttling spawns by design on a tight node. Expected when total warm pods ≥ cap. Raise `POD_POOL_GLOBAL_MAX` only after adding node CPU. |
+| Cluster warm-pod count above the cap, not shrinking | `pod-pool-refill: cluster warm-pod count exceeds global cap` | `pod-pool-refill.ts` — pre-existing pods are immutable; they drain as projects claim them. To force-shrink, delete idle warm pods (`kubectl delete pod warm-pod-… ` in the tenant vcluster); the cron won't respawn past the cap. |
+
+## Operational commands
+
+Verify pool is active in production:
+
+```bash
+# Confirm env flag is on
+kubectl -n franchise-factory exec deploy/agentflow-agents -- env | grep POD_POOL
+
+# Count warm pods in a tenant vcluster (replace 5 with the user id)
+kubectl --kubeconfig <(./scripts/dump-tenant-kubeconfig.sh 5) -n default get pods -l agentflow-pool=warm
+
+# Force a refill pass without waiting 60s
+kubectl -n franchise-factory exec deploy/agentflow-agents -- node -e \
+  "require('./dist/services/pingers/pod-pool-refill.js').runPodPoolRefillTick()"
+
+# Disable the pool without redeploy (rollback path)
+kubectl -n franchise-factory set env deploy/agentflow-agents POD_POOL_ENABLED=0
+```
+
+## Related
+
+- [Code Exec MCP](/subsystems/code-exec-mcp) — the consumer of `claimWarmPod` / `returnPodToPool`.
+- [Create Project Flow](/flows/create-project) — end-to-end approve → provision path that the pool short-circuits.
+- [Caddy Preview](/subsystems/caddy-preview) — preview URL reconcile runs after the StatefulSet pod is up, regardless of whether the image came from a warm-pool claim.
+- [Pod-GC Pinger](/subsystems/pod-gc-pinger) — kills *project* workspace pods (label `project-*`, not `agentflow-pool=warm`). The two pingers coexist: pod-gc reclaims slots from done/failed projects so refill has node Pod-limit headroom to spawn new warm pods.

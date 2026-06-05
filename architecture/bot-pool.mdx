@@ -9,6 +9,8 @@ description: "BOT_TOKEN_POOL model: lease, reclaim ladder (dead → done+idle), 
 
 `BOT_TOKEN_POOL` — JSON-массив `{token, username}[]` в env платформы, ~5 entries в проде. Шарится между всеми пользователями. Раздаётся через `services/auto-bot.ts:autoCreateTelegramBot` после `workspace_ready` для проектов `kind ∈ {tg_bot, tg_profile_bundle}`.
 
+После выдачи токена платформа кладёт canonical scaffold (`backend/bot.py` + `commands.py` + `bot_handler.py`) в `/workspace` — см. [runbooks/canonical-templates](/runbooks/canonical-templates). Старый `FF_AUTO_BOT_CREATE` echo-stub удалён.
+
 Lease НЕ perpetual: токен возвращается в пул, когда владелец-проект попадает в `failed`/`cancelled`/`draft`/`awaiting_approval` (DEAD — без probe) или в `done` + Telegram `getUpdates?timeout=0` отвечает 200 (idle — ни один pod не держит long-poll lock). `running`/`approved` владельцы — table stakes: НЕ yank'аем, даже если probe говорит idle (pod может быть в рестарте). Pool пуст / всё активно + `FF_AUTO_BOT_CREATE_BOTFATHER=1` → fallback на /newbot через Jarvis Telethon pod.
 
 ## Files
@@ -24,6 +26,11 @@ Lease НЕ perpetual: токен возвращается в пул, когда 
 | `agentflow-agents/src/services/auto-bot.ts:261` | Reclaim loop — для каждого entry в pool order: probe → owner-status check → chosen/skip. |
 | `agentflow-agents/src/services/auto-bot.ts:296` | Atomic detach старого владельца + emit `bot_unassigned`. |
 | `agentflow-agents/src/services/auto-bot.ts:447` | `bot_assigned` event с payload `{username, project_name, via: 'pool'\|'botfather'}`. |
+| `agentflow-agents/src/services/auto-bot.ts:71` | `briefJaccard` + `briefTokens` — lexical similarity prev_brief vs new_brief (≥0.5 = same product). |
+| `agentflow-agents/src/services/auto-bot.ts:103` | `llmJudgeDivergent` — Haiku-class `ModelType.TEXT_SMALL` tool_use `judge_brief_divergence` для borderline (jaccard < 0.5). |
+| `agentflow-agents/src/services/auto-bot.ts:178` | `clearTelegramWebhook` — POST `setWebhook?url=&drop_pending_updates=true`, 5с AbortSignal. |
+| `agentflow-agents/src/services/auto-bot.ts` divergent-brief block | После атомичного detach: jaccard → LLM judge → если divergent: clearTelegramWebhook + flip `requires_fresh_coder_pass=true` + emit `pool_token_reset_divergent_brief`. |
+| `agentflow-agents/src/services/graph-executor/handlers/tg-bot.ts:73` | `scaffold_aiogram` читает `requires_fresh_coder_pass`, prepend'ит "reset from scratch" directive в brief'е coder'у, clear'ит flag после coder pass. |
 | `agentflow-agents/src/services/projects.ts:1682` | `runProjectApprovalBackground` — caller, gate'нутый под `FF_AUTO_BOT_CREATE=1`. |
 | `agentflow-agents/src/services/seal.ts` | `sealString` — AES-256-GCM encryption для `projects.bot_token` + `project_secrets.value_encrypted`. |
 | `agentflow-agents/src/services/env-file-sync.ts` | `syncProjectEnvFile` — пушит decrypted secrets (включая `BOT_TOKEN`) в `/workspace/.env` для Procfile supervisor. |
@@ -57,6 +64,7 @@ re-leased (atomic detach старого + bind нового в одной functi
 
 - `projects.bot_username` (text, nullable) — visible identifier, обнуляется при reclaim.
 - `projects.bot_token` (text, nullable) — sealed (AES-256-GCM).
+- `projects.requires_fresh_coder_pass` (bool, default false; migration `2026-05-14j-fresh-coder-pass.sql`) — TRUE когда pool-token reclaim'нут с divergent brief'ом; читается `scaffold_aiogram` handler'ом → prepend reset directive в brief; clear'ится после coder pass.
 - `project_secrets` rows where `key='BOT_TOKEN'`:
   - `value_encrypted` (bytea, nullable) — sealed; null при reclaim.
   - `is_set` (bool) — gate для idempotency check в `auto-bot.ts:184`.
@@ -66,6 +74,7 @@ re-leased (atomic detach старого + bind нового в одной functi
 - `project_events`:
   - `bot_assigned` — `{username, project_name, via: 'pool'|'botfather'}`.
   - `bot_unassigned` — `{username, reason: 'pool_reclaim', previous_status, new_project_id}`.
+  - `pool_token_reset_divergent_brief` — `{token_username, prev_project_id, similarity_score, judge_source: 'lexical_match'|'llm'|'missing_brief', webhook_reset_ok, webhook_reset_detail}`. Эмиттится auto-bot когда reclaim'нутый токен принадлежал проекту с разным brief'ом → setWebhook('') + flip flag.
   - `log` (warn/info/error) — все greppable substrings из `auto-bot.ts`.
 
 **Env vars:**
@@ -81,6 +90,7 @@ re-leased (atomic detach старого + bind нового в одной functi
 **Telegram Bot API contact:**
 - `GET /bot<token>/getUpdates?timeout=0&offset=-1` — probe, 4с AbortSignal.
 - `GET /bot<token>/getMe` — validation pool-токенов, 5с AbortSignal.
+- `POST /bot<token>/setWebhook?url=&drop_pending_updates=true` — divergent-brief reclaim path, 5с AbortSignal. Очищает webhook у предыдущего владельца чтобы api.telegram.org перестал форвардить в прежний pod.
 
 **Internal MCP:**
 - code-exec `exec` в pod target проекта — `printf > /workspace/bot_token.txt`.
@@ -131,6 +141,8 @@ Probe network error → `false` (conservative — лучше попробова�
 | Pool exhausted overall | `auto-bot: no available bot tokens (pool exhausted, BotFather unavailable)` | Combine fixes above + emit `project_events.log` с уровнем `warn`. |
 | Reclaim в БД случился, но новый pod 409 | `auto-bot: reclaimed @…` + downstream `getUpdates Conflict` в bot.py | Probe не сработал (race). Restart нового pod через ~10 мин, либо вручную остановить orphan. |
 | Placeholder secret блокирует assign | `[auto-bot] project N already has populated BOT_TOKEN, skipping` ХОТЯ `is_set=false` | Не воспроизводимо после фикса — UPDATE in-place через `placeholderSecretId` в `auto-bot.ts:184`. Если видишь — проверь, что `is_set` правильный bool. |
+| Reused pool-bot shows previous owner's `/book` shell to new owner — coder-tg-bot defaults to tg-visitka template even when brief требует другой продукт (AI Battle Royale, MLM funnel). Pool contamination accelerates the drift. | `brief_fidelity_drift` event in `project_events` для проекта со свежеассайненным pool-токеном | (1) `red-bot-pool-reset` workflow чистит код бота между ownerами. (2) `presets/coder-tg-bot.json` системный prompt теперь содержит brief-imperative guard (`Your ONLY product spec is the brief below…`) + 5-шаговый skill chain `read-brief-3x → extract-intent-keywords → verify-keywords-present-in-code → code → self-review-vs-brief`. См. [Brief-Fidelity Supervisor](/subsystems/brief-fidelity-supervisor). |
+| Zombie-code carryover на pool reclaim — новый проект отвечает копией старого (incident: `agentflow_0x470c_bot` /start → "/book" wizard text после rotation #592→#596) | `auto-bot: reclaimed @…` сразу за которым нет `pool_token_reset_divergent_brief` event при разных brief'ах | RESOLVED (PR #231, 2026-05-14): divergent-brief detection (jaccard ≥0.5 short-circuit + Haiku-class LLM judge fallback) → setWebhook('') + `requires_fresh_coder_pass=true`. Grep events: `pool_token_reset_divergent_brief`. Coder начинает с нуля через `scaffold_aiogram` reset directive. Complements brief-fidelity-supervisor row above — upstream prevents drift, this row resets after a reclaim. |
 
 ## Related
 

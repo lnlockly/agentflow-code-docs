@@ -1,0 +1,91 @@
+---
+title: "Welcome USDF grant on signup"
+description: "Automatic 5 USDF credit applied to every new user row so the USDF=0 chat-gate doesn't block the first message."
+---
+
+# Welcome USDF grant on signup
+
+## TL;DR
+
+Every brand-new `users` row gets a 5 USDF credit on commit. The amount is set by `WELCOME_USDF_AMOUNT` (default `"5"`, set to `"0"` to disable without redeploy). Idempotency lives on `flow_ledger (user_id, kind='welcome_grant_usdf')` so replayed signup webhooks and the magic-link verify double-click both stay safe. Owner-applied backfill SQL credits historical users who signed up before the helper landed.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/welcome-grant.ts:1` | helper — idempotent INSERT into `flow_ledger` + UPSERT on `flow_balances.usdf_balance` |
+| `agentflow-agents/src/routes/auth-magic-link.ts` | calls `grantWelcomeUsdf(user.id)` after the `users` row commits (verify path, `user.created === true`) |
+| `agentflow-agents/src/routes/auth-password.ts` | calls helper in `handleRegister` only when the row is freshly created (skips the TG→password upgrade path) |
+| `agentflow-agents/src/routes/auth-tg-callback.ts` | calls helper in both the widget callback and Mini App `initData` flows when `user.created === true` |
+| `agentflow-agents/src/routes/access-codes.ts` | calls helper after `findOrCreateUserByTg` returns `created: true` in `/access/redeem` |
+| `agentflow-api/src/services/flow-credits.ts` | `grantWelcomeUsdf(userId, callerUserId?, tx?)` — same shape as the agents helper, reused by the internal route |
+| `agentflow-api/src/routes/internal-users.ts` | calls helper after `UsersRepo.createUser` commits (service-to-service signup path from the TG bot) |
+| `agentflow-api/tests/welcome-grant.test.ts` | source-contract test — pins the idempotency key, env knob default, USDF column write, and call ordering |
+
+## Data flow
+
+```
+                signup request (email / TG widget / TG Mini App / access code / internal bot)
+                                       │
+                                       ▼
+                          INSERT users(...) RETURNING id
+                                       │
+                                       ▼  (only when user.created === true)
+                            grantWelcomeUsdf(userId)
+                                       │
+                  ┌────────────────────┴────────────────────┐
+                  ▼                                         ▼
+       SELECT flow_ledger WHERE                INSERT flow_ledger (... kind='welcome_grant_usdf')
+       (user_id, kind=welcome_grant_usdf)      WHERE NOT EXISTS (... same row)
+                  │                                         │
+                  └──────── early-return on hit ────────────┘
+                                       │
+                                       ▼
+              UPSERT flow_balances.usdf_balance += WELCOME_USDF_AMOUNT
+```
+
+## DB / Env / API
+
+- Tables: `flow_ledger`, `flow_balances`
+- Ledger kind: `welcome_grant_usdf` (no CHECK constraint on `flow_ledger.kind`, free to use)
+- Ledger meta: `{"source":"signup","currency":"usdf"}` (or `"backfill_2026-05-17"` for the one-shot backfill)
+- Env: `WELCOME_USDF_AMOUNT` (default `"5"`, `"0"` disables)
+- Routes touched: `POST /auth/magic-link/verify`, `POST /auth/register`, `GET|POST /auth/telegram/callback`, `POST /auth/telegram` (Mini App), `POST /access/redeem`, `POST /internal/users`
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Helper returns `granted: false` with no log | `reason: 'invalid_amount'` in helper return value (silent) | check `WELCOME_USDF_AMOUNT` env — must match `/^-?\d{1,12}(\.\d{1,6})?$/` |
+| Helper logs warn but signup still succeeds | `[welcome-grant] failed for user_id=` | investigate Postgres error in `agentflow-agents/src/services/welcome-grant.ts`; signup deliberately doesn't block on grant failure |
+| User signed up but no welcome credit row | (silent — pre-helper users) | apply the backfill SQL in this page below |
+| Double-credit on retry | (cannot happen — idempotency probe + `WHERE NOT EXISTS` guard) | n/a; helper is race-safe under READ COMMITTED |
+
+## Backfill SQL (owner-applies after merge)
+
+```sql
+-- 1. Credit existing users who have no welcome_grant_usdf row.
+UPDATE flow_balances fb
+   SET usdf_balance = usdf_balance + 5, updated_at = now()
+ WHERE user_id IN (
+   SELECT u.id FROM users u
+   LEFT JOIN flow_ledger fl ON fl.user_id = u.id AND fl.kind = 'welcome_grant_usdf'
+   WHERE fl.id IS NULL
+ );
+
+-- 2. Mirror the credit into the ledger so /me/transactions shows it.
+INSERT INTO flow_ledger (user_id, caller_user_id, pool, amount, kind, meta)
+SELECT u.id, NULL, 'user', 5, 'welcome_grant_usdf',
+       '{"source":"backfill_2026-05-17","currency":"usdf"}'::jsonb
+FROM users u
+LEFT JOIN flow_ledger fl ON fl.user_id = u.id AND fl.kind = 'welcome_grant_usdf'
+WHERE fl.id IS NULL;
+```
+
+One-line verify after merge: sign up a fresh email, then
+`SELECT usdf_balance FROM flow_balances WHERE user_id=<new>` returns `5.000000`.
+
+## Related
+
+- [Billing balance (FLOW)](/subsystems/billing) — the read-side path that consumes the grant
+- [Auth and access](/subsystems/auth-and-access) — the four signup routes the grant hooks into

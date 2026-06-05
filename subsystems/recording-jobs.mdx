@@ -1,0 +1,95 @@
+---
+title: "Recording Jobs"
+description: "On-demand Playwright-in-vcluster recorder for tutorial videos without macOS Screen Recording permission."
+---
+
+# Recording Jobs
+
+## TL;DR
+
+`/me/recording-jobs` lets a user trigger a one-shot Kubernetes Job inside their own `af-tenant-<userId>` vcluster. The Job pulls `mcr.microsoft.com/playwright:v1.50.0-focal`, runs a sanitised user script against headless Chromium with `recordVideo: { dir: '/data/out' }`, and the agentflow-agents reconciler `kubectl cp` the resulting `.webm` to `/var/lib/recordings/<jobId>.webm` for public serving at `https://agents.agentflow.website/recordings/<jobId>.webm`. This sidesteps the macOS Screen Recording permission gap on the desktop daemon.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-recording-jobs.ts:1` | POST/GET routes, manifest renderer, public `/recordings/:filename` server, reconciler. |
+| `agentflow-agents/src/services/recording-sanitize.ts:1` | Static gate on user-supplied script (banned tokens, size limit, name + duration). |
+| `agentflow-agents/tests/recording-sanitize.test.ts:1` | 12 `node:test` cases for the sanitiser. |
+| `agentflow-agents/src/services/bootstrap-schema.ts:347` | `recording_jobs` table DDL (idempotent on startup). |
+| `agentflow-agents/src/server.ts:112` | Imports route + reconciler. |
+| `agentflow-agents/src/server.ts:417` | Mounts `meRecordingJobsApp` BEFORE `meDevicesApp`. |
+| `agentflow-agents/src/server.ts:415` | Calls `startRecordingJobsReconciler()` on API role boot. |
+| `agentflow-landing/src/pages/CabinetRecordings.tsx:1` | `/cabinet/recordings` — single-button trigger + last-50 list with embedded `<video>` preview. |
+
+## Data flow
+
+```
+user → POST /me/recording-jobs { script, name, duration_s }
+        │
+        ├── sanitizeRecordingScript() rejects process.exit/fs.rm/eval/...
+        ├── INSERT recording_jobs (status=queued)
+        ├── kubectl apply -f <Job manifest>  (in user's vcluster)
+        └── 201 { id, status: queued }
+
+reconciler tick (every 10 s, agentflow-agents pod):
+  SELECT queued/running rows
+  → kubectl get job <name> jsonpath status.conditions
+  → Complete: kubectl cp pod:/data/out/<name>.webm /var/lib/recordings/<id>.webm
+              UPDATE recording_jobs SET status=done, artefact_url, artefact_bytes
+              kubectl delete job
+  → Failed:   kubectl logs --tail=40 → UPDATE error, status=error
+
+user → GET /me/recording-jobs/:id → row JSON
+user → GET /me/recording-jobs/:id/video → 302 to artefact_url
+anyone → GET /recordings/<jobId>.webm → streams the .webm
+```
+
+## DB / Env / API
+
+- **Table:** `recording_jobs` — UUID PK, `user_id` FK, `status` in (`queued`,`running`,`done`,`error`,`cancelled`), `artefact_url`, `artefact_bytes`, `error`, `job_name`, `script`, `created_at`, `completed_at`. Index `idx_recording_jobs_user(user_id, created_at DESC)`.
+- **Env:**
+  - `RECORDING_DIR` (default `/var/lib/recordings`) — local path on the agentflow-agents pod where `.webm` artefacts land.
+  - `UPLOADS_PUBLIC_BASE` (default `https://agents.agentflow.website`) — public host that serves both `/uploads/` and `/recordings/`.
+- **Routes:**
+  - `POST /me/recording-jobs`
+  - `GET /me/recording-jobs`
+  - `GET /me/recording-jobs/:id`
+  - `GET /me/recording-jobs/:id/video`
+  - `GET /recordings/:filename` (public, UUID-only filename regex)
+- **MCP tools:** none (called from the cabinet directly via `agentsApi`).
+
+### Script sanitiser
+
+`sanitizeRecordingScript(input)` returns `{ ok: true, script }` or `{ ok: false, error, detail }`. Banned tokens:
+
+- `process.exit`, `eval(`, `Function(`
+- `fs.unlink`, `fs.rm`, `fs.rmdir`
+- `child_process` (token + both `require()` quoting styles)
+- path reads under `/proc/` or `/etc/`
+
+Max script size: 32 KB. The vcluster ResourceQuota + NetworkPolicy is the real boundary; this string check just blocks the obvious footguns.
+
+### Job manifest highlights
+
+- `backoffLimit: 0`, `ttlSecondsAfterFinished: 600` — fail-fast, auto-reap.
+- `activeDeadlineSeconds = duration + 60` so a runaway script can't hang forever.
+- Container sleeps 5 minutes AFTER `runner.mjs` exits so `kubectl cp` has a stable window before the Job is reaped.
+- Resources: 100m–1 CPU, 512Mi–1Gi memory. Headless Chromium fits.
+- `emptyDir` at `/data` — no PVC pressure on the tenant.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Row stuck on `queued` | `[recording-jobs] apply failed` | Check `kubectl apply` stderr in `recording_jobs.error`; usually tenant quota tightening — see `tenant-quota-verifier`. |
+| Row stuck on `running`, never `done` | `[recording-jobs] reconcile error` | Reconciler can't reach the user's vcluster (kubeconfig stale). Re-seal via `tenant-bootstrap`. |
+| `.webm` 0 bytes | `recording-done:` present but `artefact_bytes IS NULL` | Playwright wrote the video to a different filename. Check `runner.mjs` rename logic in `me-recording-jobs.ts:182`. |
+| 400 `banned_token` | `recording-sanitize` rejection | Caller asked for forbidden API. Adjust their script. |
+| 409 `tenant_not_ready` | — | The user has no vcluster yet (`users.tenant_status != 'ready'`). Run `/me/_tenant/provision`. |
+
+## Related
+
+- [Hosted Devices](/subsystems/hosted-devices) — the long-running runtime path; recording-jobs reuse the same vcluster + kubeconfig pattern but in one-shot mode.
+- [Tutorial Recording Flow](/flows/tutorial-recording)
+- [Uploads](/subsystems/uploads) — same emptyDir + public-host convention.

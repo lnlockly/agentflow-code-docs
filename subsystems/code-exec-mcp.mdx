@@ -14,7 +14,8 @@ Streamable-HTTP MCP сервер, который kubectl-exec'ит команд�
 | Repo / path | Что делает |
 |---|---|
 | `agentflow-agents/src/mcp-servers/code-exec/index.ts:710` | `write_file` — text write через base64 → kubectl exec → tee. Записывает в pod-ный `/workspace`. |
-| `agentflow-agents/src/mcp-servers/code-exec/index.ts:859` | `write_file_b64` — двоичная запись (изображения, PDF, бинарники). |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts:859` | `write_file_b64` — двоичная запись (изображения, PDF, бинарники). 25 MiB cap. |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts` `read_file_b64` | Симметричный binary reader: `kubectlRunBinary` → `cat <path>` → base64 stdout, 25 MiB cap. Returns `{ok, path, bytes, content_b64}`. Used by `tg.send_file` graph handler to stream promo-video mp4 out of project pod. Errors: `invalid_path`, `file_not_found` (exit 23), `file_too_large` (exit 24), `cat_failed`, `pod_evicted_or_missing`, `read_timed_out`, `empty_payload`. |
 | `agentflow-agents/src/mcp-servers/code-exec/index.ts:1008` | `upload_to_storage` — push в Garage S3 (CDN бакет `agentflow-public`). |
 | `agentflow-agents/src/mcp-servers/code-exec/index.ts:1213` | `exec` — shell в pod'е. Timeout, stdout/stderr capture, workdir invariant pre/post checks. |
 | `agentflow-agents/src/mcp-servers/code-exec/index.ts:1411` | `start_service` — wraps `nohup` + Procfile-style supervisor, лог в `/workspace/.runtime/logs/`. |
@@ -65,7 +66,7 @@ pool-worker / agent — если drift → ERROR_MARKERS hit → autoRetry chain
 
 **API surface:**
 - `POST /mcp` — streamable-http MCP transport (mounted в `server.ts`).
-- Tools: `write_file`, `write_file_b64`, `upload_to_storage`, `exec`, `start_service`, `expose_internal`, `expose_public`, `read_file`, `list_dir`, `delete_path`.
+- Tools: `write_file`, `write_file_b64`, `read_file_b64`, `upload_to_storage`, `exec`, `start_service`, `expose_internal`, `expose_public`, `read_file`, `list_dir`, `delete_path`.
 - Statics: `STATIC_PREVIEW_KINDS = ['spa','landing','mini_app']` (workspace-resolve.ts:567), `BUILD_OUTPUT_DIRS = ['dist','build','out','public']` (workspace-resolve.ts:563).
 
 ## Failure modes
@@ -78,6 +79,8 @@ pool-worker / agent — если drift → ERROR_MARKERS hit → autoRetry chain
 | `kubectl exec` висит | `kubectl_exec_timeout` | `helpers/kubectl.ts:40` (SIGKILL after timeout) |
 | Decrypt fail на secrets | `seal_unseal_failed` | `services/seal.ts:88` (unsealString) |
 | ACL bypass попытка | `code_exec_acl_denied` | `helpers/workspace-resolve.ts:33` (resolveProjectByWorkspace) |
+| `read_file_b64` returns `error=file_too_large` (exit 24) | `file_too_large` (literal, raised when `wc -c > 26214400`) | File exceeds 25 MiB cap. For Telegram delivery use bot-token + `send_document` URL flow; for storage use `upload_to_storage`. |
+| `read_file_b64` returns `error=file_not_found` (exit 23) | `file_not_found` (literal, raised when path missing in pod) | Upstream node never wrote the file, or path mismatch. Verify producing handler exit + `output_path` arg. |
 
 ## Related
 

@@ -1,0 +1,143 @@
+---
+title: "Pod-GC Pinger"
+description: "Every 5 min — kill workspace pods for done/failed/cancelled projects older than 2h, cap ≤100 active pods per tenant."
+---
+
+# Pod-GC Pinger
+
+## TL;DR
+
+Every 5 min, `pod-gc` deletes workspace pods at the parent k3s cluster for projects whose `status ∈ {done, failed, cancelled}` and `updated_at < now() - 2h`, plus a hard cap of 100 Running `project-*` pods per `af-tenant-*` namespace (kill oldest terminal first when exceeded). Uses `kubectl delete pod ... --grace-period=30 --force=false` for clean Telethon/socket shutdown. Idempotent — NotFound is silent. Complements [`workspace-janitor`](/subsystems/workspace-janitor) (slow STS/PVC sweep): pod-gc frees the parent-node Pod-limit (200/200) headroom, janitor reclaims storage on a longer cadence. Born from the ferma-front freeze of 2026-05-14.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/pingers/pod-gc.ts:51` | `runPodGc` — two-pass tick. Pass 1 stale-age, Pass 2 tenant cap. |
+| `agentflow-agents/src/services/pingers/pod-gc.ts:41` | `POD_GC_TICK_MS` — `setInterval` cadence. Default `300_000` (5 min). |
+| `agentflow-agents/src/services/pingers/pod-gc.ts:42` | `STALE_HOURS` — terminal-project grace. Default `2`. Override via `POD_GC_STALE_HOURS`. |
+| `agentflow-agents/src/services/pingers/pod-gc.ts:43` | `TENANT_CAP` — per-tenant Running pod ceiling. Default `100`. Override via `POD_GC_TENANT_CAP`. |
+| `agentflow-agents/src/services/pingers/pod-gc.ts:44` | `KUBECTL_TIMEOUT_SEC=20`, `GRACE_PERIOD_SEC=30` — kubectl flags. |
+| `agentflow-agents/src/services/pingers/pod-gc.ts:69` | `podName(workspaceName, ownerUserId)` — `project-<ws>-0-x-default-x-user-<uid>` vcluster syncer convention. |
+| `agentflow-agents/src/services/pingers/pod-gc.ts:73` | `tenantNs(ownerUserId)` — `af-tenant-<uid>`. |
+| `agentflow-agents/src/services/pingers/pod-gc.ts:78` | `killPod` — single `kubectl delete pod` with --grace-period=30 --force=false; NotFound → `alreadyGone:true`. |
+| `agentflow-agents/src/services/pingers/pod-gc.ts:109` | `deleteAndEmit` — gates on `is_platform`, calls `killPod`, appends `pod_gc_deleted` project_event. |
+| `agentflow-agents/src/services/pingers/pod-gc.ts:142` | `countProjectPodsPerTenant` — parent-cluster pod list filtered by namespace `af-tenant-*` + name `project-*` + `status.phase=Running`. |
+| `agentflow-agents/src/services/pingers/pod-gc.ts:178` | `runInProgress` mutex — overlapping ticks no-op. |
+| `agentflow-agents/src/server.ts:96` | Import `runPodGc, POD_GC_TICK_MS`. |
+| `agentflow-agents/src/server.ts:262` | Boot wiring — initial tick + `setInterval(POD_GC_TICK_MS)`. |
+| `agentflow-agents/tests/unit/pingers/pod-gc.test.ts` | 10 source-contract tests (SQL shape, pod-name template, kubectl flags, idempotency branch). |
+
+## Data flow
+
+```
+Boot (server.ts)
+  runPodGc()                           initial tick (non-blocking)
+  setInterval(POD_GC_TICK_MS, runPodGc)
+
+Tick (every 5 min)
+  pod-gc.ts: runPodGc
+    if runInProgress → log skip, return         (in-process mutex)
+    log "[pod-gc] tick start"
+
+    ── Pass 1: stale terminal-age ──
+    SELECT id, slug, owner_user_id, workspace_project_name, status,
+           updated_at, is_platform
+      FROM projects
+     WHERE status IN ('done','failed','cancelled')
+       AND owner_user_id IS NOT NULL
+       AND workspace_project_name IS NOT NULL
+       AND is_platform = false
+       AND updated_at < now() - (STALE_HOURS * interval '1 hour')
+     ORDER BY updated_at ASC
+      ↓ for each row
+    kubectlRunInCluster(
+      ['-n', 'af-tenant-<uid>', 'delete', 'pod',
+       'project-<ws>-0-x-default-x-user-<uid>',
+       '--grace-period=30', '--force=false', '--wait=false'])
+      ↓ exit 0 OR stderr matches /not\s*found/i (idempotent)
+    appendProjectEvent(id, 'pod_gc_deleted',
+      { slug, namespace, pod, reason:'stale_terminal', status, grace_period_sec:30 })
+
+    ── Pass 2: per-tenant cap ──
+    kubectlRunInCluster(['get','pods','--all-namespaces',
+      '-l','vcluster.loft.sh/managed-by',
+      '--field-selector=status.phase=Running','-o','json'])
+      ↓ tally namespace → count where ns startsWith 'af-tenant-'
+      ↓ and name startsWith 'project-'
+    for each tenant where count > TENANT_CAP:
+       overflow = count - TENANT_CAP
+       SELECT … FROM projects WHERE owner_user_id=$uid
+         AND status IN ('done','failed','cancelled')
+         AND workspace_project_name IS NOT NULL
+         AND is_platform = false
+        ORDER BY updated_at ASC
+        LIMIT $overflow
+       → deleteAndEmit(row, 'tenant_cap_exceeded') for each
+
+    log "[pod-gc] tick: deleted N pods ..." (only when N>0)
+    finally: runInProgress = false
+```
+
+## DB / Env / API
+
+- **Tables read:** `projects` (id, slug, owner_user_id, workspace_project_name, status, updated_at, is_platform).
+- **Tables written:** `project_events` (kind=`pod_gc_deleted`, payload = `{slug, namespace, pod, reason, status, grace_period_sec}`).
+- **Env:**
+  - `POD_GC_TICK_MS` — default `300000` (5 min).
+  - `POD_GC_STALE_HOURS` — default `2`.
+  - `POD_GC_TENANT_CAP` — default `100`.
+- **kubectl verbs needed (in-cluster ServiceAccount):**
+  - `pods/list` cluster-wide (`get pods --all-namespaces`).
+  - `pods/delete` in `af-tenant-*` (covered by existing `agentflow-agents-expose` ClusterRole — same rights `stale-pvc-sweep` uses).
+- **Routes / MCP tools:** none — internal pinger only.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Pod-limit hit again (200/200), ferma frozen | `[pod-gc] tenant cap exceeded` absent for the noisy tenant | `pod-gc.ts:143` — verify `field-selector=status.phase=Running` returns the noisy tenant. Force a tick via `runPodGc()` exec. |
+| GC keeps re-deleting same pod every tick | `[pod-gc] deleted pod` repeats with same `pod` name | vcluster syncer respawns from STS. Real fix: scale STS to 0 (workspace-janitor) or destroy from `/me/projects/:id/destroy-workspace`. Pod-gc only frees the slot, not the STS. |
+| Pod delete fails with permission denied | `[pod-gc] pod delete failed` + stderr `forbidden` | RBAC drift — re-apply `k8s/agentflow-agents.yaml` ClusterRole `agentflow-agents-expose`. |
+| Pod delete fails with `connection refused localhost:8080` | `[pod-gc] pod delete failed` + stderr `dial tcp [::1]:8080: connect: connection refused` | kubectl ≥ 1.30 stopped auto-discovering the API from `KUBERNETES_SERVICE_HOST`+SA token alone. Fixed in `kubectlRunInCluster` (PR #243) — explicit `--server`/`--token`/`--certificate-authority` flags from `/var/run/secrets/kubernetes.io/serviceaccount/`. If it reappears, check the SA mount exists inside the pod: `kubectl exec deploy/agentflow-agents -- ls /var/run/secrets/kubernetes.io/serviceaccount/token`. |
+| Tick crashes once then never runs again | `pod-gc: tick failed (non-fatal)` once + no subsequent `[pod-gc] tick start` | `runInProgress` got pinned (finally should release it). Investigate — restart deploy clears it. |
+| Pod gone but `pod_gc_deleted` not in events | `[pod-gc] appendProjectEvent failed` | DB write hiccup — pod is already terminating. Audit via `[pod-gc] deleted pod` log line; both DB + log fire on success. |
+| New project blocked from approval right after a sweep | (none — by design) | Cap kills *terminal* pods only. If `running` projects ever exceed 100 per tenant the user is over-provisioned; raise `POD_GC_TENANT_CAP` or quota. |
+
+## Operational commands
+
+```bash
+# Watch the next tick on the live deployment
+kubectl -n franchise-factory logs -f deploy/agentflow-agents \
+  --tail=200 | grep -E '\[pod-gc\]'
+
+# Force a tick without waiting 5 min
+kubectl -n franchise-factory exec deploy/agentflow-agents -- node -e \
+  "require('./dist/services/pingers/pod-gc.js').runPodGc()"
+
+# Audit recent kills from the DB
+psql "$DATABASE_URL" -c "
+  SELECT project_id, created_at, payload->>'slug' AS slug,
+         payload->>'reason' AS reason, payload->>'pod' AS pod
+    FROM project_events
+   WHERE kind = 'pod_gc_deleted'
+   ORDER BY id DESC LIMIT 50;"
+
+# Verify current pod counts per tenant
+kubectl get pods --all-namespaces \
+  --field-selector=status.phase=Running -o json \
+  | jq -r '.items[] | select(.metadata.namespace|startswith("af-tenant-"))
+           | select(.metadata.name|startswith("project-"))
+           | .metadata.namespace' \
+  | sort | uniq -c | sort -rn
+
+# Disable without redeploy (rollback path) — raise stale hours so nothing matches
+kubectl -n franchise-factory set env deploy/agentflow-agents \
+  POD_GC_STALE_HOURS=999999
+```
+
+## Related
+
+- [Pod Pre-Warm Pool](/subsystems/pod-prewarm-pool) — refills warm pods that pod-gc never touches (`agentflow-pool=warm` label is not `project-*`).
+- [Workspace janitor](/subsystems/workspace-janitor) — slow (≥7d) STS/PVC reclamation. Pod-gc is the fast pod-slot-only sibling.
+- [Debug stuck project](/runbooks/debug-stuck-project) — Case F (workspace_provision_retry without workspace_ready) is the symptom you'll see when the cap is wrong.

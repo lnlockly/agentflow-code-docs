@@ -1,0 +1,102 @@
+---
+title: "Social Network"
+description: "Public profile pages at agentflow.website/@<slug> with bio, projects, agents, Matrix-channel posts, and live presence."
+---
+
+# Social Network
+
+> **Status: shipped 2026-05-22 (presence column added today).** `/public/profile/:slug` returns owner identity + public projects + listed agents + recent Matrix posts. Today's update wires Matrix presence (`presence` + `last_active_ago_ms`) so the profile shows «Онлайн» / «Был N минут назад».
+
+## TL;DR
+
+`GET /public/profile/:slug` resolves an owner by `users.slug`, then returns their public projects (`is_public=true AND is_internal=false`), public marketplace agents (`is_public_listing=true`), recent Matrix-room posts from `#@<slug>:agentflow.website`, and a live presence snapshot fetched from Dendrite via a service-bot token. The landing renders this at `agentflow.website/@<slug>` — routed as `/:atHandle` because React Router v6 can't combine a literal prefix and a dynamic param in one segment.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/public-profile.ts:91` | `fetchPresence(matrixUserId)` — calls Dendrite `/_matrix/client/v3/presence/:user/status` |
+| `agentflow-agents/src/routes/public-profile.ts:125` | `GET /public/profile/:slug` handler |
+| `agentflow-agents/src/routes/public-profile.ts:71` | `presence` + `last_active_ago_ms` on `ProfilePayload` |
+| `agentflow-agents/src/routes/public-profile.ts:198` | `Promise.all([fetchRecentPosts, fetchPresence])` |
+| `agentflow-agents/src/routes/public-profile.ts:241` | `POST /me/profile/bio` (existing — owner bio editor) |
+| `agentflow-landing/src/pages/PublicProfile.tsx` (verify line) | Frontend renderer — «Онлайн» (green) / «Был N минут/часов/дней назад» |
+| `agentflow-landing/src/main.tsx:746` | `<Route path="/:atHandle" element={<PublicProfile/>}>` (RR6 workaround for `/@:slug`) |
+| `agentflow-landing/src/main.tsx:738` | Sibling `/u/:slug` legacy route |
+
+## Data flow
+
+```
+Browser  →  https://agentflow.website/@artem
+   │
+   ▼
+React Router v6 matches /:atHandle (any single segment that didn't match a static route)
+   PublicProfile component reads location.pathname, strips leading '@', or rejects → 404
+   │
+   ▼
+GET https://agentflow.website/_agents/public/profile/artem
+   ipRateLimit → SLUG_RE check
+   │
+   ▼
+SELECT users WHERE slug='artem' AND deleted_at IS NULL
+   │
+   ▼
+parallel:
+   • SELECT projects WHERE owner_user_id=? AND is_public AND NOT is_internal (24)
+   • SELECT agents WHERE owner_user_id=? AND is_public_listing (24)
+   • fetchRecentPosts('#@artem:agentflow.website') — reads Matrix room timeline
+   • fetchPresence('@user-N:agentflow.website') — reads Dendrite presence
+   │
+   ▼
+JSON { ok, profile: { slug, display_name, avatar_url, bio, joined_at,
+                      matrix_channel, presence, last_active_ago_ms,
+                      projects, agents, posts } }
+   │
+   ▼
+PublicProfile renders header card with «Онлайн» badge OR
+   «Был N минут / часов / дней назад» depending on (presence, last_active_ago_ms).
+```
+
+## DB / Env / API
+
+### Tables read
+- `users` (`id, slug, display_name, avatar_url, bio, joined_at, tg_username, first_name, last_name, deleted_at`)
+- `projects` (filtered `is_public AND NOT is_internal`)
+- `agents` (filtered `is_public_listing`)
+- `matrix_bots` (one enabled row — its `access_token` queries presence)
+
+### External call
+`GET ${MATRIX_HOMESERVER_INTERNAL}/_matrix/client/v3/presence/${encodedMxid}/status`
+- Header: `Authorization: Bearer <bot_access_token>` (first enabled `matrix_bots` row).
+- Response: `{ presence: 'online'|'unavailable'|'offline', last_active_ago: <ms> }`.
+- Failure path returns `{presence:null, last_active_ago_ms:null}` and the route still 200s.
+
+### Env
+- `MATRIX_HOMESERVER_INTERNAL` — cluster URL of Dendrite (verify with: `kubectl -n franchise-factory exec deploy/agentflow-agents -- env | grep MATRIX_HOMESERVER_INTERNAL`).
+- `MATRIX_SERVER_NAME` — `agentflow.website`; used to mint `@user-N:agentflow.website` and `#@<slug>:agentflow.website`.
+
+### Routes
+- `GET  /public/profile/:slug` — unauthenticated, ip-rate-limited.
+- `POST /me/profile/bio` — owner-only bio editor.
+
+### Frontend rendering rule
+- `presence === 'online'` → green dot + «Онлайн».
+- `presence !== 'online'` AND `last_active_ago_ms !== null` → grey dot + «Был X минут/часов/дней назад» (units flip on 60 m / 24 h thresholds).
+- Both null → no badge rendered (keeps header tight when Matrix is offline).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `/@:slug` route never matches | (no log — RR6 prints no warning) | React Router v6 can't combine a literal prefix and a dynamic param in one segment. `path="/@:slug"` parses as a literal segment that never matches. Keep `path="/:atHandle"` (`main.tsx:746`) and let the component reject anything not starting with `@`. **This is the #1 dev footgun** — many devs will paste `/@:slug` and lose 30 minutes |
+| Profile loads but presence badge missing | `presence: null` in response JSON | (a) `MATRIX_HOMESERVER_INTERNAL` env unset, (b) no enabled `matrix_bots` row, or (c) Dendrite presence disabled. `fetchPresence` returns the null fallback on any failure path — check `public-profile.ts:94-120` |
+| Presence stuck at `online` for offline user | Dendrite-side | Dendrite presence has a stale heartbeat. Restart the user's Element tab or wait for the heartbeat window |
+| Public route 404 on a real user | response `{"error":"not_found"}` | `users.deleted_at` not NULL, slug case mismatch (route lowercases the input — slug must be stored lowercase too), or `SLUG_RE` rejected the input |
+| `/@artem` shows static route page instead | n/a | A static route was added before `/:atHandle` and now matches `/@artem`. Move the static route's path so it stays specific (RR6 picks by specificity), or rename the offending route |
+| Avatar URL 404s | Frontend `<img onError>` falls back to slug initials | Either `users.avatar_url` was nulled or the upstream image dropped. Not a backend bug |
+
+## Related
+
+- [Matrix Chat](/subsystems/matrix-chat) — Dendrite homeserver presence is sourced from here
+- [Matrix Bots](/subsystems/matrix-bots) — first enabled row's `access_token` is used for the presence query
+- [Element Web](/subsystems/element-web) — where users actually generate presence heartbeats

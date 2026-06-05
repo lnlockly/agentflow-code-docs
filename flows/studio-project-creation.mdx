@@ -1,0 +1,69 @@
+---
+title: "Studio project creation (two-click flow)"
+description: "Studio brief → preview-kind (no DB write) → user reviews canvas → approve → POST /me/projects creates the row."
+---
+
+# Studio project creation (two-click flow)
+
+## TL;DR
+
+В Studio проект создаётся за **два клика**, не за один. Первый клик («Предпросмотр плана») вызывает `POST /me/projects/preview-kind` — только классификация kind + workflow schema, никакой записи в БД. Второй клик («Запустить команду») в bottom bar канваса вызывает `POST /me/projects` и создаёт row. Новички ловятся на первом клике и уходят со страницы, думая что проект создан. Renaming первой кнопки + inline hint баннер выше canvas bottom bar закрывают gap.
+
+## Files
+
+| Repo / path | Role |
+|---|---|
+| `agentflow-landing/src/components/studio/PromptBar.tsx:290` | Первая CTA «Предпросмотр плана» (empty mode). |
+| `agentflow-landing/src/components/studio/PromptBar.tsx:255` | Click handler `onSubmitGoal` для первой CTA. |
+| `agentflow-landing/src/components/studio/PromptBar.tsx:544` | Вторая CTA `data-testid="studio-approve-btn"` («Запустить команду», canvas mode). |
+| `agentflow-landing/src/pages/Studio.tsx:323` | `handleSubmitGoal` — вызывает `previewKind`, заполняет canvas, не пишет в БД. |
+| `agentflow-landing/src/pages/Studio.tsx:316` | Auto-scroll к approve button после успешного preview. |
+| `agentflow-landing/src/pages/Studio.tsx:518` | `handleApprove` — вызывает `createProject` → navigate `/workspace/:id`. |
+| `agentflow-landing/src/pages/Studio.tsx:883` | Inline hint banner между canvas и bottom PromptBar. |
+| `agentflow-agents/src/routes/projects.ts:429` | `POST /me/projects/preview-kind` — kind classify + workflow proposal, **no DB write**. |
+| `agentflow-agents/src/routes/projects.ts:613` | `POST /me/projects` — реальный insert через `createProjectForUser`. |
+| `agentflow-agents/src/services/projects.ts:132` | `createProjectForUser` — row insert (`status=draft`). |
+
+## Data flow
+
+```
+┌──────────────┐  1. Brief + click            ┌──────────────────────────┐
+│ Studio empty │ ───────────────────────────▶ │ POST /me/projects/       │
+│  PromptBar   │  "Предпросмотр плана"        │       preview-kind       │
+└──────┬───────┘                              └──────────┬───────────────┘
+       │                                                 │ kind + schema
+       ▼                                                 │ (no DB row)
+┌──────────────┐  hint banner appears                    │
+│ Studio canvas│ ◀───────────────────────────────────────┘
+│  nodes/edges │
+│ + bottom bar │  2. Click "Запустить команду"
+└──────┬───────┘ ───────────────────────────▶ ┌──────────────────────────┐
+       │                                      │ POST /me/projects        │
+       │                                      │  createProjectForUser    │
+       │                                      └──────────┬───────────────┘
+       │                                                 │ row id
+       ▼                                                 │
+   navigate(`/workspace/:id`) ◀──────────────────────────┘
+```
+
+## DB / Env / API
+
+- Tables: `projects` (row inserted only on second click), `project_events` (append on insert).
+- Env: none specific to this flow.
+- Routes:
+  - `POST /me/projects/preview-kind` — classification preview, idempotent, no side effects.
+  - `POST /me/projects` — creates row, spawns Maestro propose in background.
+- i18n keys: `studio.preview.cta`, `studio.preview.hint` in `agentflow-landing/src/i18n/{en,ru,zh}.json`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Юзер заполнил бриф, кликнул первую CTA, увидел canvas, ушёл — row отсутствует | front-end only, no server log; check absence of `POST /me/projects` for that user/session | Confirm hint banner renders: `agentflow-landing/src/pages/Studio.tsx:883`. Check guard `store.mode === 'build' && store.phase === 'canvas' && !store.refining && !pipelineId`. |
+| Approve кнопка не виден на canvas | n/a — canvas overflow или mobile viewport | `agentflow-landing/src/components/studio/PromptBar.tsx:544` (`data-testid="studio-approve-btn"`). Verify bottom bar sticky + auto-scroll at `Studio.tsx:316`. |
+| Preview classifier ошибается, юзер всё равно жмёт approve | server: `kind-classifier` low confidence | `agentflow-agents/src/services/kind-classifier.ts:49` (`MIN_LLM_CONFIDENCE`). Conflict banner in `Studio.tsx:666` предлагает сменить mode. |
+
+## Related
+
+- [Create project flow](/flows/create-project) — что происходит после approve (provision → scrape → auto-bot → execute).
+- [Project lifecycle](/flows/project-lifecycle) — статусы row после создания.

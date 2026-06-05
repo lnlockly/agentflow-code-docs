@@ -1,0 +1,163 @@
+---
+title: "tg_profile_bundle (graph + coder delegation)"
+description: "Полный data-flow визитки: graph nodes, coder-delegate split, sentinel-gate, unknown_project failure mode в LOCAL_DEV_MODE."
+---
+
+# tg_profile_bundle (graph + coder delegation)
+
+## TL;DR
+
+`tg_profile_bundle` — kind, который создаёт лендинг-визитку + бот-ассистент по @-хэндлу. Графовый pipeline на 6 нодах: scrape → render → scaffold → wire → deploy → booking. Из них только `scaffold_bot` и `booking_flow` делегируют LLM-агенту; остальные deterministic. С 2026-05-19 LLM-делегаты используют специализированный preset `coder-tg-profile-bundle` (раньше — `coder-tg-bot` + `coder-backend`, которые не знали `/workspace/meetings.jsonl` и переписывали scaffold с нуля).
+
+Стилевой селектор, scaffold-layout, App.tsx data-style — см. [architecture/visitka-tg-profile](/architecture/visitka-tg-profile). Эта страница — про **исполнение графа** и **failure modes** в production+LOCAL_DEV_MODE.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/graph-executor/handlers/tg-profile-bundle.ts:64` | `scrapeTgHandler` — resolves `@handle` from input or brief, calls `runBuildScrapeTgProfile`, skips with `skip_reason` when no handle present. |
+| `agentflow-agents/src/services/graph-executor/handlers/tg-profile-bundle.ts:154` | `deployLandingHandler` — `runtimeDeploy(source:'flag_gated')`, builds Vite SPA from `/workspace/frontend/`. |
+| `agentflow-agents/src/services/graph-executor/handlers/tg-profile-bundle.ts:216` | `scaffold_bot` → coder delegate. Slug: `coder-tg-profile-bundle`. Brief mandates `ls -la /workspace` first call + bans rewriting `bot.py` from scratch. |
+| `agentflow-agents/src/services/graph-executor/handlers/tg-profile-bundle.ts:233` | `booking_flow` → coder delegate. Slug: `coder-tg-profile-bundle`. Brief locks the 6 `meetings.jsonl` keys + bans SQLite migration. |
+| `agentflow-agents/src/services/graph-executor/handlers/tg-profile-bundle.ts:266` | `wireDesignapiHandler` — deterministic; calls `runBuildWireDesignapi` to drop `/workspace/.tools/designapi.py` helper into the project. NOT LLM-delegated. |
+| `agentflow-agents/src/services/graph-executor/handlers/tg-profile-bundle.ts:298` | `deployBotHandler` — `runtimeDeploy(source:'always_on')`, launches `bot: python3 -u backend/bot.py` from Procfile. |
+| `agentflow-agents/presets/coder-tg-profile-bundle.json` | Specialised coder preset for both LLM nodes — ANTI-REGENERATE rules + 6-key jsonl contract + sentinel-gate self-check. |
+| `agentflow-agents/src/services/tg-visitka-scaffold.ts:580` | `BOT_PY` heredoc — canonical aiogram 3 source with `BookFlow(StatesGroup)` + `MEETINGS_PATH = Path("/workspace/meetings.jsonl")` + `ask_llm()` designapi-helper subprocess fallback. |
+| `agentflow-agents/src/services/tg-visitka-scaffold.ts:810` | `injectVisitkaStyle()` — substitutes `__VISITKA_STYLE__` placeholder; gate-fails if any raw placeholder remains in `profile.json` after run. |
+| `agentflow-agents/src/scripts/re-instantiate-presets-from-json.ts:55` | Slug-normalizer — maps `coder-tg-profile-bundle-<hash>` agent rows to the new preset on reseed sweep. Placed BEFORE `coder-tg(-|$)` to avoid prefix collision. |
+
+## Data flow
+
+```
+approve
+  ↓ projects.runProjectApprovalBackground
+  ↓ scaffoldTgProfileBundle({brief})           ← deterministic 13-file write
+  ↓ autoCreateTelegramBot()                    ← writes /workspace/backend/bot_token.txt
+  ↓ graph-executor picks up workflow_schema id=18 (tg-profile-bundle)
+  │
+  ├─ scrape_tg          → auto-scrape.scrapeOneTarget (@handle from brief)
+  │                       writes /workspace/scraped_<hash>.json
+  │
+  ├─ render_landing     → (config-only node — schema validates input, no LLM call;
+  │                       Vite source already on disk from scaffold)
+  │
+  ├─ deploy_landing     → runtime-supervisor.deploy(flag_gated)
+  │                       → bash scripts/build-profile.sh
+  │                          → python3 backend/profile_loader.py → profile.json
+  │                          → cd frontend && npm install && npm run build
+  │                       → web: cd dist && python3 -m http.server 8080
+  │
+  ├─ scaffold_bot       → coder-tg-profile-bundle delegate (LLM)
+  │                       brief: "ls -la /workspace FIRST; polish bot.py;
+  │                              do NOT rewrite from scratch"
+  │                       expects: [backend/bot.py, backend/requirements.txt]
+  │
+  ├─ wire_designapi     → runBuildWireDesignapi (deterministic)
+  │                       writes /workspace/.tools/designapi.py
+  │
+  ├─ deploy_bot         → runtime-supervisor.deploy(always_on)
+  │                       → bot: python3 -u backend/bot.py
+  │
+  └─ booking_flow       → coder-tg-profile-bundle delegate (LLM)
+                          brief: "Extend BookFlow FSM; append to meetings.jsonl
+                                 with 6 stable keys; NEVER migrate to SQLite"
+                          expects: [backend/bot.py]
+```
+
+`render_landing` is config-only — the actual landing source ships from the scaffold; the node exists in the schema for symmetry with `landing` kind workflows. Don't add an LLM call there without re-validating the gate.
+
+## Delegation contract
+
+`scaffold_bot` and `booking_flow` both call `ctx.coderInvoke({ slug, brief, expects, timeoutMs: 600_000 })`. The handler throws `coder_did_nothing:<kind>:<slug>` when the coder returns 0 files **and** 0 tool calls — earlier behaviour was to swallow no-op replies, which let `done` slip through without any code changes.
+
+`expects` is appended to the brief as `OUTPUT_EXPECTED:\n- backend/bot.py\n…` so the coder can self-check before its final `<reply>`. The brief-fidelity-supervisor in chat-tooluse uses the same list to grep tool-use logs.
+
+The preset's `fallback_slugs: ["coder-tg-bot", "coder-backend"]` keeps the dispatch reroute (see [subsystems/agents § fallback_slugs](/subsystems/agents)) functional — if `coder-tg-profile-bundle` agent row is missing in a tenant, dispatch tries `coder-tg-bot` first, then `coder-backend`, then maestro.
+
+## meetings.jsonl — the canonical contract
+
+Append-only JSONL log at `/workspace/meetings.jsonl`. 6 stable keys, written by `bot.py` `BookFlow.waiting_contact` handler after the wizard completes:
+
+```jsonl
+{"date":"2026-05-20","topic":"intro call","contact":"@vitaliy","from_user_id":1923,"from_username":"durov","created_at":"2026-05-19T14:32:17Z"}
+```
+
+| Key | Type | Source |
+|---|---|---|
+| `date` | string (free-form) | `waiting_date` reply |
+| `topic` | string | `waiting_topic` reply |
+| `contact` | string | `waiting_contact` reply |
+| `from_user_id` | int | `message.from_user.id` |
+| `from_username` | string \| null | `message.from_user.username` |
+| `created_at` | ISO-8601 UTC | `datetime.utcnow().isoformat() + "Z"` |
+
+**Banned by the preset:**
+- migrating to `bookings` SQLite table (coder-backend's default — was the root cause of pre-2026-05-19 booking_flow drift),
+- renaming `BookFlow` states (downstream `/cancel` handler greps the name),
+- removing the `ask_llm()` designapi fallback (deploy_bot expects bot.py to still call `/workspace/.tools/designapi.py` when LLM is needed).
+
+The preset's self-check requires `grep -c 'meetings.jsonl' backend/bot.py` ≥ 1 before final reply.
+
+## Sentinel-gate (what cannot remain in backend/bot.py)
+
+After the coder pass on `scaffold_bot`, the platform asserts the following substrings have **0 occurrences** in `backend/bot.py` and `frontend/public/profile.json`. If any remain, the project bounces back to retry with an `unfilled_placeholder` audit verdict.
+
+| Placeholder | Where set | Where filled |
+|---|---|---|
+| `__VISITKA_STYLE__` | `tg-visitka-scaffold.ts:580` BOT_PY heredoc, `PROFILE_LOADER_PY` | `injectVisitkaStyle()` at scaffold time (before coder turn). 0 hits expected post-scaffold. If raw placeholder leaks into `profile.json`, scaffold ran with empty `style` slot — re-fire `scaffoldTgProfileBundle`. |
+| `SLOT:brief.start_greeting`, `SLOT:brief.*` | Inherited from `coder-tg-bot` shared template fragments | Must be filled by coder during `scaffold_bot` pass. Sentinel: `grep -c 'SLOT:brief' backend/bot.py == 0`. |
+| `TODO.*placeholder`, `FIXME` | Coder's own sloppy output | Sentinel: `grep -cE 'TODO.*placeholder|FIXME' backend/bot.py == 0`. |
+| aiogram v2 imports (`from aiogram.utils.executor`, `dp.message_handler`) | If coder regresses to v2 API | Sentinel: zero matches. See [subsystems/tg-bot § v2-ban](/subsystems/agents) for full v2-ban substring list. |
+
+Source of the gate logic: `agentflow-agents/src/services/graph-executor/handlers/tg-bot.ts:220-355` (shared with `tg_bot` kind — same gate runs after every coder pass that writes `backend/bot.py`).
+
+## DB / Env / API
+
+- **Tables**: `projects(kind='tg_profile_bundle')`, `project_events`, `agent_boilerplates(id=18)`
+- **Workspace files** (post-scaffold, before coder):
+  - `/workspace/frontend/` — Vite + React 19 source (data-style picker)
+  - `/workspace/backend/bot.py` — aiogram 3, `BookFlow` FSM, `ask_llm()` helper
+  - `/workspace/backend/profile_loader.py` — fetches `scraped_*.json`, emits `profile.json`
+  - `/workspace/backend/requirements.txt` — aiogram>=3, requests
+  - `/workspace/backend/bot_token.txt` — written by `autoCreateTelegramBot`
+  - `/workspace/Procfile` — `web: bash scripts/build-profile.sh && … && python3 -m http.server 8080` + `bot: python3 -u backend/bot.py`
+  - `/workspace/scripts/build-profile.sh` — orchestrates profile_loader + npm build
+  - `/workspace/meetings.jsonl` — touch'd empty by scaffold, appended by bot
+  - `/workspace/.tools/designapi.py` — written by `wire_designapi` node (post-scaffold)
+- **Env**:
+  - `LOCAL_DEV_MODE=1` → all code-exec calls go through `src/mcp-servers/code-exec/helpers/local-exec.ts` instead of kubectl (`/workspace` resolves to a local tmpdir).
+  - `JARVIS_TG_ACCOUNT_ID` (default `4`) — which `tg_accounts.id` runs the scrape.
+  - `JARVIS_WORKSPACE_PROJECT_NAME` — workspace name used by single-target scrape (PR #224).
+- **Routes**: `POST /internal/projects/:id/admin-approve` triggers the full pipeline.
+- **MCP tools used by coder preset**: `code-exec` (write_file / exec), `self` (sentinel self-grep), `multimodal` (image_generate / image_edit / image_describe for the visitka hero).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `coder_did_nothing:scaffold_bot:coder-tg-profile-bundle` | `coder_did_nothing:scaffold_bot` in `project_events.payload` | Coder returned `files_written=[]` and `tools=[]`. Usually means the preset's `ls -la /workspace` first-call rule was followed but the agent decided everything was fine. Re-prompt or check `chat-tooluse` logs for tool failures. |
+| `coder_did_nothing:booking_flow:coder-tg-profile-bundle` | same as above, kind `booking_flow` | Same root cause. Brief now explicitly enumerates additions (cancel handler, owner notification, inline keyboard) so the agent has at least one extension to ship. |
+| **booking_flow rewrites to SQLite** (pre-2026-05-19 default of coder-backend) | `bookings.db` written, `meetings.jsonl` stays empty | **[FIXED 2026-05-19]** — preset moved from `coder-backend` to `coder-tg-profile-bundle` which bans SQLite migration in its system prompt. If you see this regress, check `agents.character.fallback_slugs` on the live `coder-tg-profile-bundle-*` row hasn't been corrupted to skip the preset. |
+| **scaffold_bot regenerates bot.py from scratch** (pre-2026-05-19 default of coder-tg-bot) | `git diff backend/bot.py` shows `BookFlow` class deleted | **[FIXED 2026-05-19]** — preset's ANTI-REGENERATE section mandates `ls -la /workspace` first call + bans `git clone lnlockly/telegram-bot-boilerplate`. Reseed via `re-instantiate-presets-from-json.ts` if a tenant row predates the fix. |
+| `unknown_project` from `write_file` in LOCAL_DEV_MODE | `code-exec: unknown_project requested=<name>` returned to LLM | tg-mcp side-channel write (auto-scrape result writer) couldn't resolve the project workspace. In LOCAL_DEV_MODE `assertProjectExists` reads from a local registry (`local-exec.ts`), not vcluster — if the project was created in a different shell session the local registry forgets it. Fix: restart `agents` server in same shell, OR pass `JARVIS_WORKSPACE_PROJECT_NAME` env explicitly. See `code-exec/index.ts:962,1131,1264,1403,1579,1760` for all 6 emit sites. |
+| `unknown_project` in production | same string, but pod is `agentflow-agents-*` | vCluster API-server cache lag (project StatefulSet just created, vcluster hasn't observed it yet). Retry-policy on `scrape_tg` covers it (`max:2, backoffMs:5000`). If it persists past 2 retries, check vcluster syncer health. |
+| `tg_visitka_scaffold_failed: exit=1` | same string in project_events | Heredoc bug in `buildScaffoldScript()` — usually a missing `mkdir -p` for nested path. See `architecture/visitka-tg-profile § Failure modes` for the index of subtypes. |
+| `__VISITKA_STYLE__` raw in `profile.json` | `grep '__VISITKA_STYLE__' /workspace/frontend/public/profile.json` returns ≥1 | `injectVisitkaStyle()` no-op'd. Covered by unit test `'scaffold: every style produces a profile_loader.py with NO __VISITKA_STYLE__ placeholder left'`. |
+| `SLOT:brief.*` raw in `backend/bot.py` after coder pass | sentinel-gate emits `unfilled_placeholder` audit verdict | Coder skipped the substitution step. Preset has a self-check section that requires `grep -c 'SLOT:brief'` == 0 before final `<reply>`. If it still leaks, the preset reseed didn't reach the live agent row — run `re-instantiate-presets-from-json.ts`. |
+| Coder calls OpenAI/Anthropic directly instead of designapi.py | `import openai` or `import anthropic` in `backend/bot.py` diff | Preset bans hardcoded model names + direct SDK calls. The only sanctioned LLM path is `subprocess(["python3", "/workspace/.tools/designapi.py", "--prompt", ...])`. |
+
+## LOCAL_DEV_MODE warning
+
+When `LOCAL_DEV_MODE=1`, the entire code-exec layer is shimmed by `src/mcp-servers/code-exec/helpers/local-exec.ts` — no kubectl, no vcluster, `/workspace` is a local tmpdir per project. Three implications for `tg_profile_bundle`:
+
+1. **`unknown_project` is more common.** Local registry is process-memory only. If you scrape via tg-mcp from one shell and run the graph from another, the second shell's `assertProjectExists` returns empty.
+2. **Procfile `web:` and `bot:` both run on host.** No port isolation — if you have two visitka projects in flight, the second `python3 -m http.server 8080` will EADDRINUSE. Local-exec auto-picks a free port for `web:`, but `bot:` uses the host's outbound IP for Telegram polling.
+3. **Scraped JSON may be absent.** `profile_loader.py` falls back to a `{}` profile and renders an empty visitka. The bot still works (greets `@handle` even with no bio) but the landing page looks broken. This is **expected** in local — production has Jarvis always running.
+
+## Related
+
+- [architecture/visitka-tg-profile](/architecture/visitka-tg-profile) — scaffold internals, style selector, INDEX_HTML root-cause history
+- [architecture/graph-executor](/architecture/graph-executor) — node retry / timeout / typed-error contract
+- [subsystems/agents](/subsystems/agents) — `fallback_slugs`, dispatch reroute, agent reseed mechanics
+- [subsystems/code-exec-mcp](/subsystems/code-exec-mcp) — `write_file`, `exec`, `unknown_project` source
+- [subsystems/brief-fidelity-supervisor](/subsystems/brief-fidelity-supervisor) — how `expects[]` flows into chat-tooluse self-check

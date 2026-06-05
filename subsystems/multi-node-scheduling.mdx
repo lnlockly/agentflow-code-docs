@@ -1,0 +1,97 @@
+---
+title: "Multi-node scheduling & cross-node networking"
+description: "How AgentFlow runs across many k3s nodes — Calico cross-node overlay, the cluster_nodes registry, and load-balancing via soft topology spread instead of hard node pins."
+---
+
+# Multi-node scheduling & cross-node networking
+
+## TL;DR
+The platform runs on a k3s cluster that can hold many nodes: one control node
+(`ubuntu` / ff-france) plus `light` worker nodes that run tenant pods. Pods
+balance across nodes via the default scheduler + soft `topologySpreadConstraints`
+— no hard node pins. Cross-node pod/service traffic rides a **Calico** overlay
+(BGP route distribution + IPIP encapsulation); if BGP peering or the IPIP port is
+firewalled, tenant pods on a worker can't reach `agentflow-postgres` and the
+background fleet dies silently, which is why core deploys were historically
+hard-pinned to `ubuntu`.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/k8s/agentflow-agents.yaml:161` | `agentflow-agents` (api) deploy — soft hostname spread, no node pin |
+| `agentflow-agents/k8s/agentflow-agents.yaml:470` | `agentflow-workers` (background fleet) deploy — soft hostname spread |
+| `agentflow-agents/k8s/bot-platform.yaml:55` | `bot-platform` deploy — soft hostname spread |
+| `agentflow-agents/.github/workflows/deploy.yml:371` | `kubectl apply -f k8s/agentflow-agents.yaml` — one apply rolls both deploys + clears manual node-affinity drift |
+| `agentflow-agents/src/routes/cluster.ts:55` | admin CRUD over `cluster_nodes` (`/me/cluster/nodes*`, gated `FF_CLUSTER=1`, admin-only) |
+| `agentflow-agents/src/db/schema.ts:3163` | `cluster_nodes` table — node registry (role `control`/`worker`, afclass `control`/`light`) |
+
+## Data flow
+```
+new pod (deploy replica / tenant workload via vcluster syncer)
+  → default-scheduler scores nodes by free CPU/MEM requests (LeastAllocated)
+  → topologySpreadConstraints (maxSkew 1, hostname, ScheduleAnyway)
+      nudges replicas onto different nodes; soft, so a full node never strands one
+  → lands on the emptier node (worker node2 while ubuntu is saturated)
+
+cross-node pod → ClusterIP service:
+  pod(node2, 192.168.244.x) → kube-proxy DNAT → backend pod(ubuntu, 192.168.243.x)
+    → Calico route `192.168.243.0/26 via 144.217.65.94 dev tunl0 proto bird`
+    → IPIP-encapsulated (IP proto 4) over the public link → ubuntu
+  routes learned via BGP node-mesh (must be `Established`)
+```
+
+## DB / Env / API
+- Tables: `cluster_nodes` (id, hostname, ip, role, afclass, status, capacity cols).
+- Env: `FF_CLUSTER=1` (enables `/me/cluster/*` API; ON in prod), `FF_CLUSTER_HEALTH`
+  (enables the 30s capacity sampler `cluster-health-worker`; currently OFF — capacity
+  columns stay NULL until set).
+- Routes: `GET/POST /me/cluster/nodes`, `PATCH /me/cluster/nodes/:id`,
+  `POST /me/cluster/nodes/:id/{drain,uncordon}`, `DELETE /me/cluster/nodes/:id`
+  (admin-only, user 1).
+- CNI: Calico v3.27.0, `k3s --flannel-backend=none`, IPPool `default-ipv4-ippool`
+  cidr `192.168.0.0/16`, `ipipMode=Always`, `vxlanMode=Never`. clusterType `k8s,bgp,kdd`.
+
+## Joining a worker node
+```bash
+# on the worker (wipe any prior k3s first): join as agent
+curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=<server-version> \
+  K3S_URL=https://<server-ip>:6443 K3S_TOKEN=<node-token> sh -
+# node-token: on the server at /var/lib/rancher/k3s/server/node-token
+# REQUIRED firewall: open full peer trust BOTH ways (BGP 179/tcp + IPIP proto-4
+# + kubelet 10250 all need it). ufw allow is per-source-IP:
+#   on server:  sudo ufw allow from <worker-ip>  comment k3s-peer
+#   on worker:  sudo ufw allow from <server-ip>  comment k3s-peer
+# then register it so the platform knows about it:
+curl -s -X POST $BASE/me/cluster/nodes -H "x-api-key: <owner-key>" \
+  -d '{"hostname":"<node>","ip":"<ip>","role":"worker","afclass":"light"}'
+curl -s -X PATCH $BASE/me/cluster/nodes/<id> -H "x-api-key: <owner-key>" -d '{"status":"ready"}'
+```
+Verify before trusting the node: `calico-node` DaemonSet pod on the new node must be
+`1/1` (not `0/1`), BGP peer `Established`, and an in-pod probe from a debug pod on
+the new node must reach a ClusterIP (e.g. `nc -z agentflow-postgres 5432`) AND
+`nslookup kubernetes.default`. A node that is `Ready` but can't network is worse than
+no node — pods schedule there and break.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Worker pods can't reach postgres; background fleet dies | `write CONNECT_TIMEOUT agentflow-postgres:5432` | open BGP 179 + IPIP proto-4 between node IPs (ufw peer-trust); confirm `calico-node` 1/1 + BGP `Established` |
+| Cross-node DNS fails from worker pods | `EAI_AGAIN` / `nslookup ... timed out` | same — Calico overlay / firewall; verify `nslookup kubernetes.default` from a debug pod on the worker |
+| `calico-node` stuck `0/1 Running` | `bird-ready` failing (readiness `-bird-ready`) | BGP can't peer → firewall is blocking 179/tcp between nodes |
+| New replica `Pending` while a worker sits idle | `FailedScheduling: ... didn't match Pod's node affinity/selector` | a hard `nodeSelector`/`nodeAffinity: hostname In [ubuntu]` pins it — replace with soft `topologySpreadConstraints` |
+| Live deploy has a node pin the repo manifest doesn't | (drift — manual `kubectl patch` during an incident) | `kubectl apply -f k8s/agentflow-agents.yaml` (deploy.yml) reconciles it away |
+
+## History
+2026-05-29: 2nd OVH worker (`ns518544` / 158.69.53.125) joined. The cross-node
+Calico overlay was broken (ufw `DROP` + no peer rule → BGP never peered,
+`calico-node` 0/1 on both nodes, IPIP routes missing). Fixed by opening full peer
+trust in ufw both ways → BGP `Established`, `tunl0` route installed, in-pod
+postgres ClusterIP + DNS verified from a node2 pod (ping 0.37ms — same DC). Then
+the historical hard pins (`agentflow-agents` node-affinity drift, `agentflow-workers`
++ `bot-platform` `nodeSelector: ubuntu`) were lifted to soft `topologySpreadConstraints`
+so replicas + future tenant pods balance across nodes.
+
+## Related
+- [Hosted device warm pool](/subsystems/hosted-device-warm-pool)
+- [Capacity / pod quota failure modes](/subsystems/hosted-daemon)
+- [Autonomous loop](/subsystems/autonomous-loop)

@@ -1,0 +1,113 @@
+---
+title: "Funnel bot (@agentflowbot)"
+description: "Cold-visitor scenario picker — 5 quick-reply questions in @agentflowbot, then a personalized scenario card with a UTM-tagged /start CTA."
+---
+
+# Funnel bot
+
+## TL;DR
+
+`@agentflowbot` now intercepts cold visitors before the legacy referral
+welcome. The funnel runs five short questions (role, blocker, hours,
+existing asset, freeform goal) with inline-keyboard quick replies, scores
+the user against the catalog in `agentflow-bot/data/funnel-scenarios.json`,
+and replies with a top scenario card plus a CTA to
+`/start?utm_source=tg_bot&utm_campaign=funnel&utm_content=<slug>`. Every
+step writes one row into the canonical `user_events` ledger via a new
+`POST /funnel-events` endpoint on agentflow-agents (secret-gated). Auto-
+trigger from `/start` is behind `FUNNEL_BOT_AUTOSTART=1`; the `/funnel`
+command always works.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-bot/src/bot/commands/funnel.ts:1` | FSM, keyboards, callback dispatch, pitch render |
+| `agentflow-bot/src/services/funnelScenarios.ts:1` | Catalog loader + `pickScenarios(answers)` scoring |
+| `agentflow-bot/src/services/funnelClient.ts:1` | Fire-and-forget POST → `/funnel-events` |
+| `agentflow-bot/data/funnel-scenarios.json:1` | 7-entry scenario catalog (ru copy) |
+| `agentflow-bot/src/bot/index.ts:188` | `/start` auto-trigger + `/funnel` command + callback dispatch |
+| `agentflow-bot/src/bot/index.ts:347` | Q5 text intercept in the message:text chain |
+| `agentflow-bot/src/index.ts:62` | `FunnelClient` construction at boot, wired into `buildBot` |
+| `agentflow-agents/src/routes/funnel.ts:1` | `POST /funnel-events` route |
+| `agentflow-agents/src/server.ts:128` | Mounts `funnelApp` |
+| `agentflow-agents/tests/funnel-events.test.ts:1` | Route validation tests |
+| `agentflow-bot/src/__tests__/funnel.test.ts:1` | FSM + pitch-render tests |
+| `agentflow-bot/src/__tests__/funnelScenarios.test.ts:1` | Scoring + anti-slop catalog tests |
+
+## Data flow
+
+```
+user → t.me/agentflowbot
+  └─► bot.command("start") with empty payload
+        ├─ FUNNEL_BOT_AUTOSTART=1 → tryAutoFunnel → hook message + KB
+        │      [Поехали] → fun:start  /  [Не сейчас] → fun:dismiss
+        ├─ q1 callback → state.role  → POST /funnel-events {step:q1, answer:role}
+        ├─ q2 callback → state.blocker
+        ├─ q3 callback → state.hours
+        ├─ q4 callback → state.asset
+        └─ q5 text intercept → state.freeform → pickScenarios(answers)
+              └─► reply: pitch card + URL btn "Открыть AgentFlow"
+                  (utm_source=tg_bot&utm_campaign=funnel&utm_content=<slug>)
+                  + "Показать другой вариант" → fun:other (top-2)
+
+bot → POST /funnel-events  (x-agentflow-secret = INTERNAL_SECRET)
+  body { tg_user_id, step, answer, scenario_shown? }
+    └─► INSERT user_events (kind: funnel_step | funnel_pitch,
+                            anon_id: 'tg:<id>',
+                            props: { step, answer, scenario_shown? })
+```
+
+In-memory FSM is keyed by `tg_user_id` with a 15-minute TTL. Map lives in
+`agentflow-bot/src/bot/commands/funnel.ts:48`. On bot restart the user
+loses their in-flight session and gets the hook again — durable progress
+isn't worth the storage cost for a 5-question flow.
+
+## DB / Env / API
+
+Tables: existing `user_events` (no new migration). New rows:
+- `kind = 'funnel_step'` for q1-q5, `funnel_pitch` for pitch deliveries.
+- `anon_id = 'tg:<tg_user_id>'` (joinable with `users.tg_id` after signup).
+- `props = { step, answer, scenario_shown? }`.
+
+Env (agentflow-bot):
+- `AGENTFLOW_AGENTS_INTERNAL_URL` — agents base, e.g. `https://agentflow.website/_agents`.
+- `AGENTFLOW_AGENTS_INTERNAL_SECRET` — shared `x-agentflow-secret`.
+- `FUNNEL_BOT_AUTOSTART` — `0|1` (default `0`). When `1`, `/start` without a
+  referral payload runs the funnel for brand-new users.
+
+Env (agentflow-agents):
+- `INTERNAL_SECRET` — same value the bot sends. Without it the route 401s
+  every request.
+
+Routes:
+- `POST /funnel-events` body `{ tg_user_id:number, step:string, answer:string, scenario_shown?:string }`.
+
+MCP tools: none.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Bot ignores Q2 after Q1 | `funnel-events: agents responded non-200` | `agentflow-bot/src/services/funnelClient.ts` — check INTERNAL_SECRET match |
+| `/funnel` silently does nothing | `funnel-events: fetch failed` | network or `AGENTFLOW_AGENTS_INTERNAL_URL` typo |
+| Pitch card has no UTM | `funnel: scenario_shown missing` | `pickScenarios` returned [] — add scenario for that role/blocker tuple |
+| No rows in user_events | `user_events table not migrated — funnel event dropped` | run migration `0065_user_events.sql` on the agents DB |
+| 401 from /funnel-events | `funnel-events: agents responded non-200` (status 401) | mismatched `INTERNAL_SECRET` |
+| User mid-Q5 gets AI chat reply instead of the freeform handler | `funnel: text intercept no state` | TTL expired (>15 min) — user must `/funnel` again |
+
+## Scenario catalog rules
+
+- Russian copy only.
+- No banned vocabulary: `really`, `simply`, `deeply`, `just`, `actually`,
+  `literally`, `бесплатн`, `free`. Tested in `funnelScenarios.test.ts`.
+- Tags split by `roles`, `blockers`, `assets`. Each tag list is optional.
+- New scenarios go to the end of the JSON array — `pickScenarios` uses
+  JSON order as the tie-break, so prepending alters existing results.
+
+## Related
+
+- [Funnel analytics](/subsystems/funnel-analytics) — the `user_events`
+  ledger and `/admin/funnel-stats` aggregation.
+- [Cabinet onboarding wizard](/subsystems/cabinet-onboarding) — the
+  follow-up post-signup wizard that picks up where the funnel left off.

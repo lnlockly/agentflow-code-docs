@@ -23,8 +23,9 @@ description: "Что происходит между approve project и done, к
 | Path | Role |
 |---|---|
 | `agentflow-agents/src/services/env.ts` | Parse `ffGraphExecutor` (1/0) + `ffGraphExecutorKinds` (CSV) |
-| `agentflow-agents/src/services/projects-pipeline.ts` | `isGraphExecutorEnabledFor(kind)` + `approveProject` fork |
-| `agentflow-agents/src/services/projects.ts:2293` | `runProjectApprovalBackground` branch: walker vs maestro |
+| `agentflow-agents/src/services/graph-executor-routing.ts` | `resolveGraphExecutorRouting(kind)` — single resolver: master flag + allowlist + `FORCE_GRAPH_KINDS` (tg_profile_bundle, tg_farm). Returns `{useGraphExecutor, reason}`. |
+| `agentflow-agents/src/services/projects-pipeline.ts` | `approveProject` calls `resolveGraphExecutorRouting`. Re-exports `isGraphExecutorEnabledFor` / `isGraphExecutorMasterEnabled` / `FORCE_GRAPH_KINDS` for back-compat. |
+| `agentflow-agents/src/services/projects.ts` | `runProjectApprovalBackground` resolves routing itself when caller omits `useGraphExecutor` (fixes retry-pinger / TG approve / internal script callers that previously defaulted to false). |
 | `agentflow-agents/src/services/projects.ts:2313` | `runGraphExecutorDispatch` — load workflow_schema, drain walker, flip status |
 | `agentflow-agents/src/services/graph-executor/index.ts` | `runGraphExecutor` (AsyncGenerator) + `runGraphExecutorToCompletion` |
 | `agentflow-agents/src/services/graph-executor/walker.ts` | Topo + retry + per-node Abort + cycle detect |
@@ -41,9 +42,12 @@ description: "Что происходит между approve project и done, к
 POST /me/projects/:id/approve
    ↓
 approveProject (projects-pipeline.ts)
-   ↓ isGraphExecutorEnabledFor(kind) === true → useGraphExecutor=true
+   ↓ resolveGraphExecutorRouting(kind) → {useGraphExecutor, reason}
+   ↓   reasons: allowlist_match | force_kind | master_off | kind_not_allowlisted | no_kind
    ↓
-runProjectApprovalBackground (projects.ts:1682, useGraphExecutor flag)
+runProjectApprovalBackground (projects.ts, accepts useGraphExecutor OR re-resolves itself)
+   ↓ if caller omits flag → re-runs resolveGraphExecutorRouting from projects.kind
+   ↓ emits routing_reason in approval_in_flight + approval_provisioned events
    ↓ workspace provisioning (unchanged from maestro path)
    ↓ workspace_ready event
    ↓
@@ -100,6 +104,7 @@ runGraphExecutorDispatch finishes:
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
 | FF on but kind ignores walker | `[graph-executor] kind <x> not in FF_GRAPH_EXECUTOR_KINDS` | Add kind to `FF_GRAPH_EXECUTOR_KINDS` env var |
+| tg_profile_bundle / tg_farm project shipped real SPA but flipped to `status='failed'` after retry | `approval_in_flight` event has `use_graph_executor: false` followed by `execute_in_team_failed: ... "error":"capability_mismatch"` | Caller of `runProjectApprovalBackground` omitted `useGraphExecutor`. Function now self-resolves via `resolveGraphExecutorRouting` — verify by grep-ing `routing_reason` in the new approval events. |
 | Walker enabled but kind has no schema | `[graph-executor] no workflow_schema for kind=<kind>` | `agentflow-agents/src/scripts/seed-boilerplate-workflows.ts` — add the seed row |
 | workflow_schema malformed | `ZodError` thrown from `workflowSchemaSchema.parse` (surfaces as `[graph-executor] dispatch_threw`) | Fix the boilerplate row; nodes need `id`, edges need `from`+`to` |
 | Cycle in graph | `[graph-executor] cycle_detected nodes=[a,b]` | Edge points back to ancestor; remove or invert |

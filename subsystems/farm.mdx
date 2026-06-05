@@ -1,0 +1,193 @@
+---
+title: "Contact Farm"
+description: "Owner-scoped contact-messaging farm — /me/farm/* endpoints wrap the tg_farm project template (tg-cold-mailer boilerplate) that runs the real MTProto workflow."
+---
+
+# Contact Farm
+
+## TL;DR
+
+Per-user "contact farm" feature. Refactored 2026-05-15 to stop duplicating
+work: `/me/farm/start` no longer flips a status row and prays a stub worker
+does the sending — it now spawns a real `tg_farm` project using the
+`tg-cold-mailer` boilerplate. That project drives the canonical workflow
+`link_account → import_leads → personalize_template → throttled_send →
+log_replies`, running on the user's connected MTProto account via tg-mcp.
+The legacy stub worker (`services/farm-send-worker.ts`) is feature-flagged
+off; set `FF_FARM_LEGACY_WORKER=1` to re-enable for emergency rollback only.
+
+The farm's `status` column is the canonical source for the
+`farm_activated` funnel stage in [Funnel analytics](/subsystems/funnel-analytics)
+and the `farm_activated` state in [Reminders v2](/subsystems/reminders-v2).
+The linked project id (`user_farms.project_id`) is the deep-link target
+from the `/farm` UI into `/projects/:slug`.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/db/schema.ts:2479` | `userFarms` Drizzle table — now includes `projectId` FK → projects(id) |
+| `agentflow-agents/src/db/schema.ts:2510` | `farmStats` Drizzle table — counters per user |
+| `agentflow-agents/src/db/schema.ts:2537` | `farmSendLog` Drizzle table — per-send audit trail (real `throttled_send` handler INSERTs here) |
+| `agentflow-agents/migrations/2026-05-15f-user-farms-project-link.sql` | Adds `project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL` + `idx_user_farms_project` |
+| `agentflow-agents/migrations/2026-05-13-diploma-boilerplate.sql:33` | Inserts the `diploma-outreach-build` boilerplate (kind=tg_farm) — 11-node pitch→visitka/bot funnel, the historic default for tg_farm projects |
+| `agentflow-agents/migrations/2026-05-13-tg-templates-v2.sql:144` | Inserts the `tg-cold-mailer` boilerplate row (kind=tg_farm) — 5-node link_account → import_leads → personalize → throttled_send → log_replies. The broadcast/list-of-chats schema. |
+| `agentflow-agents/migrations/2026-05-13-tg-templates-v2.sql:194` | Inserts the `tg-ai-shiller` boilerplate (kind=tg_farm) — 5-node keyword-monitor + AI auto-reply |
+| `agentflow-agents/src/services/graph-executor/pick-workflow-schema.ts:pickTgFarmSchema` | Brief-keyword router that picks between the three tg_farm boilerplates (see "Brief routing" below) |
+| `agentflow-agents/src/services/graph-executor/pick-workflow-schema.ts:classifyTgFarmBriefIntent` | Pure regex classifier — returns `'tg-cold-mailer'` / `'tg-ai-shiller'` / `null` for default funnel |
+| `agentflow-agents/src/services/tg-farm-spawn.ts` | `spawnFarmProject(userId)` — idempotent project creator used by /me/farm/start (skips paid-gate, fires Maestro propose) |
+| `agentflow-agents/src/services/tg-farm-spawn.ts:findActiveFarmProject` | Look up the user's existing tg_farm project (status in draft/awaiting_approval/approved/running) |
+| `agentflow-agents/src/services/graph-executor/handlers/tg-marketing.ts:88` | `link_account` handler — Telethon/GramJS session bootstrap (idempotent) |
+| `agentflow-agents/src/services/graph-executor/handlers/tg-marketing.ts:98` | `import_leads` handler |
+| `agentflow-agents/src/services/graph-executor/handlers/tg-marketing.ts:105` | `personalize_template` handler — useModel(TEXT_LARGE), 400-char cap |
+| `agentflow-agents/src/services/graph-executor/handlers/tg-marketing.ts:113` | `throttled_send` handler — anti-ban (30-90s jitter, daily cap, pause every 10 sends) |
+| `agentflow-agents/src/services/graph-executor/handlers/tg-marketing.ts:121` | `log_replies` handler — POST /internal/tg/lead-states |
+| `agentflow-agents/src/routes/farm.ts` | Hono `app` for `/me/farm/*` — refactored to spawn-or-reuse |
+| `agentflow-agents/src/routes/farm.ts:GET /me/farm/stats` | reads `farm_send_log` aggregates + linked project metadata |
+| `agentflow-agents/src/routes/farm.ts:POST /me/farm/start` | tg-link gate → spawnFarmProject → upsert `user_farms.{status,project_id}` |
+| `agentflow-agents/src/routes/farm.ts:POST /me/farm/pause` | flip user_farms.status='paused' (project stays alive) |
+| `agentflow-agents/src/routes/farm.ts:POST /me/farm/toggle` | active↔paused; activating routes through spawnFarmProject |
+| `agentflow-agents/src/services/farm-send-worker.ts` | DEPRECATED stub. Default-disabled; opt-in via `FF_FARM_LEGACY_WORKER=1` |
+| `agentflow-agents/src/services/farm-send-worker.ts:previewFarmContacts` | Still used by GET /me/farm/contacts (pre-link preview) |
+| `agentflow-agents/src/server.ts:310` | `startFarmSendWorker()` — now no-ops unless `FF_FARM_LEGACY_WORKER=1` |
+| `agentflow-landing/src/pages/FarmPage.tsx:170` | `/farm` route — dashboard + connect-TG block |
+
+## Data flow
+
+```
+                  user clicks "Запустить ферму"
+                              │
+                              ▼
+                  POST /me/farm/start  (session auth)
+                              │
+                              ▼
+                  ┌─ tg_links row exists for user? ─ no ─► 412 tg_not_connected
+                  │ yes
+                  ▼
+                  findActiveFarmProject(userId)
+                    SELECT * FROM projects
+                    WHERE owner_user_id=? AND kind='tg_farm'
+                      AND status IN (draft, awaiting_approval, approved, running)
+                  │
+                  ├─ found  ─► reused=true, skip insert
+                  ▼
+                  spawnFarmProject:
+                    - ensurePersonalTeam(userId)
+                    - INSERT projects (kind='tg_farm', brief=buildFarmBrief, …)
+                    - appendProjectEvent(brief / project_created / maestro_thinking)
+                    - runMaestroProposeBackground → propose_project_plan
+                  │
+                  ▼
+                  UPSERT user_farms { user_id, status='active', project_id }
+                  INSERT IGNORE farm_stats { user_id }
+                  │
+                  ▼
+                  { ok, reused, project: { id, slug, title, status, kind, preview_url } }
+
+  graph-executor walker on the tg_farm project (after user clicks Approve):
+    workflow_schema.nodes from `tg-cold-mailer` boilerplate
+    → link_account → import_leads → personalize_template
+      → throttled_send → log_replies
+    each → typed handler in tg-marketing.ts → coderInvoke('coder-tg-farm')
+    runtime workers (Python/Telethon) write farm_send_log rows
+```
+
+`GET /me/farm/stats` joins `user_farms` + `farm_stats` + a live
+`farm_send_log` aggregate (`sent_total`, `sent_today`, `last_run_at`) so
+the dashboard stays accurate even when the worker's stats writes lag.
+Also returns the linked project shape so the UI can render
+"Открыть проект →".
+
+## DB / Env / API
+
+- Tables:
+  - `user_farms (id, user_id UNIQUE, status, message_template, send_hour, project_id FK→projects(id) ON DELETE SET NULL, created_at, updated_at)`
+  - `farm_stats (id, user_id UNIQUE, contacts_count, sent_total, sent_today, registrations, flow_earned, last_run_at, updated_at)`
+  - `farm_send_log (id, user_id FK→users ON DELETE CASCADE, contact_id, status, sent_at, error)` — index `idx_farm_send_log_user_time(user_id, sent_at DESC)`
+- Indexes: `user_farms_user_id_idx` UNIQUE, `idx_user_farms_project` (new)
+- Status enum: `'inactive' | 'active' | 'paused'` for farms; `'sent' | 'failed' | 'stub'` for `farm_send_log.status`
+- Env:
+  - `FF_FARM_LEGACY_WORKER` — opt-in flag (`=1`) to re-enable the deprecated stub worker; default OFF
+  - `FF_FARM_WORKER` — legacy gate (only checked when `FF_FARM_LEGACY_WORKER=1`)
+  - `FF_FARM_TICK_MS` — override interval when running the legacy worker
+- Routes (all `requireSession`, user_id = session.sub):
+  - `GET /me/farm/stats` → `{ ok, farm: { …status, counters, last_run_at, project_id, project } }`
+  - `GET /me/farm/contacts` → `{ ok, mode: 'stub' | 'real', total, contacts, recent }`
+  - `POST /me/farm/start` → `{ ok, reused, project }` or `412 tg_not_connected` / `500 project_spawn_failed`
+  - `POST /me/farm/pause` → stats payload
+  - `POST /me/farm/toggle` → stats payload OR `{ ok, reused, project }` when activating
+
+## Brief routing (kind=tg_farm)
+
+Three boilerplates share `kind=tg_farm`. Before PR
+`fix/tg-farm-broadcast-routing-2026-05-18` the picker did `LIMIT 1`
+ordered by row id, so every tg_farm brief got the diploma funnel — the
+broadcast/list-of-chats brief on project 996 never saw the cold-mailer's
+`import_leads` / `throttled_send` nodes. See
+`qa-issues/2026-05-18-tg-farm-broadcast-ui-missing.md`.
+
+`pickTgFarmSchema` now loads every tg_farm row, runs
+`classifyTgFarmBriefIntent(brief)` against the brief, and picks:
+
+| Brief signal | Boilerplate | Reason emitted |
+|---|---|---|
+| `broadcast`, `рассылка`, `список чатов`, `cold-mail(ing/er)`, `mass send`, `bulk dm`, `csv import`, `lead list`, `разослать` | `tg-cold-mailer` | `tg_farm_broadcast_route` |
+| `ai-shill(er)`, `keyword monitor`, `chat watcher`, `шиллинг`, `отвечать в чатах по ключевым словам`, `мониторинг чатов по ключевым` | `tg-ai-shiller` | `tg_farm_shill_route` |
+| neither (bare `ферма`, generic outreach, etc.) | `diploma-outreach-build` | `tg_farm_funnel_default` |
+| no recognised name in DB (drift) | first row by insertion order | `matched` |
+
+The reasons are emitted as `log` `project_events.payload.msg` at fast-path
+time (`[fast-path] kind=tg_farm skipped maestro propose — reason=…`) so
+ops can grep prod logs and confirm a project ran the right schema.
+
+## Anti-spam rails
+
+Enforced inside the `throttled_send` handler scaffold (see
+`graph-executor/handlers/tg-marketing.ts:113`):
+
+- 30–90s uniform jitter between sends
+- Daily cap (`DAILY_DM_CAP` env, default 30) — UI / FarmPage talks about 5/day,
+  but the runtime ceiling is wider so warmed accounts can ramp up. The
+  conservative 5/day visible in the legacy stub remains a guideline for
+  first-day onboarding; the runtime worker should honour `DAILY_DM_CAP`
+  from project secrets.
+- 5–15 min pause after every 10 sends
+- 30-day no-repeat per peer (handled in `db/leads.sqlite` by the runtime)
+- Message body MUST include the disclaimer
+  `(это разовое сообщение, отвечать не обязательно)` — baked into
+  `buildFarmBrief` so Maestro forwards the rule to the coder.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `/me/farm/start` returns `412 tg_not_connected` | n/a (handled at handler level) | User hasn't run TG kickstart flow — show /account/settings link |
+| 412 even after `/me/tg-accounts/confirm-code` succeeded | `tg_farm_missing_account` in projects.ts dispatcher | Two root causes (fixed 2026-05-19): (1) `mcpDirect.callTool` returns the MCP envelope so `result?.status` was always undefined → confirm-code never hit the success branch. (2) Even when active, confirm-code didn't INSERT into `tg_links` — only the bot-deeplink flow did. See `routes/tg-accounts.ts` `unwrapMcp` + tg_links upsert |
+| `/me/farm/start` returns `500 project_spawn_failed` | `slug_collision` or `db_insert_failed` | Inspect Postgres connection + rerun; spawn is idempotent on the user_id side via `findActiveFarmProject` |
+| Multiple tg_farm projects per user | n/a | `findActiveFarmProject` filter is by status set; failed/cancelled rows are ignored intentionally so the user can restart after a bad run |
+| FarmPage stuck on mock | `MOCK_STATS` fallback in `FarmPage.tsx:37` | `/me/farm/stats` 401/500 — check auth + agentsBaseUrl |
+| Counters not moving | `farm_send_log` rows never insert | Inspect the tg_farm project's plan_tasks + project_events — the runtime worker writes the rows. `coder-tg-farm` slug must be alive |
+| Legacy stub still running | `farm-send: due farms` after deploy | `FF_FARM_LEGACY_WORKER` env was set to `1` somewhere — unset it |
+| Worker booted in production by accident | `farm-send worker started` | Same — should print `FF_FARM_LEGACY_WORKER!=1 — legacy farm-send worker disabled` instead |
+| User sees "Открыть проект" but link 404s | `user_farms.project_id` points to a deleted row | The FK is `ON DELETE SET NULL`; project deletion should null it. Next /me/farm/start spawns a new one |
+| Broadcast brief shipped the diploma funnel instead of cold-mailer | `[fast-path] kind=tg_farm skipped maestro propose — reason=tg_farm_funnel_default` against a brief mentioning рассылка/broadcast | `classifyTgFarmBriefIntent` regex missed the trigger — extend the cold-mailer pattern in `pick-workflow-schema.ts` + add a unit test in `tests/services/pick-workflow-schema.test.ts` |
+| `tg_farm` project stuck because no boilerplate row exists | `[fast-path] no_schema kind=tg_farm reason=no_boilerplate — kicking maestro` | Re-run the seed migrations (`2026-05-13-diploma-boilerplate.sql`, `2026-05-13-tg-templates-v2.sql`) against the prod DB |
+
+## Backlog
+
+- **Pause underlying project workflow** — `/me/farm/pause` flips
+  `user_farms.status` only. Should also pause the linked project's
+  scheduled workflow ticks (no canonical pause primitive on
+  `projects` today; `status='paused'` isn't in the enum).
+- **Promote tg_farm to first-class flag in UI** — once the workflow is
+  visible inside the project workspace, drop the standalone FarmPage and
+  link `/farm` directly into `/projects/:slug`.
+- **Per-user daily cap override** — expose `farm.daily_cap` in
+  project_secrets so the runtime reads it instead of the env default.
+
+## Related
+
+- [TG templates matrix](/architecture/tg-templates) — canonical list of TG-flavoured boilerplates incl. tg-cold-mailer / tg-ai-shiller
+- [Funnel analytics](/subsystems/funnel-analytics) — `farm_activated` stage
+- [Reminders v2](/subsystems/reminders-v2) — `farm_activated` user state
+- [Graph executor](/architecture/graph-executor) — runtime that walks the tg-cold-mailer workflow_schema
