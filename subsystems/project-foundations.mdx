@@ -1,0 +1,354 @@
+---
+title: "Project Foundations — GitHub Starter Recommender"
+description: "How POST /me/project-foundations/recommend ranks 24 curated GitHub templates + LLM proposals for a user's project brief"
+---
+
+# Project Foundations
+
+:::caution[Deprecated — старая архитектура]
+Этот раздел про старую архитектуру с 24 curated GitHub templates + kind-классификатором. Новый flow создания проектов (AI-ранжированный live GitHub Code Search, без курируемого списка) описан в [`subsystems/projects`](/subsystems/projects/) (approved 2026-05-25).
+:::
+
+## TL;DR
+
+When a user creates a project, the backend recommends a GitHub starter
+template (foundation) that matches their brief. The recommender combines
+two streams: an **LLM proposer** that suggests 5 plausible repos, and a
+**curated list of 24 hand-picked templates** ranked by an LLM semantic
+scorer (`TEXT_SMALL`, 1 call for the whole list). Results are merged,
+enriched via GitHub REST, scored on stars + recency + token overlap, and
+the top 15 are returned. `POST /me/projects` defaults to `mode='github_repo'`
+with the top recommendation when the client passes no `selected_foundation`.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/curated-foundations.ts:41` | The 24-entry `CURATED_FOUNDATIONS` list + `matchesCuratedFoundation` substring matcher (fallback) |
+| `agentflow-agents/src/services/foundation-llm-scorer.ts:170` | `scoreCuratedFoundations` — single LLM call ranks curated entries 0-10 for the brief, 5-min cache |
+| `agentflow-agents/src/services/scoring-tweaks.ts:1` | Deterministic bonus matrix: curated bias (+3), anti-monorepo (-4), domain keyword match (+5) |
+| `agentflow-agents/src/services/foundation-structural-filter.ts:1` | **Structural probe + hard-reject** — `deriveStructuralSignals`, `decideHardReject`, `structuralBias`, `shouldUseMarketingCuratedBypass`, `pickCuratedBypassList`, `isMlmBrief`, `parseMajor` (Next major-version parser), `MARKETING_CURATED_LIST` (5-entry generic Next.js list), `MLM_CURATED_LIST` (golden-connect only). Hard-reject reasons include `next_config_ts_unsupported` (orphan `next.config.ts` + Next < 15). |
+| `agentflow-agents/src/services/graph-executor/handlers/spa.ts` (`_transpile_next_config_ts`) | SPA foundation bridge: after the clone, transpiles orphan `next.config.ts` → `next.config.mjs` via sed pipeline (strips type imports + annotations). Falls back to stub `export default {};` on sed failure. Runs over `/workspace` root AND `$APP_DIR` BEFORE Procfile generation. Salvages already-cloned legacy workspaces. |
+| `agentflow-agents/tests/unit/foundation-bridge-nextconfig.test.ts` | Source-contract tests pinning the bridge transpile shell snippet (function definition, ordering before Procfile, orphan removal, sed clauses, stub fallback, `.bak` backup). |
+| `agentflow-agents/tests/unit/scoring-next-config-ts.test.ts` | Signal + decision tests for the `next_config_ts_unsupported` reject reason (Next 14 reject, Next 15 accept, sibling `.mjs` accept, unknown-version accept). |
+| `agentflow-agents/src/services/project-foundations.ts:406` | `recommendProjectFoundations` — orchestrates marketing-bypass → LLM proposer → LLM scorer → GitHub enrichment → structural filter → scoring tweaks |
+| `agentflow-agents/src/routes/projects.ts:734` | `POST /me/project-foundations/recommend` (returns up to 15 candidates) |
+| `agentflow-agents/src/routes/projects.ts:815` | `POST /me/projects` default-foundation resolution (no scratch unless `ALLOW_SCRATCH_FOUNDATION=1`) |
+| `agentflow-agents/tests/unit/curated-foundations.test.ts:1` | 20 matcher + integration tests |
+| `agentflow-agents/tests/unit/foundation-llm-scorer.test.ts:1` | 8 scorer tests with injected LLM stub |
+| `agentflow-agents/tests/unit/scoring-tweaks.test.ts:1` | 17 bonus-matrix tests (curated bias, monorepo penalty, domain match) |
+| `agentflow-agents/tests/unit/project-foundations-recommend.test.ts:1` | End-to-end recommend tests with injected LLM + fetch |
+| `agentflow-agents/tests/unit/scoring-monorepo-reject.test.ts:1` | 28 structural-filter tests (signals, hard-reject, bias, marketing bypass, integration with 3 known-bad briefs) |
+
+## Data flow
+
+```
+POST /me/project-foundations/recommend {brief, mode:"github_first", kind_hint}
+  │
+  ▼
+recommendProjectFoundations(input)
+  │
+  ├─► shouldUseMarketingCuratedBypass(brief, kind)
+  │     │  kind=landing || kind=mlm || MARKETING_INTENT_RX matches brief
+  │     │  (кофейн, лендинг, меню, услуги, прайс, портфолио, restaurant, …)
+  │     │  OR isMlmBrief(brief) → true.
+  │     │
+  │     │  YES → skip LLM proposer + scorer; synthesise curated hits from
+  │     │        pickCuratedBypassList(brief, kind):
+  │     │          - isMlmBrief → MLM_CURATED_LIST (golden-connect ONLY)
+  │     │          - else        → MARKETING_CURATED_LIST (5 generic Next.js
+  │     │                          templates, NO golden-connect)
+  │     │
+  │     │  NO  → fall through to the usual proposer + scorer chain
+  │
+  ├─► MLM gate (after curated + LLM proposer merge)
+  │     │  if !isMlmBrief(brief, kind):
+  │     │    drop any candidate equal to `lnlockly/golden-connect-template`
+  │     │    log: `[foundation-scorer] mlm_gate dropped=...`
+  │     │  Defence-in-depth — gate runs even when curated bypass is off (so the
+  │     │  LLM proposer can't smuggle golden-connect into a non-MLM brief).
+  │
+  ├─► proposeWithLlm (TEXT_LARGE)     → up to 8 LLM-proposed GitHub repos
+  │     (skipped on marketing bypass)
+  │
+  ├─► scoreCuratedFoundations (TEXT_SMALL)
+  │     │  (skipped on marketing bypass — synthetic hits used instead)
+  │     │
+  │     │  one call: scores all 24 curated entries 0-10 for the brief
+  │     │  drops < 4, keeps top 15, cached 5min by sha1(brief|kind_hint)
+  │     │
+  │     └─► fallback: matchesCuratedFoundation (substring match)
+  │                   on LLM-down / parse-error
+  │
+  ├─► merge + de-dupe by repo_full_name (lowercase)
+  │
+  ├─► fetchRepoMeta + fetchPackageJson + fetchRootContents (parallel GitHub REST)
+  │     │   404 = swallowed (LLM hallucinated)
+  │     │
+  ├─► deriveStructuralSignals(meta, pkg_json, root_contents)
+  │     │   is_monorepo, is_app_template, is_desktop_app, is_framework_source,
+  │     │   has_workspace_dev_script, has_single_package_dev_script
+  │     │
+  ├─► decideHardReject(kind, signals)
+  │     │   for kind ∈ {spa, landing, marketing_site, web_app}:
+  │     │     is_framework_source       → REJECT (any kind)
+  │     │     is_desktop_app            → REJECT (electron/RN/expo)
+  │     │     is_monorepo && !is_app_template → REJECT (turbo/workspaces)
+  │     │   log: `[foundation-scorer] hard_reject reason=<x> candidate=<repo>`
+  │     │
+  ▼     ▼
+scoreCandidate(meta, stack, tags, briefTokens)
+  │   base = log10(stars+1) + recency_bonus + overlap_bonus
+  │   + 0.4 × llm_relevance_score (cap +4)
+  │   + scoringBonus(repo, brief, isCurated):
+  │       curated → +3.0
+  │       monorepo blacklist (vercel/next.js, supabase/supabase, ...) → -4.0
+  │       domain keyword match (MLM, e-commerce, AI chat, …) → +5.0
+  │   + structuralBias(kind, signals):
+  │       is_app_template → +5
+  │       has_single_package_dev_script → +3
+  │       has_workspace_dev_script → -5
+  ▼
+sort desc, slice top 15 → 1h LRU cache → response
+```
+
+### Structural hard-reject — why
+
+Live incidents 2026-05-22:
+
+- Brief «лендинг для кофейни» → scorer picked `calcom/cal.diy` (turbo monorepo,
+  22 packages). `next build && next start` died on
+  `@calcom/web@workspace:apps/web doesn't provide @prisma/client`.
+- Brief "todo app" → `streetwriters/notesnook` (Electron, not a SPA).
+- Brief "PetCare" → `vercel/next.js` (framework source — `turbo run build`
+  hangs for the whole framework).
+
+PR #708 added a 20-entry `MONOREPO_BLACKLIST`. That's incomplete by
+construction. The structural probe replaces enumerate-and-blacklist with a
+deterministic decision on package.json + root contents: workspaces, turbo.json,
+apps/, electron dep, app/ router. The few legit monorepo templates (eg
+`vercel/commerce`) carry `app/` at root and pass via `is_app_template`.
+
+## Default foundation on POST /me/projects
+
+```
+client POSTs /me/projects {brief}            no selected_foundation
+  │
+  ▼
+recommendProjectFoundations({brief, mode:'github_first'})
+  │
+  ├── pick = candidates[0]
+  │   exists ? → selected_foundation = { mode:'github_repo', repo, url, ref }
+  │
+  └── empty result
+      │
+      ├── ALLOW_SCRATCH_FOUNDATION=1 → mode='scratch'
+      │
+      └── default                    → mode='github_repo',
+                                       repo = steven-tey/precedent (placeholder;
+                                       bg runner overwrites with recommender pick)
+```
+
+**Fallback repo (2026-05-22):** the sync path stamps `steven-tey/precedent` —
+a clean single-page Next.js + Tailwind + auth starter — as the placeholder
+foundation. The previous fallback was `lnlockly/golden-connect-template`, an
+MLM-specific landing. Owner caught this routing every brief (кофейн, yoga,
+barbershop) through a Monar-clone visual when the bg runner failed or the
+project was inspected before the swap.
+
+## DB / Env / API
+
+- **Tables:** `projects.foundation_mode`, `projects.foundation_repo_url`,
+  `projects.foundation_repo_full_name`, `projects.foundation_ref`,
+  `projects.foundation_snapshot` (jsonb).
+- **Env:**
+  - `GITHUB_TOKEN` — REST auth (optional; rate limit is the only impact).
+  - `ALLOW_SCRATCH_FOUNDATION=1` — opt-in scratch fallback. Default OFF;
+    we always pick `github_repo` with a fallback foundation to avoid
+    empty workspace projects.
+- **Routes:**
+  - `POST /me/project-foundations/recommend` — wizard call.
+  - `POST /me/projects` — create; resolves foundation from input or
+    recommender.
+- **Cache:**
+  - `project-foundations.ts` — sha1(brief|mode|kind_hint), 1h TTL, 100 max.
+  - `foundation-llm-scorer.ts` — sha1(brief|kind_hint), 5min TTL, 100 max.
+
+## MLM gate (2026-05-22)
+
+`lnlockly/golden-connect-template` is gated behind explicit MLM-intent detection.
+
+- `isMlmBrief({brief, kind})` returns true when:
+  - `kind === 'mlm'`, OR
+  - brief matches `MLM_KEYWORDS_RX` (MLM, МЛМ, multi-level marketing,
+    network marketing, downline/upline, реферальная сеть, pyramid plan,
+    Monar, Golden Connect, …).
+- When `isMlmBrief === false`, every layer drops the template:
+  - `pickCuratedBypassList` returns `MARKETING_CURATED_LIST` (no
+    golden-connect) for marketing-intent briefs.
+  - `recommendProjectFoundations` filters golden-connect out of curated
+    hits and out of the merged candidate set, even if the LLM proposer
+    suggests it.
+- `curated-foundations.ts` narrows the template's `kinds` to `['mlm']`
+  and its `keywords` to strict MLM language — broad terms like `team`,
+  `community`, `сообщество` were causing collateral matches on cafe /
+  yoga / barbershop briefs.
+
+The LLM scorer's system prompt has a matching HARD GATE clause: score
+golden-connect 0-1 for non-MLM briefs.
+
+### Vertical → template map (`scoring-tweaks.ts`)
+
+`VERTICAL_TEMPLATE_MAP` and `detectVertical(brief)` provide a coarse
+business-vertical taxonomy → preferred Next.js templates. Used in
+diagnostic logging and as a future hook for the scorer.
+
+| Vertical | Templates |
+|---|---|
+| `coffee_restaurant` | `steven-tey/precedent`, `shadcn-ui/taxonomy` |
+| `fitness_wellness` | `steven-tey/precedent`, `shadcn-ui/taxonomy` |
+| `beauty_salon` | `steven-tey/precedent`, `shadcn-ui/taxonomy` |
+| `course_education` | `mickasmt/next-saas-stripe-starter`, `steven-tey/precedent` |
+| `dashboard_saas` | `shadcn-ui/taxonomy`, `mickasmt/next-saas-stripe-starter` |
+| `ecommerce_shop` | `vercel/commerce`, `saleor/storefront` |
+| `mlm_referral` | `lnlockly/golden-connect-template` |
+| `default` | `steven-tey/precedent`, `shadcn-ui/taxonomy` |
+
+Only `mlm_referral` points at golden-connect — enforced by a unit test
+(`scoring-no-golden-connect.test.ts`).
+
+## Curated list (24 entries, 2026-05-22)
+
+| Niche | Repo |
+|---|---|
+| AgentFlow MLM (kinds=['mlm'] only) | `lnlockly/golden-connect-template` |
+| SaaS / Stripe | `mickasmt/next-saas-stripe-starter`, `vercel/nextjs-subscription-payments` |
+| Auth-heavy | `steven-tey/precedent`, `nextauthjs/next-auth-example` |
+| Content / Blog | `shadcn-ui/taxonomy`, `vercel/platforms`, `vercel/next.js` |
+| E-commerce | `vercel/commerce`, `saleor/storefront` |
+| AI / LLM | `mckaywrigley/chatbot-ui`, `vercel/chatbot`, `a16z-infra/companion-app`, `run-llama/create-llama` |
+| Productivity | `streetwriters/notesnook`, `ueberdosis/tiptap` |
+| Forms / E-sign | `formbricks/formbricks`, `documenso/documenso` |
+| Booking | `calcom/cal.diy` |
+| Telegram | `aiogram/aiogram`, `Telegram-Mini-Apps/tma.js` |
+| Utility | `vitejs/vite`, `wallabag/wallabag` |
+| Backend ref | `supabase/supabase` |
+
+All 24 verified 200 OK on `https://api.github.com/repos/<owner>/<name>`
+(2026-05-22). Redirected names resolved at verification time:
+`vercel/ai-chatbot` → `vercel/chatbot`, `calcom/cal.com` → `calcom/cal.diy`.
+
+## next.config.ts handling (2026-05-22)
+
+Next.js 14.x does not support `next.config.ts`. Foundations that ship a
+TypeScript config and pin `next < 15` crashed every project that cloned them:
+
+```
+Error: Configuring Next.js via 'next.config.ts' is not supported.
+Please replace the file with 'next.config.js' or 'next.config.mjs'.
+    at loadConfig (.../next/dist/server/config.js:787:19)
+```
+
+Live incident: projects 1388-1392 (2026-05-22) all on
+`vercel/nextjs-subscription-payments` (next@14.2.3, ships `next.config.ts`)
+never bound the preview port.
+
+Defence in depth — both layers ship together:
+
+### Layer 1 — scorer hard-reject (prevent new projects from picking it)
+
+`deriveStructuralSignals` exposes two new fields:
+
+- `has_orphan_next_config_ts` — root contains `next.config.ts` AND no sibling
+  `next.config.{js,mjs,cjs}`.
+- `next_major_version` — major version from `dependencies.next` /
+  `devDependencies.next` (via `parseMajor`), or `null` for non-numeric ranges
+  (`latest`, `workspace:*`).
+
+`decideHardReject` then returns
+`{ reject: true, reason: 'next_config_ts_unsupported' }` when:
+
+```
+has_orphan_next_config_ts === true
+&& typeof next_major_version === 'number'
+&& next_major_version < 15
+```
+
+Edge cases that accept:
+
+- **Next ≥ 15** — TS-config support is native.
+- **Sibling `.mjs`/`.js`/`.cjs` exists** — Next.js loads the JS file first; the
+  orphan flag is false.
+- **Major version unparseable** (`latest`, `workspace:*`) — defer to the bridge
+  transpile below.
+
+### Layer 2 — bridge transpile (salvage already-cloned workspaces)
+
+After the foundation clone in `services/graph-executor/handlers/spa.ts`, the
+bridge runs `_transpile_next_config_ts` over BOTH `/workspace` root AND the
+resolved `$APP_DIR` (monorepo foundations like `vercel/commerce` keep the
+config at workspace root, single-package ones at the app root). The function
+runs BEFORE Procfile generation, so the supervisor never sees the `.ts` file.
+
+Decision tree:
+
+1. **No `next.config.ts` at this path** → noop.
+2. **Sibling `.js`/`.mjs`/`.cjs` already exists** → remove orphan `.ts`. Next.js
+   loaded the JS file first anyway; the `.ts` was dead weight.
+3. **Sed pipeline** strips:
+   - `import type { ... } from 'next';`
+   - `import { type NextConfig } from 'next';`
+   - `import { NextConfig } from 'next';`
+   - `: NextConfig` annotations
+   - `satisfies NextConfig` clauses
+   - `as const` casts
+   Writes the result to `next.config.mjs` and removes the `.ts`.
+4. **Sed fails** (exotic TS-only syntax — enums, namespaces, …) → write a
+   minimal `export default {};` stub so `next` boots and renders.
+
+The original `.ts` is preserved at `next.config.ts.foundation-bak` for the
+coder to inspect. Bridge stdout (echo lines like
+`[foundation] transpiled next.config.ts → next.config.mjs in /workspace`) lands
+in the `admin_panel: preserved github foundation frontend` project_event's
+`stdout` field (last 600 chars).
+
+Idempotent: re-running the bridge over an already-transpiled workspace is a
+no-op (no `next.config.ts` left to transpile).
+
+## Workflow rule for users
+
+The proper way to iterate on a project is:
+
+1. POST `/me/projects` with the **core brief** ("AI mood tracker").
+2. Once the project exists, send **follow-up chat messages** in the
+   workspace to refine. Don't stuff every requirement into the first
+   brief — the LLM scorer ranks better on short, intent-focused briefs.
+3. Foundations are picked once at create-time and frozen into
+   `projects.foundation_snapshot`. To swap foundation, create a new
+   project (idempotency window 60s prevents accidental duplicates).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Recommender returns 0 candidates | `[foundations] llm returned zero suggestions for brief` | `services/project-foundations.ts:453` |
+| All GitHub lookups 404 | `[foundations] all github lookups failed; returning empty` | `services/project-foundations.ts:498` |
+| LLM scorer down / 5xx | `[foundations.llm-scorer] llm call failed:` | `services/foundation-llm-scorer.ts:227` |
+| Scorer JSON parse error | scorer returns `[]` silently → fallback to substring | `services/foundation-llm-scorer.ts:131` |
+| Generic framework monorepo wins ranking (e.g. `vercel/next.js` for a PetCare brief) | `[foundation-scorer] hard_reject reason=framework_source candidate=vercel/next.js` (expected — repo is being rejected). If still wins → check `FRAMEWORK_SOURCE_REPOS` set in structural filter | `services/foundation-structural-filter.ts:67` |
+| Cal.com or other turbo monorepo wins ranking for a landing brief | `[foundation-scorer] hard_reject reason=monorepo candidate=calcom/cal.diy` (expected). If still wins → check root-contents fetch is returning entries | `services/foundation-structural-filter.ts:111` |
+| Electron / notesnook surfaces for a todo SPA brief | `[foundation-scorer] hard_reject reason=desktop_app candidate=streetwriters/notesnook` (expected). If still wins → verify package.json deps include `electron` | `services/foundation-structural-filter.ts:140` |
+| Cafe / landing brief picks a random LLM-proposed repo instead of curated | `[foundation-scorer] marketing_bypass` should appear in logs; if missing → check `MARKETING_INTENT_RX` covers the brief's intent words | `services/foundation-structural-filter.ts:227` |
+| Non-MLM brief (cafe / yoga / barbershop) lands on `lnlockly/golden-connect-template` | `[foundation-scorer] mlm_gate dropped=lnlockly/golden-connect-template reason=non_mlm_brief` should appear in logs. If missing → check `MLM_KEYWORDS_RX` did not match a false-positive term (a brief literally mentioning "MLM" or "network marketing" will route through the MLM list correctly). | `services/foundation-structural-filter.ts:294` + `services/project-foundations.ts:550` |
+| Explicit MLM brief surfaces a generic Next.js template instead of golden-connect | check `isMlmBrief` returns true for the brief; if false → extend `MLM_KEYWORDS_RX` | `services/foundation-structural-filter.ts:294` |
+| Project crashes on first `next start` with `Configuring Next.js via 'next.config.ts' is not supported` | `[foundation] transpiled next.config.ts → next.config.mjs in ...` should appear in bridge stdout (last 600 chars live in the `admin_panel: preserved github foundation frontend` project_event). If absent — bridge didn't run; if present and crash persists — sed transpile produced syntactically invalid JS, check `next.config.ts.foundation-bak` in workspace. | `services/graph-executor/handlers/spa.ts` (`_transpile_next_config_ts`) |
+| Scorer surfaces `vercel/nextjs-subscription-payments` for a Next < 15 brief | `[foundation-scorer] hard_reject reason=next_config_ts_unsupported candidate=vercel/nextjs-subscription-payments` (expected). If still wins → verify package.json `next` dep parses major as `< 15` via `parseMajor` | `services/foundation-structural-filter.ts:283` |
+| Curated MLM/e-commerce template not in top 3 for matching brief | extend `DOMAIN_MAP` keywords or repos list | `services/scoring-tweaks.ts:63` |
+| Project lands on `scratch` mode in DB | only when `ALLOW_SCRATCH_FOUNDATION=1` or client explicitly sent `selected_foundation.mode='scratch'` | `routes/projects.ts:815` |
+
+## Related
+
+- [Code-exec MCP](/subsystems/code-exec-mcp) — used by the coder agent that
+  consumes the chosen foundation.
+- [Foundation rebrand](/subsystems/foundation-rebrand) — how clone+rebrand
+  removes upstream branding before the coder starts.

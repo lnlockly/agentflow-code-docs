@@ -1,0 +1,93 @@
+---
+title: "Account automations (account_automations)"
+description: "Per-account recipe + schedule that the worker drafts via connector.buildAction and arms into the approval queue — never auto-sends."
+---
+
+# Account automations
+
+## TL;DR
+
+An `account_automations` row pairs a `recipe` (a connector `ActionIntent`
+template) with a `trigger` (`{kind:'cron'|'event', value}`) for one owner +
+account. A 60s worker tick selects active cron rows whose schedule has elapsed,
+routes each to the right connector by the `${platform}:${ref}` prefix, drafts
+the action via `connector.buildAction(...)` (dry-run, NEVER sends), and `arm()`s
+it into `entity_approval_queue`. The owner confirms in the Пульт — automations
+schedule drafts, the [approval queue](/subsystems/approval-queue) is the only
+send gate. Mounted at `/me/account-automations` because `/me/automations` is
+already the Activepieces marketplace surface.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/db/migrations/0089_account_automations.sql:22` | `account_automations` table DDL + status/user indexes |
+| `agentflow-agents/src/db/schema.ts:4562` | `accountAutomations` drizzle mirror of the table |
+| `agentflow-agents/src/services/automations/engine.ts:93` | `validateRecipe(recipe)` → `recipe_bad_type` on a bad template |
+| `agentflow-agents/src/services/automations/engine.ts:109` | `validateTrigger(trigger)` → `trigger_bad_cron` on a bad cron |
+| `agentflow-agents/src/services/automations/engine.ts:127` | `platformOf(accountRef)` — `${platform}:${ref}` → `PlatformId` (no per-platform branch) |
+| `agentflow-agents/src/services/automations/engine.ts:152` | `createAutomation(userId, input)` — insert one row; `name_required` on empty name |
+| `agentflow-agents/src/services/automations/engine.ts:180` | `listAutomations(userId)` — owner feed |
+| `agentflow-agents/src/services/automations/engine.ts:199` | `setAutomationStatus(userId, id, status)` — active ⇄ paused |
+| `agentflow-agents/src/services/automations/engine.ts:225` | `deleteAutomation(userId, id)` — owner-scoped |
+| `agentflow-agents/src/services/automations/engine.ts:246` | `isDue(trigger, lastRunAt, now)` — schedule-elapsed test |
+| `agentflow-agents/src/services/automations/engine.ts:264` | `selectActiveCron({sql, limit})` — the worker's row selection |
+| `agentflow-agents/src/services/automations/engine.ts:280` | `recordRun(id, result, {sql})` — stamps `last_run_at` + `last_result` |
+| `agentflow-agents/src/services/automations/engine-worker.ts:44` | `AUTOMATIONS_TICK_MS = 60_000` |
+| `agentflow-agents/src/services/automations/engine-worker.ts:82` | `runAutomationsTick(deps)` — select → isDue → fire → recordRun |
+| `agentflow-agents/src/services/automations/engine-worker.ts:155` | `connector.buildAction(account, intent, ...)` (dry-run, NEVER sends) |
+| `agentflow-agents/src/services/automations/engine-worker.ts:159` | `arm(row.user_id, {action})` → `entity_approval_queue` |
+| `agentflow-agents/src/routes/me-account-automations.ts:75` | `GET /me/account-automations` |
+| `agentflow-agents/src/routes/me-account-automations.ts:85` | `POST /me/account-automations {accountRef, name, recipe, trigger}` |
+| `agentflow-agents/src/routes/me-account-automations.ts:106` | `PATCH /me/account-automations/:id {status}` — `invalid_body` unless `active\|paused` |
+| `agentflow-agents/src/routes/me-account-automations.ts:123` | `DELETE /me/account-automations/:id` |
+| `agentflow-agents/src/server.ts:343` | `startAutomationsWorker()` — the 60s tick |
+| `agentflow-agents/src/server.ts:760` | `app.route('/', meAccountAutomationsApp)` mount |
+
+## Data flow
+
+```
+every 60s (AUTOMATIONS_TICK_MS) → runAutomationsTick():
+  selectActiveCron({limit})                       (status='active', cron only)
+    for each row:
+      isDue(trigger, last_run_at, now) ? continue : skip
+      platformOf(account_ref) → getConnector(platform)
+      connector.buildAction(account, recipe-as-intent, ctx)   ← dry-run, NO send
+      arm(user_id, {action}) → INSERT entity_approval_queue status='armed'
+      recordRun(id, result)  → stamp last_run_at + last_result
+                                    │
+owner Пульт: GET /me/approvals?status=armed ──▶ confirm ──▶ executeAction once
+```
+
+The PATCH body recognises only `status` (`active`|`paused`); any other value →
+`400 invalid_body`. The worker only ever drafts — there is no auto-send path.
+
+## DB / Env / API
+
+- Tables: `account_automations (id, user_id, account_ref, name, recipe jsonb,
+  trigger jsonb, status, last_run_at, last_result, created_at, updated_at)`;
+  indexes `idx_account_automations_status (status, last_run_at)` +
+  `idx_account_automations_user`.
+- Env: none new. Worker cadence is the `AUTOMATIONS_TICK_MS` constant (60s).
+- Routes (all `requireSession`, owner = `session.sub`):
+  - `GET    /me/account-automations` → `{ ok, count, items }`
+  - `POST   /me/account-automations { accountRef, name, recipe, trigger }` → `{ ok, item }`
+  - `PATCH  /me/account-automations/:id { status }` → `{ ok }`
+  - `DELETE /me/account-automations/:id` → `{ ok }`
+- MCP tools: none directly — the connector each automation routes to wraps them.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Create rejected, malformed recipe | `recipe_bad_type` | `src/services/automations/engine.ts:93` |
+| Create rejected, bad cron string | `trigger_bad_cron` | `src/services/automations/engine.ts:109` |
+| Create rejected, empty name | `name_required` | `src/services/automations/engine.ts:160` |
+| PATCH status to a non-`active\|paused` value | `invalid_body` (`status must be active\|paused`) | `src/routes/me-account-automations.ts:114` |
+| Automation fires but the platform has no connector | `runAutomationsTick` skips on `getConnector` miss / `recordRun` error | `src/services/automations/engine-worker.ts:116` |
+
+## Related
+
+- [Approval queue](/subsystems/approval-queue) — every automation draft is `arm()`-ed here; the owner is the only send gate.
+- [Account groups](/subsystems/account-groups) — the farm a future bulk automation fans out over.
+- [Connector core](/subsystems/connector-core) — `buildAction` / `getConnector` the worker drives, no per-platform branch.

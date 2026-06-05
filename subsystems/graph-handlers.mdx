@@ -79,6 +79,13 @@ through to maestro for them.
 | `billing_stripe` | `handlers/spa.ts` | coder-backend delegate (Stripe Checkout + webhook) | 1 / 3s / false | 600s |
 | `multi_tenant` | `handlers/spa.ts` | coder-backend delegate (X-Org-Id + Membership guard) | 1 / 3s / false | 600s |
 | `admin_panel` | `handlers/spa.ts` | coder-spa delegate (React admin under admin-frontend/) | 1 / 3s / false | 600s |
+| `routes` | `handlers/mini-app.ts` | coder-spa delegate (react-router + TG BackButton/MainButton) | 1 / 3s / false | 600s |
+| `scaffold_nest` | `handlers/spa.ts` | coder-backend delegate (NestJS 11 skeleton → `backend/src/main.ts` + `backend/src/app.module.ts` + `backend/package.json`) | 1 / 3s / false | 600s |
+| `scaffold_prisma` | `handlers/spa.ts` | coder-backend delegate (Prisma 6 + User/Org/Membership → `backend/prisma/schema.prisma` + `backend/src/prisma/prisma.module.ts`) | 1 / 3s / false | 600s |
+| `jwt_auth` | `handlers/spa.ts` | coder-backend delegate (passport-jwt + /auth routes → `backend/src/auth/*`) | 1 / 3s / false | 600s |
+| `billing_stripe` | `handlers/spa.ts` | coder-backend delegate (Stripe Checkout + webhook → `backend/src/billing/*`) | 1 / 3s / false | 600s |
+| `multi_tenant` | `handlers/spa.ts` | coder-backend delegate (X-Org-Id + Membership guard → `backend/src/orgs/*`) | 1 / 3s / false | 600s |
+| `admin_panel` | `handlers/spa.ts` | coder-spa delegate (React admin inside the existing `frontend/` Vite project → `frontend/src/pages/admin/*`, NOT a separate `admin-frontend/` tree) | 1 / 3s / false | 600s |
 | `tg.get_user` | `handlers/tg.get_user.ts` | MCP `telegram/get_user` (peer lookup → username/user_id) | 2 / 3s / true | 60s |
 | `tg.send_text` | `handlers/tg-composite.ts` | MCP `telegram/send_message`, peer fallback to upstream `tg.get_user.username`. Optional `text_by_intent` map (diploma v2 preemptive deliver) reads `ctx.steps[intent_source_id].output.intent` and picks the template — `intent_source_id` defaults to `llm.classify_intent`. | 1 / 0s / false | 60s |
 | `tg.wait_reply` | `handlers/tg-composite.ts` | MCP `telegram/get_history` cursor poll, emits `node_waiting` | 1 / 0s / true | 1800s |
@@ -102,6 +109,89 @@ Coder-fallback (`kind: '__coder__'`,
 fires only for unknown node ids — registered handlers above resolve
 without falling back. The coverage gate is enforced by
 [`tests/unit/graph-executor/handlers/registry-coverage.test.ts`](https://github.com/lnlockly/agentflow-agents/blob/main/tests/unit/graph-executor/handlers/registry-coverage.test.ts).
+
+## Soft-gate, sanitizer, idempotency-on-resume
+
+Three cross-cutting concerns landed in May 2026 (PRs #519 + #522 against
+SPA + landing + mini-app + tg-bot handlers). They sit between the coder
+turn and the post-coder gate.
+
+### Soft-gate (`makeCoderHandler({ softGate: true })`)
+
+`handlers/spa.ts:73-167` factory accepts `{ softGate: true }`. When the
+coder produces no writes (`coder_did_nothing`) OR misses some `expects`
+paths (`missing_expected_files`), the handler downgrades the failure to
+a warning event (`<kind>_coder_did_nothing_soft` /
+`<kind>_missing_expected_files_soft`) and returns
+`{files_written: [], reply: '', delegated_to: slug}`. The graph
+continues to the next edge.
+
+Currently only `multi_tenant` runs in soft mode
+(`handlers/spa.ts:244-259`) — multi-tenant Orgs are opt-in SaaS plumbing;
+single-user briefs like "manage MY subscriptions" should still ship
+admin_panel + deploy without the coder being forced to fabricate an
+unused `org_context.guard.ts`. All other SPA nodes (`scaffold_nest`,
+`scaffold_prisma`, `jwt_auth`, `billing_stripe`) stay hard-gate.
+
+### JSX sanitizer for `App.tsx`
+
+`spa-frontend-prefill.ts:920-922` exports
+`sanitizeBrokenJsxEscapes(body)`. Targeted regex
+`/\{\\"([^"\\]*)\\"\}/g → {"$1"}` heals the `{\"text\"}` artifact some
+coders (notably haiku-4-5) emit when "polishing" prefilled JSX. They
+re-serialize an already-correct `{"Главная"}` JSX expression container
+through `JSON.stringify` a second time, planting literal `\` + `"`
+bytes that esbuild rejects:
+
+```
+ERROR: Syntax error '"'
+  <Link to="/">{\"Главная\"}</Link>
+                 ^
+```
+
+`sanitizeSpaAppTsx(ctx)` (line 929) wraps it as a post-coder safety
+net — read `App.tsx`, run sanitizer, `write_file` back via
+`applyScaffoldInPod` only if the regex matched. Called from
+`admin_panel` handler (`handlers/spa.ts:404-421`) after the coder
+declares done, before deploy. Idempotent: clean files are not rewritten.
+
+### Idempotency on `graph_executor_resumed`
+
+`coder-output.ts:159-194` exports
+`expectsAlreadySatisfied(exec, expects, sentinels?)`. For each entry in
+the post-coder `expects[]` (with `||` alternatives), builds one shell
+line:
+
+```sh
+{ [ -s 'path' ] && ! grep -qE 'BrandX|Acme Inc|SLOT:brief|{{SLOT:|<!-- SLOT:' 'path' 2>/dev/null; } \
+  && echo OK:path \
+  || echo FAIL:path
+```
+
+Returns `true` only when ALL entries print `OK:`. On exec failure
+returns `false` — never a false positive that would skip a missing
+file.
+
+Wired into every coder-handler entry point:
+
+| Handler | Run line |
+|---|---|
+| `handlers/spa.ts` `makeCoderHandler.run` | scaffold_nest, scaffold_prisma, jwt_auth, billing_stripe, multi_tenant |
+| `handlers/spa.ts` `adminPanelHandler.run` | admin_panel (uses `ADMIN_PANEL_EXPECTS`) |
+| `handlers/landing.ts` `makeCoderLandingHandler.run` | render_landing |
+| `handlers/mini-app.ts` `makeCoderHandler.run` | scaffold_vite, tg_webapp_init |
+| `handlers/mini-app.ts` `makeRoutesHandler.run` | routes (mini_app) |
+| `handlers/tg-bot.ts` `scaffoldAiogramHandler.run` | scaffold_aiogram (`SCAFFOLD_AIOGRAM_EXPECTS` = `backend/bot.py`, `backend/requirements.txt`, `Procfile`) |
+
+On hit the handler emits `node_skipped_idempotent` (event kind, payload
+`{node_kind, delegated_to, reason: 'expects_already_satisfied',
+expects}`) and returns
+`{files_written: [], reply: '', delegated_to: slug}`. Downstream nodes
+read the `expects` paths directly, so an empty `files_written` does not
+break them.
+
+Spec:
+[`docs/specs/2026-05-19-coder-idempotency-on-resume.md`](https://github.com/lnlockly/agentflow-agents/blob/main/docs/specs/2026-05-19-coder-idempotency-on-resume.md).
 
 ## Files
 
@@ -196,6 +286,15 @@ ctx.emit({ kind: 'node_finished', payload: { output } })
 | `render_landing` throws `coder_landing_did_nothing` even though `landing.config.ts` exists with rich content | `coder_landing_did_nothing:render_landing` + `pre=<sha> post=<sha>` in handler error | The Edit/MultiEdit path landed identical bytes (idempotent re-write, same hash) — coder did NOT change brief content. Inspect the coder reply for tools used. If genuinely a no-op, the brief is too narrow; widen `RENDER_LANDING_BRIEF_LANDING`. If post-hash is `<missing>`, the boilerplate clone failed — check pod free disk + git network. `fix/landing-procfile-gate-2026-05-18`. |
 | Landing preview returns 823-byte HTML with empty `<div id="root"></div>` even after coder writes a full `landing.config.ts` | `landing.config.ts` exists at `/workspace/src/config/` (14KB) but bundle ships from `/workspace/frontend/` (28 modules, 194KB) | Procfile `cd frontend` built the 3-file stub instead of the rich boilerplate at workspace root. Fix `fix/landing-procfile-gate-2026-05-18`: `landing-scaffold.ts` Procfile now runs `npm install + npm run build` at `/workspace` root and is marked `force: true` so pool-reclaimed pods overwrite the old `cd frontend` line. See [landing-scaffold](/subsystems/landing-scaffold). |
 | Mini-app preview returns HTML shell with empty `<div id="root"></div>` even though project status is `done` | `coder_mini_app_did_nothing:routes` + `pre=<sha> post=<sha>` in handler error (post-fix); pre-fix: silent pass with `files_written=[]` on every coder node | Boilerplate-first preset edits the scaffold's `frontend/src/App.tsx` via Edit/MultiEdit, which doesn't always surface in `files_written`. Pre-fix the `length === 0` gate didn't fire and the empty bundle deployed. Project 1005 root cause. Fix `fix/landing-procfile-gate-2026-05-18`: `handlers/mini-app.ts` `routes` node SHA1-probes `frontend/src/App.tsx` before + after the coder turn and throws when both files are empty AND the hash never moves. |
+| SPA preview ships `<div id="root"></div>` with no auth/admin pages bundled (project 1001 / `5f3i5l4e`) | `spa_bundle_too_small` in `landing_gate_fail`; coder reply lists `apps/frontend/src/pages/Login.tsx` etc. | Coder drifted into `/workspace/apps/*` (preset trained on a never-applied `webapp-boilerplate`). `Procfile` builds `cd frontend && npm run build` so any `apps/*` writes go un-bundled. Fixed by `handlers/spa.ts` rewriting briefs to explicit `backend/...` + `frontend/...` paths + `<kind>_apps_dir_forbidden` gate; `presets/coder-spa.json` purged of `apps/*` references; `spa-scaffold.ts` ships `backend/.gitkeep` so the directory exists pre-coder. See `docs/specs/2026-05-18-spa-layout-fix.md`. |
+| SPA `scaffold_nest` / `jwt_auth` / `admin_panel` throws `<kind>_coder_did_nothing` | Literal `_coder_did_nothing` in graph executor error log | Coder turn returned `files_written=[]`. Reading without writing is not work. Parity with `render_landing` PR #467 gate. Auto-retry re-briefs once; if it persists, escalate via brief-fidelity-supervisor. |
+| SPA `scaffold_nest` / `jwt_auth` / `admin_panel` throws `<kind>_apps_dir_forbidden` | Literal `_apps_dir_forbidden` in graph executor error log; greppable `apps/` in `files_written` | Coder ignored the layout directive (`/workspace/apps/*` is forbidden — Procfile builds `frontend/` only). Walker rebriefs with the directive once; if it persists, preset still trains the drift — inspect `presets/coder-spa.json` for any remaining `apps/` references. |
+| `multi_tenant` coder returns empty / misses `orgs.module.ts` and graph still reaches admin_panel | `multi_tenant_coder_did_nothing_soft` or `multi_tenant_missing_expected_files_soft` in `project_events` (level=warn) | Expected — node runs with `softGate: true` (`handlers/spa.ts:244-259`). Single-user briefs don't need Org plumbing. To force hard-gate, drop `{ softGate: true }` from the registration — but the graph will then loop on briefs like "personal subscription tracker". |
+| SPA preview HTML loads but esbuild deploy fails with `Syntax error '"'` on `<Link to="/">{\"Главная\"}</Link>` | `admin_panel: sanitized N broken JSX escape(s) in App.tsx` (info — sanitizer fired); when sanitizer is bypassed: `ERROR: Syntax error '"'` in build log | Coder (typically haiku-4-5) re-stringified an already-correct prefilled JSX expression. `sanitizeSpaAppTsx(ctx)` heals via regex `/\{\\"([^"\\]*)\\"\}/g → {"$1"}`. If sanitizer info-log fires but build still breaks, the artifact moved beyond `App.tsx` — extend `sanitizeSpaAppTsx` to walk `pages/**/*.tsx` too. |
+| `graph_executor_resumed` re-runs an in-flight coder node and either loops 20+ min or overwrites finished files with placeholder scaffold | `node_skipped_idempotent` (kind in `project_events`) — handler now skips. Pre-fix: repeated `agent_invoke_started` for same node id after `graph_executor_resumed`. | Fixed by `expectsAlreadySatisfied` guard at top of each coder-handler `run()` (PR #522). If you see the pre-fix pattern, the guard is bypassed — either `expects[]` is empty (no-op) OR the probe failed (treated as `false` to avoid false-positive). Check `code-exec.exec` health and `expects` paths on the failing handler. |
+| Guard falsely skips a node when scaffold-only placeholder text still on disk | `node_skipped_idempotent` followed by downstream gate throwing `SLOT:brief placeholders` / `coder_did_nothing` | Sentinel list (`DEFAULT_IDEMPOTENCY_SENTINELS` in `coder-output.ts:126-132`) is too narrow — your scaffold uses a marker we don't grep for. Add the substring to the list (kept deliberately narrow to avoid flagging real copy). |
+| Scaffold silently fails — App.tsx stays empty, gate fires 90s later with useless "too small" verdict (iter6 / project 1081) | `<scaffoldName>_failed: exit=` in `project_events` (e.g. `mini_app_app_prefill_failed: exit=1 stderr=unknown_project`) | `applyScaffoldInPod` (`agentflow-agents/src/services/scaffold-utils.ts:127`) now returns `Promise<ScaffoldApplyResult>` (`{ok, exit_code?, stderr?, error?}`). Callers that need to gate downstream coder work on a half-applied scaffold MUST read `.ok` (see `handlers/mini-app-app-prefill.ts:715` for the canonical wiring). Root cause is usually the approval-retry re-entry race — see next row. |
+| Approval-retry re-entry race: parallel runProjectApprovalBackground passes hammer code-exec, scaffolds get `unknown_project` (iter6 / project 1081) | `approval_in_flight: heartbeat` events missing OR present-but-stale beyond 30 min; multiple `approval_in_flight` `source=approval` (not `approval-heartbeat`) on same project; `unknown_project` in code-exec replies | `runProjectApprovalBackground` (`agentflow-agents/src/services/projects.ts:2147-2168`) registers `setInterval(5 min)` re-emitting `approval_in_flight` (`source=approval-heartbeat`) and clears it in `finally`. The pinger's `APPROVAL_IN_FLIGHT_MAX_MS` cap is 30 min (`pingers/approval-retry.ts:63`) — bump higher only if a single legitimate approval routinely exceeds 30 min. Heartbeat timer is `.unref()`-ed so it never holds the event loop. |
 
 ## Related
 

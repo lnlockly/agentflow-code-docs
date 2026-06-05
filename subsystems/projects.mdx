@@ -1,0 +1,174 @@
+---
+title: "Projects (new architecture, 2026-05-25)"
+description: "Brief → GitHub template search → hosted pod git clone → агент-разработчик в pod'е → live preview через Caddy. Заменяет старый kind-классификатор."
+---
+
+# Projects (new architecture)
+
+## TL;DR
+
+Новый flow создания проектов (approved 2026-05-25, см. `PROJECT_ARCHITECTURE.html` в корне workspace). Юзер пишет бриф → AI ищет подходящий Next.js шаблон через GitHub Code Search → hosted daemon в vcluster юзера делает `git clone` шаблона → внутри pod'а работает агент-разработчик (OpenCode CLI + Claude/GPT-5.3-codex), который читает бриф, пишет код, запускает `npm run dev`, чинит ошибки, коммитит. Юзер видит live preview на `<slug>.proj.agentflow.website` через Caddy + ws-tunnel и общается с агентом через кабинет. Старый LLM-классификатор `kind=landing/spa/tg_bot` уходит в depreciated.
+
+**Один путь, два runtime'а.** Almost every brief resolves to `kind=nextjs` / `runtime_class=web`. The one fork is Telegram-bot intent: `POST /me/projects` runs the deterministic regex classifier `analyzeBrief(brief)` and, when it returns `kind_inferred==='tg_bot'` (or the client posted an explicit `kind:'tg_bot'`), the project is created with `kind='tg_bot'` / `runtime_class='tg_bot'`. That single value steers the template picker to the aiogram starter (`KIND_FALLBACKS.tg_bot` → `lnlockly/agentflow-tg-bot-starter`, ships `bot.py` `cmd_start` with `<!-- SLOT:brief.start_greeting -->`) and fires the BotFather token pipeline in `project-clone.ts` instead of a Next.js dev server. An explicit non-tg web kind (`landing` / `spa` / `nextjs`) is respected and is NOT auto-promoted even if the copy mentions a bot. Added 2026-05-29 (PR #964) — before it, a bot brief without an explicit kind resolved to nextjs and shipped a marketing landing about a bot (`bot_username=null`, invented @handle in copy) instead of a runnable bot (live repro: project 1586).
+
+## 12 lifecycle steps
+
+| # | Шаг | Кратко |
+|---|---|---|
+| 01 | Brief | Юзер пишет описание в `POST /me/projects {brief}` |
+| 02 | Search | `github-template-search.ts` бьёт GitHub Code Search API с топиками + ключевыми словами брифа |
+| 03 | Pick | AI ранжирует топ-30 кандидатов, выбирает топ-1, сохраняет `template_url` / `template_repo_full` |
+| 04 | Provision | `POST /me/projects/:id/approve` минтит hosted device `kind=daemon` в `af-tenant-<userId>` |
+| 05 | Clone | Daemon вызывает `project_setup` MCP-tool: `git clone <template_url> /workspace/proj-<slug>`, fresh git history, initial commit «init from template X» |
+| 06 | Plan | Агент читает бриф + structure репо → генерирует список задач в `project_tasks` |
+| 07 | Develop | Daemon берёт задачи через OpenCode CLI: читает файлы, пишет код, `npm run dev`, проверяет порт 3000, чинит билд, коммитит после каждой задачи |
+| 08 | Preview | Caddy autosync держит публичный preview `<slug>.proj.agentflow.website`. HMR из Next.js dev server даёт hot-reload |
+| 09 | Iterate | Юзер в `/account/projects/<id>` видит preview + log + chat. Сообщение → новая задача в `project_tasks` |
+| 10 | Publish | По команде «готово» — domain attach (`{slug}.agentflow.website` или custom), production build, артефакты в R2/S3, pod hibernated |
+| 11 | Maintain | Pod просыпается на новые задачи. История git/задач/чата сохранена в PVC 5Gi |
+| 12 | Archive | Soft-delete row + pod terminate. Workspace volume хранится 30 дней на случай восстановления |
+
+## 4 roles
+
+| Роль | Кто | Что делает |
+|---|---|---|
+| 🧑 Юзер | Человек | Пишет бриф, смотрит preview, чатится с агентом, принимает «готово». НЕ знает про код, git, cluster. |
+| 🤖 Project Picker | server-side AI в `github-template-search.ts` | На `POST /me/projects` достаёт keywords из брифа → GitHub Search API → AI скорит топ-5 → возвращает топ-1. No-match fallback (app-shaped brief) = `lnlockly/agentflow-nextjs-starter` (clean Next.js 14, no auth/DB, serves 200 at `/`). Was `steven-tey/precedent` until 2026-05-29 — Clerk in its root layout 500'd `/` without `CLERK_*` keys. |
+| ⚙️ Hosted Daemon | Pod в `af-tenant-<userId>` (`kind=daemon`) | Реальный разработчик: OpenCode CLI + Claude/GPT. Читает бриф, пишет код, гоняет `npm run dev`, коммитит. Использует `AF_SHELL_WHITELIST` (git, npm, node, curl, jq, grep, sed; НЕ `rm -r`) |
+| 📦 Caddy + ws-tunnel | Edge proxy | Auto-route `<slug>.proj.agentflow.website` → WS-tunnel к port 3000 pod'а. HMR работает as-is через Next.js dev server |
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/github-template-search.ts:210` | `GithubTemplate` interface — фигурирует во всём flow (repo_full, url, stars, relevance_score) |
+| `agentflow-agents/src/services/github-template-search.ts:335` | `searchGithub` — обёртка над GitHub Code Search REST (`/search/repositories?q=...`) |
+| `agentflow-agents/src/services/github-template-search.ts:395` | `rankByBrief` — AI-ранжирование через `useModel(ModelType.TEXT_LARGE)` (читает description + topics) |
+| `agentflow-agents/src/services/github-template-search.ts:500` | `searchTemplatesForBrief(brief)` → топ-5 кандидатов с кэшем 1ч |
+| `agentflow-agents/src/services/github-template-search.ts:539` | `pickBestTemplateForBrief(brief)` → топ-1 или `FALLBACK_TEMPLATE` (clean Next.js / static / kind-fallback via `pickFallbackForBrief`) |
+| `agentflow-agents/src/services/github-template-search.ts:45` | `FALLBACK_TEMPLATE` = `lnlockly/agentflow-nextjs-starter` — app-shaped brief, GitHub returned 0 candidates. Clean Next.js 14 + Tailwind, no auth/DB → 200 at `/`. (Was `steven-tey/precedent` → 500 via Clerk before 2026-05-29.) |
+| `agentflow-agents/src/services/github-template-search.ts:178` | `pickFallbackForBrief(brief, kind)` — routes no-match briefs: `KIND_FALLBACKS[kind]` first, else `APP_BRIEF_KEYWORDS` → `FALLBACK_TEMPLATE`, else `STATIC_FALLBACK`. |
+| `agentflow-agents/src/services/bootstrap-schema.ts:522` | ALTER TABLE projects ADD COLUMN template_url / template_repo_full / template_picked_at (Phase A2) |
+| `agentflow-agents/src/routes/projects.ts:843` | `POST /me/projects` — entry point; вызывает `pickBestTemplateForBrief` вместо LLM-классификатора kind |
+| `agentflow-agents/src/routes/projects.ts:875` | tg_bot intent resolution — `analyzeBrief(brief).kind_inferred==='tg_bot'` (or explicit `kind:'tg_bot'`) → `isTgBotIntent` → `resolvedKind='tg_bot'`. Explicit non-tg web kind suppresses auto-promotion. |
+| `agentflow-agents/src/services/brief-analyzer.ts:98` | `KIND_RULES` tg_bot regex (telegram-bot / aiogram / телеграм-бот / тг-бот / чат-бот) + low-precedence Russian `бот` fallback (line 135). No LLM. |
+| `agentflow-agents/src/services/github-template-search.ts:106` | `KIND_FALLBACKS.tg_bot` → `lnlockly/agentflow-tg-bot-starter` (aiogram). Honoured first in `pickFallbackForBrief` when `kind==='tg_bot'`. |
+| `agentflow-agents/src/services/project-clone.ts:382` | `if (project.kind === 'tg_bot')` → `ensureBotTokenForProject` (BotFather-auto or owner-pasted token) + `bot_username` + `.env` BOT_TOKEN. |
+| `agentflow-agents/src/routes/projects.ts:2725` | `POST /me/projects/:id/approve` — триггерит provision daemon + clone |
+| `agentflow-agents/src/services/projects-pipeline.ts:631` | `approveProject(opts)` — server-side orchestration approve-шага |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/tools/project_setup.py` | MCP-tool `project_setup` (создаётся в Phase A3): `git clone <template_url>` + `npm install` + `npm run dev` на :3000 |
+| `PROJECT_ARCHITECTURE.html` (workspace root) | Source of truth для архитектуры (12 lifecycle steps + 4 роли + 8 open questions, approved 2026-05-25) |
+
+## Data flow
+
+```
+[user] → POST /me/projects {brief}
+            │
+            ▼
+   pickBestTemplateForBrief(brief)
+            │
+            ├── extractKeywords(brief)              (AI, 3-5 thematic terms)
+            ├── searchGithub(keywords)              (GitHub Search API)
+            └── rankByBrief(candidates, brief)      (AI top-1)
+            │
+            ▼
+   INSERT projects (template_url, template_repo_full, template_picked_at)
+            │
+            ▼
+[user] → POST /me/projects/:id/approve
+            │
+            ▼
+   approveProject → mint hosted_devices (kind=daemon, size=small, preset=project-daemon)
+            │
+            │  POST /me/hosted-devices (internal app.fetch)
+            ▼
+   af-tenant-<userId>:<pod>  (daemon up в ~60-90с)
+            │
+            │  project_setup MCP-tool
+            │   ├── git clone <template_url> /workspace/proj-<slug>
+            │   ├── git checkout --orphan main; git commit -m "init from template <repo_full>"
+            │   ├── npm install
+            │   └── npm run dev (listens :3000)
+            ▼
+   Caddy edge: <slug>.proj.agentflow.website → ws-tunnel → pod:3000 (HMR)
+            │
+            ▼
+[user] → GET /account/projects/<id>   (preview iframe + chat + task log)
+            │
+            │  POST /me/projects/:id/message (chat)
+            ▼
+   project_tasks INSERT → daemon picks up via cron → OpenCode loop:
+       read files → write code → npm run dev → if compile ok → git commit
+```
+
+## DB / Env / API
+
+**Tables**
+- `projects` — добавлены `template_url TEXT`, `template_repo_full TEXT`, `template_picked_at TIMESTAMPTZ` (migration `bootstrap-schema.ts:522`).
+- `project_tasks` — queued/running/done/failed список задач, который daemon берёт через cron.
+- `project_events` — append-only лог (использует `kind`, `payload`).
+- `hosted_devices` + paired `user_devices` — pod с `kind=daemon` для проекта.
+- `project_secrets` — env-секреты для billed integrations (TG token, OPENAI_KEY).
+- `projects.kind` + `projects.kind_classification` — deprecated, всегда возвращают `'nextjs'` для backward-compat (см. секцию ниже).
+
+**Env (agentflow-agents pod)**
+- `GITHUB_TOKEN` — PAT для GitHub Search API (без него — 60 req/h на IP; с ним — 5000 req/h на токен).
+- `GITHUB_TEMPLATE_SEARCH_CACHE_TTL_MS` — default 3 600 000 (1 час).
+- `AF_PROJECT_DAEMON_PRESET` — slug пресета для project daemon (default `coder-nextjs-generic`).
+- `AF_PROJECT_PVC_SIZE` — размер PVC под workspace (default `5Gi`).
+- `AF_PROJECT_IDLE_HIBERNATE_MIN` — простой до scale-to-0 STS (default `120`).
+
+**Env (daemon pod через manifest)**
+- `AF_SHELL_WHITELIST=git,gh,node,npm,curl,jq,grep,sed,head,tail,cat,ls` — разрешённые команды (НЕ `rm -r`).
+- `AF_OPENCODE_MODEL=anthropic/claude-opus-4.7` — модель для агента-разработчика.
+- `AF_PROJECT_WORKSPACE=/workspace/proj-<slug>` — куда клонится репо.
+
+**Routes**
+- `POST /me/projects` — `{brief}` → 201 `{id, slug, template_url, template_repo_full}` (template подобран синхронно при создании, см. `projects.ts:762`).
+- `POST /me/projects/:id/approve` — `{}` → 200 `{ok:true, hosted_device_id}` (см. `projects.ts:2725`).
+- `POST /me/projects/:id/message` — `{text}` → INSERT `project_tasks` row, daemon подхватит.
+- `GET /me/projects/:id` — `{status, tasks, preview_url, template_url, last_commit}`.
+- Auth: `requireSession` (cookie или `x-api-key`). Owner key user 1: in the `agentflow-agents-env` k8s secret (`NIGHTLY_E2E_OWNER_KEY`) — never inline it in docs (the prior literal was committed, now redacted, and must be ROTATED).
+
+**MCP tools (agentflow-computer-mcp)**
+- `project_setup(template_url, slug)` — git clone + npm install + npm run dev (A3 будет создавать в `driver/tools/project_setup.py`).
+- `project_commit(message, files)` — `git add <files> && git commit -m <message>`.
+- `project_run_dev()` — `npm run dev` если ещё не запущен, возвращает port 3000 status.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Все проекты получают одинаковый fallback (`agentflow-nextjs-starter` / `agentflow-static-starter`) | `github_search_failed status=403` / `[github-template-search]` | GitHub Search rate-limit. Set `GITHUB_TOKEN` env в agents pod (5000 req/h вместо 60). См. `github-template-search.ts:335`. |
+| `pickBestTemplateForBrief` вернул fallback хотя бриф осмысленный | `[github-template-search] ranked_zero_candidates brief=` | AI-ранкер не нашёл совпадений → расширь keywords в `extractKeywords` (`github-template-search.ts:112`). |
+| Project stuck в `provisioning` > 5 мин | `[hosted-devices] apply failed id=` | kubectl apply фейлится на vcluster apiserver — см. `marketplace-hosted-deploy.mdx` failure modes. |
+| Daemon pod up но `npm install` падает | `[project-setup] npm_install_failed exitCode=` | Шаблон требует Node > 20 или yarn/pnpm. Daemon базовый image — Node 20 + npm. Проверь `package.json#engines` в выбранном шаблоне. |
+| Preview URL 502 на edge | `caddy: dial tcp ... connection refused :3000` | Daemon процесс `npm run dev` упал или ещё не успел стартовать. `kubectl -n af-tenant-<id> logs project-proj-<slug>-0 \| grep "ready in"`. |
+| `clone_status: ok=false, error="port_unreachable"` хотя coder агент умер ~мгновенно | `dev port <N> did not respond within 900s on slug=` | Aider edits files и exits — daemon сам поднимает dev server через `_watch_and_report_clone_status` → `_spawn_dev_server`. Если порт не открылся — смотри `dev_server_fallback.error` (например `fallback_install_failed`) в payload `clone_status`. До 2026-05-28 эта роль была на opencode + его brief'е; opencode иногда exits до `npm run dev` (проекты 1547/1552/1553/1557). После перехода на aider (PR 2026-05-28) daemon ВСЕГДА spawn'ит dev server после aider exit. Фикс: `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/tools/agent_brief.py:_spawn_dev_server`. |
+| Caddy 502 после успешного коммита | `caddy: STS hd-<slug> not found` | STS scaled-to-0 (hibernate после 120 мин простоя). Trigger через `POST /me/projects/:id/wake` или любое сообщение в chat. |
+| `git clone` падает на private репо | `[project-setup] git_clone_failed exitCode=128` | Public templates only (open question #8). Будущий fix: юзерский GitHub OAuth → `GITHUB_USER_TOKEN` в pod env. |
+| Approve вернул 409 `still_preparing` | `approveProject: project still in preparing` | Background prep ещё не завершился. См. `projects-create-flow.mdx` (instant-create). |
+| `template_url=NULL` на старом проекте | row создан до 2026-05-25 | Legacy row — старый flow по kind classifier. Новых таких не появится; легаси обрабатывается отдельной веткой в `projects-pipeline.ts:631`. |
+| Bot brief shipped a marketing landing (`kind=nextjs`, `bot_username=null`, invented @handle) | grep `kind_fallback_tg_bot` absent for a bot brief; row has `kind='nextjs'` | Pre-PR-#964 bug — `POST /me/projects` only honoured explicit `kind:'tg_bot'`. Fixed: `analyzeBrief` infers tg_bot from the brief (`routes/projects.ts:875`). Repro: project 1586. |
+| Fallback Next.js project edits + serves but `/` returns HTTP 500, never promotes to `running` | `throwMissingPublishableKeyError` / `Missing publishableKey` in the project pod dev log; `template.reasoning='fallback'` with `repo_full='steven-tey/precedent'` | Pre-2026-05-29 bug — `FALLBACK_TEMPLATE` was `steven-tey/precedent`, which wires `ClerkProvider` into `app/layout.tsx` + `clerkMiddleware` into `app/middleware.ts`; without `CLERK_*` env keys `/` 500s and preview-reconciler can't promote. Fixed: fallback is now `lnlockly/agentflow-nextjs-starter` (no auth/DB, 200 at `/`). `github-template-search.ts:45`. |
+| Project shows `running` with a public preview URL that returns 500 on every route | `projects.status='running'` + a `p-<slug>.proj.agentflow.website` preview that 500s (e.g. Clerk `Missing publishableKey` on a Clerk-dependent template); coder-shim clone_status carried `port_reachable:false` yet the project is `running`; `project_event 'preview_exposed' source='reconciler'` | the **preview-reconciler** (`pingers/preview-reconciler.ts`, a 2nd promoter independent of clone-status, runs every 15s) `probePort` accepted ANY HTTP 100-599 on `/` as "reachable" — INCLUDING 500 — and flipped `status='running'` + wired the public Ingress, overriding coder-shim's correct `port_reachable:false`. So a hard-500 app showed as "live". Live repro: project 1625 (kiranism Clerk dashboard), 2026-05-30. Fixed (PR fix/preview-reconciler-promote-fail-close): the promote gate now rejects 5xx (`isPromotableStatus`: 100-499 promote, 5xx no), matching the watchdog's demote gate; a persistent 500 never promotes and ages out to `failed` at `MAX_PROVISIONING_AGE_MIN`. |
+
+## Open questions (default answers, see PROJECT_ARCHITECTURE.html)
+
+1. **Template choice**: AI сам выбирает топ-1 (юзер может сменить через chat).
+2. **Pod-per-project**: 1 pod = 1 проект (изоляция, hibernation per project).
+3. **Zero candidates**: fallback на `vercel/next.js` + warning юзеру.
+4. **Hibernation**: после 120 мин простоя scale-to-0; возврат 30-60с.
+5. **Storage**: PVC 5Gi per project (git history + node_modules + .next cache).
+6. **TG-bots**: bot-intent брифы (`analyzeBrief → tg_bot`) больше НЕ идут в Next.js — `kind='tg_bot'` / `runtime_class='tg_bot'`, клонируется aiogram-стартер (`lnlockly/agentflow-tg-bot-starter`), coder заполняет `bot.py` SLOT из брифа. Токен минтится автоматически через BotFather (owner с привязанным TG) или вставляется owner'ом (`bot_token` в create-payload). Mini App — отдельный kind (`mini_app`, TWA-стартер).
+7. **Billing**: pod биллится из USDF баланса по `tg_action_pricing`; hibernate = 0 ₽/час, active small = ~0.5 ₽/час.
+8. **Private GitHub**: public only пока; future — юзерский OAuth.
+
+## Related
+
+- [`subsystems/hosted-daemon`](/subsystems/hosted-daemon/) — auth + manifest + handshake для `kind=daemon` pod'а
+- [`subsystems/marketplace-hosted-deploy`](/subsystems/marketplace-hosted-deploy/) — параллельный flow «развернуть пресет на hosted» (та же провижн-машинерия)
+- [`subsystems/showcase-kits`](/subsystems/showcase-kits/) — 8 curated kits, некоторые из них уже используют новый projects-flow для landing
+- [`subsystems/projects-create-flow`](/subsystems/projects-create-flow/) — _deprecated_, описывает старый bg-prep + kind-classifier
+- [`subsystems/caddy-preview`](/subsystems/caddy-preview/) — Caddy autosync + ws-tunnel для preview URL
+- [`subsystems/opencode-integration`](/subsystems/opencode-integration/) — _deprecated 2026-05-28 для project briefs_ — desktop OpenCode installer ещё живёт, project lifecycle перешёл на aider (см. `agent_brief.py:_default_spawn_aider`)

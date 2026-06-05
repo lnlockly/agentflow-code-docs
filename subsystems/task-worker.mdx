@@ -1,0 +1,95 @@
+---
+title: "Task Worker"
+description: "The loop that makes agents visibly claim, work, and revise Plane goal-board tasks."
+---
+
+# Task Worker
+
+## TL;DR
+Phase 3 shipped the agent task helpers (assignee, comment, due, subtask, read
+comments) but nothing drove them, so the owner saw no agent claiming tasks. The
+task-worker is the loop that does: a bounded pass over the configured Plane
+boards ("Цели AgentFlow" + "Kwork" + "GoldenConnect") that picks the next
+unassigned todo/backlog task, claims it under the `AgentFlow-агент` label, posts
+an ETA + due date, splits a big task into sub-tasks, spawns a coder run for a
+coding task, and on each pass reads the owner's comments to revise.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/task-worker.ts:480` | `runTaskWorkerPass` — one bounded pass over the boards |
+| `agentflow-agents/src/services/task-worker.ts:327` | `claimAndAdvance` — CLAIM → PLAN → DO → PROGRESS on a fresh task |
+| `agentflow-agents/src/services/task-worker.ts:410` | `reviseFromOwnerComment` — ack + re-brief on a new owner comment |
+| `agentflow-agents/src/services/task-worker.ts:200` | `newestUnseenOwnerComment` — owner-vs-agent comment diff |
+| `agentflow-agents/src/services/task-worker.ts:168` | `isClaimedByAgent` — idempotent no-double-claim probe |
+| `agentflow-agents/src/services/task-worker.ts:309` | `eligibleIssues` — todo/backlog, not owner-assigned, not a sub-task |
+| `agentflow-agents/src/services/task-worker.ts:232` | `splitIntoSubtasks` — big-task split (≥ 280 chars) |
+| `agentflow-agents/src/services/task-worker.ts:120` | `liveTaskWorkerDeps` — wires the Phase-3 Plane helpers |
+| `agentflow-agents/src/routes/internal-task-worker.ts:91` | `POST /internal/task-worker/tick` — manual one-pass trigger |
+| `agentflow-agents/src/routes/internal-task-worker.ts:123` | `startTaskWorker` — interval bootstrap (FF_TASK_WORKER=1) |
+| `agentflow-agents/src/routes/internal-task-worker.ts:53` | `makeWorkerSpawnRun` — per-owner key → POST /me/projects + approve |
+| `agentflow-agents/src/server.ts` | mounts the route + arms the interval |
+
+## Data flow
+```
+interval tick (FF_TASK_WORKER=1)  OR  POST /internal/task-worker/tick
+   │
+   ▼ runTaskWorkerPass(deps, {boardNames, maxClaims, maxRevisions})
+   │
+   ├─ listTaskProjects → resolve "Цели AgentFlow" + "Kwork" + "GoldenConnect"
+   │
+   └─ per board: listTaskIssues + per-issue listTaskComments
+        │
+        ├─ (A) REVISE  already-claimed + new owner comment
+        │        └─ addTaskComment("Принял правку…") + spawnRun(re-brief)
+        │           + addTaskComment("[[af:seen:<id>]]")   ← last-seen marker
+        │
+        └─ (B) CLAIM   next eligible fresh task (idempotent on agent marker)
+                 ├─ setTaskAssignee(AgentFlow-агент)   ← [[af:assignee:…]] marker
+                 ├─ addTaskComment("Взял в работу. ETA…")
+                 ├─ updateTaskIssue(target_date = +3d)
+                 ├─ if big → createSubtask × N
+                 ├─ if coding → spawnRun(name+desc)   ← POST /me/projects + approve
+                 │  else → addTaskComment(next action)
+                 └─ updateTaskIssue(state = started)
+```
+
+The spawn path is reused, never re-implemented: `makeWorkerSpawnRun` mints a
+per-owner `af_live_*` key (`cloud-ide-flow-key.ensureCloudIdeFlowKey`) and
+forwards in-process to `projectsApp` `POST /me/projects` + `/approve`, the same
+canonical clone lifecycle the freelance conveyor uses.
+
+## State without a new table
+The comment thread IS the state — no migration:
+- **claimed** → an `[[af:assignee:<label>]]` marker comment is present
+  (`setTaskAssignee` writes it for an agent label, per the binding convention).
+- **last-seen** → an `[[af:seen:<commentId>]]` marker records the newest owner
+  comment the worker already reacted to, so the same comment is never re-handled.
+
+## DB / Env / API
+- Tables: none new — reuses the Plane board + the comment thread + `api_keys`
+  (one short-lived per-owner flow key per spawn).
+- Env: `PLANE_API_BASE`, `PLANE_API_TOKEN`, `PLANE_WORKSPACE` (same as the tasks
+  MCP — unset → the pass returns `configured:false` and does nothing).
+  `FF_TASK_WORKER=1` arms the interval; `TASK_WORKER_TICK_MS` (default 300000);
+  `TASK_WORKER_OWNER_USER_ID` (default 1).
+- Routes: `POST /internal/task-worker/tick` (header `x-agentflow-secret`),
+  body `{ boardNames?, maxClaims?, maxRevisions? }`.
+- MCP tools reused: the Phase-3 service helpers in `me-apps-tasks.ts`
+  (`setTaskAssignee`, `addTaskComment`, `updateTaskIssue`, `createSubtask`,
+  `listTaskComments`, `listTaskIssues`, `listTaskProjects`).
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Worker does nothing | `FF_TASK_WORKER not set` | set `FF_TASK_WORKER=1` on the worker pod |
+| Pass is a no-op | `configured:false` from the tick | set `PLANE_*` in the agents secret |
+| A board never claims | `task_worker_board_list_failed` | check the board name + Plane states |
+| Spawn never fires | `spawn_failed` in the action log | check the owner key mint + `/me/projects` |
+| Owner comment re-handled | missing `[[af:seen:` marker on the thread | `reviseFromOwnerComment` stamps it after acting |
+| Double-claim | `[[af:assignee:` already on thread but re-claimed | `isClaimedByAgent` re-checks right before claim |
+
+## Related
+- [Agent Task Loop](/subsystems/agent-task-loop) — the protocol + the Phase-3 tools the worker drives
+- [Projects ↔ Plane Task Binding](/subsystems/projects-tasks-binding) — the bind + the marker convention
+- [Freelance Conveyor](/subsystems/freelance-conveyor) — the reused spawn lifecycle

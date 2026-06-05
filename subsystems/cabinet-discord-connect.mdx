@@ -1,0 +1,69 @@
+---
+title: "Cabinet Discord Connect"
+description: "UI-first cabinet screen at /account/integrations/discord — paste a user or bot token, the mautrix-discord bridge takes over."
+---
+
+# Cabinet Discord Connect
+
+## TL;DR
+Cabinet screen for linking a Discord account to the user's Matrix
+identity through the `mautrix-discord` bridge. UI ships ahead of the
+bridge (agentflow-agents PR #82) and gracefully shows
+«Backend в работе» on HTTP 501.
+
+Two tabs:
+- **Token** — paste a user-bot token (default). ToS-risk banner shown.
+- **Bot**  — paste a Developer Portal bot token.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/pages/AccountDiscordIntegration.tsx:88` | route component with tabs + form |
+| `agentflow-landing/src/chat/useDiscordLink.ts:55` | hook: status + connect + disconnect; mirrors `useInstagramLink` |
+| `agentflow-landing/src/lib/discordValidation.ts:33` | pure token classifier + Russian error copy |
+| `agentflow-landing/src/main.tsx:367` | lazy import + Route registration |
+| `agentflow-landing/src/pages/AccountIntegrations.tsx:55` | hub card entry |
+| `agentflow-landing/tests/unit/discord-connect-validation.test.mjs:1` | validator unit coverage |
+| `agentflow-landing/tests/components/DiscordConnect.test.mjs:1` | page/hook contract test |
+
+## Data flow
+```
+[user pastes token] -> classifyDiscordToken()      (pure, client-side)
+                       ├─ ok      -> POST /me/chat/discord/connect {token, mode}
+                       └─ !ok     -> inline Russian error, no network
+
+POST /me/chat/discord/connect
+  ├─ 200 -> {status: 'linked', discord_username} -> ConnectedCard
+  ├─ 501 -> backendReady=false -> «Backend в работе» banner
+  ├─ 401/403 -> «Discord отверг токен»
+  ├─ 503/504 -> «Мост временно недоступен»
+  └─ 429 -> «Discord ограничил частоту»
+
+DELETE-style POST /me/chat/discord/disconnect  (via confirm dialog)
+GET   /me/chat/discord/status
+```
+
+## DB / Env / API
+- Routes (planned, owned by agentflow-agents PR #82):
+  - `GET /me/chat/discord/status` → `{ok, status, discord_username?}`
+  - `POST /me/chat/discord/connect` body `{token, mode: 'user' | 'bot'}`
+  - `POST /me/chat/discord/disconnect`
+- Tables: none on the landing side. Bridge persists tokens encrypted (mautrix-discord schema).
+- Env: none new on the frontend. Backend env will land with #82.
+- Frontend never writes the raw token to `localStorage` or `console`.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Form rejects token before submit | `discord_token_invalid_format` (n/a — client) | `agentflow-landing/src/lib/discordValidation.ts:33` |
+| «Backend в работе» banner permanent | HTTP 501 from `/me/chat/discord/*` | agentflow-agents PR #82 (mautrix-discord) |
+| 503/504 after submit | `mautrix-discord` pod not ready | `kubectl -n franchise-factory get pods -l app=mautrix-discord` |
+| 401 after submit | Discord rotated/banned the token | user pastes fresh token |
+| Bot mode says «no servers» | bot not invited yet | user opens Discord OAuth URL, adds bot to a server |
+
+## ToS-risk copy (verbatim)
+> Discord может забанить аккаунт за использование стороннего клиента (бриджа). Используй burner-аккаунт, если не хочешь рисковать основным.
+
+## Related
+- [Matrix Telegram Bridge](/subsystems/matrix-tg-bridge) — same architectural shape
+- [Matrix Chat](/subsystems/matrix-chat) — where Discord rooms surface after link
