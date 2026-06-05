@@ -1,0 +1,84 @@
+---
+title: "Cabinet — goal-create CTA on /cabinet root"
+description: "Empty-state hero block and compact recent-goals row mounted on /cabinet. Routes the user into the device-detail autonomous tab where the existing NewGoalForm lives."
+---
+
+# Cabinet — goal-create CTA
+
+## TL;DR
+
+`/cabinet` (CabinetDashboard) now mounts `CabinetGoalCta` between
+`HomeWidgetsRow` and the stat tiles. The component fetches
+`GET /me/autonomous/goals` and switches between three branches:
+
+- empty → hero card «Поставь первую цель» + button «Создать цель»
+- non-empty → compact «Цели (N)» row with the 3 most recent goals + «Все цели» link
+- error / loading → gentle inline copy or skeleton (no NaN / undefined)
+
+The CTA does NOT open a modal inline. Both the button and goal cards
+navigate to `/cabinet/devices` where the existing `NewGoalForm` (inside
+`DeviceAutonomousPanel`) handles the create flow. This avoids
+duplicating the form and keeps the autonomous goal lifecycle scoped to
+the device that will execute it.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/components/cabinet/CabinetGoalCta.tsx:1` | new component — three render branches off `useQuery(['cabinet','autonomous-goals'])` |
+| `agentflow-landing/src/components/cabinet/CabinetGoalCta.tsx:65` | empty branch — hero card + `data-testid="cabinet-goal-cta-create"` button |
+| `agentflow-landing/src/components/cabinet/CabinetGoalCta.tsx:127` | non-empty branch — `goals.slice(0,3)` mini-cards + «Все цели» link |
+| `agentflow-landing/src/components/cabinet/CabinetGoalCta.tsx:152` | `GoalMiniCard` — compact card with status pill + progress bar |
+| `agentflow-landing/src/pages/CabinetDashboard.tsx:40` | `import { CabinetGoalCta }` |
+| `agentflow-landing/src/pages/CabinetDashboard.tsx:194` | `<CabinetGoalCta />` mount point |
+| `agentflow-landing/tests/components/CabinetGoalCta.test.mjs:1` | smoke test — 6 assertions on contract |
+
+## Data flow
+
+```
+User opens /cabinet
+   │
+   ▼
+CabinetDashboard mounts
+   │
+   ▼
+<CabinetGoalCta />
+   │
+   │ useQuery(['cabinet','autonomous-goals'])
+   │   → autonomousApi.listGoals()
+   │     → GET /me/autonomous/goals  (af_session cookie)
+   │       → { ok, goals[] }
+   ▼
+ ┌─────────────────────────────────────────────────────┐
+ │ goals.length === 0   →  hero + «Создать цель» button│
+ │                          onClick: nav /cabinet/devices
+ │ goals.length >= 1    →  3 mini-cards + «Все цели»   │
+ │                          onClick: nav /cabinet/devices
+ │ isError              →  «Не удалось загрузить…»     │
+ │ isLoading            →  skeleton ×2                 │
+ └─────────────────────────────────────────────────────┘
+```
+
+The React-Query key `['cabinet','autonomous-goals']` is intentionally
+distinct from the device panel's `['autonomous-goals']`. The cabinet
+refetches every 30s on focus; the device panel polls every 15s. Sharing
+a key would force both surfaces onto the slower cadence.
+
+## DB / Env / API
+
+- Endpoint: `GET /me/autonomous/goals` (already shipped; see
+  `subsystems/autonomous-goals.mdx`).
+- No new env vars, no new tables.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| /cabinet skeleton stays forever | DevTools network — `/me/autonomous/goals` pending | server side; client falls through to `isError` after the React-Query timeout |
+| «Все цели» link 404s | route `/cabinet/devices` missing | `agentflow-landing/src/main.tsx` route table |
+| Mini-card click lands on wrong device | client navigates to list page, not specific device | by design — backend doesn't tie goals to a device until `planToday` |
+
+## Related
+
+- [Cabinet Device — «Автономно» tab](/subsystems/cabinet-device-autonomous-tab) — where the actual `NewGoalForm` lives.
+- [Autonomous goals](/subsystems/autonomous-goals) — full backend contract.

@@ -1,0 +1,164 @@
+---
+title: "Remotion renderer"
+description: "Standalone pod that turns (composition_id, props) into an MP4 in MinIO."
+---
+
+# Remotion renderer
+
+## TL;DR
+
+Standalone HTTP service (`agentflow-remotion-runner`, port 4200) that bundles
+a Remotion entry once at first request, then renders any registered
+composition by id with caller-supplied props. The MP4 is uploaded to MinIO
+under `remotion/<composition_id>/<uuid>.mp4` and the public URL is returned to
+the caller. PR-1 ships the runner pod, Dockerfile, k8s manifest, GHA build,
+and one built-in composition (`simple-card`). PR-2 ships the
+`@agentflow-video` MCP server with one tool `remotion.render` that POSTs to
+this Service and surfaces the runner envelope to the LLM (5-minute fetch
+timeout, owner-pinned mount). PR-3 will add the `remotion-video-operator`
+preset that uses the tool.
+
+## Files
+
+| Repo / path | Role |
+|---|---|
+| `agentflow-agents/remotion-runner/Dockerfile` | node:20-bookworm-slim + chromium + ffmpeg + fonts-noto*; single-stage, ~1.4GB. |
+| `agentflow-agents/remotion-runner/package.json` | `@remotion/{bundler,cli,renderer}` 4.0.302 pinned; Hono server. |
+| `agentflow-agents/remotion-runner/src/server.ts` | Hono server. `GET /health`, `POST /render`. Caches bundle in `/tmp/remotion-bundle`. |
+| `agentflow-agents/remotion-runner/src/Root.tsx` | Remotion composition registry. Add new compositions here. |
+| `agentflow-agents/remotion-runner/src/compositions/simple-card.tsx` | Built-in `simple-card` (title/subtitle/bgColor, 30s 1080p). |
+| `agentflow-agents/remotion-runner/src/minio.ts` | Ported SigV4 PUT from `agentflow-agents/src/services/minio-client.ts`. Single-shot, no SDK. |
+| `agentflow-agents/k8s/remotion-runner.yaml` | Deployment + ClusterIP Service. Pulls `minio-creds` Secret, optional `agentflow-agents-config` ConfigMap for `MINIO_PUBLIC_URL`. |
+| `agentflow-agents/.github/workflows/build-remotion-runner.yml` | Builds + pushes `ghcr.io/lnlockly/agentflow-remotion-runner` on `remotion-runner/**` changes. |
+| `agentflow-agents/src/mcp-servers/video/index.ts` | `@agentflow-video` MCP server. Exposes `remotion.render` — POSTs to `${REMOTION_RUNNER_URL}/render`, 5-min timeout, passes runner envelope through. |
+| `agentflow-agents/src/mcp-servers/video/index.test.ts` | Unit tests — registry shape, missing-url branch, happy path, runner 4xx, empty `composition_id`, non-json reply. |
+| `agentflow-agents/src/routes/internal-mcp.ts:VIDEO_PATHS` | Owner-pinned mount at `/internal/mcp/video/?owner=<uid>` with the `x-mcp-auth` header (secret is header-only, SECURITY.md M-3). |
+| `agentflow-agents/src/services/internal-mcp-resolver.ts:INTERNAL_MCPS` | `'video'` whitelisted for `${AGENTFLOW_INTERNAL}` placeholder substitution. |
+| `agentflow-agents/src/services/env.ts:remotionRunnerUrl` | Reads `REMOTION_RUNNER_URL`; defaults to empty so the tool refuses with `remotion_runner_not_configured` instead of hung fetch. |
+| `agentflow-agents/k8s/agentflow-agents.yaml:REMOTION_RUNNER_URL` | `http://agentflow-remotion-runner:4200` on the api Deployment. Workers don't call the MCP. |
+
+## Data flow
+
+```
+agentflow-agents pod  ──POST /render──►  agentflow-remotion-runner pod
+   (PR-2 MCP tool)            (Hono :4200)
+                                  │
+                                  ├─► getBundle()           (first request only, then cached)
+                                  │     └─► @remotion/bundler → /tmp/remotion-bundle
+                                  │
+                                  ├─► selectComposition()   (resolves composition_id + merges props)
+                                  │
+                                  ├─► renderMedia()         (chromium → mp4 → /tmp/out-<uuid>.mp4)
+                                  │
+                                  └─► putObject()           (SigV4 PUT → minio:9000)
+                                        └─► remotion/<composition_id>/<uuid>.mp4
+                                  ◄── { ok, mp4_url, duration_sec, size_bytes }
+```
+
+## DB / Env / API
+
+- **Tables:** none. Renderer is stateless.
+- **Env (runner pod):**
+  - `PORT` (default 4200)
+  - `MINIO_ENDPOINT` (default `http://minio:9000`)
+  - `MINIO_BUCKET` (default `agentflow-files`)
+  - `MINIO_REGION` (default `us-east-1`)
+  - `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY` (from `minio-creds` Secret)
+  - `MINIO_PUBLIC_URL` (optional; falls back to in-cluster endpoint)
+  - `REMOTION_CONCURRENCY` (default 2; match CPU limit)
+  - `REMOTION_BUNDLE_CACHE` (default `/tmp/remotion-bundle`)
+  - `REMOTION_ENTRY` (default `/app/src/index.ts`)
+  - `REMOTION_CHROME_EXECUTABLE` (default `/usr/bin/chromium`)
+- **Env (agents pod, PR-2):** `REMOTION_RUNNER_URL` (default in-cluster: `http://agentflow-remotion-runner:4200`). Empty value → tool returns `remotion_runner_not_configured`.
+- **Routes (runner pod):**
+  - `GET  /health` → `{ok:true, service:'remotion-runner'}`
+  - `POST /render` → `{ok, mp4_url, composition_id, duration_sec, size_bytes, render_ms}` or `{ok:false, error, details?}`
+- **Routes (agents pod):**
+  - `POST /internal/mcp/video/?owner=<uid>` with the `x-mcp-auth: <INTERNAL_API_SECRET>` header — JSON-RPC streamable-http MCP. `initialize`, `tools/list`, `tools/call`. Owner-pinned. The secret is HEADER-ONLY (legacy `?token=` query no longer accepted, SECURITY.md M-3).
+- **MCP tools (PR-2 shipped):**
+  - `remotion.render({ composition_id, props?, fps?, duration_frames? })` — agentflow-agents proxies the POST to the runner Service and returns the runner envelope unchanged.
+
+### MCP tool call shape
+
+Wire-level JSON-RPC `tools/call`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "remotion.render",
+    "arguments": {
+      "composition_id": "simple-card",
+      "props": { "title": "Hello", "subtitle": "World", "bgColor": "#000" }
+    }
+  }
+}
+```
+
+Response (`result.content[0].text` is the JSON-encoded runner envelope):
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "isError": false,
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"ok\":true,\"mp4_url\":\"https://files.proj.agentflow.website/remotion/simple-card/...mp4\",\"composition_id\":\"simple-card\",\"duration_sec\":30,\"size_bytes\":1234567,\"render_ms\":42000}"
+      }
+    ]
+  }
+}
+```
+
+### Request schema
+
+```ts
+{
+  composition_id: string,         // required, e.g. "simple-card"
+  props?: Record<string, unknown>, // forwarded to the composition
+  fps?: number,                    // override registered fps (1..120)
+  duration_frames?: number,        // override registered duration (1..7200)
+  template_url?: string,           // reserved — PR-1 returns 400 if set
+}
+```
+
+## Failure modes
+
+| Symptom | Log / response signature for grep | Where to fix |
+|---|---|---|
+| Unknown composition id | response `{ok:false, error:"composition_not_found"}` | Add composition in `remotion-runner/src/Root.tsx`. |
+| Render crash / prop type mismatch | response `{ok:false, error:"render_failed", details:"..."}` | Caller fix props; if Chromium crash, bump pod memory in `k8s/remotion-runner.yaml`. |
+| Missing MinIO creds | response `{ok:false, error:"minio_credentials_missing"}` | Ensure `minio-creds` Secret projected into the pod env. |
+| MinIO PUT failed | response `{ok:false, error:"minio_put_failed", details:"minio_put_failed: <code> ..."}` | Check bucket exists, policy, quota. |
+| `template_url` rejected | response `{ok:false, error:"template_url_not_supported"}` | Use built-in `composition_id` until PR-2/3 wires arbitrary bundles. |
+| Bundle stuck after tmpfs full | `[remotion-runner] listening` but `/render` hangs on bundle step | Pod restart clears it; bump `ephemeral-storage` limit in manifest. |
+| Agents pod env missing runner URL | MCP tool returns `{ok:false, error:"remotion_runner_not_configured"}` (no HTTP attempted) | Set `REMOTION_RUNNER_URL` on `deploy/agentflow-agents` (k8s/agentflow-agents.yaml). |
+| Runner pod down / Service unreachable | MCP tool returns `{ok:false, error:"remotion_runner_unreachable", details:"..."}` (text surfaced to user: `Рендер не удался — сервис remotion-runner недоступен (fetch failed)`) | `kubectl -n franchise-factory get pods -l app=agentflow-remotion-runner`; check restart count / OOMKilled. Verified 2026-05-17 16:57Z on prod run #163 — remains failure mode post PR #425. |
+| Render >5 min | MCP tool returns `{ok:false, error:"remotion_runner_timeout"}` (AbortSignal.timeout fires) | Either shorten composition `duration_frames` or split into smaller renders. |
+| Runner replies non-json | MCP tool returns `{ok:false, error:"remotion_runner_bad_response", details:"..."}` | Renderer regression — check pod logs for stack trace. |
+| Preset not in marketplace catalog | `/marketplace/<slug>` resolves but `/marketplace` listing hides the card | Add slug to `PUBLIC_SEED_SLUGS` + `PLATFORM_AUTO_SEED_SLUGS` in `agentflow-agents/src/scripts/bootstrap-marketplace.ts`. Fixed for the 3 video presets 2026-05-17. |
+
+## Available presets
+
+PR-3 (2026-05-17) ships three chat-callable agents wired to the renderer + the shared Playwright pod:
+
+| Slug | Plugins declared | MCP servers wired | Use-case |
+|---|---|---|---|
+| `remotion-video-operator` | `@agentflow-video` | `video` | One-shot Remotion render. Built-in `simple-card` composition (title/subtitle/bgColor). 5¢ per run. |
+| `playwright-screencast-operator` | `@agentflow-playwright` | `browser` | Frame-by-second capture of any public URL via the shared playwright-mcp pod. Suggests `video.record_graph_demo` when ffmpeg-merge isn't in scope. 8¢ per run. |
+| `video-screencast-remotion` | `@agentflow-video` + `@agentflow-playwright` | `video` + `browser` | End-to-end promo: Remotion intro/outro card + scripted screencast of `target_url`. 20¢ per run. |
+
+Files: `agentflow-agents/presets/remotion-video-operator.json`, `agentflow-agents/presets/playwright-screencast-operator.json`, `agentflow-agents/presets/video-screencast-remotion.json`. Contract tests in `agentflow-agents/tests/unit/video-presets.test.ts` (36 assertions: JSON parseable, plugin namespace honesty, MCP server wiring matches plugin claim, no user-supplied secrets, pricePerRunMicroUsd > 0).
+
+The `@agentflow-video` plugin namespace is advertisement only — actual tool reachability comes from `settings.mcp.servers.video.url = ${AGENTFLOW_INTERNAL}/video` which the resolver substitutes to the owner-pinned mount described above. Same pattern for `@agentflow-playwright` ↔ `settings.mcp.servers.browser.url = ${PLAYWRIGHT_MCP_URL}`.
+
+## Related
+
+- [AI-Видео (brief → reel)](/subsystems/ai-video-remotion) — `POST /me/functions/video` orchestrates brief → script → `brief-reel` render on this runner.
+- [code-exec MCP](/subsystems/code-exec-mcp) — sibling MCP-driven pod pattern.
+- [graph handlers](/subsystems/graph-handlers) — `video.record_graph_demo` does playwright-based screen capture; this renderer is the React-first alternative.

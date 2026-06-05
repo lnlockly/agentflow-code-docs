@@ -1,0 +1,77 @@
+---
+title: "Desktop agent LLM"
+description: "Daemon AI loop: model defaults, reasoning_effort pass-through, bridge to codex.sale."
+---
+
+# Desktop agent LLM
+
+## TL;DR
+
+`agentflow-desktop` daemon defaults to `gpt-5.3-codex` with `reasoning_effort=medium` (fast-mode).
+Owner directive: codex.sale fast-mode beats `high` on Mac task loops (2-3s tool decisions vs 8-12s)
+and is sharper than `low` on multi-step plans. Daemon ships the hint via Anthropic-wire `metadata.reasoning_effort`;
+the backend bridge lifts it to the upstream OpenAI body where codex.sale picks it up.
+
+Env override: `AF_DESKTOP_MODEL` and `AF_DESKTOP_REASONING_EFFORT`. CLI flag: `--reasoning-effort {low,medium,high}`.
+Per-task `scope.model` / `scope.reasoning_effort` win over both env and CLI defaults.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py:35` | `DEFAULT_MODEL = "gpt-5.3-codex"` (env: `AF_DESKTOP_MODEL`) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py:39` | `DEFAULT_REASONING_EFFORT = "medium"` (env: `AF_DESKTOP_REASONING_EFFORT`) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py:44` | `_is_gpt5_family(model)` — gates the reasoning hint to gpt-5 / o-series only |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py:65` | `_augment_body_with_reasoning(body, model, effort)` — injects `metadata.reasoning_effort` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py:985` | main loop body construction — calls `_augment_body_with_reasoning` before `post_llm_cancellable` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py:642` | `_request_checkpoint` body — same `metadata.reasoning_effort` attached |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py:1257` | `task_worker` — reads `task_scope.model` + `task_scope.reasoning_effort`, overrides daemon defaults |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/desktop_cli.py:480` | `--reasoning-effort` CLI flag on `run` subcommand |
+| `agentflow-computer-mcp/tests/test_loop_reasoning_effort.py` | unit tests: gpt-5 detection + body augmentation + run_task wiring + scope override |
+| `agentflow-agents/src/services/anthropic-openai-bridge.ts:32` | `AnthropicRequestMetadata` type with `reasoning_effort?: 'low'\|'medium'\|'high'` |
+| `agentflow-agents/src/services/anthropic-openai-bridge.ts:77` | `OpenAiChatRequest.reasoning_effort` field |
+| `agentflow-agents/src/services/anthropic-openai-bridge.ts:194` | bridge passes `req.metadata.reasoning_effort` → `openaiReq.reasoning_effort` |
+| `agentflow-agents/src/routes/public-llm.ts:493` | `proxyAnthropicViaOpenAi` — codex.sale receives the field on `/chat/completions` |
+
+## Data flow
+
+```
+desktop daemon (loop.py)
+   └─ build body { model: "gpt-5.3-codex", messages, ..., metadata: { reasoning_effort: "medium" } }
+       │
+       ▼ POST https://agentflow.website/_agents/llm/v1/messages   (Anthropic wire format, x-api-key)
+agentflow-agents (public-llm.ts → proxyAnthropicViaOpenAi)
+   └─ pickUpstreamForAnthropicRequest("gpt-5.3-codex")  → codex.sale (format=openai)
+   └─ translateAnthropicToOpenAi(body, upstream.model)
+       ├─ system + messages translated
+       └─ req.metadata.reasoning_effort === "medium" → openaiReq.reasoning_effort = "medium"
+   └─ POST <codex.sale>/chat/completions { ..., reasoning_effort: "medium", stream: true }
+```
+
+## DB / Env / API
+
+- Env (daemon):
+  - `AF_DESKTOP_MODEL` (default `gpt-5.3-codex`)
+  - `AF_DESKTOP_REASONING_EFFORT` (default `medium`, must be one of `low|medium|high`)
+- Env (backend): no new env. Bridge auto-detects `metadata.reasoning_effort` on incoming Anthropic body.
+- Routes: `POST /llm/v1/messages` (existing; behaviour change only when metadata present).
+- CLI: `agentflow-desktop run --reasoning-effort medium` (or `drive --reasoning-effort high`).
+- Per-task scope keys: `task_scope.model`, `task_scope.reasoning_effort` — set by cabinet on
+  `task_dispatch` frames.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Daemon stuck on slow tool decisions (>8s/step) | `model:   gpt-5.3-codex (reasoning_effort=high)` in startup banner | Flip `AF_DESKTOP_REASONING_EFFORT=medium` or restart daemon. Owner directive: `medium` is the contract. |
+| Codex.sale 4xx `unknown field reasoning_effort` | `upstream_http_400` in `proxyAnthropicViaOpenAi` response | Upstream contract changed — drop the field in `translateAnthropicToOpenAi` for that model id. |
+| Daemon hits Claude model but body still carries `metadata.reasoning_effort` | n/a (Claude ignores extra keys) | Expected — `_is_gpt5_family` guards on the daemon side; if you bypass it manually, Anthropic silently drops the field. |
+| Cabinet override doesn't take effect | grep daemon log for `loaded …` startup; check `task_dispatch` frame `scope` payload | `task_worker` reads `task_scope.reasoning_effort` only when it's a non-empty string — JSON `null` or empty string falls back to daemon default. |
+| Daemon stuck on `claude-sonnet-4-6` after upgrade | `model:   claude-sonnet-4-6` in startup banner | Old `AF_DESKTOP_MODEL` env set on the machine — unset or override. New default is `gpt-5.3-codex`. |
+
+## Related
+
+- [Computer-MCP bridge](/subsystems/computer-mcp) — server-side WS tunnel + task dispatch.
+- [Desktop coding tools](/subsystems/desktop-coding-tools) — tools the daemon exposes to the LLM.
+- [LLM router](/subsystems/llm-router) — server-side routing for non-daemon callers.
+- [Public LLM facade](/subsystems/public-llm-facade) — `/llm/v1/messages` endpoint that bridges Anthropic ↔ OpenAI upstreams.

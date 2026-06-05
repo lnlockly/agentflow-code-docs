@@ -1,0 +1,114 @@
+---
+title: "Maestro skip when workflow_schema present"
+description: "Boilerplate workflow_schema is the plan. Create-time fast-path and dispatch-time both route through one helper that picks the schema and brief-routes for kind=tg_bot."
+---
+
+# Maestro skip when workflow_schema present
+
+## TL;DR
+
+When `agent_boilerplates.workflow_schema` is non-empty for a project's
+resolved kind, Maestro's propose-loop is redundant — the schema IS the
+plan. The platform now synthesises a `proposed_plan` from the nodes at
+`POST /me/projects` create-time and flips status straight to
+`awaiting_approval`. Same helper (`pickWorkflowSchema`) runs again at
+approve-time inside `runGraphExecutorDispatch` so both paths agree on
+the schema.
+
+`kind=tg_bot` has 4+ niche boilerplates sharing one kind. The helper
+loads every tg_bot row in one query, picks the niche whose node ids
+match the brief (subscription-gate / voice / crosspost / join-request),
+and otherwise returns the generic `telegram-bot-boilerplate` schema
+with `reason=tg_bot_generic_fallback`. Net effect: kind=tg_bot ALWAYS
+gets a graph schema — never falls to Maestro, never hangs the coder
+on TARGET_CHANNEL placeholders. A Sales-Assistant brief now ships
+through `request_token → scaffold_aiogram → smoke_test → self_heal_loop → deploy`.
+
+Fixes three P1 bugs from 2026-05-17:
+- mini_app stuck in `maestro_thinking` for 50+ min ([qa #1](#failure-modes))
+- tg_farm Maestro picks bot-tester → capability_mismatch loop until 240s timeout
+- Every kind=tg_bot project ran the subscription-gate flow regardless of brief
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/graph-executor/pick-workflow-schema.ts` | Single helper: override → DB lookup → tg_bot brief-routing. Returns `{schema, reason}`. |
+| `agentflow-agents/src/routes/projects.ts:970` | Create-time fast-path. Synthesises proposed_plan from schema nodes when `picked.schema != null`. |
+| `agentflow-agents/src/services/projects.ts:2602` | `runGraphExecutorDispatch` — same helper at dispatch time so both paths agree. |
+| `agentflow-agents/src/routes/projects.ts:854` | `resolvedKind` resolution (raw → classifier → canonical). Fast-path now reads this, NOT `parsed.data.kind`. |
+| `agentflow-agents/tests/services/pick-workflow-schema.test.ts` | 21 unit tests covering all 6 graph kinds + tg_bot brief-mismatch + generic-fallback cases. |
+| `agentflow-agents/src/db/schema.ts:1523` | `agentBoilerplates.workflowSchema` column (jsonb, nullable). |
+| `agentflow-agents/src/db/migrations/0059_boilerplate_workflow.sql` | Migration that added the column. |
+| `agentflow-agents/src/scripts/seed-boilerplate-workflows.ts` | Seeds workflow_schema for 11 boilerplates across the 6 graph kinds. |
+
+## Data flow
+
+```
+POST /me/projects { brief, kind?: auto | landing | tg_bot | … }
+  │
+  ├─ kind resolution (rawKind → classifier → resolvedKind)
+  │
+  ├─ DB insert: projects row, status=draft, kind=resolvedKind
+  │
+  ├─ pickWorkflowSchema({ kind: resolvedKind, brief, override }):
+  │     ├─ override?    → reason='override', schema=override
+  │     ├─ no kind?     → reason='no_kind', schema=null
+  │     ├─ kind=tg_bot? → pickTgBotSchema(brief):
+  │     │                  ├─ load ALL tg_bot rows (one PG call, no LIMIT)
+  │     │                  ├─ for each non-generic row:
+  │     │                  │     classifyTgBotBriefMismatch(schema, brief)
+  │     │                  │       ├─ subscription nodes + subscription brief → matched
+  │     │                  │       ├─ voice nodes + voice brief               → matched
+  │     │                  │       ├─ crosspost nodes + crosspost brief       → matched
+  │     │                  │       └─ join_request nodes + join brief         → matched
+  │     │                  └─ no niche match → return generic
+  │     │                       (name='telegram-bot-boilerplate'),
+  │     │                       reason='tg_bot_generic_fallback'
+  │     ├─ else          → DB lookup → first agent_boilerplates row by kind
+  │     └─ return { schema, reason }
+  │
+  ├─ schema != null:
+  │     ├─ synthesise proposed_plan { agents:[maestro], steps:nodes.map(...) }
+  │     ├─ UPDATE projects SET proposed_plan=..., status='awaiting_approval'
+  │     └─ emit plan_proposed event
+  │
+  └─ schema == null:
+        └─ runMaestroProposeBackground(projectId, ownerUserId)
+              (handles freeform briefs + kinds without a baked workflow)
+
+POST /me/projects/:id/approve
+  │
+  ├─ approveProject(...) → status='approved' → runProjectApprovalBackground
+  │
+  └─ runGraphExecutorDispatch:
+        ├─ pickWorkflowSchema(...) again (same helper, same answer)
+        ├─ schema != null → walker.run({ projectId, workflowSchema, ctxOverrides })
+        └─ schema == null → runProjectExecutionBackground (legacy maestro)
+```
+
+## DB / Env / API
+
+- Tables: `agent_boilerplates(kind, workflow_schema jsonb)`, `projects(kind, workflow_override, proposed_plan, status)`
+- Env: `FF_GRAPH_EXECUTOR`, `FF_GRAPH_EXECUTOR_KINDS` (legacy fallback). Live values in DB-driven `feature_flags`: `graph_executor.enabled`, `graph_executor.kinds`.
+- Routes: `POST /me/projects` (create-time fast-path), `POST /me/projects/:id/approve` (dispatch-time)
+- MCP tools: still `team-manager.propose_project_plan` when Maestro fallback fires
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Project stuck in maestro_thinking 50+ min | `maestro_thinking` event without subsequent `propose_project_plan` for >10 min | Verify `resolvedKind` is in `EXPLICIT_KINDS` (`routes/projects.ts:835`) — if not, helper returns `no_kind` and Maestro is kicked which can deadlock on cold-start |
+| tg_bot project hung on `fetch_target_channel` | event `tool_call` with node_id `fetch_target_channel` for a non-subscription brief | Generic-fallback should have fired. Check `agent_boilerplates` for a row with `name='telegram-bot-boilerplate'` and a non-null `workflow_schema`. Re-run `seed-boilerplate-workflows.ts` if missing |
+| tg_bot project fell back to Maestro | `[fast-path] no_schema kind=tg_bot reason=no_boilerplate` | Generic row missing from `agent_boilerplates` (DB drift). Re-seed |
+| Fast-path proposed_plan written but graph-executor still chooses maestro | `[graph-executor] no workflow_schema for kind=<x> reason=<r>` | Helper returned different result at dispatch vs create. Check `projects.workflow_override` wasn't cleared between calls; check the boilerplate row wasn't deleted |
+| Niche schema picked for a generic brief | `[fast-path] kind=tg_bot ... reason=matched` but proposed_plan steps include `fetch_target_channel` for a Sales-Assistant brief | `classifyTgBotBriefMismatch` returned `null` even though brief is generic. Patterns in `pick-workflow-schema.ts:classifyTgBotBriefMismatch` — keyword may be too lax |
+| Empty proposed_plan but status=awaiting_approval | `[fast-path]` log present but `proposed_plan.steps.length === 0` | `boilerplate.workflow_schema.nodes` empty — fix seed via `seed-boilerplate-workflows.ts` |
+| tg_farm 412 not fired despite no tg_links | `kind=tg_farm` row with status=awaiting_approval and no `tg_links` for owner | The 412 guard at `routes/projects.ts:647` checks `parsed.data.kind`, not `resolvedKind` — auto-classify path can miss it. Either send explicit kind from client or move check after `resolvedKind` resolution |
+
+## Related
+
+- [Graph executor](/architecture/graph-executor) — walker + handler contract
+- [Add new kind](/runbooks/add-new-kind) — how to register a new boilerplate kind
+- [Project lifecycle](/flows/project-lifecycle) — full status machine
+- [Create project flow](/flows/create-project) — end-to-end request path

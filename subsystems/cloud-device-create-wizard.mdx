@@ -1,0 +1,95 @@
+---
+title: "Cloud device create wizard (hosted/new)"
+description: "Step-by-step wizard at /cabinet/devices/hosted/new with a plain-language permissions step that applies a device scope inline after create."
+---
+
+# Cloud device create wizard (hosted/new)
+
+## TL;DR
+
+`/cabinet/devices/hosted/new` is a guided multi-step wizard (one simple choice
+per step, progress bar) for creating a cloud device. For an AI-agent (daemon)
+device the steps are Тип → Мощность → Движок и софт → Разрешения → Готово; for
+a plain Linux device the engine + permissions steps drop out (Тип → Мощность →
+Готово). The create POST is unchanged (`/me/hosted-devices`). The permissions
+step's chosen scope is applied **inline after create** via
+`devicesApi.updateScope(user_device_id, scope)`, best-effort.
+
+This is a sibling of [device-create-wizard](/subsystems/device-create-wizard)
+(the unified `/cabinet/devices/new` funnel) — different route, different page.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/pages/CabinetHostedDeviceNew.tsx:282` | `CabinetHostedDeviceNew` — the wizard component |
+| `agentflow-landing/src/pages/CabinetHostedDeviceNew.tsx:272` | `type StepId = 'type'\|'power'\|'engine'\|'perms'\|'review'` |
+| `agentflow-landing/src/pages/CabinetHostedDeviceNew.tsx:307` | `steps` — daemon = 5 steps; plain = 3 (engine + perms skipped) |
+| `agentflow-landing/src/pages/CabinetHostedDeviceNew.tsx:245` | `WIZARD_DEFAULT_SCOPE` — friendly safe default (all bundles allowed, shell.exec gated) |
+| `agentflow-landing/src/pages/CabinetHostedDeviceNew.tsx:351` | `submit()` — POST create, then inline scope apply, then navigate |
+| `agentflow-landing/src/pages/CabinetHostedDeviceNew.tsx:384` | `devicesApi.updateScope(resp.device.user_device_id, scope)` (best-effort, try/catch) |
+| `agentflow-landing/src/pages/CabinetHostedDeviceNew.tsx:819` | sticky footer `bottom-[60px] md:bottom-0` — clears the fixed mobile tab bar |
+| `agentflow-landing/src/pages/CabinetDevicePermissions.tsx:66` | `PERMISSION_BUNDLES` — files/internet/memory → scope ids (single source of truth, reused) |
+| `agentflow-landing/src/pages/CabinetDevicePermissions.tsx:104` | `bundleStateFor` (exported for the wizard) |
+| `agentflow-landing/src/pages/CabinetDevicePermissions.tsx:119` | `applyBundleToggle` (exported, reused) |
+| `agentflow-landing/src/lib/devicesApi.ts:79` | `updateScope(id, scope)` → `POST /me/devices/:id/scope` |
+| `agentflow-landing/src/main.tsx:741` | route `/cabinet/devices/hosted/new` (RequireAuth + AccessGate) |
+| `agentflow-agents/src/routes/me-devices/crud.ts:360` | `POST /me/devices/:id/scope` — updates `user_devices` by id |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:1395` | on-demand create returns `device.user_device_id` |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:1323` | warm-pool claim returns `device.user_device_id` |
+
+## Data flow
+
+```
+/cabinet/devices/hosted/new
+  └─ CabinetHostedDeviceNew (wizard)
+       Тип ─ Мощность ─ [Движок+софт] ─ [Разрешения] ─ Готово
+                                                          │
+       «Включить агента 24/7» ──► POST /me/hosted-devices { name,size,kind,preinstall,template? }
+                                     │  201 { device: { id, user_device_id } }
+                                     ▼
+       daemon + user_device_id?  ──► POST /me/devices/<user_device_id>/scope { scope }   (best-effort)
+                                     │  (failure is swallowed — backend safe default stays)
+                                     ▼
+       navigate → /cabinet/devices/hosted/<device.id>
+```
+
+Why `user_device_id` and not `device.id`: the `/me/devices/:id/scope` route
+runs `UPDATE user_devices ... WHERE id = :id` — it does NOT resolve a
+`hosted_devices.id`. `device.id` (returned for the `/cabinet/devices/hosted/:id`
+detail route) is the `hosted_devices.id`. The create response carries both, so
+the wizard sends the scope to `device.user_device_id`.
+
+## Permissions step
+
+Plain-RU framing «Что агенту можно». Reuses `PERMISSION_BUNDLES` /
+`bundleStateFor` / `applyBundleToggle` from `CabinetDevicePermissions` so the
+bundle → scope-id mapping never drifts (labels localised via i18n keyed by
+bundle id). A bundle ON means its scope ids are absent from
+`scope.confirm_before` (agent runs without the per-call confirm gate). The
+«спрашивать перед важными действиями» toggle maps to `shell.exec` in
+`confirm_before`; the spend-limit chips set `scope.budget_usd` (default $2). The
+wizard opens on `WIZARD_DEFAULT_SCOPE` (all bundles ON, shell.exec gated) so it
+never starts on a «mixed» badge.
+
+## DB / Env / API
+
+- Tables: `user_devices` (scope_json), `hosted_devices`
+- Routes: `POST /me/hosted-devices` (create), `POST /me/devices/:id/scope` (scope apply)
+- i18n keys: `cabinet.hosted.wiz.*` in `agentflow-landing/src/i18n/{ru,en,zh}.json`
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Cloud create returns 404 (service not deployed) | `cabinet.hosted.unavailable_title` shown | `CabinetHostedDeviceNew.tsx` 404 branch in `submit()` |
+| Goose engine rejected (canary off) | `goose_canary_disabled` | `submit()` 403 branch → reverts to coder, returns to engine step |
+| Permissions not applied after create | (silent — try/catch around `updateScope`) | owner re-applies at `/cabinet/devices/:id/permissions` |
+| Sticky «Далее» hidden behind mobile tab bar | n/a (visual) | footer `bottom-[60px] md:bottom-0`, `CabinetHostedDeviceNew.tsx:819` |
+
+## Related
+
+- [device-create-wizard](/subsystems/device-create-wizard) — unified `/cabinet/devices/new`
+- [hosted-device](/subsystems/hosted-device) — backend provisioner + create payload
+- [hosted-device-warm-pool](/subsystems/hosted-device-warm-pool) — warm-pool claim path
+- [devices-unified](/subsystems/devices-unified) — `/me/devices/:id` resolver (hosted vs local)

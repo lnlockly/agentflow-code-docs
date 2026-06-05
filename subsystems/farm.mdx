@@ -30,7 +30,11 @@ from the `/farm` UI into `/projects/:slug`.
 | `agentflow-agents/src/db/schema.ts:2510` | `farmStats` Drizzle table — counters per user |
 | `agentflow-agents/src/db/schema.ts:2537` | `farmSendLog` Drizzle table — per-send audit trail (real `throttled_send` handler INSERTs here) |
 | `agentflow-agents/migrations/2026-05-15f-user-farms-project-link.sql` | Adds `project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL` + `idx_user_farms_project` |
-| `agentflow-agents/migrations/2026-05-13-tg-templates-v2.sql:144` | Inserts the `tg-cold-mailer` boilerplate row (kind=tg_farm) whose `workflow_schema` is what Maestro picks up |
+| `agentflow-agents/migrations/2026-05-13-diploma-boilerplate.sql:33` | Inserts the `diploma-outreach-build` boilerplate (kind=tg_farm) — 11-node pitch→visitka/bot funnel, the historic default for tg_farm projects |
+| `agentflow-agents/migrations/2026-05-13-tg-templates-v2.sql:144` | Inserts the `tg-cold-mailer` boilerplate row (kind=tg_farm) — 5-node link_account → import_leads → personalize → throttled_send → log_replies. The broadcast/list-of-chats schema. |
+| `agentflow-agents/migrations/2026-05-13-tg-templates-v2.sql:194` | Inserts the `tg-ai-shiller` boilerplate (kind=tg_farm) — 5-node keyword-monitor + AI auto-reply |
+| `agentflow-agents/src/services/graph-executor/pick-workflow-schema.ts:pickTgFarmSchema` | Brief-keyword router that picks between the three tg_farm boilerplates (see "Brief routing" below) |
+| `agentflow-agents/src/services/graph-executor/pick-workflow-schema.ts:classifyTgFarmBriefIntent` | Pure regex classifier — returns `'tg-cold-mailer'` / `'tg-ai-shiller'` / `null` for default funnel |
 | `agentflow-agents/src/services/tg-farm-spawn.ts` | `spawnFarmProject(userId)` — idempotent project creator used by /me/farm/start (skips paid-gate, fires Maestro propose) |
 | `agentflow-agents/src/services/tg-farm-spawn.ts:findActiveFarmProject` | Look up the user's existing tg_farm project (status in draft/awaiting_approval/approved/running) |
 | `agentflow-agents/src/services/graph-executor/handlers/tg-marketing.ts:88` | `link_account` handler — Telethon/GramJS session bootstrap (idempotent) |
@@ -113,6 +117,29 @@ Also returns the linked project shape so the UI can render
   - `POST /me/farm/pause` → stats payload
   - `POST /me/farm/toggle` → stats payload OR `{ ok, reused, project }` when activating
 
+## Brief routing (kind=tg_farm)
+
+Three boilerplates share `kind=tg_farm`. Before PR
+`fix/tg-farm-broadcast-routing-2026-05-18` the picker did `LIMIT 1`
+ordered by row id, so every tg_farm brief got the diploma funnel — the
+broadcast/list-of-chats brief on project 996 never saw the cold-mailer's
+`import_leads` / `throttled_send` nodes. See
+`qa-issues/2026-05-18-tg-farm-broadcast-ui-missing.md`.
+
+`pickTgFarmSchema` now loads every tg_farm row, runs
+`classifyTgFarmBriefIntent(brief)` against the brief, and picks:
+
+| Brief signal | Boilerplate | Reason emitted |
+|---|---|---|
+| `broadcast`, `рассылка`, `список чатов`, `cold-mail(ing/er)`, `mass send`, `bulk dm`, `csv import`, `lead list`, `разослать` | `tg-cold-mailer` | `tg_farm_broadcast_route` |
+| `ai-shill(er)`, `keyword monitor`, `chat watcher`, `шиллинг`, `отвечать в чатах по ключевым словам`, `мониторинг чатов по ключевым` | `tg-ai-shiller` | `tg_farm_shill_route` |
+| neither (bare `ферма`, generic outreach, etc.) | `diploma-outreach-build` | `tg_farm_funnel_default` |
+| no recognised name in DB (drift) | first row by insertion order | `matched` |
+
+The reasons are emitted as `log` `project_events.payload.msg` at fast-path
+time (`[fast-path] kind=tg_farm skipped maestro propose — reason=…`) so
+ops can grep prod logs and confirm a project ran the right schema.
+
 ## Anti-spam rails
 
 Enforced inside the `throttled_send` handler scaffold (see
@@ -135,6 +162,7 @@ Enforced inside the `throttled_send` handler scaffold (see
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
 | `/me/farm/start` returns `412 tg_not_connected` | n/a (handled at handler level) | User hasn't run TG kickstart flow — show /account/settings link |
+| 412 even after `/me/tg-accounts/confirm-code` succeeded | `tg_farm_missing_account` in projects.ts dispatcher | Two root causes (fixed 2026-05-19): (1) `mcpDirect.callTool` returns the MCP envelope so `result?.status` was always undefined → confirm-code never hit the success branch. (2) Even when active, confirm-code didn't INSERT into `tg_links` — only the bot-deeplink flow did. See `routes/tg-accounts.ts` `unwrapMcp` + tg_links upsert |
 | `/me/farm/start` returns `500 project_spawn_failed` | `slug_collision` or `db_insert_failed` | Inspect Postgres connection + rerun; spawn is idempotent on the user_id side via `findActiveFarmProject` |
 | Multiple tg_farm projects per user | n/a | `findActiveFarmProject` filter is by status set; failed/cancelled rows are ignored intentionally so the user can restart after a bad run |
 | FarmPage stuck on mock | `MOCK_STATS` fallback in `FarmPage.tsx:37` | `/me/farm/stats` 401/500 — check auth + agentsBaseUrl |
@@ -142,6 +170,8 @@ Enforced inside the `throttled_send` handler scaffold (see
 | Legacy stub still running | `farm-send: due farms` after deploy | `FF_FARM_LEGACY_WORKER` env was set to `1` somewhere — unset it |
 | Worker booted in production by accident | `farm-send worker started` | Same — should print `FF_FARM_LEGACY_WORKER!=1 — legacy farm-send worker disabled` instead |
 | User sees "Открыть проект" but link 404s | `user_farms.project_id` points to a deleted row | The FK is `ON DELETE SET NULL`; project deletion should null it. Next /me/farm/start spawns a new one |
+| Broadcast brief shipped the diploma funnel instead of cold-mailer | `[fast-path] kind=tg_farm skipped maestro propose — reason=tg_farm_funnel_default` against a brief mentioning рассылка/broadcast | `classifyTgFarmBriefIntent` regex missed the trigger — extend the cold-mailer pattern in `pick-workflow-schema.ts` + add a unit test in `tests/services/pick-workflow-schema.test.ts` |
+| `tg_farm` project stuck because no boilerplate row exists | `[fast-path] no_schema kind=tg_farm reason=no_boilerplate — kicking maestro` | Re-run the seed migrations (`2026-05-13-diploma-boilerplate.sql`, `2026-05-13-tg-templates-v2.sql`) against the prod DB |
 
 ## Backlog
 

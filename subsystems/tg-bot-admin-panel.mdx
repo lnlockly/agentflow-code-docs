@@ -1,0 +1,65 @@
+---
+title: "TG bot admin panel + OWNER_TG_ID injection"
+description: "Creator-only /admin command in the tg_bot starter template, gated on the OWNER_TG_ID env var written by auto-bot.ts from the project owner's tg_links row."
+---
+
+# TG bot admin panel + OWNER_TG_ID injection
+
+## TL;DR
+
+The default `tg_bot` template (`lnlockly/agentflow-tg-bot-starter`) ships with a SQLite-backed user tracker and an inline `/admin` panel. Only the project creator's Telegram account can open the panel. The platform looks up that account via `tg_links.tg_user_id` for `projects.owner_user_id` and writes it as the `OWNER_TG_ID` project secret; `env-file-sync.ts` then mirrors it into `/workspace/.env` so the running bot picks it up on the next supervisor restart loop iteration.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-tg-bot-starter/bot.py` | Wires the dispatcher, includes the admin router, runs `db.init_db()` on boot |
+| `agentflow-tg-bot-starter/admin.py` | `/admin` command + inline menu, `is_owner()` gate against `OWNER_TG_ID` env |
+| `agentflow-tg-bot-starter/db.py` | SQLite helpers — `users`, `bookings`, `broadcasts` tables |
+| `agentflow-tg-bot-starter/middleware.py` | Outer middleware upserts every interacting user |
+| `agentflow-agents/src/services/auto-bot.ts:765` | Calls `persistOwnerTgIdSecret` after the BOT_TOKEN row is written |
+| `agentflow-agents/src/services/auto-bot.ts:783` | `persistOwnerTgIdSecret(projectId, ownerUserId)` — looks up tg_links and seals OWNER_TG_ID |
+| `agentflow-agents/src/services/env-file-sync.ts:82` | Reads all `project_secrets` rows and writes `/workspace/.env` |
+
+## Data flow
+
+```
+projects table              tg_links table          project_secrets table       /workspace/.env
+─────────────────           ──────────────          ─────────────────────       ──────────────
+owner_user_id ─────────────► user_id                                            BOT_TOKEN=...
+                            tg_user_id ─────────────► OWNER_TG_ID (sealed) ────► OWNER_TG_ID=1361...
+
+                              ▲                              ▲                      ▲
+                              │ persistOwnerTgIdSecret       │ env-file-sync         │ Procfile
+                              │ (auto-bot.ts)                │ (auto-bot.ts last)    │ supervisor
+                              │                              │                      │ re-source
+                                                                                    │
+                                                                            bot.py reads
+                                                                            os.getenv('OWNER_TG_ID')
+                                                                            on /admin
+```
+
+## DB / Env / API
+
+- Tables: `tg_links (tg_user_id, user_id)`, `project_secrets (project_id, key='OWNER_TG_ID')`, plus SQLite-local `users`, `bookings`, `broadcasts` inside the project pod.
+- Env (in the project pod, written by env-file-sync):
+  - `BOT_TOKEN` — aiogram authentication
+  - `BOT_USERNAME` — cosmetic, used in startup log
+  - `OWNER_TG_ID` — gate for `/admin` (numeric Telegram user ID)
+  - `BOT_DB_PATH` — optional override for SQLite path
+- No new routes. The flow piggybacks on the existing `auto-bot` runtime callback that fires on `workspace_ready` for `kind=tg_bot` projects.
+- No new MCP tools.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `/admin` rejects everyone including owner | `[auto-bot] no tg_links row for owner_user_id=` | Owner has never linked Telegram via `/me/tg-link/init` — direct them to the cabinet's "Connect Telegram" flow |
+| OWNER_TG_ID secret never appears | `[auto-bot] persistOwnerTgIdSecret(...) threw:` | DB connectivity issue at write time; secret will be retried on next bot_assigned trigger |
+| `/admin` rejects owner after they pasted a new tg_user_id | `[auto-bot] OWNER_TG_ID already set for project ... leaving as-is` | This is by design — owner pasted their own value (is_set=true) so platform won't overwrite. Owner edits the Secrets pane to fix. |
+| Bot starts but OWNER_TG_ID still unset in /workspace/.env | `[env-sync] pod write failed for project` | Pod-write kubectl timeout; resync via `POST /me/projects/:id/resync-env` |
+
+## Related
+
+- [auto-bot token assignment](/subsystems/projects/) — the BOT_TOKEN flow this hooks onto
+- [env-file-sync](/subsystems/projects-create-flow/) — secrets → /workspace/.env mirroring

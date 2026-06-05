@@ -1,0 +1,142 @@
+---
+title: "AgentFlow Desktop (forked Goose Desktop)"
+description: "Rebranded fork of Block's Goose Desktop (Electron) with a device-bridge so the website drives the local goosed — dual-mode."
+---
+
+# AgentFlow Desktop (forked Goose Desktop)
+
+## TL;DR
+AgentFlow Desktop is a rebranded fork of Block's Goose Desktop (Electron Forge app)
+living in `lnlockly/agentflow-goose` at `ui/desktop/`. It ships the local `goosed`
+binary (Rust, `crates/goose-server`) and runs in two modes: standalone (user chats,
+goose codes + controls the machine) and platform-driven (device-bridge enrolls with
+AgentFlow and runs the same `goosed` from `task_dispatch`). Phase 1 (this page's
+current scope) rebrands the brand surface only — name, bundle id, icons, theme accent,
+installer metadata, updater target, docs links. Internal identifiers (`goosed`,
+`GOOSE_*` env, `goose://` deep-link scheme, `@aaif/goose-sdk` workspace pkg) are kept
+unchanged on purpose.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-goose/ui/desktop/package.json:3` | `productName` / `description` → "AgentFlow Desktop" |
+| `agentflow-goose/ui/desktop/forge.config.ts:9` | `appBundleId: 'com.agentflow.desktop'` (macOS bundle id) |
+| `agentflow-goose/ui/desktop/forge.config.ts` | maker-deb/rpm/flatpak name+homepage, publisher repo `lnlockly/agentflow-goose` |
+| `agentflow-goose/ui/desktop/index.html:9` | window `<title>` → AgentFlow Desktop |
+| `agentflow-goose/ui/desktop/src/main.ts:615` | macOS About panel `applicationName` |
+| `agentflow-goose/ui/desktop/src/main.ts:2175` | app-menu lookup keyed on new app name |
+| `agentflow-goose/ui/desktop/src/utils/githubUpdater.ts:30` | updater default owner/repo/bundleName → AgentFlow |
+| `agentflow-goose/ui/desktop/src/utils/autoUpdater.ts:355` | release feed owner/repo default → lnlockly/agentflow-goose |
+| `agentflow-goose/ui/desktop/src/utils/winShims.ts:16` | Windows shim dir `%LOCALAPPDATA%\AgentFlow Desktop\bin` |
+| `agentflow-goose/ui/desktop/src/styles/main.css:30` | brand accent tokens → AgentFlow lime (`#a6f25c` / `#d4ff00`) |
+| `agentflow-goose/ui/desktop/src/images/icon.{icns,ico,png,svg}` | regenerated AgentFlow app icons (dark square + lime chevron) |
+| `agentflow-goose/ui/desktop/src/images/iconTemplate*.png` | macOS menubar tray template (black chevron) |
+| `agentflow-goose/ui/desktop/forge.deb.desktop` / `forge.rpm.desktop` | Linux desktop entries renamed |
+| `agentflow-goose/ui/desktop/src/device-bridge/auth.ts` | auth.json load/save + connect headers (port of computer-mcp `auth.py`) |
+| `agentflow-goose/ui/desktop/src/device-bridge/wsBridge.ts` | WS reverse-tunnel: hello/hello_ack secret rotation, heartbeat, task_dispatch/cancel, reconnect backoff (port of `ws_client.py`) |
+| `agentflow-goose/ui/desktop/src/device-bridge/goosedDispatch.ts` | drives local goosed `POST /agent/start`→`/reply` SSE; accumulates answer + token usage |
+| `agentflow-goose/ui/desktop/src/device-bridge/queuedTasks.ts` | drains `/me/devices/:id/queued_tasks` on reconnect |
+| `agentflow-goose/ui/desktop/src/device-bridge/index.ts` | `startDeviceBridge()` wiring + `ws` connect-header adapter + `flowGatewayEnvFromAuth()` |
+| `agentflow-goose/ui/desktop/src/device-bridge/engineConfig.ts` | flow-gateway env builder (`buildFlowGatewayEnv`) + extensions config (`buildExtensionsConfig`), ported from coder-shim `goose-runner.ts` |
+| `agentflow-goose/ui/desktop/src/device-bridge/extensionsSetup.ts` | merge `computercontroller` (builtin) + af_* MCP (`@agentflow/mcp-server`) into `~/.config/goose/config.yaml` — add-if-absent, never clobbers user entries |
+| `agentflow-goose/ui/desktop/src/main.ts` (`ensureDeviceBridge`) | starts the bridge after goosed; gated `FF_DEVICE_BRIDGE=1` |
+| `agentflow-goose/ui/desktop/src/main.ts` (goosed env merge) | injects the flow-gateway env into the spawned goosed; gated `FF_FLOW_LLM=1` |
+| `agentflow-goose/ui/desktop/resources/agentflow-mcp/server.cjs` | vendored single-file af_* MCP bundle (esbuild of `@agentflow/mcp-server`, SDK+zod inlined, ~792KB) shipped as a forge extraResource |
+| `agentflow-goose/ui/desktop/scripts/bundle-af-mcp.mjs` | regenerates the af_* bundle from the sibling repo |
+| `agentflow-goose/ui/desktop/forge.config.ts` (extraResource) | ships `resources/agentflow-mcp` so af_* loads on a stock install (no `AGENTFLOW_MCP_PATH`) |
+
+## Data flow
+```
+                ┌──────────── AgentFlow Desktop (ui/desktop, Electron) ────────────┐
+ Mode A chat ──►│ renderer (React+Vite) ─► main.ts ─► spawns local goosed (Rust)   │
+                │                                       extensions: developer +     │
+ Mode B WS ────►│ device-bridge ⇄ wss://agentflow.website/_agents/_devices/connect │
+ (FF_DEVICE_    │   task_dispatch ─► same goosed (POST /agent/start→/reply SSE)     │
+  BRIDGE=1)     │   ─► task_progress/task_complete frames; drain queued on reconnect│
+                └──────────────────────────────────────────────────────────────────┘
+                          LLM for both = `flow` gateway (GOOSE_PROVIDER=openai,
+                          GOOSE_MODEL=flow, OPENAI_HOST=https://agentflow.website)
+```
+
+## DB / Env / API
+- Env (build/runtime, unchanged identifiers): `GOOSE_PROVIDER`, `GOOSE_MODEL`,
+  `OPENAI_HOST`, `GOOSE_BUNDLE_NAME`, `GITHUB_OWNER`, `GITHUB_REPO`, `APPLE_TEAM_ID`,
+  `APPLE_ID`, `WINDOWS_CERTIFICATE_FILE`.
+- Bundle id: `com.agentflow.desktop` (macOS). Deep-link scheme: `goose://` (kept —
+  recipe/resume deep-links + server-emitted URLs depend on it).
+- Updater target default: `github.com/lnlockly/agentflow-goose/releases/latest`.
+- Device-bridge enrolment: `~/.agentflow/auth.json` (`api_key`, `device_id`,
+  `device_secret`/`enrollment_token`, `ws_url`) — same file the old daemon used.
+- Device-bridge env: `FF_DEVICE_BRIDGE=1` (opt-in until packaged-verified),
+  `AGENTFLOW_DIR` (auth dir override), `AF_API_URL` (REST base, default
+  `https://agentflow.website` → `/_agents`).
+- Engine LLM env (P3, gated `FF_FLOW_LLM=1`): `GOOSE_PROVIDER=openai`,
+  `GOOSE_MODEL=flow` (alias only — gateway's `pickFlowUpstream` resolves it),
+  `OPENAI_HOST=https://agentflow.website`,
+  `OPENAI_BASE_PATH=_agents/llm/v1/chat/completions`, `OPENAI_API_KEY=<af key
+  from auth.json>`, `GOOSE_DISABLE_KEYRING=true`. `GOOSE_MODE` is NOT set so
+  interactive Mode A keeps its tool-approval UX. The gateway requires an
+  `af_live_*` key, so a keyless standalone launch keeps the user's own provider.
+- Engine extensions (P3.5, same `FF_FLOW_LLM=1` gate): `computercontroller`
+  builtin always merged into `config.yaml`; af_* MCP merged when
+  `AGENTFLOW_MCP_PATH` (or the packaged resource path) resolves. af_* env in the
+  config entry: `AGENTFLOW_API_KEY`, `AGENTFLOW_BASE_URL=…/_agents`,
+  `AGENTFLOW_DEVICE_ID` (optional). `XDG_CONFIG_HOME` overrides the config dir.
+- WS frames (device→server): `hello`, `heartbeat`, `task_progress`,
+  `task_complete`, `task_error`; (server→device): `hello_ack` (rotates
+  `device_secret`), `task_dispatch`, `task_cancel`, `subscribe_stream`/`unsubscribe_stream`.
+- goosed headless dispatch: `POST /agent/start` (→ `Session.id`) then `POST /reply`
+  (SSE, header `X-Secret-Key`), events `Message`/`Finish`/`Error` — `crates/goose-server`.
+- Docs links repointed: `goose-docs.ai` → `docs.agentflow.website`; issues →
+  `github.com/lnlockly/agentflow-goose/issues`.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Tray icon missing after rebrand | `Tray icon not found` | `ui/desktop/src/main.ts:1310` |
+| Auto-update can't find asset | asset name mismatch vs `bundleName` | `ui/desktop/src/utils/githubUpdater.ts:32` |
+| macOS app menu actions missing | app-menu lookup returns undefined if app name ≠ `'AgentFlow Desktop'` | `ui/desktop/src/main.ts:2175` |
+| Backend fails to launch | `AgentFlow Desktop Failed to Start` | `ui/desktop/src/main.ts:976` |
+| Bridge never connects | `device bridge skipped: ~/.agentflow/auth.json not enrolled` | enrol device / check auth.json |
+| Bridge connects then drops repeatedly | `[device-bridge] heartbeat timeout — closing` | network / server WS keepalive |
+| Dispatched task fails | `[device-bridge] task … cancelled` or `task_error: task_failed:` frame | `ui/desktop/src/device-bridge/goosedDispatch.ts` |
+| Queued tasks not replayed | `queued-task drain failed` | `ui/desktop/src/device-bridge/queuedTasks.ts` |
+
+## Device-bridge verification status
+The bridge module is unit-verified — 29 vitest tests (auth round-trip + header
+build, SSE framing + `/reply` answer/usage accumulation, WS handshake +
+secret-rotation + task dispatch/cancel/progress, queued-task normalization) pass,
+and the whole module typechecks clean under the repo's strict + `noUnusedLocals`/
+`noUnusedParameters`/`noImplicitReturns` flags. The live wiring (`main.ts`
+`ensureDeviceBridge`) is gated `FF_DEVICE_BRIDGE=1`. End-to-end Mode B against a
+real cabinet dispatch needs a packaged build (matrix b3/b4/b6) — that is the next
+verification step once P1 lands and a signed/packaged artifact exists.
+
+## Not yet done (tracked follow-ups)
+- **Packaged live verify (P4):** with af_* now bundled, the remaining step is a
+  packaged Mode-A (standalone chat builds code + drives the machine on `flow`) +
+  Mode-B (cabinet dispatch → same goosed) run on a real built artifact — matrix
+  b3/b4/b6. Needs a packaged (ideally signed/notarized) build + a real device +
+  the gateway; owner/infra-gated.
+- **Code-signing / notarization** certs (Apple + Windows EV) — infra/owner.
+- **af_* bundle refresh:** `resources/agentflow-mcp/server.cjs` is a vendored
+  esbuild artifact — re-run `scripts/bundle-af-mcp.mjs` when `@agentflow/mcp-server`
+  changes (or publish it to a registry + depend on it instead of vendoring).
+- **Live-screen stream (b6 "watch live"):** `subscribe_stream`/`unsubscribe_stream`
+  are routed to an `onStreamSubscribe` hook, but the screen-capture publisher
+  (port of computer-mcp `CaptureLoop`) is not yet wired — flag for P3/P4.
+- **Renderer/i18n copy scrub:** ~65 `src/components/*` files + `src/i18n/messages/en.json`
+  still say "goose" in user-facing copy (e.g. "Welcome to goose", "goose is thinking…").
+  Deferred from Phase 1 to avoid breaking `i18n:check` (compiled-message parity). Needs a
+  dedicated extract+recompile pass across all locale files.
+- **Splash frames** `src/images/loading-goose/*.svg` still the goose animation — replace
+  with AgentFlow mark.
+- **Code-signing / notarization** certs (Apple + Windows EV) — infra/owner.
+- **Packaged Mode-B e2e:** flip `FF_DEVICE_BRIDGE=1` in a packaged build, enrol via
+  cabinet, dispatch a task, confirm `task_complete` with a real answer artifact.
+
+## Related
+- [Coder-shim goose bridge](/subsystems/coder-shim-goose-bridge) — pod/cloud coder side
+- [Desktop auto-updater](/subsystems/desktop-auto-updater)
+- [Devices (unified)](/subsystems/devices-unified)
+- Plan: `agentflow/plans/goose-desktop-fork.md`

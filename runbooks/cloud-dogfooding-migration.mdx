@@ -1,0 +1,168 @@
+---
+title: "Cloud-dogfooding migration — move AgentFlow's own dev off the Mac onto the server"
+description: "Phased plan to run AgentFlow's own development in the cloud: dev tasks in Plane, code written in a per-user cloud dev pod (code-server + Claude), built/tested in CI, never on the owner's Mac."
+---
+
+# Cloud-dogfooding migration
+
+## TL;DR
+
+AgentFlow already gives users cloud devices that install any software and run
+agent tasks. **We turn that on ourselves.** AgentFlow's own development moves off
+the owner's weak Mac and onto the server: **dev tasks live in Plane**, code is
+written in a **per-user cloud dev environment** (a pod running code-server / VS
+Code in the browser plus Claude Code / the Claude extension), and everything is
+**built and tested in CI on the ff-france self-hosted runner — never on the
+Mac**. The Mac becomes a thin client: a browser tab pointing at the cloud IDE.
+
+This is dogfooding: the same cloud-device + JSON-app machinery from the
+[Ecosystem overview](/architecture/ecosystem-overview) runs our own engineering.
+
+## Why (the hard constraint)
+
+The owner's Mac is weak and runs many tabs. Local `npm install`, `npm run build`,
+`tsc`, `vite build`, and test runs are slow or fall over. **No heavy compute on
+the Mac.** All of it — clone, install, build, test — happens in the cloud (a dev
+pod) or in CI (ff-france runner). The workspace rule already forbids manual
+builds; this runbook makes the cloud the default place those builds live.
+
+> Existing self-hosted CI: every `lnlockly/agentflow-*` workflow runs on
+> `runs-on: [self-hosted, ff-france]` (not `ubuntu-latest`). The cloud dev pod
+> is the interactive twin of that runner.
+
+## What we already have (reuse, don't rebuild)
+
+| Piece | Where | Reuse for |
+|---|---|---|
+| Cloud devices (install any software, exec, power) | `agentflow-agents/src/routes/me-hosted-devices/lifecycle.ts:114` | The dev pod base — `apt-get install` code-server, etc. |
+| Warm device pool | [Hosted device warm pool](/subsystems/hosted-device-warm-pool) | Fast pod spin-up so a dev env is ready in seconds |
+| VS Code extension telemetry | `agentflow-agents/src/routes/me-extension.ts:1` | Claude/VS Code extension already pings the platform; the dev pod runs the same extension |
+| Device task lifecycle | [Device Task Lifecycle](/subsystems/device-task-lifecycle) | Agents dispatch dev tasks onto the pod the same way |
+| JSON-app system | `agentflow-agents/src/app-manifests/schema.ts:122` | The "Cloud IDE" surface ships as a JSON app, not bespoke code |
+| `flow` / goose engine | `agentflow-agents/src/coder-shim/goose-runner.ts:27` | Agents in the dev pod code with the same brain users get |
+
+## Phased plan
+
+### Phase 1 — Plane up (the dev inbox)
+
+Stand up Plane as the central task manager and put **AgentFlow's own dev tickets**
+in it. One board: bug, feature, refactor, RAG-update. This is the same Plane the
+[Ecosystem overview](/architecture/ecosystem-overview) names as pillar 1 — we
+seed it first with our own work.
+
+- Deploy Plane (self-hosted on ff-france, namespace alongside `agentflow-agents`).
+  Owner-only access to start.
+- Create a `agentflow-dev` board. Columns: Backlog → In progress → In review →
+  Done. A task carries a repo + branch + the PR link when one opens.
+- **Exit check:** a real dev task (e.g. "add app-manifests DB backing") exists as
+  a Plane row, assignable.
+
+> Plane is **greenfield** — there is no Plane integration in the code today (grep
+> for `plane` returns only unrelated matches). Phase 1 is a deploy + seed, not a
+> code change in `agentflow-agents`.
+
+### Phase 2 — Cloud dev pod (code-server + Claude)
+
+Build a per-user **cloud dev environment**: a pod that runs **code-server / VS
+Code in the browser** plus **Claude Code / the Claude extension**, with the repos
+cloned and `flow`/goose available. Reuse the hosted-device lifecycle — the pod is
+a cloud device with a dev image.
+
+- Image: base hosted-device image + `code-server`, Node 20, git, gh CLI, the
+  Claude Code CLI, and the VS Code extension that already pings
+  `POST /me/extension/ping` (`src/routes/me-extension.ts:1`).
+- Install path: the device `exec` endpoint already runs `apt-get install` etc.
+  (`src/routes/me-hosted-devices/lifecycle.ts:99`), so the image can be assembled
+  or extended live.
+- code-server is exposed per-user through the existing per-project expose path
+  (one service name per pod — see [per-project expose] in the device docs) so two
+  users never share an endpoint.
+- Auth: paste the owner API key (`af_live_…`) into the Claude extension settings;
+  the extension authenticates and the pod's goose config points `GOOSE_MODEL` at
+  `flow` (`src/coder-shim/goose-runner.ts:30`).
+- **Exit check:** open a browser tab → code-server loads → edit a repo file →
+  Claude Code answers in-pod → `gh pr create` works. **Zero `npm` on the Mac.**
+
+### Phase 3 — A "Cloud IDE" JSON-app in /apps
+
+Express the cloud dev environment as a **JSON app** so it lives in the cabinet
+launcher next to every other app, not as a one-off page.
+
+- Add `app-manifests/cloud-ide.json` following
+  `agentflow-agents/src/app-manifests/schema.ts:122`:
+  - `pricing: "premium"` (heavy compute), `icon`, `title: "Cloud IDE"`.
+  - `modes`: `code` (open the IDE), `review` (open a PR's diff), `task` (run a
+    dispatched dev task).
+  - `uses.engine: "flow"`, `uses.mcp_tools: [...]` for git / device exec.
+  - `panels`: a `device` panel (the code-server iframe) + a `tasks` panel (the
+    Plane board slice).
+  - `composer.routes`: `"^/open" → code`, `"^/review" → review`.
+- The manifest loads through the same registry
+  (`src/app-manifests/registry.ts:13`) and shows up in `GET /me/apps`
+  (`src/routes/me-apps.ts:25`) and `agentflow-apps list`
+  (`src/cli/agentflow-apps.ts:1`) — GUI and CLI in parity, no bespoke route.
+- **Exit check:** `agentflow-apps show cloud-ide` prints the manifest; the tile
+  appears in `/apps`; clicking it opens the dev pod's code-server.
+
+### Phase 4 — Move real repos' dev tasks into Plane
+
+Migrate the actual backlog. Every `lnlockly/agentflow-*` repo's dev work becomes
+a Plane task, not a note on the Mac.
+
+- Seed Plane from the live trackers: open `qa-issues/INDEX.md`, the autonomous
+  plans, and the RAG `update-rag-docs` TODOs as Plane tasks.
+- A task links repo + branch; when a PR opens, the PR URL goes on the task.
+- CI status (ff-france runner) is the close signal — a task closes when its PR
+  merges green.
+- **Exit check:** the next 5 dev tasks across `agentflow-agents` /
+  `agentflow-landing` are worked from Plane, each producing a branch + PR built in
+  CI, none built on the Mac.
+
+### Phase 5 — Agents and devs both work in the cloud env
+
+Flip the default. New dev work — whether a human picks it up or an agent does — is
+**claimed from Plane, written in the cloud dev pod, built/tested in CI**.
+
+- Agents from the fleet (`flow`/goose) dispatch dev tasks onto the dev pod via the
+  device task lifecycle ([Device Task Lifecycle](/subsystems/device-task-lifecycle));
+  the pod runs the same `flow` model a human's Claude extension uses.
+- The Mac is a viewer: a browser tab on code-server + the Plane board + the PR.
+- Heavy lifting (install, build, test, browser, screenshots) stays in the pod and
+  in CI.
+- **Exit check:** a full feature lands — Plane task → branch in the cloud pod →
+  PR → CI green on ff-france → merge → Plane task closed — with the owner's Mac
+  doing nothing but rendering tabs.
+
+## End state (one line)
+
+`Plane task → cloud dev pod (code-server + Claude + flow/goose) → PR → CI on
+ff-france → merge → task closed.` The Mac never compiles.
+
+## DB / Env / API
+
+- **Routes reused:** `POST /me/hosted-devices/:id/exec|power`
+  (`src/routes/me-hosted-devices/lifecycle.ts:114`),
+  `POST /me/extension/ping` (`src/routes/me-extension.ts`),
+  `GET /me/apps` (`src/routes/me-apps.ts:25`), device `dispatch_task`.
+- **New artifact:** `agentflow-agents/app-manifests/cloud-ide.json` (Phase 3).
+- **Model alias:** `flow` (`GOOSE_MODEL`, `src/coder-shim/goose-runner.ts:30`).
+- **CI:** `runs-on: [self-hosted, ff-france]` on every `lnlockly/agentflow-*`
+  workflow — the build/test floor.
+- **New system:** Plane (self-hosted, ff-france) — no code integration yet.
+
+## Failure modes
+
+| Symptom | Log signature / check for grep | Where to fix |
+|---|---|---|
+| Cloud-IDE app missing from `/apps` | `app_not_found` | `agentflow-agents/src/routes/me-apps.ts:33` |
+| code-server endpoint shows another user's pod | per-pod service-name not set | per-project expose (device docs) |
+| Goose in dev pod uses wrong model | `GOOSE_MODEL` not `flow` | `agentflow-agents/src/coder-shim/goose-runner.ts:30` |
+| Owner accidentally builds on the Mac | `npm run build` / `vite build` invoked locally | move to CI / dev pod — never the Mac |
+| Dev pod install fails | exec error from `apt-get` | `agentflow-agents/src/routes/me-hosted-devices/lifecycle.ts:99` |
+
+## Related
+
+- [Ecosystem overview](/architecture/ecosystem-overview) — the whole picture this dogfoods
+- [Device Task Lifecycle](/subsystems/device-task-lifecycle) — dispatch dev tasks onto the pod
+- [Hosted device warm pool](/subsystems/hosted-device-warm-pool) — fast pod spin-up
+- [connector-core](/subsystems/connector-core) — platform registry

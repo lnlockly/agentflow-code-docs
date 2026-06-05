@@ -1,0 +1,101 @@
+---
+title: "Soul clone (template → user-owned flow)"
+description: "How POST /me/souls/clone-template copies a preset graph, scrubs canonical peer/account, and stamps the cloning user's TG-rental account_id so agent-trigger-worker polls the right inbox."
+---
+
+# Soul clone
+
+## TL;DR
+
+`POST /me/souls/clone-template` reads a whitelisted preset JSON from
+`agentflow-agents/presets/souls/*.json`, scrubs the canonical sales peer
+(`@avsee4`) + account id (`"6"`) out of the graph, and persists a copy
+owned by the calling user. As of 2026-05-17, the handler also looks up
+the caller's active TG-pool rental and stamps that `account_id` into
+every node config field that carries a clone-time marker
+(`${input.account_id}`, `${steps.soul.output.account_id}`,
+`__ACCOUNT_PLACEHOLDER__`, or legacy literal `"6"`). Without the stamp,
+`agent-trigger-worker` had no inbox to poll and cloned souls stayed
+silent (root cause of `2026-05-17 — avsee4 ↔ AgentFlowTEAM` QA incident).
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/onboarding.ts:203` | `POST /me/souls/clone-template` handler |
+| `agentflow-agents/src/routes/onboarding.ts:141` | `placeholderizeGraph` — wipes `@avsee4` + literal `"6"` |
+| `agentflow-agents/src/routes/onboarding.ts:154` | `scrubAccountId` — recursive `account_id` rewrite |
+| `agentflow-agents/src/routes/onboarding.ts:186` | `stampAccountIdInGraph` — stamps owner rental id over markers at clone time |
+| `agentflow-agents/src/routes/onboarding.ts:240` | `findActiveTgAccountForUser` — JOIN against `tg_account_rentals` + `platform_tg_accounts` |
+| `agentflow-agents/presets/souls/*.json` | 26 canonical soul presets (whitelisted via `TEMPLATE_REGISTRY`) |
+| `agentflow-agents/src/db/schema.ts:2892` | `tg_account_rentals` table (drizzle) |
+| `agentflow-agents/src/db/schema.ts:2822` | `platform_tg_accounts` table (drizzle) |
+| `agentflow-agents/tests/unit/onboarding-route.test.ts:1` | Unit tests for the helpers + source contract |
+
+## Data flow
+
+```
+POST /me/souls/clone-template { template_slug }
+  │
+  ▼
+requireSession  →  session.sub = userId
+  │
+  ▼
+loadTemplatePreset(slug)              ← TEMPLATE_REGISTRY whitelist
+  │
+  ▼
+duplicate check (owner_user_id + name suffix "(моя копия)")
+  │  hit → return { flow_id, slug, already_cloned:true } 200
+  │
+  ▼
+placeholderizeGraph(graph)            ← strip @avsee4 + "6"
+  │
+  ▼
+findActiveTgAccountForUser(userId)
+  │
+  ├─ rental found  →  stampAccountIdInGraph(graph, accountId)
+  │                   log: [souls.clone-template] stamped account_id=N replaced=K for user=U
+  │
+  └─ none          →  keep placeholders, response: tg_account_required:true
+  │
+  ▼
+INSERT INTO flows { owner_user_id, slug, graph, enabled:false, ... }
+  │
+  ▼
+UPDATE users SET template_picked = true
+  │
+  ▼
+201 { flow_id, slug, account_id_stamped, account_id_replaced,
+      account_id? | tg_account_required:true }
+```
+
+## DB / Env / API
+
+- Tables:
+  - `flows` — destination of every clone (`enabled=false` by default).
+  - `tg_account_rentals` — joined to find caller's latest un-expired rental.
+  - `platform_tg_accounts` — joined to filter `status='active'` pool rows.
+  - `users` — `template_picked` flag flipped on success.
+- Env: `FF_FLOWS=1` (route gate). No new vars added.
+- Routes:
+  - `POST /me/souls/clone-template` — body `{ template_slug }`, response
+    `{ flow_id, slug, account_id_stamped, account_id_replaced, account_id? | tg_account_required:true }`.
+  - `GET /me/onboarding/progress` — surfaces latest cloned flow.
+  - `POST /me/onboarding/first-send` — separate handler, runs the cloned graph end-to-end.
+- MCP tools: none specific to clone-template (uses REST through session).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Cloned soul never polls inbox | `[souls.clone-template]` shows `account_id_stamped: false` | User has not rented a TG-pool account. Hit `/me/tg-pool/available` + `/me/tg-pool/:id/rent`, then re-clone (idempotent). |
+| Unknown template | `unknown_template` 404 in response | Caller passed a slug missing from `TEMPLATE_REGISTRY`. Add an entry + preset JSON, or fix the slug. |
+| Duplicate clone returns 200 not 201 | response field `already_cloned:true` | Working as intended — idempotency on `(owner_user_id, name="<preset> (моя копия)")`. Delete or rename the existing flow to re-clone. |
+| Feature disabled | response `{ error: 'feature_disabled' }` 503 | `FF_FLOWS != 1`. Set the env var on the deployment. |
+| Stamp count 0 with a rental present | `[souls.clone-template] stamped account_id=N replaced=0` | Preset has no `account_id` field anywhere (or values don't match the recognised markers). Verify preset JSON; add `${input.account_id}` to relevant nodes. |
+
+## Related
+
+- [Template clone (generic inputs → project)](/subsystems/template-clone) — sister flow for project-scoped clones with `inputs[]` schema.
+- [Onboarding quests](/subsystems/onboarding-quests) — `/start` page that triggers this clone via step 2.
+- [Souls](/subsystems/souls) — souls catalog + execution model.
