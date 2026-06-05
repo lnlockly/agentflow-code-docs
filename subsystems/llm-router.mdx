@@ -7,7 +7,68 @@ description: "Mini-registry с приоритетом, owner-scoped провай
 
 ## TL;DR
 
-Все LLM-вызовы внутри agentflow-agents идут через `invokeAI()` → mini-registry, которая выбирает провайдера по `ModelType` (`TEXT_SMALL`/`TEXT_BIG`/`EMBEDDING_*` и т.п.), приоритету (desc) и owner_user_id-скоупу. Перед вызовом — budget gate (`assertUserBudget`), после — запись в `agent_usage`. DB-таблица `llm_provider_configs` позволяет добавлять providers (anthropic-compat или openai-compat) без деплоя — `refreshDbProviders` тикает каждые N секунд и подкидывает новые handlers в registry.
+Все LLM-вызовы внутри agentflow-agents идут через `invokeAI()` → mini-registry, которая выбирает провайдера по `ModelType` (`TEXT_SMALL`/`TEXT_BIG`/`EMBEDDING_*` и т.п.), приоритету (desc) и owner_user_id-скоупу. Перед вызовом — budget gate (`assertUserBudget`), затем exact-match response cache (опц. `LLM_CACHE_ENABLED=1`), после — запись в `agent_usage`. DB-таблица `llm_provider_configs` позволяет добавлять providers (anthropic-compat или openai-compat) без деплоя — `refreshDbProviders` тикает каждые N секунд и подкидывает новые handlers в registry.
+
+## Current TEXT_LARGE primary (as of 2026-05-14)
+
+Default model — `claude-opus-4-7`. Live route — static `legacy-callwithfallback` (priority=15) → east-api-3 proxy. Model id resolved via `ANTHROPIC_LARGE_MODEL` env on `deploy/agentflow-agents`. Probed: east-api-3.org returns 200 OK + `stop_reason=end_turn` on both `claude-opus-4-7` and `claude-opus-4-6`.
+
+Effective priority chain (TEXT_LARGE, owner=platform):
+
+| Pri | Provider | Model | Health |
+|---|---|---|---|
+| 50 | `db:platform-anthropic-direct` (api.anthropic.com) | claude-sonnet-4-6 | **DEAD — 401 invalid x-api-key** (pod's `ANTHROPIC_API_KEY` is east-api-3 proxy key, real anthropic.com rejects) |
+| 40 | `db:oauth-proxy-direct` (in-cluster claude-oauth-proxy:4200) | claude-sonnet-4-6-20250929 | **DEAD — 401 Invalid bearer token** (provider sends `x-api-key`, proxy wants OAuth bearer) |
+| 30 | `db:claudecodeapi-bedrock-sonnet46` (api.claudecodeapi.cloud) | claude-sonnet-4.6 | **DEAD — 401 Неверный API ключ** (pod's east-api-3 key doesn't auth here) |
+| **15** | **`legacy-callwithfallback` (static, code)** | **`env.anthropicLargeModel` → `claude-opus-4-7`** | **LIVE PRIMARY — verified PONG** |
+| 10 | `db:east-api-3-opus47` (api.east-api-3.org) | claude-opus-4-7 | live fallback |
+| 8 | `designapi` (static, gpt-5.5) | gpt-5.5 | OpenAI-compat fallback |
+| 5 | `claudecodeapi` (static) | claude-sonnet-4-6 (default-when-empty) | bottom fallback; still contains stale opus→sonnet rewrite (`claudecodeapi.ts:56-58`) — backlog cleanup |
+| 5 | `db:east-api-3-haiku45` | claude-haiku-4-5 | TEXT_SMALL only |
+
+Flip lever: `kubectl -n franchise-factory set env deploy/agentflow-agents ANTHROPIC_LARGE_MODEL=<model>` + rolling restart. No code change required. Verified live 2026-05-14:
+
+```
+$ kubectl exec deploy/agentflow-agents -- node -e 'useModel(TEXT_LARGE, ...)'
+[ai-router] bootstrapped: bge-m3, claudecodeapi, designapi, elevenlabs, legacy-callwithfallback, xai(no-key-skip), db-driven
+[db-providers] refreshed: enabled=5
+[health-probe] observed healthy=legacy-callwithfallback type=TEXT_LARGE
+MODEL_RETURNED=claude-opus-4-7
+```
+
+Callers that pass explicit `params.model` win over env (`legacy-callwithfallback.ts:63-68` + `db-driven.ts:182-184`) — so `services/character.ts:174` `CODER_LOCKED_MODEL='claude-sonnet-4-5'` still uses sonnet for coder system, by design (sonnet follows structured output more reliably per inline comment).
+
+Tenant runtime pods (spawned per project) are seeded with `ANTHROPIC_LARGE_MODEL=claude-sonnet-4-6` hardcoded at `services/tenant-bootstrap.ts:341-342` — those pods will NOT inherit the agentflow-agents flip until that hardcode is updated (backlog).
+
+## `flow` alias multi-provider failover (T1.10, 2026-06-03)
+
+The `flow` alias resolves to a **TEXT_LARGE chain**, not a single pinned provider. Ordering is owned by `llm_provider_configs` (priority DESC), so the live chain is:
+
+| Pri | Provider | Role |
+|---|---|---|
+| 30 | `db:codexsale` (codex.sale) | primary — intermittently flaps |
+| 20 | `db:designapi-text` | first fallback |
+| 15 | `db:claudecodeapi` | second fallback |
+| 10 | `db:claude-oauth` | last resort |
+
+There is **no `preferredProvider` hard-pin** for `flow` — codex.sale leads purely by priority, so when it flaps the `useModel` loop advances down the chain on its own. The loop fails over on a thrown error AND on `healthy()===false`, and only raises `AiRouterError` (listing every attempt) when the whole chain is exhausted. The chain ordering and which providers are enabled is an owner-tunable DB concern: `UPDATE llm_provider_configs SET priority=… / enabled=…` + `POST /admin/llm-providers/refresh`. No code change needed to reorder.
+
+### Flapping-aware unhealthy cache (always-on)
+
+When codex.sale throws, the loop records it into the per-provider unhealthy cache (`markUnhealthy`, 60s TTL, `agentflow-agents/src/services/ai-router/health-probe.ts:120`). On the **next** `flow` call within that TTL the candidate is moved to the back of the queue (`agentflow-agents/src/ai-router/registry.ts:187`), so the call goes straight to designapi instead of replaying the 3-attempt transient-retry storm against the flapping primary. After the TTL the provider is retried — the cache self-heals. This is **always on**, independent of `PICK_HEALTHY_ENABLED` (that env still only gates the pre-call probe). Cached-unhealthy providers are demoted, never removed: if the entire chain is cached-unhealthy they are still tried as a last resort so a transient cluster-wide blip surfaces a clean `AiRouterError`, not a false `no_provider`.
+
+Verified locally (codex.sale forced to throw 503):
+
+```
+[ai-router] provider db:codexsale failed, falling through type=TEXT_LARGE owner=platform err=503 Сервис временно недоступен
+MODEL_RETURNED=db:designapi-text   # served from the next provider, no error to the caller
+```
+
+## Response cache (exact-match)
+
+`response-cache.ts` хеширует канонический payload `{modelType, model, temperature, system, messages, tools, tool_choice, max_tokens}` через SHA-256 и пишет/читает строку из `llm_response_cache`. Кешируются только детерминированные пути: TEXT_* при явном `temperature===0` и OBJECT_* (любые). IMAGE/VIDEO/TTS/embedding/streaming — пропускаются на гейте `isCacheable`. TTL — 7 дней (read-time фильтр + cleanup sweep). На `hit` пропускается upstream + `agent_usage` (чтобы не дублировать billing); на `miss` — обычный fallback chain через `useModel`, ответ кладётся в кеш. Опт-ин через env флаг — выключенный cache no-op'ит и оба пути работают как раньше.
+
+Backlog: semantic / pgvector lookup для случаев когда exact-match промахивается на пунктуации/пробелах.
 
 ## Files
 
@@ -18,7 +79,12 @@ description: "Mini-registry с приоритетом, owner-scoped провай
 | `agentflow-agents/src/ai-router/registry.ts:118` | `getProviderHandler` — lookup по slug. |
 | `agentflow-agents/src/ai-router/registry.ts:158` | `useModel` — main entry: probe-then-route, preferred provider, candidate fallback chain. |
 | `agentflow-agents/src/ai-router/registry.ts:243` | `listProviders` — debug endpoint backing. |
-| `agentflow-agents/src/ai-router/instrumented.ts:112` | `invokeAI` — wraps useModel с budget gate + usage record + Sentry span. |
+| `agentflow-agents/src/ai-router/instrumented.ts:112` | `invokeAI` — wraps useModel: budget gate + exact-match cache + usage record. |
+| `agentflow-agents/src/ai-router/response-cache.ts:64` | `computeCacheKey` — SHA-256 over canonical params (deterministic property order). |
+| `agentflow-agents/src/ai-router/response-cache.ts:108` | `isCacheable` — gate: TEXT_*/OBJECT_* only, TEXT_* requires `temperature===0`. |
+| `agentflow-agents/src/ai-router/response-cache.ts:154` | `lookupCached` — DB read, 7-day TTL filter, bump hit_count + last_hit_at. |
+| `agentflow-agents/src/ai-router/response-cache.ts:189` | `storeCached` — insert/upsert response payload on miss. |
+| `agentflow-agents/migrations/2026-05-14n-llm-response-cache.sql` | `llm_response_cache` table + indexes. |
 | `agentflow-agents/src/ai-router/types.ts:25` | `ModelType` enum — `TEXT_SMALL`, `TEXT_BIG`, `EMBEDDING_BASE`, и т.д. |
 | `agentflow-agents/src/ai-router/types.ts:52` | `AiCallContext` — `{ user_id, project_id?, agent_slug?, model_type }`. |
 | `agentflow-agents/src/ai-router/types.ts:181` | `TextGenerationResult` — `{ text, usage, model, provider }`. |
@@ -38,6 +104,7 @@ Agent / service вызывает invokeAI({ ctx, model_type, messages, max_token
    ↓
 instrumented.invokeAI (line 112)
    ↓ assertUserBudget(ctx.user_id, estimated_cost) → BudgetExceededError → emit budget_cap_hit
+   ↓ isCacheable + computeCacheKey → lookupCached → HIT? return cached response (skip usage record)
    ↓
 registry.useModel (registry.ts:158)
    ↓ select providers WHERE supports(model_type) AND (owner=null OR owner=ctx.user_id)
@@ -48,6 +115,7 @@ provider handler (anthropic-compat | openai-compat | custom)
    ↓
 instrumented.invokeAI logs to agent_usage:
    { user_id, project_id, model, provider, prompt_tokens, completion_tokens, cost_usd }
+   ↓ storeCached(hash, response) — fire-and-forget on miss
    ↓
 return result
 ```
@@ -57,12 +125,17 @@ return result
 **DB:**
 - `llm_provider_configs` — `{ slug, kind: anthropic_compat|openai_compat, base_url, api_key_sealed, model_id, priority, owner_user_id?, supports_model_types[], max_tokens, enabled }`.
 - `agent_usage` — append-only usage log: `{ user_id, project_id, agent_slug, model, provider, prompt_tokens, completion_tokens, cost_usd, created_at }`.
+- `llm_response_cache` — `{ hash (sha256), model_type, provider, model, prompt_preview, response (jsonb), created_at, last_hit_at, hit_count }`. 7-day TTL at read time.
 - `users.budget_cents_remaining` — counter, decremented в budget gate.
 
 **Env:**
+- `ANTHROPIC_LARGE_MODEL` — default model for `legacy-callwithfallback` provider when caller doesn't pin one. Live flip lever for TEXT_LARGE — set to `claude-opus-4-7` (2026-05-14) or any other model the upstream proxy serves.
+- `ANTHROPIC_SMALL_MODEL` — same idea for TEXT_SMALL (currently `claude-sonnet-4-6` — haiku-4-5 is broken on the proxy per `claudecodeapi.ts:54`).
+- `EAST_API_3_KEY` (canonical) / `ANTHROPIC_API_KEY` (DEPRECATED alias — one release of back-compat) + `ANTHROPIC_BASE_URL` — proxy creds. Production uses east-api-3.org (NOT real api.anthropic.com — the prefix `sk-ant-03-*` is proxy-format). The env var was renamed 2026-05-27 because every new contributor pasted a real Anthropic key into `ANTHROPIC_API_KEY` and watched every request return 401; `EAST_API_3_KEY` makes the upstream obvious. `env.ts:eastApi3Key()` reads new name first, falls back to old. Migration `2026-05-27d-rename-east-api-3-key.sql` flips `llm_provider_configs.api_key_env` from `ANTHROPIC_API_KEY` → `EAST_API_3_KEY` for east-api-3 rows.
 - `XAI_API_KEY` — opt-in registration for xAI provider в bootstrap.
 - `OPENROUTER_API_KEY` — legacy fallback (ai-router/bootstrap.ts:21).
 - `LLM_DB_REFRESH_MS` — cadence для refreshDbProviders.
+- `LLM_CACHE_ENABLED` — `1`/`true` to enable exact-match response cache (default off).
 
 **API surface:**
 - `invokeAI(ctx, opts)` — единственная точка входа из application кода.
@@ -76,9 +149,18 @@ return result
 | Budget exceeded — agent застрял | `BudgetExceededError` или `budget_cap_hit` | `ai-router/instrumented.ts:112` |
 | Ни один provider не отвечает | `AiRouterError: no_provider_for_model` | `ai-router/registry.ts:158` (useModel) |
 | Все рейт-лимитнули | `ai_router_all_candidates_failed` | `ai-router/registry.ts:158` (fallback chain) |
+| `flow` primary (codex.sale) flaps — fell through to designapi | `provider db:codexsale failed, falling through` | `ai-router/registry.ts:287` — expected behaviour; chain advanced. If it falls through on EVERY call, codex.sale is down longer than the 60s unhealthy TTL — check upstream codex.sale status. |
+| `flow` chain re-hits a dead codex.sale on every call (retry storm) | repeated `provider db:codexsale failed, falling through` with `<400ms` between, never reaching designapi cache | `ai-router/registry.ts:187` — flapping-aware skip not demoting; confirm `health-probe.markUnhealthy` ran (the loop calls it on throw at `registry.ts:279`). |
+| All four `flow` providers down | `AiRouterError: all_providers_failed for TEXT_LARGE: db:codexsale=…; db:designapi-text=…; db:claudecodeapi=…; db:claude-oauth=…` | `ai-router/registry.ts:158` — every provider in the chain threw. Rotate keys / check `llm_provider_configs.enabled`. |
 | DB provider не подтянулся | `refresh_db_providers_failed` | `llm-providers/db-driven.ts:454` |
 | Owner-scoped provider не виден | `provider_owner_mismatch` | `ai-router/registry.ts:158` (filter clause) |
 | Stream aggregate упал в середине | `aggregate_openai_stream_failed` | `llm-providers/db-driven.ts:80` |
+| Stale cache return для подобных но разных промптов | `[llm-cache] hit` без ожидаемого upstream call | `ai-router/response-cache.ts:64` (computeCacheKey — добавь missing field в payload). |
+| Cache lookup/store падает — но запросы проходят | `[llm-cache] lookup_failed` / `store_failed` | `ai-router/response-cache.ts:154` (Postgres reachable? миграция применена?). |
+| Cache double-bills юзера | `[llm-cache] hit` + agent_usage row с теми же tokens | `ai-router/instrumented.ts` (cacheHit guard на usage insert). |
+| Top-priority DB rows silently 401 — routing falls through to lower priorities | DB rows id=23/6/1 enabled but never hit; logs show `selected=legacy-callwithfallback` despite higher-priority rows | `llm_provider_configs` — rotate the auth key matching each row's `base_url`, OR set `enabled=false` to stop the lazy-fallthrough overhead. |
+| Tenant pod still on sonnet after agentflow-agents was flipped to opus | Tenant runtime logs show `model=claude-sonnet-4-6` even after the env flip on agentflow-agents | `services/tenant-bootstrap.ts:341-342` hardcodes `ANTHROPIC_LARGE_MODEL=claude-sonnet-4-6` into spawned pod env. Patch the hardcode or thread the env through from agentflow-agents. |
+| Caller requested Opus on the static `claudecodeapi` provider but got Sonnet | response `model=claude-sonnet-4-6` despite `params.model='claude-opus-4-7'` | `llm-providers/claudecodeapi.ts:56-58` — stale opus→sonnet rewrite from when the proxy didn't serve Opus. East-api-3 and claudecodeapi.cloud both serve opus-4-7 as of 2026-05-14 (probed). Backlog: drop the rewrite. |
 
 ## Related
 

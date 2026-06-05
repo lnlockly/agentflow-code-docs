@@ -1,0 +1,121 @@
+---
+title: "Reminders v2 (state-based)"
+description: "State-based reminder catalogue served by agentflow-agents and polled by agentflow-bot. Disjoint from the legacy time-based waitlist scheduler."
+---
+
+# Reminders v2 (state-based)
+
+## TL;DR
+
+Track A companion to [Funnel analytics](/subsystems/funnel-analytics).
+The agents service derives each user's funnel state (registered →
+onboarding_completed → tg_connected → farm_activated) from
+`user_events` + `user_farms` + `tg_links`, matches it against a
+hardcoded `REMINDERS_V2` catalogue, and emits "stuck" candidates.
+The bot polls every 5 minutes, sends the localized text, and posts an
+ack back to dedupe via `reminder_sends_v2`.
+
+Runs in parallel with the legacy waitlist `reminderScheduler.ts` (which
+hits agentflow-api). Step IDs are namespaced into `1001+` so they never
+collide with v1 `reminder_steps` PKs.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/db/schema.ts:2559` | `reminderSendsV2` Drizzle table |
+| `agentflow-agents/src/db/migrations/0065_user_events.sql` | Migration (also creates `user_events`) |
+| `agentflow-agents/src/routes/reminders-v2.ts:37` | `REMINDERS_V2` hardcoded catalogue (1001-1005) |
+| `agentflow-agents/src/routes/reminders-v2.ts:119` | `GET /internal/reminders-v2/pending` |
+| `agentflow-agents/src/routes/reminders-v2.ts:234` | `POST /internal/reminders-v2/sent` |
+| `agentflow-agents/src/server.ts:88` | Imports `remindersV2App` |
+| `agentflow-agents/src/server.ts:526` | Mounts `remindersV2App` |
+| `agentflow-bot/src/services/reminderSchedulerV2.ts:50` | `startReminderSchedulerV2()` entry point |
+| `agentflow-bot/src/services/reminderSchedulerV2.ts:148` | `fetchPending()` — GET pending with `x-agentflow-secret` |
+| `agentflow-bot/src/services/reminderSchedulerV2.ts:180` | `markSent()` — POST sent ack |
+| `agentflow-bot/src/index.ts:270` | Scheduler wire-up in bot bootstrap |
+
+## Data flow
+
+```
+agentflow-bot (every 5min)
+    │ x-agentflow-secret
+    ▼
+GET /internal/reminders-v2/pending?limit=N
+    │
+    ├─► fetch candidate users (joined ≤ 30d, has tg_links, NOT academy_paid)
+    ├─► derive in-memory state per user:
+    │     farm.status='active'      → farm_activated
+    │     user_events tg_connected   → tg_connected
+    │     user_events onb_completed  → onboarding_completed
+    │     else                       → registered
+    ├─► join REMINDERS_V2 by (state, stuck_hours)
+    ├─► anti-join reminder_sends_v2 (already-sent step_ids)
+    │
+    ▼
+[{ user_id, tg_id, language_code, step_id, text_ru, text_en, user_state }, …]
+    │
+    ▼
+bot.api.sendMessage(tg_id, pickText(r))    ◄─ link_preview_options.is_disabled=true
+    │
+    │ on success only
+    ▼
+POST /internal/reminders-v2/sent  { user_id, step_id }
+    │
+    ▼
+INSERT reminder_sends_v2 ON CONFLICT (user_id, step_id) DO NOTHING
+```
+
+## Reminder catalogue
+
+| step_id | state | stuck_hours | Trigger |
+|---|---|---|---|
+| 1001 | registered | 2 | No `onboarding_completed` event in `user_events` |
+| 1002 | onboarding_completed | 24 | No `tg_connected` event |
+| 1003 | tg_connected | 4 | No `user_farms` row with `status='active'` |
+| 1004 | farm_activated | 168 | Farm active ≥ 7d (template-tune nudge) |
+| 1005 | farm_activated | 336 | Farm active ≥ 14d (gentle academy upsell) |
+
+Paid users (any `academy_paid` event) are filtered out at the candidate
+query — never spammed.
+
+Locale selection: `text_en` is picked only when `language_code === 'en'`;
+everything else (null, ru, zh, future locales) falls back to `text_ru`.
+The agents service always populates `text_ru`.
+
+## DB / Env / API
+
+- Tables: `reminder_sends_v2(id, user_id, step_id, sent_at)`
+- Indexes:
+  - `uniq_reminder_sends_v2_user_step(user_id, step_id)` UNIQUE
+  - `idx_reminder_sends_v2_user(user_id)`
+- Env (bot side):
+  - `AGENTFLOW_AGENTS_INTERNAL_URL` — base for `/internal/reminders-v2/*`
+  - `AGENTFLOW_AGENTS_INTERNAL_SECRET` — `x-agentflow-secret` header value
+  - If either unset, scheduler stays dormant (log line `AGENTFLOW_AGENTS_INTERNAL_URL/SECRET unset — reminder v2 disabled`)
+- Env (agents side):
+  - `INTERNAL_API_SECRET` — consumed by `requireInternalSecret`
+- Routes (internal, header `x-agentflow-secret`):
+  - `GET /internal/reminders-v2/pending?limit=N` — N is clamped to [1, 500], default 100
+  - `POST /internal/reminders-v2/sent` body `{ user_id, step_id }`
+- Tick cadence: `BOOT_DELAY_MS=10_000`, then `DEFAULT_INTERVAL_MS=5 * 60 * 1000` (5 min)
+- Per-fetch timeout: `FETCH_TIMEOUT_MS=15_000`
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Bot never sends any reminders | `AGENTFLOW_AGENTS_INTERNAL_URL/SECRET unset — reminder v2 disabled` | Set both env vars on bot deployment |
+| Reminders fetch errors | `reminder-v2 fetch error` (also `reminders-v2 pending non-2xx`) | Check agents reachability + secret match — bot retries next tick (5min) |
+| User has no `tg_links` row | n/a (silently skipped) | Expected — only users who connected TG get reminded |
+| Send fails (blocked bot, deleted account) | `reminder-v2 send failed` with `code` from Telegram | Bot caches no `/sent` POST → retried next tick. Logs `error_code` from grammy |
+| Same reminder fires twice on bot restart | n/a — `INSERT … ON CONFLICT DO NOTHING` on `uniq_reminder_sends_v2_user_step` | By design — at-least-once delivery, unique index dedupes |
+| `/sent` POST fails after successful TG send | `reminder-v2 markSent failed` | Step will re-emit next tick → at-least-once. Investigate agents 5xx |
+| Boot/interval ticks crash | `reminder-v2 boot tick crashed` or `reminder-v2 tick crashed` | Check stack trace; scheduler keeps running via setInterval, only the failing tick is lost |
+
+## Related
+
+- [Funnel analytics](/subsystems/funnel-analytics) — shares `user_events` source-of-truth
+- [Farm](/subsystems/farm) — `user_farms.status='active'` defines the `farm_activated` state
+- Spec: `agentflow-landing/docs/specs/2026-05-15-analytics-funnel-reminders-v2.md`
+- Tests: `agentflow-bot/src/__tests__/reminderSchedulerV2.test.ts`

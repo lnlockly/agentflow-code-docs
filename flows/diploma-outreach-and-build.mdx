@@ -9,8 +9,23 @@ description: "Single DAG demonstrating AgentFlow's full power — TG outreach + 
 > Walker + handlers shipped in [PR #209](https://github.com/lnlockly/agentflow-agents/pull/209);
 > MCP unwrap regression caught and fixed in [PR #210](https://github.com/lnlockly/agentflow-agents/pull/210).
 > **v2 (preemptive parallel)** lands in the same boilerplate row (id=31) via
-> `migrations/2026-05-14d-diploma-preemptive.sql` — see § "v2 Parallel preemptive"
-> below. v1 sections retained for historical context.
+> `migrations/2026-05-14d-diploma-preemptive.sql`, patched by
+> `migrations/2026-05-14e-wait-reply-self-loop.sql` (accept_outbound),
+> `migrations/2026-05-14i-wait-reply-since-from-ack.sql` (since_message_id +
+> from_self templating), and re-asserted by
+> `migrations/2026-05-14o-preemptive-outreach.sql` (canonical edges,
+> idempotent drift-correction). See § "v2 Parallel preemptive" below.
+> v1 sections retained for historical context.
+>
+> **Empty-text guard (project #621):** `llm.classify_intent` previously
+> required `message` to be a non-empty string via `z.string().min(1)`. A
+> sticker reply (msg_id 390512, `text=""`) zod-failed the node and killed
+> the parent DAG. The schema is now `z.string().optional()` and the
+> handler short-circuits to `intent: 'ambiguous', reasoning:
+> 'empty_or_non_text_reply'` BEFORE the LLM call when the trimmed text is
+> empty. Deliver branch falls into `text_by_intent.default`. Fix lives in
+> `handlers/tg-composite.ts` + test cases under
+> `tests/unit/graph-executor/handlers/tg-composite.test.ts`.
 
 ## v2: Parallel preemptive build (current shape)
 

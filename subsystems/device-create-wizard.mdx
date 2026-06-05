@@ -1,0 +1,94 @@
+---
+title: "Device create wizard + calm manage view"
+description: "Step-by-step create funnel (where → local/cloud → first task → done) and the disclosure-based device manage page with the use-case recipe picker."
+---
+
+# Device create wizard + calm manage view
+
+## TL;DR
+
+Adding a device is a 4-step funnel (`CabinetDeviceSetup.tsx`): pick where (local
+desktop vs cloud pod) → connect/provision → optional first task → done. The device
+detail page (`CabinetDeviceDetail.tsx`) was rebuilt as a "calm" manage view: primary
+actions (Дать задачу / Пауза / Стоп) up top, everything technical folded into
+collapsed `<Disclosure>` panels. The **Сценарии** use-case recipe picker (PR #543)
+lives as the first disclosure and dispatches `agent_run_recipe`.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/pages/CabinetDeviceSetup.tsx:67` | `type StepId = 1\|2\|3\|4` — the four wizard steps |
+| `agentflow-landing/src/pages/CabinetDeviceSetup.tsx:355` | `StepWhere` — step 1, local-desktop vs cloud-pod choice |
+| `agentflow-landing/src/pages/CabinetDeviceSetup.tsx:498` | `StepLocalInstall` — step 2 local: download + connect the desktop agent |
+| `agentflow-landing/src/pages/CabinetDeviceSetup.tsx:749` | `StepCloudProvision` — step 2 cloud: spin a hosted pod (`ProvisionState` idle→creating→connecting→done) |
+| `agentflow-landing/src/pages/CabinetDeviceSetup.tsx:899` | `StepFirstTask` — step 3, optional first task (skippable) |
+| `agentflow-landing/src/pages/CabinetDeviceSetup.tsx:1042` | `StepDone` — step 4, confirmation |
+| `agentflow-landing/src/pages/CabinetDeviceDetail.tsx:100` | `type AdvancedPanel = null\|'usecases'\|'access'\|'autonomous'\|'history'` — which disclosure is open |
+| `agentflow-landing/src/pages/CabinetDeviceDetail.tsx:165` | `isHosted` / `useCaseHome` — hosted pod → cloud (C*) use-cases, else local (L*) |
+| `agentflow-landing/src/pages/CabinetDeviceDetail.tsx:535` | `Сценарии` disclosure — renders `DeviceUseCasePicker` (PR #543) |
+| `agentflow-landing/src/components/devices/DeviceUseCasePicker.tsx:86` | dispatches `tool: 'agent_run_recipe'` with `{ recipe, params, cron? }` |
+| `agentflow-landing/src/data/deviceUseCases.ts` | manifest-driven L*/C* use-case catalog (mirrors fork `recipes/devices/manifest.json`) |
+| `agentflow-landing/src/main.tsx:720` | `/cabinet/devices/new` → `CabinetDeviceSetup` (wizard) |
+| `agentflow-landing/src/main.tsx:721` | `/cabinet/devices/setup` → `CabinetDeviceSetup` |
+| `agentflow-landing/src/main.tsx:722` | `/cabinet/devices/new/cards` → `CabinetDeviceNew` (legacy card picker, fallback) |
+
+## Data flow
+
+```
+/cabinet/devices/new
+   └─ CabinetDeviceSetup
+        StepWhere ──local──> StepLocalInstall ──connected(device)──┐
+                 └─cloud──> StepCloudProvision ──provisioned(id)───┤
+                                                                   ▼
+                                                  StepFirstTask (skip ok)
+                                                                   ▼
+                                                              StepDone
+                                                                   │
+                                            navigate → /cabinet/devices/:id
+                                                                   ▼
+                                              CabinetDeviceDetail (manage)
+   primary: Дать задачу · Пауза · Стоп
+   Дополнительно (collapsed Disclosures):
+     ├─ Сценарии   → DeviceUseCasePicker → dispatch agent_run_recipe
+     ├─ Доступы    → scope (apps / paths / shell / confirm / budget) + DeviceAppWhitelist
+     ├─ Автономно  → DeviceAutonomousPanel
+     └─ История    → sessions table → DeviceLiveSession
+```
+
+## DB / Env / API
+
+- Routes: `/cabinet/devices/new`, `/cabinet/devices/setup` (wizard);
+  `/cabinet/devices/new/cards` (legacy fallback); `/cabinet/devices/:id` (manage).
+- Dispatch tool (use-case picker): `agent_run_recipe` with `scope: { recipe, params, cron? }`.
+- Generic + manifest-driven — no per-slug code. Local devices surface `L*` use-cases,
+  hosted pods `C*`, keyed off `device.kind === 'hosted' || device.hosted`.
+
+## Screenshots
+
+PR #544 evidence under `agentflow-landing/docs/screenshots/device-wizard/`:
+`step1-where.png`, `step1-mobile.png`, `step2-local.png`, `step2-cloud.png`,
+`step3-selected.png`, `step3-firsttask-cloud.png`, `step4-done.png`,
+`manage-view.png`, `manage-access-expanded.png`.
+
+## Rebase note (2026-05-30)
+
+PR #544 (wizard + manage rewrite) was rebased onto main after PR #543 (use-case picker)
+merged. #544 replaced the old tab nav with disclosures, so #543's `tab==='usecases'`
+"Сценарии" tab was re-grafted as the first `<Disclosure>` (`advanced==='usecases'`).
+Both survive: the picker still renders and dispatches `agent_run_recipe`. The old
+`tab`/`setTab` state was dropped (disclosures use `advanced`).
+
+## Failure modes
+
+| Symptom | Log / grep signature | Where to fix |
+|---|---|---|
+| Сценарии disclosure empty for a hosted pod | `useCaseHome` resolves to `local` for a `kind==='hosted'` device | `CabinetDeviceDetail.tsx:165` — `isHosted` check |
+| Recipe never dispatched on outcome select | no `agent_run_recipe` in events | `DeviceUseCasePicker.tsx:86` — dispatch payload |
+| `/cabinet/devices/new` shows old card picker not wizard | route points at `CabinetDeviceNew` | `main.tsx:720` — must be `CabinetDeviceSetup` |
+
+## Related
+
+- [Landing app shell + design tokens](/subsystems/landing-shell)
+- [Cabinet device autonomous tab](/subsystems/cabinet-device-autonomous-tab)
+- [Hosted device preinstall](/subsystems/hosted-device-preinstall)

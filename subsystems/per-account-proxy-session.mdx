@@ -1,0 +1,77 @@
+---
+title: "Per-account proxy session (NodeMaven sticky residential)"
+description: "Deterministic NodeMaven sticky residential proxy per (userId, accountRef) so connector fetches exit the same IP the platform session was minted on."
+---
+
+# Per-account proxy session
+
+> **Status: shipped 2026-06-04 (#1114).** Generic by construction, disabled by default — every accessor returns `null` when the NodeMaven creds are unset, so connectors fetch direct exactly as before until the secret lands.
+
+## TL;DR
+
+IP-bound platforms (kwork first) bind a session cookie to the IP that minted it, so a cookie minted in the owner's home browser is rejected from the pod's datacenter IP. `ProxySessionService` builds a **deterministic** NodeMaven sticky residential proxy URL per `(userId, accountRef)` so every connector fetch for that account exits the **same** residential IP for the 24h sticky window. Same account ⇒ same `sid` ⇒ same exit IP; a different account ⇒ a different `sid` ⇒ a different IP. No DB, no network — pure functions over env.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/proxy-session.ts:50` | `PLATFORM_COUNTRY` — per-platform default exit country (data, not branching) |
+| `agentflow-agents/src/services/proxy-session.ts:85` | `readEnv` — reads NodeMaven creds; returns `null` (proxy disabled) when either is unset |
+| `agentflow-agents/src/services/proxy-session.ts:96` | `shortHash` — 10-hex-char sha256 of `userId:accountRef` → the sticky `sid` slot |
+| `agentflow-agents/src/services/proxy-session.ts:114` | `ProxySessionService` class — all accessors deterministic + pure given env |
+| `agentflow-agents/src/services/proxy-session.ts:131` | `proxyRefForAccount` → `{ sid, country }` persistable sticky identity |
+| `agentflow-agents/src/services/proxy-session.ts:148` | `proxyUrlForAccount` → `http://<sticky-username>:<pass>@<gateway>` |
+| `agentflow-agents/src/services/proxy-session.ts:168` | `proxyAgentForAccount` → undici `ProxyAgent` typed `unknown` (dodges the undici-types `Dispatcher` build-break, incident 2026-05-06i) |
+| `agentflow-agents/src/services/proxy-session.ts:180` | `proxySession` — process-wide singleton bound to `process.env` |
+| `agentflow-agents/src/connector-core/connector.ts:38` | `ConnectorCtx.proxyFor?` — optional ctx-supplied per-account proxy resolver |
+| `agentflow-agents/src/connector-core/connector.ts:49` | `connectorProxyFor(ctx, accountRef, platform?)` — generic resolver; prefers ctx, falls back to the singleton |
+| `agentflow-agents/src/connector-core/index.ts:16` | re-exports `connectorProxyFor` |
+| `agentflow-agents/src/mcp-servers/kwork-inbox.ts:53` | imports `proxySession` + `ProxyRef` |
+| `agentflow-agents/src/mcp-servers/kwork-inbox.ts:222` | `resolveSessionCookies` attaches the per-account agent to `ResolvedCookies` |
+| `agentflow-agents/src/mcp-servers/kwork-inbox.ts:321` | `kworkRequest` hands the agent to `fetch` via `dispatcher` (local cast) |
+| `agentflow-agents/tests/proxy-session.test.ts` | stable URL per account, distinct per account, env-unset ⇒ null |
+
+## Data flow
+
+```
+connector fetch for kwork account "KWORK_SESSION_JSON" (owner 1)
+  │
+  ▼
+proxySession.proxyAgentForAccount(1, accountRef, { platform: 'kwork' })
+  ├─ readEnv → null?  ── yes ──► return null ──► fetch direct (zero change)
+  └─ env present:
+        sid     = shortHash("1:KWORK_SESSION_JSON")          // 10 hex
+        country = PLATFORM_COUNTRY['kwork'] ?? 'ru'
+        user    = `${user}-country-ru-sid-<sid>-ttl-24h`      // sticky grammar
+        url     = http://<user>:<pass>@gate.nodemaven.com:8080
+        return new ProxyAgent({ uri: url })  (typed unknown)
+  │
+  ▼
+kworkRequest: fetch(url, { ...init, dispatcher: agent }
+                          as RequestInit & { dispatcher?: unknown })
+  → all kwork.ru calls exit the SAME residential IP for 24h
+```
+
+When the sticky IP rotates the platform session drops (surfaced as `needsReauth` elsewhere); a re-login with the same `sid` lands on a fresh-but-sticky IP.
+
+## DB / Env / API
+
+- **Tables:** none. The sticky ref (`sid`, `country`) is derived deterministically from `(userId, accountRef)`; the proxied-browser-login path persists it into `user_credentials.meta.proxy_ref` so the connector reuses the exact session (see [proxied-browser-login](/subsystems/proxied-browser-login)).
+- **Env:** `NODEMAVEN_PROXY_USER`, `NODEMAVEN_PROXY_PASS` (both required to enable), `NODEMAVEN_PROXY_GATEWAY` (default `gate.nodemaven.com:8080`).
+- **Routes:** none — this is an internal connector primitive, not an owner-facing API.
+- **Sticky username grammar:** `${user}-country-${cc}-sid-${shortHash(userId:accountRef)}-ttl-24h`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Proxy never engages despite creds set | (no log — silent direct fetch) `readEnv` returned null because one of USER/PASS is empty | `services/proxy-session.ts:88` |
+| kwork still serves CAPTCHA after enabling proxy | `signal:'captcha'` on the kwork request | `mcp-servers/kwork-inbox.ts:330` — IP reputation; verify the NodeMaven exit is residential, not the gateway's own DC range |
+| TS build breaks on `Dispatcher` type | `undici` / `undici-types` mismatch | keep the agent typed `unknown` across the boundary; cast `{ dispatcher }` locally — never thread `Dispatcher` through an exported signature (`services/proxy-session.ts:35`) |
+| Two accounts share an exit IP | identical `sid` for distinct accounts | `services/proxy-session.ts:138` — `accountRef` must be unique per account |
+
+## Related
+- [Proxied browser login (backend launcher + chromium runtime)](/subsystems/proxied-browser-login) — mints the session ON this proxy
+- [Proxied cloud-browser connect (FE)](/subsystems/proxied-browser-connect) — the connect-drawer that drives it
+- [kwork-connector](/subsystems/kwork-connector) — the datacenter-IP CAPTCHA this fixes
+- [Proxy Pool](/subsystems/proxy-pool) — the older per-resource proxy table (VK cookie-paste)

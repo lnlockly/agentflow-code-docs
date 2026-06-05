@@ -1,0 +1,143 @@
+---
+title: "LLM Cabinet — /llm-cabinet (frontend)"
+description: "Customer-facing cabinet that surfaces API keys, usage, model catalog, and per-request history backed by /me/api-keys + /llm/v1/models"
+---
+
+# LLM Cabinet — frontend
+
+## TL;DR
+
+`/llm-cabinet` (titled «Баланс и AI») renders inside **AppShellV2** — the
+common cabinet shell (sidebar nav + topbar + avatar + dual-balance card) used
+by every other cabinet page. As of PR #569 it no longer ships its own top-nav:
+the bespoke `CabinetTopNav`, «← AgentFlow» back-pill, mini-balance pill, and
+custom avatar were removed because AppShellV2 already supplies them. The
+«Баланс и AI» item in AppShellV2 `CORE_NAV` (`/llm-cabinet`) highlights on this
+route. Six tabs become **in-page sub-tabs** at the top of the content area:
+primary **Кабинет** (wallet dashboard — balance + spend + usage tiles) and
+**История** (per-request log); then a «Для разработчиков» divider fronting
+**Модели** (catalog driven by `/llm/v1/models`), **Псевдонимы** (model
+aliases), **API** (key CRUD + curl examples), **Инструкции** (quickstart
+recipes). All six stay deep-linkable via `?tab=`. The Models tab reads live
+from the public LLM facade so the UI never drifts from the actually-enabled
+provider set.
+
+Mobile (390/360px): the sidebar collapses to the AppShellV2 drawer +
+bottom-nav, and the `.lc-tabs` sub-tab row left-aligns at the top of the
+content and horizontal-scrolls so the «Для разработчиков» group stays reachable
+without page overflow.
+
+The page is re-skinned onto the shared cabinet design system
+(`dark-tokens.css` / `cabinet-dashboard.css`): the scoped `--lc-*` variables
+in `llm-cabinet.css:11` remap onto the `--af-*` tokens (lime accent `#A6F25C`,
+surfaces `#0A0A0C / #141417 / #17171B`, Inter/Geist), so `/llm-cabinet` matches
+`/cabinet` and `/cabinet/agents` instead of the old acid-`#d4ff00` palette. No
+component markup changed for the colour pass — only the token map.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/pages/LlmCabinet.tsx` | route entry (`useHead` + JSON-LD), renders `LlmCabinetShell` |
+| `agentflow-landing/src/sections/llm-cabinet/LlmCabinetShell.tsx:113` | `<AppShellV2 breadcrumbs={[{ label: t('app.shell.nav.llm_cabinet') }]}>` wraps the page; `.lc-page` holds the tab row + `.lc-shell` body |
+| `agentflow-landing/src/sections/llm-cabinet/LlmCabinetShell.tsx:31` | `PRIMARY_TABS` (dashboard / history) |
+| `agentflow-landing/src/sections/llm-cabinet/LlmCabinetShell.tsx:38` | `DEVELOPER_TABS` (models / aliases / api / instructions) — rendered after the `.lc-tabs-group` «Для разработчиков» divider (line 104) |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:129` | `CORE_NAV` «Баланс и AI» entry (`/llm-cabinet`) — highlights on this route |
+| `agentflow-landing/src/styles/llm-cabinet.css:10` | `.lc-page` — palette tokens + content width inside `.af-body` (replaced the full-page `.lc-root`); `.lc-tabs` in-page sub-tab row below it |
+| `agentflow-landing/src/sections/llm-cabinet/tabs/DashboardTab.tsx:85` | calls `agentsGet('/me/billing/usage?range=7d')` for tiles; spend tile («Расход за 7 дней») leads at line 120 |
+| `agentflow-landing/src/sections/llm-cabinet/components/LcApiKeyCard.tsx:73` | `developerNote` muted caption frames the key block as developer-optional |
+| `agentflow-landing/src/sections/llm-cabinet/tabs/HistoryTab.tsx:107` | calls `apiGet('/me/api-keys/:id/recent?limit=100')` |
+| `agentflow-landing/src/sections/llm-cabinet/tabs/ApiTab.tsx:45` | `GET /me/api-keys` list + `POST /me/api-keys` create |
+| `agentflow-landing/src/sections/llm-cabinet/tabs/ApiTab.tsx:239` | OpenAI + Anthropic curl examples (path: `/llm/v1/chat/completions` and `/llm/v1/messages`) |
+| `agentflow-landing/src/sections/llm-cabinet/tabs/ModelsTab.tsx:21` | calls `fetchEnabledModels()` to render table |
+| `agentflow-landing/src/sections/llm-cabinet/data/llm-cabinet-models.ts:223` | `fetchEnabledModels()` hits `https://agentflow.website/llm/v1/models` |
+| `agentflow-landing/src/sections/llm-cabinet/data/llm-cabinet-models.ts:53` | `VISUAL_MAP` — glyph/vendor/tier visuals keyed by model id regex |
+| `agentflow-landing/src/lib/api.ts:35` | `apiGet/apiPost/apiDelete` — absolute URLs pass through; default base = `VITE_API_URL` |
+
+## Data flow
+
+```
+LlmCabinetShell (tab router via ?tab=)
+  [primary]
+  ├─ Кабинет     ──► agentsGet /me/billing/usage?range=7d   (wallet dashboard)
+  ├─ История    ──► apiGet /me/api-keys          (pick most-recent by last_used_at)
+  │                └─► apiGet /me/api-keys/:id/recent?limit=100
+  · · · «Для разработчиков» divider (.lc-tabs-group) · · ·
+  [developers]
+  ├─ Модели     ──► fetch https://agentflow.website/llm/v1/models  (public, no auth)
+  ├─ Псевдонимы ──► agentsGet /me/llm/aliases
+  ├─ API        ──► apiGet /me/api-keys          (list)
+  │                ├─ apiPost /me/api-keys       (create, raw key returned once)
+  │                └─ apiDelete /me/api-keys/:id (revoke)
+  └─ Инструкции ──► apiGet /me/api-keys          (first prefix for snippet)
+```
+
+The tab grouping is presentation-only (A4b): `PRIMARY_TABS` and
+`DEVELOPER_TABS` render into one `.lc-tabs` track, so on mobile (390/360px)
+the whole row scrolls horizontally and the dev group stays reachable.
+`isTab()` still accepts all six ids, so `?tab=api` etc. deep-links unchanged.
+Group label comes from i18n key `llm_cabinet.group.developers`; the dashboard
+key-card caption from `llm_cabinet.dashboard.developer_optional`.
+
+`apiGet(path)` routes:
+
+- `path` starts with `http*` → passed to `fetch` as-is (used for `/llm/v1/models`).
+- otherwise → `${VITE_API_URL}${path}` (in prod: `/_api/me/api-keys/...`).
+
+## DB / Env / API
+
+- Frontend env:
+  - `VITE_API_URL` — agentflow-api base (prod: `/_api`).
+  - `VITE_AGENTS_URL` — agentflow-agents base (prod: `/_agents`).
+- Backend routes consumed:
+  - `GET /me/api-keys` — list keys (returns `{id, name, prefix, created_at, last_used_at, tier?, rate_limit_rpm?}`).
+  - `POST /me/api-keys` — create, body `{name}`, returns `{ok, key, row}` (raw key shown once).
+  - `POST /me/api-keys/install-token` — mint a key labelled `desktop-install-<YYYY-MM-DD-HH:MM>`; returns `{ok, id, name, prefix, raw_api_key, created_at}` with HTTP 201. Used by the "Установи AgentFlow Desktop" cabinet card to inline the key into the curl/PowerShell one-liner. Source: `agentflow-api/src/routes/api-keys.ts:99` (route) and `agentflow-landing/src/lib/devicesApi.ts:241` (caller).
+  - `DELETE /me/api-keys/:id` — revoke.
+  - `GET /me/api-keys/:id/recent?limit=100` — per-request log; rows `{id, endpoint, status_code, flow_charged, tokens_in, tokens_out, model, duration_ms, created_at}`.
+  - `GET /me/api-keys/:id/usage` — aggregated `{by_endpoint, by_model, totals}` (not yet rendered in cabinet, used by `/account/usage`).
+  - `GET /me/billing/usage?range=7d` — dashboard tiles (`total_spent_usd, total_requests, total_tokens`).
+  - `GET https://agentflow.website/llm/v1/models` — public catalog, returns `{object, data:[{id, owned_by, agentflow_format, pricing?, context_window?}]}`.
+- Backing tables (host service): `api_keys`, `api_key_usage`, `flow_balances`, `flow_ledger`, `flow_model_pricing`, `llm_provider_configs`. See [Public LLM Facade](/subsystems/public-llm-facade).
+
+### Catalog visual fallbacks
+
+`fetchEnabledModels()` consumes the live response. Visual fields
+(`glyph / glyphBg / glyphText / tier`) are NOT in the API payload — they
+come from `VISUAL_MAP` keyed by regex on `model.id` (claude-opus, gpt-5.5,
+gemini, deepseek, …). Unknown models fall through to `FALLBACK_VISUAL`
+(monochrome dot glyph).
+
+Pricing strings appear only when the live row carries pricing. The
+`/llm/v1/models` payload nests it as `pricing.input_per_mtok` /
+`pricing.output_per_mtok` (NOT `pricing.input` / `pricing.output`) — the
+parser at `llm-cabinet-models.ts:263` reads `input_per_mtok` first and keeps
+`input` as a legacy fallback. Before this fix every row rendered `уточняется`
+(Models tab) / `—` (dashboard price rail) because the parser read the wrong
+keys. Without any pricing the cabinet shows `уточняется` so the catalog can
+display a new model the second it lands in `llm_provider_configs`, before
+pricing is seeded.
+
+The `flow` alias row (an internal routing alias, `pricing: null`) is filtered
+out of the catalog at `llm-cabinet-models.ts:266`. The dashboard price rail
+(`DashboardTab.tsx`) now calls `fetchEnabledModels()` itself rather than
+rendering the static `MODELS` fallback (which ships no pricing), so its rail
+shows live `$/1M` prices and its «Все N →» count tracks the live catalog.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Models tab stuck on skeleton | `Каталог временно недоступен (...)` in DOM | `/llm/v1/models` 5xx — check `public-llm.ts` route + `loadConfigs` |
+| Curl example 404s | `curl https://agentflow.website/v1/chat/completions` (without `/llm` prefix) | the path was missing `/llm/` before this PR — fixed at `ApiTab.tsx:239` |
+| History tab empty for an active key | `apiGet('/me/api-keys/:id/recent?limit=100')` returns `{rows: []}` | confirm `api_key_usage` writes; see [Public LLM Facade § stream usage capture](/subsystems/public-llm-facade) |
+| Model dropdown only shows static 4 | `fetchEnabledModels()` threw, fell back to `MODELS` static array | check network for `/llm/v1/models` 5xx; static array kept as last-resort |
+| Status column always green even on 4xx | `statusColor(code)` not matching | `HistoryTab.tsx:76` — only treats 2xx as `var(--lc-acid)`; verify `r.status_code` is numeric in row |
+| Price rail / Models tab show `—` / `уточняется` for every row | parser reads `pricing.input` (undefined) instead of `pricing.input_per_mtok` | `llm-cabinet-models.ts:263` — read `input_per_mtok` first |
+| «API ключ» label wraps to vertical single chars at 360px | old `.flex.justify-between` row could not shrink | `LcApiKeyCard.tsx` uses `.lc-keycard-head` (wraps as a unit, label stays `nowrap`) |
+| Models table columns crush to vertical chars on mobile | `.lc-table` had no `min-width`, so the 8-col table compressed instead of scrolling | `llm-cabinet.css` — `.lc-table { min-width: 640px }` + `th/td { white-space: nowrap }` inside `overflow-x:auto` |
+
+## Related
+
+- [Public LLM Facade](/subsystems/public-llm-facade) — backend routes and billing
+- [Earnings Dashboard](/subsystems/earnings-dashboard) — sister cabinet for operators
