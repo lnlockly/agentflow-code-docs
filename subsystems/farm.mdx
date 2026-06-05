@@ -1,5 +1,6 @@
 ---
 title: "Contact Farm"
+description: "Owner-scoped contact-messaging farm — user_farms + farm_stats, /me/farm/* endpoints, FarmPage and the ProductsHub farm card."
 description: "Owner-scoped contact-messaging farm — /me/farm/* endpoints wrap the tg_farm project template (tg-cold-mailer boilerplate) that runs the real MTProto workflow."
 ---
 
@@ -7,6 +8,12 @@ description: "Owner-scoped contact-messaging farm — /me/farm/* endpoints wrap 
 
 ## TL;DR
 
+Per-user "contact farm" feature: a connected Telegram account auto-sends
+one referral-link message per day to its contacts. Backend tables and
+endpoints shipped 2026-05-15. The daily send worker shipped same day in
+**stub mode** — it ticks hourly, writes audit rows to `farm_send_log`,
+and bumps `farm_stats.sent_today` / `sent_total`. Real MTProto sending
+is still backlog (needs per-user Telethon transport — see Backlog).
 Per-user "contact farm" feature. Refactored 2026-05-15 to stop duplicating
 work: `/me/farm/start` no longer flips a status row and prays a stub worker
 does the sending — it now spawns a real `tg_farm` project using the
@@ -26,6 +33,24 @@ from the `/farm` UI into `/projects/:slug`.
 
 | Path | Role |
 |---|---|
+| `agentflow-agents/src/db/schema.ts:2479` | `userFarms` Drizzle table — status / message_template / send_hour |
+| `agentflow-agents/src/db/schema.ts:2506` | `farmStats` Drizzle table — counters per user |
+| `agentflow-agents/src/db/schema.ts:2532` | `farmSendLog` Drizzle table — per-send audit trail |
+| `agentflow-agents/src/db/migrations/0064_farm_tables.sql` | Migration creating user_farms + farm_stats |
+| `agentflow-agents/migrations/2026-05-15d-farm-send-log.sql` | Migration creating farm_send_log |
+| `agentflow-agents/src/routes/farm.ts:19` | Hono `app` for `/me/farm/*` |
+| `agentflow-agents/src/routes/farm.ts:40` | `GET /me/farm/stats` — never 404s; returns `EMPTY_STATS` for unknown users |
+| `agentflow-agents/src/routes/farm.ts` | `POST /me/farm/start` — upsert with status='active', seeds contacts_count |
+| `agentflow-agents/src/routes/farm.ts` | `POST /me/farm/pause` — set status='paused' |
+| `agentflow-agents/src/routes/farm.ts` | `POST /me/farm/toggle` — flip active↔paused |
+| `agentflow-agents/src/routes/farm.ts` | `GET /me/farm/contacts` — contacts preview + recent farm_send_log entries |
+| `agentflow-agents/src/services/farm-send-worker.ts` | Hourly worker — picks due active farms, writes audit rows + bumps counters |
+| `agentflow-agents/src/server.ts:85` | Imports `farmApp` |
+| `agentflow-agents/src/server.ts:106` | Imports `startFarmSendWorker` |
+| `agentflow-agents/src/server.ts:290` | Boots the worker (gated by `FF_FARM_WORKER`) |
+| `agentflow-landing/src/pages/FarmPage.tsx:170` | `/farm` route — dashboard + connect-TG block |
+| `agentflow-landing/src/pages/ProductsHub.tsx:107` | Farm product card on `/products` (live `contacts` metric) |
+| `agentflow-landing/src/pages/ProjectsDashboard.tsx:629` | `FarmBanner` widget on `/projects` |
 | `agentflow-agents/src/db/schema.ts:2479` | `userFarms` Drizzle table — now includes `projectId` FK → projects(id) |
 | `agentflow-agents/src/db/schema.ts:2510` | `farmStats` Drizzle table — counters per user |
 | `agentflow-agents/src/db/schema.ts:2537` | `farmSendLog` Drizzle table — per-send audit trail (real `throttled_send` handler INSERTs here) |
@@ -61,6 +86,32 @@ from the `/farm` UI into `/projects/:slug`.
                   POST /me/farm/start  (session auth)
                               │
                               ▼
+                  upsert user_farms { user_id, status:'active' }
+                  upsert farm_stats { user_id, … defaults }
+                              │
+                              ▼
+                  GET /me/farm/stats  ─► dashboards (FarmPage, ProductsHub
+                                          farm card, UserStatsStrip,
+                                          ProjectsDashboard FarmBanner)
+
+  hourly farm-send-worker tick (FF_FARM_WORKER, default ON):
+    SELECT user_farms.user_id WHERE status='active'
+      AND (farm_stats.last_run_at IS NULL OR < NOW() - 23h)
+      LIMIT 10
+    → for each: buildStubContacts(user_id) → 3..15 ids
+    → INSERT farm_send_log (user_id, contact_id, status='stub')
+    → UPDATE farm_stats SET sent_today += n, sent_total += n,
+                            contacts_count = n, last_run_at = NOW()
+  midnight UTC: UPDATE farm_stats SET sent_today = 0
+
+  [BACKLOG]  real Telethon sending (per-user MTProto session)
+    Today's worker is stub-only — every audit row has status='stub'.
+```
+
+The funnel's `farm_activated` stage in `/admin/funnel-stats` is sourced
+directly from `COUNT(*) FROM user_farms WHERE status='active'` (see
+`stats.ts:133`), not from the events table — activation is observable
+the moment the user clicks start, before any send has fired.
                   ┌─ tg_links row exists for user? ─ no ─► 412 tg_not_connected
                   │ yes
                   ▼
@@ -101,6 +152,19 @@ Also returns the linked project shape so the UI can render
 ## DB / Env / API
 
 - Tables:
+  - `user_farms (id, user_id UNIQUE, status, message_template, send_hour, created_at, updated_at)`
+  - `farm_stats (id, user_id UNIQUE, contacts_count, sent_total, sent_today, registrations, flow_earned, last_run_at, updated_at)`
+  - `farm_send_log (id, user_id FK→users ON DELETE CASCADE, contact_id, status, sent_at, error)` — audit trail; index `idx_farm_send_log_user_time(user_id, sent_at DESC)`
+- Indexes: `user_farms_user_id_idx` UNIQUE, `farm_stats_user_id_idx` UNIQUE
+- Status enum (string-typed): `'inactive' | 'active' | 'paused'` for farms; `'sent' | 'failed' | 'stub'` for `farm_send_log.status`
+- `send_hour`: UTC hour 0-23 — currently informational; worker ticks hourly and uses 23h cooldown rather than gating on send_hour
+- Env: `FF_FARM_WORKER` (set to `0` to disable, default ON), `FF_FARM_TICK_MS` (override interval for tests; default `3_600_000`)
+- Routes (all `requireSession`, user_id = session.sub):
+  - `GET /me/farm/stats` — returns `{ ok, farm: { status, message_template, send_hour, contacts_count, sent_total, sent_today, registrations, flow_earned, last_run_at } }`
+  - `GET /me/farm/contacts` — returns `{ ok, mode: 'stub' | 'real', total, contacts: [{contact_id}], recent: [{id, contact_id, status, sent_at}] }`
+  - `POST /me/farm/start`
+  - `POST /me/farm/pause`
+  - `POST /me/farm/toggle`
   - `user_farms (id, user_id UNIQUE, status, message_template, send_hour, project_id FK→projects(id) ON DELETE SET NULL, created_at, updated_at)`
   - `farm_stats (id, user_id UNIQUE, contacts_count, sent_total, sent_today, registrations, flow_earned, last_run_at, updated_at)`
   - `farm_send_log (id, user_id FK→users ON DELETE CASCADE, contact_id, status, sent_at, error)` — index `idx_farm_send_log_user_time(user_id, sent_at DESC)`
@@ -161,6 +225,27 @@ Enforced inside the `throttled_send` handler scaffold (see
 
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
+| User without any farm record gets a response | `EMPTY_STATS` returned (status='inactive', all zeros) | By design — endpoint never 404s. Frontend renders the connect-TG CTA |
+| Farm stage stuck at 0 in admin funnel | n/a | Confirm `user_farms` migration 0064 applied, then check `SELECT count(*) FROM user_farms WHERE status='active'` directly |
+| `FarmPage` shows mock data | `MOCK_STATS` constant in `FarmPage.tsx:37` | Frontend still uses mock-on-fetch-failure — verify `/me/farm/stats` reachable from browser |
+| `ProductsHub` farm card has no live count | `apiGet<FarmStatsLite>('/me/farm/stats')` in `ProductsHub.tsx:135` returned error | Card hides the metric silently — check auth state, agentsBaseUrl in DevTools |
+| User exists but `toggle` does nothing | Toggle path explicitly only flips active↔paused | If status='inactive' (never started), call `/me/farm/start` first |
+| Counters not moving despite active status | `farm-send: due farms` log absent | Verify `FF_FARM_WORKER!=0`; check the row has last_run_at older than 23h (or NULL) |
+| Audit log full of `status='stub'` | `farm-send tick complete` log has `mode: 'stub'` | By design until real MTProto transport ships — see Backlog |
+| `sent_today` doesn't reset at midnight | `farm-send: midnight reset failed` | Inspect DB connectivity; reset retries every tick once the new UTC day arrives |
+
+## Backlog
+
+- **Real MTProto send** — wire `farm-send-worker.processFarm()` to a per-user Telethon transport (today's `tg-scraper` hard-pins user 1's Jarvis pod, so reuse needs generalisation). Once live, swap `status='stub'` → `'sent'` / `'failed'` and drop the `mode: 'stub'` log tag.
+- **Contact pool ingestion** — UI for the user to import their contacts list. Today the worker uses a deterministic `buildStubContacts(userId)` generator (3..15 ids per day).
+- **Registration credit** — wire `farm_activated` referral signups into `farm_stats.registrations` + `flow_earned`. The funnel already observes the activation event; the credit side is still open.
+
+## Related
+
+- [Funnel analytics](/subsystems/funnel-analytics) — `farm_activated` stage sourced from this table
+- [Reminders v2](/subsystems/reminders-v2) — `farm_activated` user state matches `user_farms.status='active'`
+- [Projects Dashboard](/subsystems/projects-dashboard) — FarmBanner widget consumes `/me/farm/stats`
+- [Products Hub](/subsystems/products-hub) — Farm card consumes `/me/farm/stats`
 | `/me/farm/start` returns `412 tg_not_connected` | n/a (handled at handler level) | User hasn't run TG kickstart flow — show /account/settings link |
 | 412 even after `/me/tg-accounts/confirm-code` succeeded | `tg_farm_missing_account` in projects.ts dispatcher | Two root causes (fixed 2026-05-19): (1) `mcpDirect.callTool` returns the MCP envelope so `result?.status` was always undefined → confirm-code never hit the success branch. (2) Even when active, confirm-code didn't INSERT into `tg_links` — only the bot-deeplink flow did. See `routes/tg-accounts.ts` `unwrapMcp` + tg_links upsert |
 | `/me/farm/start` returns `500 project_spawn_failed` | `slug_collision` or `db_insert_failed` | Inspect Postgres connection + rerun; spawn is idempotent on the user_id side via `findActiveFarmProject` |
