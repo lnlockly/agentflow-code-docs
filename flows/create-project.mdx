@@ -5,6 +5,10 @@ description: "POST /me/projects → kind classify → Maestro propose → user a
 
 # Create project flow
 
+:::caution[Deprecated — старая архитектура]
+Этот flow про старую архитектуру: kind-классификатор (`landing` / `spa` / `tg_bot` / etc.) → Maestro propose → kind-specific provision (auto-scrape / auto-bot / scaffold). Новый flow (brief → GitHub template search → hosted daemon git clone → агент-разработчик в pod'е) описан в [`subsystems/projects`](/subsystems/projects/) (approved 2026-05-25).
+:::
+
 ## TL;DR
 
 Юзер шлёт бриф → `POST /me/projects` → создаётся row `status=draft` + в background стартует Maestro propose; Maestro заполняет `proposed_plan` (jsonb) → `status=awaiting_approval`. На `POST /me/projects/:id/approve` запускается approval chain: provision pod → workspace_ready → auto-scrape (если есть @handles) → auto-bot (для tg_bot/tg_profile_bundle) → scaffold (только tg_profile_bundle) → execute_in_team → pool-worker drains `plan_tasks`.

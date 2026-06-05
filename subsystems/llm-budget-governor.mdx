@@ -1,0 +1,78 @@
+---
+title: "LLM budget governor"
+description: "Platform-wide pre-call LLM cost gate with 80%/110% TG notifications, owner bypass, and fail-open on DB outage."
+---
+
+# LLM budget governor
+
+## TL;DR
+
+Every `invokeAI()` call passes through `enforceBudget(userId, estCostUsd)` before hitting the provider. The governor reads / upserts `llm_budget_state(user_id, day)`, fires one TG notification at 80 % of the daily cap and a kill-switch at 110 %. Owner ids in `LLM_BUDGET_OWNER_BYPASS_USER_IDS` bypass enforcement. Postgres outages fail open. This is the *daily* layer between the cumulative cap (`services/llm-budget.ts`) and the hourly circuit breaker (`services/llm-circuit-breaker.ts`).
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/llm-budget-governor.ts:1` | governor entrypoint, `enforceBudget` / `recordActualCost` / `evaluateGovernor` |
+| `agentflow-agents/src/services/llm-budget-governor.ts:30` | `readGovernorConfig` — reads `LLM_BUDGET_PER_USER_USD`, `LLM_BUDGET_OWNER_BYPASS_USER_IDS` |
+| `agentflow-agents/src/services/llm-budget-governor.ts:172` | `enforceBudget` — pre-call gate |
+| `agentflow-agents/src/services/llm-budget-governor.ts:251` | `recordActualCost` — post-call atomic increment |
+| `agentflow-agents/src/ai-router/instrumented.ts:140` | hook point — calls `enforceBudget` after `assertUserBudget` |
+| `agentflow-agents/src/ai-router/instrumented.ts:218` | post-call `recordActualCost` for non-cache-hit calls |
+| `agentflow-agents/src/db/schema.ts:2125` | drizzle binding `llmBudgetState` |
+| `agentflow-agents/migrations/2026-05-24a-llm-budget-state.sql:1` | DDL |
+| `agentflow-agents/tests/unit/llm-budget-governor.test.ts:1` | 14 unit tests |
+
+## Data flow
+
+```
+invokeAI(modelType, params, ctx)
+  │
+  ├─ assertHourlyCircuit(ctx.ownerUserId)   ← short-window kill
+  ├─ assertUserBudget(ctx.ownerUserId)      ← cumulative agent_runs cap
+  ├─ enforceBudget(ctx.ownerUserId, 0)      ← THIS — daily governor
+  │    ├─ ownerIds.has(userId) → return ok  ← log `budget_owner_bypass`
+  │    ├─ INSERT … ON CONFLICT (user, day) DO UPDATE → row
+  │    ├─ evaluateGovernor(spent, est, cap, flags, ratios)
+  │    │    ├─ projected ≥ killAt → deny + fire_110 once
+  │    │    └─ projected ≥ warnAt → allow + fire_80 once
+  │    ├─ if fire_80 → sendOwnerNotify + SET notified_80 = TRUE
+  │    └─ if fire_110 → sendOwnerNotify + SET notified_110 = TRUE
+  │
+  ├─ provider call
+  │
+  └─ recordActualCost(userId, actualUsd)
+       └─ INSERT … ON CONFLICT DO UPDATE SET total_cents += actualCents
+```
+
+## DB / Env / API
+
+- **Tables:** `llm_budget_state(user_id INT, day DATE, total_cents INT, notified_80 BOOL, notified_110 BOOL, updated_at TIMESTAMPTZ, PK(user_id, day))`
+- **Env:**
+  - `LLM_BUDGET_PER_USER_USD` — daily cap per user, default `20`
+  - `LLM_BUDGET_OWNER_BYPASS_USER_IDS` — CSV of user ids that bypass, default `1`
+  - `ADMIN_TG_BOT_TOKEN` + `ADMIN_TG_CHAT_ID` — TG notification path (falls back to `AGENTFLOW_BOT_TOKEN` + chat `1361064246`)
+- **Routes:** none new — existing `POST /admin/users/:id/budget` already manages overrides via `user_budget_overrides`.
+- **MCP tools:** none.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Owner blocked at launch | `budget_cap_exceeded user=1` | add user id to `LLM_BUDGET_OWNER_BYPASS_USER_IDS` (env on deploy/agentflow-agents) |
+| TG warning spam every minute at 80 % | `budget_80_notified` >1× same user/day | check `notified_80` UPDATE landed; if PG was unreachable the flag stays FALSE and re-fires next time `services/llm-budget-governor.ts:226` |
+| Postgres outage blocks every LLM call | `budget_governor_db_failed_open` | expected behaviour — governor returns ok on DB error; investigate the DB outage, not this code |
+| Killswitch never fires above $22 spend | absence of `budget_cap_exceeded` in logs | verify `LLM_BUDGET_PER_USER_USD` env is set on `deploy/agentflow-agents`; check `evaluateGovernor` killRatio (`services/llm-budget-governor.ts:122`) |
+| Owner bypass with wrong id | `budget_owner_bypass user=N` for unexpected N | `readGovernorConfig` CSV parse — `services/llm-budget-governor.ts:42` |
+| Drift between `llm_budget_state.total_cents` and `agent_runs.cost_cents` | `record_cost_failed_open` | DB write of `recordActualCost` dropped; safe — `llm-budget.ts` cumulative cap is the authoritative ledger |
+
+## Related
+
+- [LLM router](/subsystems/llm-router)
+- `services/llm-budget.ts` — cumulative monthly/daily cap
+- `services/llm-circuit-breaker.ts` — hourly platform + per-user, **and (2026-05-30) a platform-wide DAILY cap** (`LLM_DAILY_CAP_USD`, shared with `gpt-fallback.checkDailyCap` + `owner-alerts.probeFlowBalance`) enforced in `assertHourlyCircuit` for every provider path incl. `userId=null` system calls. `0` = disabled (current prod value). Greppable log: `platform_daily_circuit`
+- `services/pingers/llm-burn-alert.ts` — 5-min poll of `flow_ledger` for global burn rate
+
+:::caution[Caps DISABLED in prod (verified 2026-05-30)]
+`LLM_DAILY_CAP_USD=0`, `LLM_PLATFORM_HOURLY_CAP_USD=0`, `LLM_USER_HOURLY_CAP_USD=0`, `LLM_BURN_ALERT_DAILY_USD=0` on the agents Deployment — the $3000-burn protection is coded but switched off. Only the per-user daily governor (`LLM_BUDGET_PER_USER_USD`, default $20) is active, and it bypasses `userId=null` system calls + owner id 1. Owner-gated: set sane ceilings. See `plans/autonomous/_cost-guardrails-audit-2026-05-30.md`.
+:::

@@ -500,10 +500,141 @@ production callers go through `runGraphExecutor` which forces ON.
 | Handler accidentally reads `process.env.BOT_TOKEN_POOL` directly | Lint rule (banned import) + code review. `ExecCtx` does not expose raw env; pool reads stay inside the `request_token` handler that wraps `autoCreateTelegramBot`. |
 | What happens to `projects.proposed_plan` | Walker ignores it. `workflow_schema` is the contract; proposed_plan stays for backward-compat with maestro freestyle until Phase 6. |
 
+## Foundation rebrand (kind=spa, github_repo mode)
+
+When a SPA project clones a GitHub foundation (`projects.foundationMode='github_repo'`), the `admin_panel` handler in `src/services/graph-executor/handlers/spa.ts:519` runs a brand rewrite pass before the Procfile + build step. The pass lives in `src/services/foundation-rebrand.ts`.
+
+### Why
+
+Cloning `mickasmt/next-saas-stripe-starter` or `lnlockly/golden-connect-template` leaves the rendered landing page hardcoded with the template's brand strings — `<title>SaaS Starter</title>`, `name: "Golden Connect"`. The user briefs "Cookora — рецепты из холодильника" and lands on a 200-OK page that still says "SaaS Starter". Observed on projects 1293, 1327, 1361 (2026-05-22).
+
+### Surface
+
+| File | Replacement |
+|---|---|
+| `config/site.ts` / `src/config/site.ts` | `name: "SaaS Starter"` → brief-derived name; `description:` rewritten when template-shaped |
+| `package.json` | `name` slugified from brief; `description` rewritten when template-shaped |
+| `README.md` | First `# <template-name>` heading → `# <brief-name>` + one-line tagline |
+| `app/layout.tsx` / `src/app/layout.tsx` | Probed but not rewritten (Next.js renders title from `metadata` exported elsewhere) |
+
+The rebrand derives `{site_name, site_description, hero_title, hero_subtitle}` from the brief via one `useModel(ModelType.TEXT_LARGE)` call, parses STRICT JSON, falls back to `SAFE_DEFAULTS` on parse failure. Banned words (`free`, `бесплатно`, `platform`, `protocol`, etc.) are stripped post-LLM.
+
+### Idempotency
+
+The rebrand writes `.runtime/.rebrand_applied` on success. Subsequent admin_panel passes (e.g. graph-executor resume after pod restart) detect the marker and skip the LLM call entirely. To force a re-rebrand: delete the marker.
+
+### Production Procfile speedup
+
+Same handler upgrades the Procfile `web:` line from `npx next dev` → `npx next build && npx next start` (with fallback to dev on build failure). First paint drops from 40-60s (dev compile-on-demand) to sub-second. Owner sees their preview once; no HMR needed.
+
+## Curated foundations
+
+`src/services/curated-foundations.ts` ships 5 deterministic GitHub templates that surface in `recommendProjectFoundations` even when the LLM hallucinates dead repos:
+
+| Repo | Use case |
+|---|---|
+| `lnlockly/golden-connect-template` | MLM / community / lots / referrals |
+| `mickasmt/next-saas-stripe-starter` | Generic SaaS dashboard / Stripe billing |
+| `shadcn-ui/taxonomy` | Content sites / docs / MDX blogs |
+| `vercel/commerce` | E-commerce / storefront / marketplace |
+| `vitejs/vite` | Utility tools / MVPs / scratch builds (no auth/DB) |
+
+Matching is cheap lowercase substring against brief keywords + kind hint. Adding a 6th entry: edit `CURATED_FOUNDATIONS` array and add a test in `tests/unit/curated-foundations.test.ts`.
+
+## Owner-message routing (deployed-project bypass, 2026-05-22)
+
+A follow-up `POST /me/projects/:id/messages` on a project where the
+workspace is already live MUST NOT re-trigger graph-executor. The
+deployed-project bypass at the top of the messages handler short-
+circuits to direct coder dispatch instead.
+
+### Decision (pure function)
+
+The routing decision lives in [`src/services/owner-message-route.ts`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/owner-message-route.ts) — pure, no DB, unit-tested.
+
+| status | preview_url | text length | verdict |
+|---|---|---|---|
+| `done` / `running` | non-null | ≥ 20 chars | `coder_iterate` |
+| `done` / `running` | non-null | < 20 chars | `maestro` |
+| `done` / `running` | null | any | `maestro` |
+| `draft` / `awaiting_approval` | any | substantial | `graph_executor` |
+| `failed` / `cancelled` | any | substantial | `maestro` |
+| any | any | empty / whitespace | `noop` |
+
+`OWNER_MESSAGE_SUBSTANTIAL_MIN_CHARS = 20` (trimmed). Short messages
+(greetings, "ok", "👍") never carry actionable intent — LLM triage
+handles those.
+
+### Wiring
+
+Two call sites:
+
+- `agentflow-agents/src/routes/projects.ts` — the `/me/projects/:id/messages` handler. Bypass block runs BEFORE the heavy-iteration trigger at line ~2290 and BEFORE the iterate-intent fallback at line ~2609.
+- `agentflow-agents/src/services/projects-pipeline.ts:enqueueOwnerMessage` — used by collaborator chat + approved-suggestion flow via `routes/live-projects.ts`.
+
+Both sites resolve the canonical coder via the same pickers used by the
+legacy fast-path: `pickRecentCoderForPlan` → `pickGraphExecutorCoderForKind`
+→ `verifyProjectAgentSlug`. On success: insert `plan_tasks` row,
+emit `coder_dispatched` event, flip `status=done` → `running`. The
+graph-executor path is never re-entered for a deployed project.
+
+Greppable success: `[chat-iterate] direct coder dispatch project=…`.
+
+### Plan resolution (`ensurePlanForProject`)
+
+Graph-executor projects often sit at `projects.plan_id = NULL` because handlers invoke coders inline via `ctx.coderInvoke` and never insert a `plans` row. The bypass cannot insert `plan_tasks` without a `plan_id`, so [`src/services/ensure-plan.ts`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/ensure-plan.ts) walks 4 paths:
+
+1. `projects.plan_id` (fast path)
+2. Latest `plan_started` event `payload.plan_id`
+3. Latest plan tied to the project's team
+4. INSERT a stub plan (`goal = "chat-iterate stub for project #N"`) and self-heal `projects.plan_id`
+
+`plans.maestro_agent_id` is NOT NULL with FK to agents — stub creation picks `teams.maestroAgentId` → most-recent `teamMembers` row → any non-tombstoned agent owned by the team owner. If none exists the helper returns null and the bypass falls back to the legacy maestro reply background.
+
+Greppable when stub is created: `[chat-iterate] stub plan created plan_id=…`.
+
+### Why graph-executor was re-running
+
+Live evidence project 1292 (2026-05-22): owner sent
+`"@coder add file .test.txt with text TEST"` to a `kind=spa` project
+with `status=running` + `preview_url` set. Sequence before the fix:
+
+```
+owner_message              → handler dispatched
+log "re-iterating (iterate-intent fallback)"  ← BUG
+graph_executor_started     ← BUG: ran again
+node_skipped_idempotent    (mini_app_coder already satisfied)
+node_started admin_panel
+foundation_rebranded       ← BUG: rewrote site_name + Procfile
+node_started deploy
+```
+
+No file was created in the workspace. The iterate-intent branch
+fired `runMaestroProposeBackground`, which re-ran `runProjectApprovalBackground`,
+which re-entered the graph. Because every node is idempotent except
+`foundation_rebrand` (LLM call) + `deploy` (writes Procfile), the
+graph "succeeded" but the owner's actual message was discarded.
+
+The bypass introduced here returns BEFORE iterate-intent ever runs, so
+the only path for a deployed project is `plan_tasks` insert →
+pool-worker drains → coder edits files → `task_done` → SSE update.
+
+### Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Deployed project ignores owner message, graph_executor restarts | `re-iterating (iterate-intent fallback)` followed by `graph_executor_started` | Pre-2026-05-22 routing. Fixed by `[chat-iterate] direct coder dispatch`. If you see this log again — the bypass either misclassified the project or `pickGraphExecutorCoderForKind` returned null. |
+| Bypass picked a coder but verify failed | `[chat-iterate] picked @<slug> not verifiable for project — falling back to legacy path` | `verifyProjectAgentSlug` rejected the slug. Check agent state (tombstoned?), team ownership, and whether the slug matches the canonical coder pattern. |
+| Bypass found no canonical coder | `[chat-iterate] no canonical coder for kind=<x>` | `coderSlugForKind` returned null for this kind. Add a case to `services/kind-registry.ts:coderSlugForKind` or seed a `coder-<kind>` agent for the team owner. |
+| Bypass triggered but plan was empty | `[chat-iterate] no effective plan for deployed project` | Graph-executor should always insert a `plans` row at approve time. If this fires, check `runGraphExecutorDispatch` initialisation; falls through to legacy maestro path so the message isn't lost. |
+
 ## Failure modes
 
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
+| Foundation preview shows template brand | `admin_panel: rebrand skipped` event in project_events | `services/foundation-rebrand.ts` — check probe path matches actual cloned layout |
+| Rebrand LLM returned garbage / no JSON | `[foundation-rebrand]` SAFE_DEFAULTS applied | LLM at `ANTHROPIC_API_KEY` / east-api-3 unreachable; rebrand returned site_name="New Project". Investigate via `project_events.foundation_rebranded`. |
+| First paint still 40s+ on Next.js foundation | Procfile contains `npx next dev` instead of `npx next build && npx next start` | Foundation Procfile generated before this PR — delete `.runtime/foundation_port` and re-trigger admin_panel node |
 | Walker doesn't run despite flag on | `[graph-executor] kind <x> not in graph_executor.kinds allowlist` | Set `feature_flags['graph_executor.kinds']` via `PATCH /admin/feature-flags/graph_executor.kinds` |
 | Cycle in workflow_schema | `[graph-executor] cycle_detected nodes=[…]` | `seed-boilerplate-workflows.ts` — the seed has a bad edge |
 | Handler missing for node id | `[graph-executor] handler missing for kind=<id>, delegating to coder-agent` | Register a handler in `src/services/graph-executor/handlers/` OR verify the coder brief is enough |
@@ -517,6 +648,7 @@ production callers go through `runGraphExecutor` which forces ON.
 | **RESOLVED 2026-05-17** Walker-stale tick crashes on Date binding | `walker-stale tick failed` + `Received an instance of Date` | Fixed in `walker-persistence.ts:claimStaleWalker` — `seenAt.toISOString()` before SQL bind. postgres-js v3.4.5 throws `Buffer.from(date)` on raw Date for timestamptz equality in `prepare: false`. Symptom: queue head jammed by 5 chronically-stale walkers, projects 942/943 stuck `running` despite live preview URLs. |
 | Walker chronically broken — same row stuck at queue head | `[walker-stale] max_attempts_reached project_id=…` + `walker_max_attempts_reached` event | After `WALKER_STALE_MAX_ATTEMPTS=10` resumes, pinger flips project to `failed` and DELETEs walker_state row. Check handler that keeps throwing on resume. |
 | One bad walker row used to kill the whole tick | `[walker-stale] row_failed project_id=…` | Fixed 2026-05-17 — per-row `try/catch` in `runWalkerStaleTick`. Old behaviour: throw inside loop → loop exited → no other walker resumed. |
+| **RESOLVED 2026-05-22** Owner free-form message into a graph-executor project silently dropped | `r4_design_gate_injected` → `plan_proposed` then SILENCE; `chat_dispatch: no coder found in plan history; falling back to maestro` | Fixed by `coderSlugForKind` + `pickGraphExecutorCoderForKind` ([`routes/projects.ts`](https://github.com/lnlockly/agentflow-agents/blob/main/src/routes/projects.ts) + [`projects-pipeline.ts`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/projects-pipeline.ts)). Graph-executor handlers invoke coders inline via `ctx.coderInvoke`, never inserting into `plan_tasks`. The `/me/projects/:id/messages` fast-path called `pickRecentCoderForPlan` → null → `pickRosterFallbackAgent` (which reads `proposedPlan`) → null → Maestro re-propose → re-run the (idempotent) graph + `r4_design_gate_injected` → 4 new steps sat at `proposedPlan` forever. The third fallback `pickGraphExecutorCoderForKind` resolves the canonical coder (`coder-spa` / `coder-landing` / `coder-tg-bot` / …) owned by the team owner, mirroring the prefix-match pool-worker does on claim. Greppable success: `chat_dispatch: graph-executor coder fallback picked @<slug>`. |
 
 ## Related
 

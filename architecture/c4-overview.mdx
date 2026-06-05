@@ -1,0 +1,183 @@
+---
+title: "C4 Architecture Map (browsable)"
+description: "Кликабельная карта архитектуры AgentFlow на уровнях C4 — контекст, контейнеры, компоненты. Для не-программиста: открой в браузере и смотри, как всё связано."
+---
+
+# C4 Architecture Map
+
+## TL;DR
+
+Это **карта того, как устроен AgentFlow**, нарисованная прямо в браузере — открываешь страницу и видишь, кто с кем связан. Никакого редактора кода. Три уровня детализации по модели **C4**: сначала «кто пользуется и с чем общается» (контекст), потом «из каких частей собран продукт» (контейнеры), потом крупный план одной несущей части — **пульт + очередь подтверждения** (компоненты).
+
+Карта показывает **только то, что мы оставляем** (KEEP-архитектура: 15 экранов из Pencil + их бэкенд + спина connector-core/approval + устройства/движки + токен-лаунчпад). Всё, что мы скоро удаляем, тут не нарисовано.
+
+> Те же диаграммы есть в виде модели **Structurizr DSL** в репозитории: `structurizr/workspace.dsl`. DSL — для инженеров (можно открыть на [structurizr.com](https://structurizr.com) или в Structurizr Lite). Эта страница — для просмотра в браузере без инструментов.
+
+## Уровень 1 — Контекст: кто и с чем общается
+
+**Человеческим языком.** Владелец заходит в AgentFlow в браузере и ставит задачу. AgentFlow — это «ИИ с руками»: он сам читает диалоги в Telegram, отвечает на Kwork, управляет твоим компьютером или облачным сервером и запускает токен. Но **ничего не отправляется в Telegram или Kwork, пока человек не нажал «Подтвердить»**. Тексты для ответов сочиняет языковая модель — AgentFlow обращается к ней через «роутер» `flow`, который сам переключается между провайдерами, если один отвалился.
+
+```mermaid
+C4Context
+    title Контекст — AgentFlow и его окружение
+
+    Person(owner, "Владелец / User", "Ставит задачи, проверяет черновики, жмёт «Подтвердить»")
+
+    System(agentflow, "AgentFlow", "ИИ с руками: аккаунты, проекты, устройства, токен — всё за одним пультом подтверждения")
+
+    System_Ext(telegram, "Telegram (MTProto)", "Аккаунты и боты — только через tg-mcp")
+    System_Ext(kwork, "Kwork", "Биржа: задания, диалоги, авто-отклики")
+    System_Ext(llm, "LLM-провайдеры", "codex.sale → designapi → claudecodeapi → claude-oauth, через роутер flow")
+    System_Ext(devices, "Устройства пользователя", "Mac / Windows / Linux или облачный под")
+    System_Ext(chain, "BEP20 chain", "Сеть, где живёт токен лаунчпада")
+
+    Rel(owner, agentflow, "Работает в браузере: пишет задачу, подтверждает действия")
+    Rel(agentflow, telegram, "Читает диалоги, шлёт сообщения (после подтверждения)", "tg-mcp")
+    Rel(agentflow, kwork, "Читает задания, постит отклики (после подтверждения)", "kwork-inbox")
+    Rel(agentflow, llm, "Сочиняет черновики и рассуждения агента", "flow")
+    Rel(agentflow, devices, "Отправляет задачи, показывает Live-экран", "WebSocket")
+    Rel(agentflow, chain, "Запускает и ведёт токен", "agentflow-api")
+
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
+```
+
+## Уровень 2 — Контейнеры: из каких частей собран продукт
+
+**Человеческим языком.** Браузерное приложение (15 экранов) — это то, что видит человек. Оно разговаривает с бэкендом `agentflow-agents`. Внутри бэкенда три ключевых блока: **connector-core** (одинаковые «переходники» к каждой платформе — Telegram, Kwork, дальше VK — без отдельного кода под каждую), **approval-queue** (очередь подтверждения: сюда складываются черновики, человек жмёт «Подтвердить», и только тогда коннектор отправляет) и **ai-router (flow)** (выбирает рабочую языковую модель). Отдельно — демон на устройстве (он же запускает движок goose), база Postgres (одна на всё) и лаунчпад токена.
+
+```mermaid
+C4Container
+    title Контейнеры — KEEP-архитектура AgentFlow
+
+    Person(owner, "Владелец / User", "Браузер")
+
+    System_Boundary(af, "AgentFlow") {
+        Container(landing, "agentflow-landing", "React 19, Vite, Tailwind", "15 экранов Pencil: Лендинг, Чат, Проекты, Workspace, Пульт ×3, Устройства, Live, Cloud, Автоматизации, Баланс …")
+        Container(agents, "agentflow-agents", "Hono, TypeScript", "Бэкенд: /me/* REST + SSE, авторизация, миграции, lifecycle проектов")
+        Container(connector, "connector-core", "TS-модуль", "Один интерфейс Connector на платформу. buildAction рисует черновик, executeAction — единственная отправка")
+        Container(approval, "approval-queue", "TS-модуль", "Очередь «armed → confirm». Атомарный единоразовый захват перед любой отправкой")
+        Container(router, "ai-router (flow)", "TS-модуль", "useModel + цепочка провайдеров с health-failover")
+        Container(mcp, "MCP-серверы", "tg-mcp / kwork-inbox / tg-bot", "Транспорт. Вызовы через mcpDirect.callTool(...)")
+        Container(daemon, "Демон устройства", "computer-mcp → goose", "На компьютере или в поде: задачи по WS, Live-экран, движок")
+        ContainerDb(pg, "Postgres", "PostgreSQL 16", "Аккаунты, entity_approval_queue, устройства, проекты — 200+ таблиц")
+        Container(launchpad, "agentflow-api", "TS-сервис", "BEP20 / dPNM токен-лаунчпад — отдельно от бэкенда")
+    }
+
+    System_Ext(telegram, "Telegram (MTProto)", "")
+    System_Ext(kwork, "Kwork", "")
+    System_Ext(llm, "LLM-провайдеры", "")
+    System_Ext(udev, "Устройства пользователя", "")
+    System_Ext(chain, "BEP20 chain", "")
+
+    Rel(owner, landing, "Открывает в браузере")
+    Rel(landing, agents, "REST + SSE (/me/*), x-api-key / cookie", "HTTPS")
+    Rel(landing, launchpad, "Экран токена", "HTTPS")
+
+    Rel(agents, connector, "Список сущностей / черновик действия")
+    Rel(agents, approval, "Кладёт черновик, подтверждает, исполняет")
+    Rel(agents, router, "useModel(...) для черновика")
+    Rel(agents, pg, "Читает / пишет", "SQL")
+    Rel(agents, daemon, "Задачи + Live", "WebSocket")
+
+    Rel(connector, mcp, "Оборачивает тулы", "callTool")
+    Rel(approval, connector, "executeAction() после подтверждения")
+    Rel(approval, pg, "entity_approval_queue", "SQL")
+    Rel(router, llm, "Цепочка flow (health-gated)", "HTTPS")
+    Rel(mcp, telegram, "", "MTProto")
+    Rel(mcp, kwork, "", "Inbox API")
+    Rel(daemon, udev, "Запускается / управляет")
+    Rel(launchpad, chain, "Транзакции токена", "BEP20")
+
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
+```
+
+Где почитать про каждую часть подробно (если страница уже есть):
+
+- **Пульт аккаунтов** (`agentflow-landing`, 3-зонный экран) → [Cabinet «Пульт аккаунтов»](/agentflow-code-docs/subsystems/cabinet-accounts-pult)
+- **ai-router / flow** → [LLM Router](/agentflow-code-docs/subsystems/llm-router)
+- **MCP-серверы (Telegram)** → [Telegram MCP](/agentflow-code-docs/subsystems/tg-mcp)
+- **Устройства / движок goose** → [AgentFlow Desktop (Goose fork)](/agentflow-code-docs/subsystems/agentflow-desktop-fork)
+- **connector-core** и **approval-queue** — крупный план ниже (отдельные subsystem-страницы появятся в Wave 1, T1.9).
+
+## Уровень 3 — Компоненты: пульт + очередь подтверждения (спина)
+
+Это та самая несущая «спина», вокруг которой строятся все три экрана Пульта: **Platform → Account → EntityKind → Entity → Action → ApprovalQueue**.
+
+**Человеческим языком.** Ты пишешь в Пульте «напиши Косте, что готово». Модель понимает: это отправка сообщения Косте. Коннектор находит Костю в диалогах и **рисует черновик** — это ещё не отправка. Черновик ложится в **очередь подтверждения** как карточка «armed» (заряжено, но не выстрелило). Ты видишь конкретный текст и адресата, жмёшь **«Подтвердить»**. Очередь делает атомарный захват (чтобы один и тот же черновик нельзя было отправить дважды), и только теперь коннектор реально отправляет в Telegram. Карточка становится «Отправлено ✓».
+
+```mermaid
+C4Component
+    title Компоненты — connector-core + approval спина
+
+    Container(landing, "agentflow-landing", "Web", "Пульт ×3: браузер сущностей + очередь подтверждения")
+
+    Container_Boundary(agents, "agentflow-agents") {
+        Component(meAcc, "me-accounts route", "src/routes/me-accounts.ts", "GET /me/accounts/:id/entities + POST /:id/command (SSE). Черновик → arm()")
+        Component(meApp, "me-approvals route", "src/routes/me-approvals.ts", "GET /me/approvals; confirm / edit / reject / confirm-all")
+        Component(reg, "Connector Registry", "registry.ts", "getConnector(platform). Новая платформа = одна строка")
+        Component(conn, "Connector (per platform)", "connectors/*.ts", "listEntities / buildAction(черновик) / executeAction (единственная отправка)")
+        Component(qsvc, "Queue service", "approval/queue.ts", "arm() / listArmed() / edit() / reject()")
+        Component(exec, "Executor", "approval/executor.ts", "Атомарный захват armed→executing, затем executeAction()")
+        ComponentDb(eaq, "entity_approval_queue", "Postgres", "Одна таблица на все платформы: payload, status armed→executed")
+    }
+
+    Container(mcp, "MCP-серверы", "tg-mcp …", "")
+    System_Ext(telegram, "Telegram", "")
+
+    Rel(landing, meAcc, "Браузер сущностей + команда (SSE)")
+    Rel(landing, meApp, "Лента + «Подтвердить / Изменить / Отклонить»")
+    Rel(meAcc, reg, "getConnector(platform)")
+    Rel(reg, conn, "выдаёт")
+    Rel(meAcc, qsvc, "buildAction → arm() черновик")
+    Rel(qsvc, eaq, "INSERT status='armed'")
+    Rel(meApp, exec, "confirm → захват + исполнение")
+    Rel(exec, eaq, "атомарный захват armed→executing, запись результата")
+    Rel(exec, conn, "executeAction() — единственная отправка")
+    Rel(conn, mcp, "callTool", "mcpDirect")
+    Rel(conn, telegram, "send (после подтверждения)", "tg-mcp")
+
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
+```
+
+### Что гарантирует эта спина
+
+- **Никакой отправки без человека.** `buildAction` рисует только черновик. `executeAction` — единственный метод с побочным эффектом, и его дёргает исполнитель **после** подтверждения.
+- **Нельзя отправить дважды.** Захват `UPDATE … WHERE status='armed' RETURNING *` атомарный: повторное нажатие «Подтвердить» — пустышка (idempotent).
+- **Ноль кода под платформу.** Поведение берётся из реестра (`PLATFORM_REGISTRY`), а не из `if (platform === 'telegram')`. Добавить VK = одна строка в реестре + один файл коннектора.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-code-docs/structurizr/workspace.dsl` | Structurizr C4 model — context / containers / components for the KEEP scope |
+| `agentflow-code-docs/architecture/c4-overview.mdx` | This page — the same model embedded as Mermaid C4 |
+| `agentflow-agents/src/connector-core/registry.ts` | Connector registry (per `plans/build/01-ARCHITECTURE.md` §3) |
+| `agentflow-agents/src/connector-core/connectors/telegram.ts` | Telegram connector — wraps the 33 tg-mcp tools (§7) |
+| `agentflow-agents/src/approval/executor.ts` | Atomic claim → `executeAction` → status write (§4) |
+| `agentflow-agents/src/routes/me-accounts.ts` | Entity browse + `command` SSE (§5) |
+| `agentflow-agents/src/routes/me-approvals.ts` | Approval feed + confirm/edit/reject (§5) |
+| `agentflow-landing/src/pages/CabinetAccounts.tsx` | Пульт — three-zone command center |
+
+> File refs trace `plans/build/01-ARCHITECTURE.md` §7 (module layout) and `_groundtruth-backend.md`. Some Wave-1 paths (`me-approvals.ts`, `approval/executor.ts`) are in-flight; verify line numbers against the merged code before quoting them.
+
+## DB / Env / API
+
+- **Tables:** `entity_approval_queue` (the spine), plus existing `platformTgAccounts`, `kworkPendingResponses` (the seed pattern), `userDevices` / `deviceTasks`.
+- **Env:** routed LLM only — no model strings. The `flow` alias is configured in the ai-router, never pinned.
+- **Routes:** `GET /me/accounts/:id/entities`, `GET /me/accounts/:id/entities/:eid/thread`, `POST /me/accounts/:id/command` (SSE), `GET /me/approvals`, `POST /me/approvals/:id/{confirm,edit,reject}`, `POST /me/approvals/confirm-all`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Mermaid block renders as raw text, not a diagram | (no error — block stays a `pre`) | Confirm `astro-mermaid` runs **before** `starlight()` in `astro.config.mjs` so Expressive Code skips the `mermaid` language |
+| Confirm sends twice | `alreadyHandled` not returned | Atomic claim missing — `UPDATE … WHERE status='armed' RETURNING *` in `src/approval/executor.ts` |
+| New platform needs route/UI changes | n/a (design smell) | A branch leaked outside the registry — keep behavior data-driven in `connector-core/registry.ts` |
+
+## Related
+
+- [Architecture Overview](/agentflow-code-docs/architecture/overview) — the 5-minute tour
+- [Cabinet «Пульт аккаунтов»](/agentflow-code-docs/subsystems/cabinet-accounts-pult) — the frontend slice this map's component view backs
+- [LLM Router](/agentflow-code-docs/subsystems/llm-router) — the `flow` alias + failover
+- [Telegram MCP](/agentflow-code-docs/subsystems/tg-mcp) — the transport connectors wrap
+- Source plans: `plans/build/00-MASTER.md` (§0 + §3.5), `plans/build/01-ARCHITECTURE.md` (the spine)
