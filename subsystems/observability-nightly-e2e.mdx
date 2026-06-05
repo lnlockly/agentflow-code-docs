@@ -1,0 +1,92 @@
+---
+title: "Nightly E2E + integration-health"
+description: "Two k8s CronJobs that detect platform breakage automatically and notify the owner via TG before users complain."
+---
+
+# Nightly E2E + integration-health
+
+## TL;DR
+
+Two independent CronJobs run on the cluster every day. `agentflow-nightly-e2e` (03:13 UTC) creates one real project per `runtime_class` through the public API, waits for liveness, asserts brief-derived strings appear in the rendered preview / bot, then deletes the project and posts PASS/FAIL to the owner TG bot. `agentflow-integration-health-digest` (07:30 UTC) hits `GET /internal/integration-health` on the agentflow-agents pod, which probes every external dependency (LLM proxies, Telegram, MinIO, Matrix, Postgres) with 5-second timeouts and returns a JSON envelope; the cron formats the result for TG. Owner gets two scheduled messages per day — silence on TG means platform is healthy. Anything red flips the Job to FAIL state in `kubectl get jobs` so the operator notices even if TG delivery breaks.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/integration-health.ts:1` | Probe functions + `runAllIntegrationChecks()` + `formatHealthSummary()` |
+| `agentflow-agents/src/services/nightly-e2e.ts:1` | `NIGHTLY_SCENARIOS` + `runScenario()` + `runNightlyE2E()` + `formatNightlySummary()` |
+| `agentflow-agents/src/routes/internal.ts:1806` | `GET /internal/integration-health` route registration |
+| `agentflow-agents/scripts/run-nightly-e2e.ts:1` | CronJob entrypoint for the nightly smoke |
+| `agentflow-agents/scripts/run-integration-health-digest.ts:1` | CronJob entrypoint for the daily integration digest |
+| `agentflow-agents/k8s/nightly-e2e-cron.yaml:1` | Both CronJob manifests (nightly-e2e + integration-health-digest) |
+| `agentflow-agents/tests/unit/integration-health.test.ts:1` | Source-contract + formatter tests |
+
+## Data flow
+
+```
+03:13 UTC CronJob
+  └─ scripts/run-nightly-e2e.ts
+       └─ services/nightly-e2e.runNightlyE2E
+            ├─ for each scenario in NIGHTLY_SCENARIOS:
+            │    POST {API_BASE}/me/projects                (create)
+            │    POST {API_BASE}/me/projects/:id/approve    (approve)
+            │    poll  projects.preview_promoted_at | bot_username  (≤10m)
+            │    fetch preview_url, assert must_contain[]   (web)
+            │    assert bot_username non-empty              (tg_bot)
+            │    DELETE {API_BASE}/me/projects/:id          (cleanup)
+            └─ POST api.telegram.org/bot{TOKEN}/sendMessage to owner chat
+
+07:30 UTC CronJob
+  └─ scripts/run-integration-health-digest.ts
+       └─ GET http://agentflow-agents:4100/internal/integration-health
+            └─ services/integration-health.runAllIntegrationChecks
+                 ├─ checkPostgres        (SELECT 1)
+                 ├─ checkEastApi3        (GET /v1/models)
+                 ├─ checkDesignApi       (GET /v1/models)
+                 ├─ checkTelegramOwnerBot (GET getMe)
+                 ├─ checkMinio           (HEAD {endpoint}/{bucket})
+                 └─ checkMatrix          (GET /_matrix/client/versions)
+       └─ POST api.telegram.org/.../sendMessage to owner
+```
+
+## DB / Env / API
+
+- Tables read: `projects` (`preview_promoted_at`, `preview_url`, `bot_username`, `status`)
+- Tables written: none (cleanup uses public `DELETE /me/projects/:id`)
+- Env (all consumed via `envFrom: secretRef: agentflow-agents-env`):
+  - `NIGHTLY_E2E_API_BASE` — e.g. `https://agentflow.website/_agents`
+  - `NIGHTLY_E2E_OWNER_KEY` — `af_live_*` API key (currently user 1, swap to dedicated bot user when minted)
+  - `NIGHTLY_E2E_NOTIFY_TOKEN` — TG bot token (`8706270502:…`)
+  - `NIGHTLY_E2E_CHAT_ID` — owner chat id (`1361064246`)
+  - `INTEGRATION_HEALTH_URL` — in-cluster URL of agentflow-agents `/internal/integration-health`
+  - `INTERNAL_API_SECRET` — same secret the agents pod uses
+- Route: `GET /internal/integration-health` (guarded by `requireInternalSecret`, header `x-agentflow-secret`)
+- Return contract: `200` on full-OK, `503` when any check failed. Body always `{ ok, checked_at, checks: { name: { ok, ms, detail? } } }`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Nightly cron fails every night | `nightly-e2e missing required env` | Re-apply the secret patch from `k8s/nightly-e2e-cron.yaml` header comment |
+| All scenarios time out | `liveness timeout (status=...)` | Check preview-reconciler / bot-auto-tester pingers; see `subsystems/preview-reconciler.mdx` |
+| Scenario PASS but TG silent | `tg notify failed` | `checkTelegramOwnerBot` will flag this in the integration digest the same day |
+| Integration digest false-positive | `http 503` from `/internal/integration-health` | Probe a check manually: `curl -H 'x-agentflow-secret: $X' http://agentflow-agents:4100/internal/integration-health \| jq` |
+| Cleanup leaves orphan projects | `cleanup failed` | DELETE /me/projects/:id returned non-2xx; manual sweep via SQL (see `CLAUDE.md` recipe) |
+
+## Adding a new scenario
+
+1. Append an entry to `NIGHTLY_SCENARIOS` in `src/services/nightly-e2e.ts`.
+2. Every string in `must_contain` MUST also appear in the brief — the test in `tests/unit/integration-health.test.ts` enforces this so we never assert on something the coder was never told.
+3. Pick literal proper nouns or prices (e.g. `'Латте'`, `'1800'`). Generic words match template boilerplate too.
+
+## Adding a new integration check
+
+1. Add `checkFoo()` to `src/services/integration-health.ts`. Use `timedProbe()` so you get the 5-second timeout + `{ ok, ms, detail }` envelope for free.
+2. Wire `['foo', checkFoo]` into the `probes` array inside `runAllIntegrationChecks()`.
+3. The source-contract test `every probe wired in runAllIntegrationChecks` will fail until you do both.
+
+## Related
+
+- [Preview reconciler](/subsystems/preview-reconciler) — why `preview_promoted_at` is the right liveness column
+- [Bot auto-tester](/subsystems/bot-auto-tester) — companion runbook the nightly run leans on for tg_bot scenarios
+- [Ci-cd](/subsystems/ci-cd) — image build pipeline that produces the `ghcr.io/lnlockly/agentflow-agents:latest` tag the CronJobs pull
