@@ -1,9 +1,39 @@
 ---
 title: "Project lifecycle"
-description: "Полный набор статусов projects.status + переходы. Healer loop, auto-retry chain, finalize gate, stop/cancel."
+description: "Post-refactor lifecycle: single template-flow path. No kind-classifier, no approveProject. Daemon clone → opencode → preview promote."
 ---
 
 # Project lifecycle
+
+## Post-refactor canonical (2026-05-28)
+
+PR #917 collapsed the lifecycle to a single path. **Deleted:**
+
+- `services/kind-classifier.ts` (the `regex → LLM` classifier).
+- `services/projects.ts:approveProject` + `runProjectApprovalBackground`.
+- The graph-executor dispatch branch inside `runProjectApprovalBackground`.
+
+What now runs the show:
+
+```mermaid
+flowchart TD
+  A[POST /me/projects<br/>{brief, kind?, templateRepoFull?}] --> B{Has templateRepoFull?}
+  B -- yes --> D[triggerProjectClone]
+  B -- no --> C[Template scorer<br/>builtin shortlist + AI ranker]
+  C -- match --> D
+  C -- no match --> X[HTTP 400<br/>project_missing_template_repo]
+  D --> E[Daemon clone into<br/>/workspace/proj-&lt;slug&gt;]
+  E --> F[opencode runs in pod<br/>model: openai/flow]
+  F --> G[preview-reconciler<br/>per-kind cool-down]
+  G -- promoted --> H[status=done]
+  G -- 3 consecutive 5xx --> I[demote running]
+```
+
+Callers migrated to `triggerProjectClone`: `internal-tg`, `team-manager`, `retry-pinger`. Rows that arrive without a resolvable template return **400 `project_missing_template_repo`** instead of falling through to the old per-kind graph.
+
+The `kind` column survives for backward-compat and per-runtime branching (e.g. preview cool-down: `nextjs=240s, spa=240s, landing=60s, tg_bot=30s`, default 180s — PR #914). Phase 3 collapses it into a 3-value `runtime_class` (`web | tg_bot | workspace`).
+
+The healer, auto-retry chain, finalize gate, and pool-worker drain described below still apply — those weren't touched by #917.
 
 ## TL;DR
 
@@ -15,7 +45,7 @@ description: "Полный набор статусов projects.status + пер�
 |---|---|
 | `agentflow-agents/src/services/projects.ts:132` | `createProjectForUser` — initial row (status=draft). |
 | `agentflow-agents/src/services/projects.ts:221` | `appendProjectEvent` — единственная точка записи в `project_events`. |
-| `agentflow-agents/src/services/projects.ts:1682` | `runProjectApprovalBackground` — draft→running chain. |
+| ~~`agentflow-agents/src/services/projects.ts:1682`~~ | ~~`runProjectApprovalBackground`~~ — **DELETED in PR #917**. Lifecycle no longer runs an approval chain; intake goes straight through `triggerProjectClone` once a template is resolved. |
 | `agentflow-agents/src/services/projects.ts:2294` | `runProjectExecutionBackground` — materialize plan + start pool drain. |
 | `agentflow-agents/src/services/pool-worker/claim.ts:33` | `runTick` — claim pending plan_tasks (MAX_CONCURRENT=4, MAX_PER_PLAN=4). |
 | `agentflow-agents/src/services/pool-worker/constants.ts:44` | `MAX_AUTO_RETRY = 3`. |
@@ -108,3 +138,7 @@ description: "Полный набор статусов projects.status + пер�
 - [Preview deploy](/flows/preview-deploy)
 - [Auto-bot assign](/flows/auto-bot-assign)
 - [Debug stuck project](/runbooks/debug-stuck-project)
+
+---
+
+Last updated 2026-05-28 (post-refactor — PR #917 removed `kind-classifier` + `approveProject` + `runProjectApprovalBackground`; intake now routes through `triggerProjectClone`).
