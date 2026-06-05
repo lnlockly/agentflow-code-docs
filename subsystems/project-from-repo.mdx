@@ -1,0 +1,135 @@
+---
+title: "Project from an existing GitHub repo — VS Code clone + dev"
+description: "selected_foundation.mode='github_repo' clones the repo (authed for private) into a VS Code pod, installs deps, runs the dev script — no kind/template/coder-shim/approve."
+---
+
+# Project from an existing GitHub repo
+
+## TL;DR
+
+When `POST /me/projects` carries `selected_foundation.mode='github_repo'` with a
+`repo_full_name` (e.g. the PRIVATE Next.js app `lnlockly/golden-connect-v2`), the
+backend routes it through a dedicated VS Code flow: provision the pod, `git clone`
+the repo into `/workspace` AUTHED for private repos (`x-access-token:<token>@github.com/...`),
+`npm install` (lockfile-aware), and run the project's dev script in a detached
+`dev` tmux session. There is **no kind classification, no template scorer, no
+coder-shim build pipeline, and no approve step**. The row is created
+`kind='github_repo'` / `runtime_class='web'` / `status='provisioning'`, and the
+EXISTING preview-reconciler promotes it to `running` once the dev server answers.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/projects.ts:1367` | `isGithubRepoCreate` gate — `selected_foundation.mode==='github_repo'` + `repo_full_name` (and not `legacy_template_flow`). Routed FIRST, before claude-build / scorer. |
+| `agentflow-agents/src/routes/projects.ts:1372` | `return handleGithubRepoCreate(...)` — short-circuit into the from-repo handler. |
+| `agentflow-agents/src/routes/projects.ts:882` | `handleGithubRepoCreate` — idempotency probe (owner\|github_repo\|team\|repo, 60s), slug, personal-team attach, INSERT `kind='github_repo'`/`runtime_class='web'`/`status='provisioning'` + foundation columns, fire `runProjectFromRepoBackground` via `setImmediate`. NO scorer / classifier / approve. |
+| `agentflow-agents/src/routes/projects.ts:1066` | `runProjectFromRepoBackground` dynamic import + `setImmediate` fire. |
+| `agentflow-agents/src/routes/projects.ts:2497` | IDE route `POD_BACKED` set now includes `provisioning` so the owner can open the editor and `tmux attach -t dev` during the clone. |
+| `agentflow-agents/src/services/project-from-repo.ts:104` | `authedGithubCloneUrl` — inject `x-access-token:<token>@github.com/...` for private github.com clones; untouched for public / non-github / token-free. |
+| `agentflow-agents/src/services/project-from-repo.ts:157` | `buildRepoCloneCommand` — pure shell: idempotent authed clone, lockfile-aware install (pnpm/yarn/bun/npm), detached `$RUN dev` on the port, origin reset to the token-free URL (no PAT on disk). |
+| `agentflow-agents/src/services/project-from-repo.ts:247` | `loadOwnerGithubToken` — per-user PAT from `git_tokens` (same source as code-exec MCP), fallback to platform `GITHUB_TOKEN`. |
+| `agentflow-agents/src/services/project-from-repo.ts:293` | `cloneAndRunRepo` — resolve token, build authed URL, run the clone+install+dev exec; typed degrade on failure. |
+| `agentflow-agents/src/services/project-from-repo.ts:367` | `runProjectFromRepoBackground` — fire-and-forget: preWarmWorkspace → ensureProjectIde → provisionProjectIdePodTools → cloneAndRunRepo → stamp `preview_port` + emit `clone_status{ok:true}`. |
+| `agentflow-agents/src/coder-shim/pipeline.ts:213` | `injectGithubCloneToken` — SAFETY NET: same auth rewrite for the legacy coder-shim clone, defined locally (no services dep in the daemon bundle). |
+| `agentflow-agents/src/coder-shim/pipeline.ts:362` | legacy clone now `injectGithubCloneToken(cloneUrl, process.env.GITHUB_TOKEN)` then `git remote set-url origin` back to the token-free URL. |
+| `agentflow-agents/src/services/runtime-class.ts:38` | `github_repo` → `web` mapping (it serves an HTTP dev port). |
+| `agentflow-agents/tests/project-from-repo.test.ts:1` | Unit tests: authed clone URL, clone/install/dev command, `cloneAndRunRepo` with mocked token + exec, coder-shim safety net, route source-pin. |
+
+## Data flow
+
+```
+client → POST /me/projects { brief, selected_foundation:{ mode:'github_repo',
+                                                          repo_full_name, repo_url } }
+   │
+   ▼
+isGithubRepoCreate gate (routes/projects.ts:1367)  → handleGithubRepoCreate
+   ├─ idempotency probe (owner|github_repo|team|repo, 60s)
+   ├─ slug + ensurePersonalTeam
+   ├─ INSERT projects(kind='github_repo', runtime_class='web',
+   │                  status='provisioning', foundation_repo_full_name=…)
+   ├─ appendProjectEvent × 2 (brief, project_created mode='github_repo')
+   └─ setImmediate(runProjectFromRepoBackground)
+   ▼
+return 201 { project:{ status:'provisioning', kind:'github_repo' } }   ← <2s
+
+(after response flushes)
+
+runProjectFromRepoBackground:
+   1. preWarmWorkspaceForProject  → pod up, workspace_project_name='proj-<slug>'
+   2. ensureProjectIde            → code-server (VS Code) up in the same pod
+   3. provisionProjectIdePodTools → .agentflow/flow.env (attachable Claude `work` session)
+   4. cloneAndRunRepo:
+        loadOwnerGithubToken → authedGithubCloneUrl
+        exec buildRepoCloneCommand:
+          git clone --depth 1 https://x-access-token:<token>@github.com/<owner>/<repo>.git .
+          git remote set-url origin https://github.com/<owner>/<repo>.git   (token off disk)
+          lockfile-aware install (pnpm/yarn/bun/npm)
+          tmux new-session -d -s dev → $RUN dev --port <port> --host 0.0.0.0
+   5. UPDATE projects SET preview_port=<port>; appendProjectEvent clone_status{ok:true}
+
+preview-reconciler (EXISTING, runtime_class='web' + preview_port + status='provisioning')
+   → probes pod:preview_port → 'provisioning' → 'running'   (no approve)
+```
+
+## DB / Env / API
+
+- Tables: `projects.kind='github_repo'`, `projects.runtime_class='web'`,
+  `projects.status='provisioning'`, `projects.preview_port` (stamped by the bg
+  runner), `projects.foundation_mode='github_repo'` +
+  `foundation_repo_url` / `foundation_repo_full_name` / `foundation_ref`.
+  `git_tokens` (per-user sealed PAT) is read for the clone auth.
+- Env: `GITHUB_TOKEN` — platform fallback when the user has no per-user PAT;
+  also the token the coder-shim safety net reads. The per-user PAT in
+  `git_tokens` is the primary source.
+- Routes: `POST /me/projects { brief, selected_foundation:{ mode:'github_repo',
+  repo_full_name, repo_url, ref? } }` → 201 `{ project:{ status:'provisioning',
+  kind:'github_repo' } }`. `GET /me/projects/:id/ide` opens for
+  `status='provisioning'`; `tmux attach -t dev` watches the dev server.
+- Events: `project_created` (mode='github_repo'), `repo_clone_started`,
+  `repo_cloned`, `clone_status{ok:true}`, `repo_dev_running`, `build_failed`.
+- MCP tools: `exec` (clone + install + launch the dev session).
+
+## Auth — private repos
+
+The clone URL is rewritten to `https://x-access-token:<token>@github.com/<owner>/<repo>.git`,
+the documented username form for fine-grained PATs — the same line the code-exec
+MCP writes into `~/.git-credentials` (`src/mcp-servers/code-exec/index.ts:1800`).
+Without this rewrite a private repo clone exits 128. The token is never echoed in
+stdout and `origin` is reset to the token-free URL after the clone, so the PAT
+never lands in the workspace `.git/config`.
+
+The legacy coder-shim clone (`pipeline.ts:362`) got the same safety net so any
+path that still clones a private repo authenticates with the pod's `GITHUB_TOKEN`.
+
+## Status lifecycle
+
+```
+provisioning → running → done
+   │
+   └─ failed   (provision / pod-tools / clone / dev-launch failure)
+```
+
+No `awaiting_approval`, no `approved` on this path. The `provisioning` row is live
+from the first response; the EXISTING preview-reconciler promotes to `running`
+when the dev server answers on `preview_port`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Project stuck `provisioning`, no pod | `build_failed error=workspace_provision_failed` | `project-from-repo.ts:367` (step 1) / `projects/provision.ts:293` |
+| `provisioning` but Claude `work` session has no flow env | `build_failed error=pod_tools_failed` | `project-from-repo.ts` step 3 / `project-ide-pod-tools.ts:349` |
+| Private repo clone fails (128 / auth) | `build_failed error=repo_clone_failed` + detail `clone failed (no token — private repo?)` | `project-from-repo.ts:293` (`cloneAndRunRepo`) — user has no `git_tokens` PAT and no platform `GITHUB_TOKEN` |
+| Cloned but dev server never launches | `build_failed error=repo_dev_failed` / exec stdout `af_repo_no_tmux` | `project-from-repo.ts` (`buildRepoCloneCommand`) |
+| Cloned + dev up but never promoted | `preview_reconciler_timeout` after 30 min | confirm `preview_port` stamped + `runtime_class='web'` + `clone_status{ok:true}` emitted |
+| Legacy coder-shim private clone still 128 | `git_clone_failed` with a private repo | `pipeline.ts:362` — pod missing `GITHUB_TOKEN` |
+
+## Related
+
+- [`subsystems/project-claude-build`](/subsystems/project-claude-build/) — the
+  default scratch-build path (no repo); this is the existing-repo sibling.
+- [`subsystems/project-foundations`](/subsystems/project-foundations/) — how
+  `selected_foundation` is recommended (the wizard that produces `repo_full_name`).
+- [`subsystems/project-preview`](/subsystems/project-preview/) — the
+  preview-reconciler promotion path this flow reuses.
