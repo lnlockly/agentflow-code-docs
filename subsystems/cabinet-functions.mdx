@@ -1,120 +1,143 @@
 ---
-title: "Cabinet «Функции» (ready-function catalog)"
-description: "Owner-facing one-shot AI functions — brief in, one real artifact out — backing the /cabinet/functions catalog page."
+title: "Cabinet «Функции» ready-function catalog"
+description: "Site/cabinet витрина (/cabinet/functions) of one-click ready-functions: landing, copy, image. Each card produces a real artifact, not a mock."
 ---
 
 # Cabinet «Функции»
 
 ## TL;DR
-The «Функции» catalog (`/cabinet/functions`) is a витрина of one-click AI
-functions: the user types one brief/prompt and gets ONE real artifact back
-synchronously — a post, a market analysis, content ideas, an image, an MP4, or
-a live landing. Each card calls a thin `POST /me/functions/*` endpoint on
-agentflow-agents; «Сделать лендинг» reuses the projects pipeline instead.
+
+`/cabinet/functions` (`CabinetFunctions.tsx`) is the catalog витрина where a
+user clicks a ready-function instead of describing an agent. Three functions are
+wired to real execution: «Сделать лендинг» reuses the existing projects pipeline
+(`createProject` → `approveProject` → poll `getProject` for the live preview
+URL), «Написать текст» calls `POST /me/functions/copy` (reuses
+`autopost/generate.ts::generatePost`), «Сгенерировать картинку» calls
+`POST /me/functions/image` (straight through the ai-router `IMAGE` capability).
+«Видео» + «AI-Охотник» are «скоро» placeholders. The catalog lives on the
+site/cabinet, never inside a pod.
 
 ## Files (with line refs)
+
 | Path | Role |
 |---|---|
-| `agentflow-agents/src/routes/me-functions.ts:60` | `POST /me/functions/copy` — brief → post text (reuses `generatePost`) |
-| `agentflow-agents/src/routes/me-functions.ts:88` | `POST /me/functions/research` — brief → market/topic analysis |
-| `agentflow-agents/src/routes/me-functions.ts:117` | `POST /me/functions/ideas` — brief → 5-8 content/campaign ideas |
-| `agentflow-agents/src/routes/me-functions.ts:172` | `POST /me/functions/trends` — brief → 5-7 viral content angles |
-| `agentflow-agents/src/routes/me-functions.ts:199` | `POST /me/functions/funnel` — brief → 4-6 step sales auto-funnel |
-| `agentflow-agents/src/routes/me-functions.ts:226` | `POST /me/functions/slides` — brief → `{slides:[{title,body}], text}` carousel |
-| `agentflow-agents/src/routes/me-functions.ts:257` | `POST /me/functions/voice` — text → real mp3 (`{url, b64, mime, bytes, voice_id}`) |
-| `agentflow-agents/src/routes/me-functions.ts:293` | `POST /me/functions/image` — prompt → one image |
-| `agentflow-agents/src/routes/me-functions.ts:358` | `POST /me/functions/video` — brief/script → brief-reel MP4 |
-| `agentflow-agents/src/services/text-function.ts:86` | `generateResearch(brief, {ownerUserId})` — flow-routed analysis |
-| `agentflow-agents/src/services/text-function.ts:91` | `generateIdeas(brief, {ownerUserId})` — flow-routed ideas |
-| `agentflow-agents/src/services/text-function.ts:138` | `generateTrends` / `generateFunnel` — flow-routed `TEXT_LARGE` |
-| `agentflow-agents/src/services/text-function.ts:204` | `generateSlides` — JSON array → `{slides, text}` (`extractJsonArray` strips ```json fence) |
-| `agentflow-agents/src/services/voice-function.ts:74` | `transliterateLatinTokens` — Latin runs → Cyrillic when text contains Russian |
-| `agentflow-agents/src/services/voice-function.ts:116` | `generateVoice` — `invokeAI(TEXT_TO_SPEECH)` → `persistMultimodalArtifact` mp3 |
+| `agentflow-agents/src/routes/me-functions.ts:49` | `POST /me/functions/copy` — `generatePost(brief, ownerUserId)` → `{ ok, text }` |
+| `agentflow-agents/src/routes/me-functions.ts:73` | `POST /me/functions/image` — `invokeAI(ModelType.IMAGE, { prompt, cheap:true })` → `{ ok, url, b64, mime, model }` |
+| `agentflow-agents/src/routes/me-functions.ts:39` | `copySchema` (`brief` 5-4000) |
+| `agentflow-agents/src/routes/me-functions.ts:43` | `imageSchema` (`prompt` 3-2000) |
+| `agentflow-agents/src/server.ts:781` | `app.route('/', meFunctionsApp)` mount |
+| `agentflow-agents/src/services/autopost/generate.ts:61` | `generatePost` — reused by the copy function (proven autopost generator, `useModel(TEXT_LARGE)`) |
+| `agentflow-agents/src/ai-router/instrumented.ts:126` | `invokeAI` — image function entry point |
+| `agentflow-agents/src/llm-providers/designapi.ts:53` | `IMAGE_MODEL_CASCADE` = `gpt-image-1, flux-pro, dall-e-3, flux-2-max` |
+| `agentflow-agents/src/llm-providers/designapi.ts:246` | `POST {baseURL}/v1/images/generations` — designapi IMAGE handler |
+| `agentflow-agents/tests/me-functions.test.ts:1` | 8 schema unit tests |
+| `agentflow-landing/src/pages/CabinetFunctions.tsx:68` | `LandingCard` — `createProject` + `approveProject` + poll `getProject` for `preview_url` |
+| `agentflow-landing/src/pages/CabinetFunctions.tsx:177` | `CopyCard` — `generateFunctionCopy` + clipboard |
+| `agentflow-landing/src/pages/CabinetFunctions.tsx` | `ImageCard` — `generateFunctionImage`, renders url or `data:` b64 |
+| `agentflow-landing/src/lib/agentsApi.ts:5556` | `generateFunctionCopy(brief)` → `POST /me/functions/copy` |
+| `agentflow-landing/src/lib/agentsApi.ts:5570` | `generateFunctionImage(prompt)` → `POST /me/functions/image` |
+| `agentflow-landing/src/main.tsx:736` | `/cabinet/functions` route (lazy) |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:128` | «Функции» CORE_NAV entry (icon `Zap`) + BOTTOM_NAV |
+
+### Batch 2 functions (voice / trends / funnel / slides)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-functions.ts:172` | `POST /me/functions/trends` — `generateTrends(brief)` → `{ ok, text }` (5-7 viral angles) |
+| `agentflow-agents/src/routes/me-functions.ts:199` | `POST /me/functions/funnel` — `generateFunnel(brief)` → `{ ok, text }` (4-6 step sales auto-funnel) |
+| `agentflow-agents/src/routes/me-functions.ts:226` | `POST /me/functions/slides` — `generateSlides(brief)` → `{ ok, slides:[{title,body}], text }` |
+| `agentflow-agents/src/routes/me-functions.ts:257` | `POST /me/functions/voice` — `generateVoice(text)` → `{ ok, url, b64, mime, bytes, voice_id }` real mp3 |
+| `agentflow-agents/src/routes/me-functions.ts:168` | `trendsSchema` / `funnelSchema` / `slidesSchema` (`brief` 5-4000), `voiceSchema` (`text` 2-5000) |
+| `agentflow-agents/src/services/text-function.ts:138` | `generateTrends` — `invokeAI(TEXT_LARGE)`, niche viral angles |
+| `agentflow-agents/src/services/text-function.ts:143` | `generateFunnel` — `invokeAI(TEXT_LARGE)`, touch sequence → оплата |
+| `agentflow-agents/src/services/text-function.ts:204` | `generateSlides` — `invokeAI(TEXT_LARGE)` → JSON array → `{ slides, text }`, tolerant ```json fence parser |
+| `agentflow-agents/src/services/voice-function.ts:74` | `transliterateLatinTokens` — Latin runs → Cyrillic when text contains Russian (ElevenLabs mispronounces Latin mid-RU) |
+| `agentflow-agents/src/services/voice-function.ts:116` | `generateVoice` — `invokeAI(TEXT_TO_SPEECH)` → `persistMultimodalArtifact` → `{ url, b64, mime, bytes }`. Voice id from `FUNCTIONS_VOICE_ID` env, else handler default |
 | `agentflow-agents/src/llm-providers/elevenlabs.ts:30` | ElevenLabs `TEXT_TO_SPEECH` handler reused by the voice function |
-| `agentflow-landing/src/lib/agentsApi.ts:5574` | `generateFunctionTrends` / `…Funnel` / `…Slides` / `…Voice` |
-| `agentflow-landing/src/pages/CabinetFunctions.tsx:408` | `TrendsCard` / `FunnelCard` / `SlidesCard` / `VoiceCard` (audio player) |
-| `agentflow-agents/src/services/text-function.ts:58` | shared `invokeAI(ModelType.TEXT_LARGE)` call — no hardcoded model |
-| `agentflow-agents/src/services/autopost/generate.ts` | `generatePost` — reused by the copy function |
-| `agentflow-agents/src/services/video-script.ts` | brief → brief-reel props for the video function |
-| `agentflow-agents/src/server.ts:781` | `meFunctionsApp` mounted ONCE (`app.route('/', meFunctionsApp)`) |
-| `agentflow-landing/src/pages/CabinetFunctions.tsx` | the card grid + inline-result UI |
-| `agentflow-landing/src/lib/agentsApi.ts:5556` | `generateFunctionCopy` |
-| `agentflow-landing/src/lib/agentsApi.ts:5562` | `generateFunctionResearch` |
-| `agentflow-landing/src/lib/agentsApi.ts:5568` | `generateFunctionIdeas` |
-| `agentflow-agents/tests/me-functions.test.ts` | schema + text-function unit tests (LLM stubbed) |
+| `agentflow-agents/tests/me-functions.test.ts:1` | 36 unit tests (schemas + text services + slides parser + translit + voice persist, LLM/TTS stubbed) |
+| `agentflow-landing/src/lib/agentsApi.ts:5574` | `generateFunctionTrends` / `generateFunctionFunnel` / `generateFunctionSlides` / `generateFunctionVoice` |
+| `agentflow-landing/src/pages/CabinetFunctions.tsx:408` | `TrendsCard` / `FunnelCard` (reuse `TextFunctionCard`) |
+| `agentflow-landing/src/pages/CabinetFunctions.tsx:444` | `SlidesCard` — structured numbered slide cards + copy |
+| `agentflow-landing/src/pages/CabinetFunctions.tsx:537` | `VoiceCard` — inline `<audio>` player from url / `data:` b64 + download |
 
 ## Data flow
-```
-CabinetFunctions.tsx card
-  → agentsApi.generateFunction{Copy,Research,Ideas,Image}(brief|prompt)
-    → POST /me/functions/{copy,research,ideas,image,video}  (x-api-key / session)
-      → requireSession → ownerUserId = session.sub
-      → text functions: services/text-function.ts
-          → invokeAI(ModelType.TEXT_LARGE, {messages}, {ownerUserId, agentSlug})
-          → flow alias → live provider (e.g. gpt-5.3-codex), billed to owner
-      → { ok:true, text }  (or { ok:false, error, detail })
-  → card renders the text inline + a «Копировать» button
-```
 
-The text functions return plain text (no JSON parse): the model reply is
-trimmed; an empty trimmed reply throws `text_function_empty_llm_reply`.
+```
+cabinet /cabinet/functions (CabinetFunctions.tsx)
+  │
+  ├─ «Сделать лендинг»
+  │    createProject(brief)             POST /me/projects     → { id, slug }
+  │    approveProject(id)               POST /me/projects/:id/approve
+  │    poll getProject(id) every 4s     GET  /me/projects/:id
+  │      until preview_url set → render <slug>.proj.agentflow.website link
+  │    (existing projects pipeline — template scorer + clone + preview-reconciler)
+  │
+  ├─ «Написать текст»
+  │    generateFunctionCopy(brief)      POST /me/functions/copy
+  │      → generatePost(brief, ownerUserId)  (useModel TEXT_LARGE)
+  │      → { text }                     render + clipboard copy
+  │
+  └─ «Сгенерировать картинку»
+       generateFunctionImage(prompt)    POST /me/functions/image
+         → invokeAI(IMAGE, { prompt, cheap:true })
+         → designapi cascade /v1/images/generations
+         → { url | b64 }                render <img src=url | data:…>
+```
 
 ## DB / Env / API
-- Routes: `POST /me/functions/{copy,research,ideas,trends,funnel,slides,voice,image,video}`.
-- Auth: `requireSession` (cabinet session cookie OR `x-api-key: af_live_…`).
-- LLM (text): `invokeAI(ModelType.TEXT_LARGE)` → `flow` alias. No model strings
-  hardcoded; provider resolution + priority live in `llm_provider_configs` /
-  `llm_model_aliases`. `ownerUserId` carries BYOK lookup + billing.
-- Voice: `invokeAI(ModelType.TEXT_TO_SPEECH)` → ElevenLabs handler. Voice id is
-  NOT hardcoded — `FUNCTIONS_VOICE_ID` env, else the handler default
-  `xdADm9fX0hNasTe0AGW0`. mp3 persisted via `persistMultimodalArtifact`
-  (`/files/multimodal/<sha>.mp3`). Latin runs are transliterated to Cyrillic
-  before TTS (ElevenLabs mispronounces Latin mid-Russian).
-- Env (voice): `ELEVENLABS_API_KEY` (required), `FUNCTIONS_VOICE_ID` (optional),
-  `UPLOAD_DIR` + `UPLOADS_PUBLIC_BASE` (artifact persistence).
-- No new tables. trends/funnel/slides add no env.
+
+- Tables: none new. Landing function writes `projects` via the existing
+  pipeline; copy + image are stateless one-shots.
+- Env (agentflow-agents pod): `DESIGNAPI_BASE_URL` + `DESIGNAPI_API_KEY`
+  (image), the platform LLM router env for `useModel(TEXT_LARGE)` (copy).
+- Routes: `POST /me/functions/copy`, `POST /me/functions/image`
+  (`requireSession`, owner-scoped). Landing reuses `POST /me/projects` +
+  `POST /me/projects/:id/approve` + `GET /me/projects/:id`.
+- MCP tools: none. No model strings hardcoded — copy via `useModel`, image via
+  `invokeAI(ModelType.IMAGE)`.
+- Batch-2 routes: `POST /me/functions/{trends,funnel,slides,voice}`
+  (`requireSession`, owner-scoped). trends/funnel/slides route the brief through
+  `invokeAI(TEXT_LARGE)` (text-function.ts); voice routes the text through
+  `invokeAI(TEXT_TO_SPEECH)` → ElevenLabs (elevenlabs.ts) and persists the mp3
+  via `persistMultimodalArtifact` (served at `/files/multimodal/<sha>.mp3`).
+- Env (voice): `ELEVENLABS_API_KEY` (required), `FUNCTIONS_VOICE_ID` (optional —
+  falls back to the handler default `xdADm9fX0hNasTe0AGW0`), `UPLOAD_DIR` +
+  `UPLOADS_PUBLIC_BASE` (artifact persistence). No model/voice strings hardcoded.
 
 ## Failure modes
+
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
-| Research card shows "try again", 502 | `research generation failed` | `me-functions.ts:106` |
-| Ideas card shows "try again", 502 | `ideas generation failed` | `me-functions.ts:133` |
-| Empty model reply (400, caller re-runs) | `text_function_empty_llm_reply` | `services/text-function.ts:81` |
-| Blank/oversized brief rejected at edge | `invalid_body` | `me-functions.ts` (zod schemas) |
-| Budget cap hit before the LLM call | `budget_cap_hit` | `ai-router/instrumented.ts` |
-| Trends/funnel card 502 | `trends generation failed` / `funnel generation failed` | `me-functions.ts:188` / `:215` |
-| Slides card 400, model returned non-JSON | `slides generation failed` + `text_function_slides_unparseable` / `text_function_slides_empty` | `services/text-function.ts:179` (`extractJsonArray` already strips a ```json fence) |
-| Voice card 502 for every text | `voice generation failed` + `all_providers_failed for TEXT_TO_SPEECH: elevenlabs=elevenlabs 401 ... payment_issue` | ElevenLabs invoice unpaid — pay it OR set `OPENAI_API_KEY` for the BYOK-OpenAI TTS handler. No code change. Observed 2026-06-01. |
-| Voice mispronounces a Latin brand | n/a (audio) | `transliterateLatinTokens` (`voice-function.ts:74`) rewrites Latin→Cyrillic only when Russian present |
+| Image card shows `image_provider_unavailable` / 502 for every prompt | designapi returns `model_not_found ... under group rub` for all cascade models; route returns 502 `image_provider_unavailable` | designapi account/key in a group with **no image channel** (`group_no_image_access`). Enable an image channel on the designapi key, OR set a non-empty `OPENAI_API_KEY` so the BYOK-OpenAI IMAGE handler (`llm-providers/byok-openai.ts:88`) serves it. No code change. Observed 2026-05-31: `rub` group blocks images and the pod `OPENAI_API_KEY` was empty. |
+| Copy card 400 | route returns 400 `generation_failed` with `autopost_empty_brief` / `autopost_empty_generation` | blank/too-short brief — caller-fixable; the textarea min-length (5) normally prevents this |
+| Copy card 502 | route 502 `generation_failed` | LLM router outage or budget cap (`BudgetExceededError`) — retry / raise cap |
+| Landing card stuck «Агент работает…» past ~6 min | project `status` stays `provisioning`; preview never sets | cold pod / clone slow — card hands off to the workspace («Открой проект»). See `projects.mdx` failure modes (502 from edge, npm install). |
+| Landing card «Сборка не завершилась» | project `status='failed'` | build failed — open the project for the log. See `projects.mdx`. |
+| Voice card 502 for every text | route 502 `voice_generation_failed`; router throws `all_providers_failed for TEXT_TO_SPEECH: elevenlabs=elevenlabs 401 ... payment_issue` | ElevenLabs subscription has a failed/incomplete invoice — pay it, OR set a non-empty `OPENAI_API_KEY` so the BYOK-OpenAI TTS handler (`llm-providers/byok-openai.ts`) serves `TEXT_TO_SPEECH`. No code change. Observed 2026-06-01: ElevenLabs `payment_issue` and pod `OPENAI_API_KEY` empty. |
+| Slides card 400 | route 400 `generation_failed` with `text_function_slides_unparseable` / `text_function_slides_empty` | model returned non-JSON / empty — re-run; the parser already strips a ```json fence and the surrounding prose (`text-function.ts:179` `extractJsonArray`). |
+| Voice mispronounces a Latin brand word | n/a (audio quality) | `transliterateLatinTokens` rewrites Latin runs to Cyrillic only when the text contains Russian; a pure-Latin (English) script is left untouched. |
 
-## Verification (live, flow router)
-Owner-key smoke (lead runs post-merge):
-```bash
-curl -X POST https://agentflow.website/_agents/me/functions/research \
-  -H "x-api-key: af_live_…" -H "Content-Type: application/json" \
-  -d '{"brief":"рынок доставки кофе в Москве"}'
-```
-Verified 2026-06-01 in-pod via `invokeAI(TEXT_LARGE)` (model `gpt-5.3-codex`
-through the `flow` alias, owner user=1): research returned 5 markdown sections
-(аудитория / конкуренты / риски / отстройка); ideas returned 7 numbered post
-hooks with formats (reels / сторис / рассылка). Both brief-derived, no fake
-stats/links, no «бесплатно».
+## Verify
 
-Batch-2 verified 2026-06-01 in-pod (same router, owner user=1, brief =
-«барбершоп в Питере, мужские стрижки и уход за бородой»):
-- **trends** — 5+ numbered viral angles (до/после Reels, POV кресло, разбор
-  ошибок ухода, питерский стиль недели), brief-derived.
-- **funnel** — 4-step touch sequence with ready example copy per step, ending
-  on «закрытие на запись / оплата».
-- **slides** — parsed a 6-item JSON array into `{title, body}` slides (крючок →
-  призыв «Запишись в барбершоп»); fence-tolerant parser handles ```json wrap.
-- **voice** — code path reached the ElevenLabs handler with the transliterated
-  text and the prod key, but the ElevenLabs account returned `401 payment_issue`
-  (unpaid invoice) and no `OPENAI_API_KEY` fallback is set, so no mp3 bytes can
-  be produced until the invoice is paid. The endpoint returns 502
-  `voice_generation_failed` honestly. Transliteration is independently verified:
-  `transliterateLatinTokens('Привет от AgentFlow и KuCoin')` →
-  `'Привет от Агентфлов и Кукоин'`; a pure-English string is left untouched.
+Verified 2026-05-31 against `https://agentflow.website/_agents` as test user 293:
+
+- **Landing**: project 1668 (brief = кофейня «Тёплый угол», Казань) reached
+  `status='running'` with `preview_url=https://p-6s73568p.proj.agentflow.website/`.
+  `curl` → HTTP 200; DOM contains brief-derived content (`Тёплый угол`,
+  `городская кофейня · Казань`, фирменная обжарка section, seasonal menu with
+  prices, photo gallery, booking form, hours 8:00–22:00, заказ навынос) and no
+  `{{SLOT}}` markers.
+- **Copy**: `generatePost` (same code as `/me/functions/copy`) produced a real
+  brief-derived post for the «Тёплый угол» brief (mentions Казань, фирменная
+  обжарка, сезонные напитки, навынос).
+- **Image**: code path verified correct; designapi `rub` group currently has no
+  image channel (every cascade model 503 `model_not_found`) and the pod's
+  `OPENAI_API_KEY` is empty, so no real bytes can be produced until an image
+  channel is enabled. The endpoint returns 502 `image_provider_unavailable`
+  honestly rather than a placeholder.
 
 ## Related
-- [Autopost](/subsystems/autopost) — `generatePost`, reused by the copy function.
+
+- [`subsystems/projects`](/subsystems/projects/) — the landing function reuses this pipeline
+- [`subsystems/project-preview`](/subsystems/project-preview/) — `*.proj.agentflow.website` preview serving
+- [`subsystems/openclaw-autopost`](/subsystems/openclaw-autopost/) — device-scoped «Функции» (autopost), distinct from this cabinet catalog

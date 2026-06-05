@@ -25,7 +25,10 @@ registry (`PLATFORM_ENTITY_REGISTRY`), zero `if (platform === …)` in routes/co
 | `agentflow-agents/src/services/account-entities/index.ts:83` | `fetchEntities` — resolve kind → `callTool` → normalise; degrade to `[]` |
 | `agentflow-agents/src/services/account-entities/index.ts:124` | `fetchEntityThread` — open one openable entity → message history |
 | `agentflow-agents/src/services/account-entities/index.ts:62` | `defaultEntityKind` — first openable kind for a `?kind=`-less request |
-| `agentflow-agents/src/services/account-entities/telegram.ts:121` | `TELEGRAM_ENTITY_KINDS` — dialogs/channels/contacts via `get_dialogs`, thread via `get_messages` |
+| `agentflow-agents/src/services/account-entities/telegram.ts:138` | `TELEGRAM_ENTITY_KINDS` — dialogs/channels/contacts/groups/bots via `get_dialogs`, thread via `get_messages` |
+| `agentflow-agents/src/services/account-entities/telegram.ts:196` | `kind:'groups'` ("Группы") — filters `get_dialogs` rows on `Boolean(d.is_group)` (filter at `telegram.ts:206`) |
+| `agentflow-agents/src/services/account-entities/telegram.ts:215` | `kind:'bots'` ("Боты") — filters via `isBotDialog` (filter at `telegram.ts:225`) |
+| `agentflow-agents/src/services/account-entities/telegram.ts:99` | `isBotDialog(d)` — true when peer `username.endsWith('bot')`; Telethon exposes `is_channel`/`is_user`/`is_group` but no per-dialog `is_bot`, so the username suffix is the heuristic |
 | `agentflow-agents/src/services/account-entities/kwork.ts:89` | `KWORK_ENTITY_KINDS` — dialogs (`list_dialogs`), gigs (`list_my_kworks`), exchange (`list_wants`), thread via `get_dialog` |
 | `agentflow-agents/src/services/account-entities/types.ts` | `Entity` / `EntityMessage` / `EntityKindDef` contracts |
 | `agentflow-agents/src/services/account-contact-resolver.ts:111` | `resolveContact` — fan to `get_dialogs`, fuzzy-rank name/username |
@@ -73,6 +76,10 @@ HISTORY   POST …/command also: ensureAccountThread(acct:telegram:4) +
 - MCP tools: telegram `get_dialogs` / `get_messages`; kwork `list_dialogs` /
   `get_dialog` / `list_my_kworks` / `list_wants`. Bridge =
   `mcpDirect.callTool(server, tool, args, { ownerUserId })`.
+- Telegram entity kinds — `dialogs`, `channels`, `contacts`, `groups`, `bots`
+  (#1109) — all share ONE `get_dialogs` round-trip; each kind is a pure
+  client-side filter over the same `RawDialog[]` (`is_channel` / `is_user` /
+  `is_group` / `username.endsWith('bot')`). No extra MCP call per kind.
 - Kwork tools key on `account_session_secret_key` (default `KWORK_SESSION_JSON`),
   not `owner_user_id` — owner is pinned into the MCP URL `?owner=`.
 

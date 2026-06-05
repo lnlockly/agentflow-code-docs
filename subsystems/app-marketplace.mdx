@@ -1,0 +1,64 @@
+---
+title: "App marketplace (JSON-apps)"
+description: "Publish / discover / monetize JSON-apps in agentflow-api. Listings reference manifests by slug; premium installs gate behind an entitlement check."
+---
+
+# App marketplace (JSON-apps)
+
+## TL;DR
+A user publishes an `app_listings` row referencing a JSON-app manifest by slug; other users install it via `app_installs`. Most apps are free; premium listings gate the install behind an entitlement check (an active `subscriptions` row) and return `402 payment_required` otherwise. This is distinct from the agent marketplace (`agents.published` + `agent_tool_prices`, which monetizes per-tool FLOW calls). The manifest body lives in agentflow-agents app-manifests; agentflow-api owns publish/discover/monetize only.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-api/src/db/migrations/0022_app_marketplace.sql` | `app_listings` + `app_installs` tables, CHECK constraints, indexes |
+| `agentflow-api/src/db/schema.ts` (`appListings`, `appInstalls`) | Drizzle table defs + inferred types |
+| `agentflow-api/src/routes/app-marketplace.ts` | All 4 endpoints + `isEntitled` premium gate |
+| `agentflow-api/src/routes/app-marketplace.ts` (`isEntitled`) | Entitlement check — active subscription = entitled |
+| `agentflow-api/src/server.ts` (`appMarketplaceRoutes`) | Route mount at `/` |
+| `agentflow-api/src/services/webhooks.ts` (`KNOWN_EVENTS`) | Adds `app.published`, `app.installed` |
+| `agentflow-api/tests/app-marketplace.test.ts` | CRUD + free-vs-premium gate suite |
+
+## Data flow
+
+```
+author: POST /marketplace/listings { app_slug, title, pricing, price_cents? }
+  └─ requireAuth → upsert app_listings ON CONFLICT (author_user_id, app_slug)
+       └─ dispatchEvent(author, 'app.published', …) → 201 { listing }
+
+browser: GET /marketplace/listings?pricing=free|premium&q=…
+  └─ WHERE status='published' (+ optional pricing/q filter) → { items, next_cursor }
+
+browser: GET /marketplace/listings/:slug
+  └─ latest published row for app_slug → { listing } | 404
+
+installer: POST /marketplace/listings/:slug/install
+  └─ requireAuth → load published listing | 404
+       └─ if pricing='premium' AND NOT isEntitled(user): 402 payment_required
+            else: INSERT app_installs ON CONFLICT (listing_id, user_id) DO nothing-ish
+                 └─ dispatchEvent(installer, 'app.installed', …) → 200 { install }
+```
+
+## DB / Env / API
+- Tables: `app_listings` (id, app_slug, title, author_user_id, pricing, price_cents, status, created_at, updated_at), `app_installs` (id, listing_id, user_id, created_at)
+- Reused: `subscriptions` (entitlement primitive — `status='active'`)
+- Env: none new (reuses `AUTH_JWT_SECRET` + DB)
+- Routes: `POST /marketplace/listings`, `GET /marketplace/listings`, `GET /marketplace/listings/:slug`, `POST /marketplace/listings/:slug/install`
+- Auth: `requireAuth` (x-api-key | bearer JWT | cookie) on publish + install; browse + detail are public
+- Webhook events: `app.published`, `app.installed`
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Premium install blocked | `payment_required` | `routes/app-marketplace.ts` install handler |
+| Premium publish rejected | `premium_requires_price` | `routes/app-marketplace.ts` publishSchema coherence check |
+| Free listing rejected | `free_listing_no_price` | `routes/app-marketplace.ts` publishSchema coherence check |
+| DB rejects bad pricing/price | `chk_app_listings_price` | `migrations/0022_app_marketplace.sql` CHECK constraint |
+
+## Related
+- [Agent marketplace](/subsystems/agents) — the FLOW-per-call agent catalog (different table set)
+- [USDT topup + referrals](/subsystems/billing-usdt-topup-referrals) — billing primitives the entitlement gate will eventually call into
+
+## Follow-ups (not yet wired)
+- Real per-listing payment: one-off purchase → entitlement row instead of "any active subscription entitles all premium apps".
+- agentflow-agents / landing side that reads these listings into `/apps`.

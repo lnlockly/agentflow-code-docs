@@ -1,0 +1,139 @@
+---
+title: "Hermes Pod Engine (Phase 1)"
+description: "Hermes (NousResearch) as a selectable hosted-device engine — boot + reachable, wired to the flow router, behind FF_HERMES."
+---
+
+# Hermes Pod Engine (Phase 1)
+
+## TL;DR
+Hermes (`NousResearch/hermes-agent`) is a fourth hosted-device engine next to
+`goose`, `openclaw`, and the legacy `coder` daemon. A device created with
+`template:'hermes'` (gated by `FF_HERMES`) runs the `agentflow-hermes` image: it
+renders `~/.hermes/config.yaml` (model → flow router, `terminal.backend: local`)
++ `~/.hermes/.env` (`API_SERVER_ENABLED`), boots Hermes' loopback OpenAI-compatible
+API server (`:8642`), and runs an in-pod bridge that speaks the existing
+devices-ws task protocol — so a `dispatch_task` round-trips to Hermes and streams
+the reply back. The bridge prefers Hermes' `/v1/runs` + SSE event stream for the
+`/live` step feed, falling back to `/v1/chat/completions` on any stream failure.
+Phase-1 proves boot + reachability + round-trip. Reversible: delete the device →
+gone. Goose/coder/openclaw defaults are untouched.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-hosted-devices.ts:152` | `HERMES_DAEMON_IMAGE_DEFAULT` image ref |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:183` | `resolveDaemonImage` hermes branch (mirrors openclaw) |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:459` | `template` Zod enum includes `'hermes'` |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:492` | `isHermesCanaryEnabled()` — `FF_HERMES` gate |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:838` | `hermesLines` — manifest env injection (HERMES_API_SERVER_KEY + HERMES_TERMINAL_BACKEND + AGENTFLOW_FLOW_KEY) |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:1435` | create handler 403 `hermes_canary_disabled` |
+| `agentflow-agents/src/hermes-shim/config.ts:108` | `renderHermesConfigYaml` — pure config.yaml renderer |
+| `agentflow-agents/src/hermes-shim/config.ts:68` | `flowBaseUrl` — `<origin>/_agents/llm/v1` |
+| `agentflow-agents/src/hermes-shim/config.ts:73` | `MissingFlowKeyError` — fail closed |
+| `agentflow-agents/src/hermes-shim/config.ts:58` | `SAFE_TERMINAL_BACKENDS` — backends that need no in-pod container runtime |
+| `agentflow-agents/src/hermes-shim/config.ts:46` | `FLOW_USER_AGENT` — non-`OpenAI/*` UA (WAF) |
+| `agentflow-agents/src/hermes-shim/client.ts:209` | `runChat` — POST /v1/chat/completions round-trip |
+| `agentflow-agents/src/hermes-shim/client.ts:235` | `streamRun` — POST /v1/runs + SSE /v1/runs/:id/events |
+| `agentflow-agents/src/hermes-shim/client.ts:41` | `extractChatCompletionText` — final assistant text |
+| `agentflow-agents/src/hermes-shim/client.ts:117` | `runEventToStep` — SSE event → humanized step |
+| `agentflow-agents/src/hermes-shim/bridge.ts:326` | `handleDispatch` — devices-ws dispatch → streamRun (chat fallback) |
+| `agentflow-agents/src/hermes-shim/main.ts` | bridge entrypoint |
+| `agentflow-agents/src/hermes-shim/write-config.ts` | renders config.yaml + .env at boot |
+| `agentflow-agents/hermes-image/Dockerfile` | dual-runtime image (python hermes + node bridge) |
+| `agentflow-agents/hermes-image/entrypoint.sh` | reenroll → render config → assert local backend → boot hermes → run bridge |
+| `agentflow-agents/.github/workflows/build-hermes.yml` | ghcr CI (self-hosted ff-france) |
+| `agentflow-agents/migrations/2026-06-01a-hosted-devices-template-hermes.sql` | CHECK-widen for `'hermes'` |
+
+## Data flow
+```
+POST /me/hosted-devices { template:'hermes' }    (FF_HERMES=1 or → 403)
+  → resolveDaemonImage('hermes') → ghcr.io/lnlockly/agentflow-hermes:latest
+  → STS in af-tenant-<userId> vcluster, env: HERMES_API_SERVER_KEY (per-pod),
+    HERMES_TERMINAL_BACKEND=local, AGENTFLOW_FLOW_KEY (= device af_live key),
+    AF_API_KEY/AF_DEVICE_ID/...
+
+entrypoint.sh:
+  reenroll()        → POST /me/hosted-devices/:id/reenroll {rotation_secret}
+                      → fresh AF_ENROLLMENT_TOKEN, clear AF_DEVICE_TOKEN
+                      (one-time token consumed on first connect; stateless pod
+                       re-mints one on every boot)
+  write-config.js   → renders ~/.hermes/config.yaml (model:flow → flow router,
+                      terminal.backend:local, fail-closed on missing key) +
+                      ~/.hermes/.env (API_SERVER_ENABLED, API_SERVER_KEY)
+  ASSERT backend in {local,ssh,modal,daytona}  (else FATAL — no docker shell-out)
+  hermes gateway    → loopback OpenAI API server on :8642   (background)
+  wait /health
+  main.js (bridge):
+    ── devices-ws ──▶  wss://agentflow.website/_agents/_devices/connect
+       headers: x-api-key + x-device-id + x-enrollment-token (first) /
+                x-device-secret (reconnect, from hello_ack, cached to disk)
+    ── loopback   ──▶  http://127.0.0.1:8642  (Bearer HERMES_API_SERVER_KEY)
+
+dispatch (live):   devices-ws task_dispatch{task}
+                   ──▶ POST /v1/runs {input} → SSE /v1/runs/:id/events
+                       (steps → task_action; on failure → POST /v1/chat/completions)
+                   task_complete{answer}  ◀── final assistant text
+dispatch (queued): cross-replica → device_tasks.status='queued' → bridge polls
+                   GET /me/devices/:id/queued_tasks (10s) → same handleDispatch
+```
+
+## DB / Env / API
+- **Tables:** `hosted_devices.template` (CHECK now includes `'hermes'`).
+- **Env (server):** `FF_HERMES` (canary gate). **Env (pod):**
+  `HERMES_API_SERVER_KEY`, `HERMES_TERMINAL_BACKEND` (=`local`), `AGENTFLOW_FLOW_KEY`,
+  `HERMES_CONFIG_PATH`, `HERMES_ENV_PATH`, plus the standard `AF_API_KEY` /
+  `AF_DEVICE_ID` / `AF_ENROLLMENT_TOKEN` / `AF_API_URL`.
+- **Routes:** `POST /me/hosted-devices {template:'hermes'}` (201, or 403
+  `hermes_canary_disabled`). Bridge connects `/_agents/_devices/connect`.
+- **Model:** flow router at `<origin>/_agents/llm/v1`, alias `flow` (resolved by
+  `pickFlowUpstream`). No hardcoded model id — config.yaml `model: flow` +
+  `api_key: ${AGENTFLOW_FLOW_KEY}` env-ref. `api_mode: chat_completions`.
+- **Hermes API (pod, loopback :8642):** `POST /v1/chat/completions`,
+  `POST /v1/runs` (→ `run_id`, 202), `GET /v1/runs/:id/events` (SSE),
+  `GET /health`. Bearer = `HERMES_API_SERVER_KEY`.
+- **Ports (pod):** 8642 (Hermes API + /health, loopback only), 8765 (bridge
+  /api/health, the k8s readiness probe).
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Pod boots but Hermes never answers | `FATAL: hermes gateway exited during boot` | `hermes-image/entrypoint.sh` |
+| Hermes boots without a model | `AGENTFLOW_FLOW_KEY missing — refusing to boot a degraded agent` | `src/hermes-shim/write-config.ts` |
+| Config rendered a docker/singularity backend | `needs a container runtime the pod lacks` | `src/hermes-shim/config.ts:114` (renderer fails closed) |
+| On-disk config has an unsafe backend | `FATAL: terminal.backend='...' needs a container runtime the pod lacks` | `hermes-image/entrypoint.sh` assertion |
+| Create returns 403 | `hermes_canary_disabled` | set `FF_HERMES=1` on agentflow-agents |
+| INSERT rejected on provision | `hosted_devices_template_check` | apply the 2026-06-01a migration |
+| Dispatch never completes | `dispatch <id> failed: hermes_run_failed` | `src/hermes-shim/bridge.ts:326` |
+| Runs/SSE path flaky, dispatch still finishes | `stream path failed (...); falling back to chat.completions` | expected fallback — `bridge.ts handleDispatch` |
+| Every chat 403s at the flow facade | `403 Your request was blocked` / `reason=auth` | WAF blocks `OpenAI/*` UA — `client.ts` sends `AgentFlow-Hermes/1.0` |
+| Dispatch stuck `queued`; bridge loops 401 then reconnects | `devices-ws error:` + 401 | one-time enrollment token consumed on first connect → `entrypoint.sh reenroll()` re-mints one each boot |
+| Cross-replica dispatch stays `queued`, never drains | `queued poll drained 0 task(s)` absent | bridge must poll `GET /me/devices/:id/queued_tasks` — `bridge.ts startQueuedPoll/drainQueuedTasks` |
+
+## Security
+- Hermes API server binds **loopback only** (`API_SERVER_HOST=127.0.0.1`); 8642
+  never leaves the pod. `API_SERVER_KEY` is required for every deployment incl.
+  the loopback bind (Hermes docs) — the bridge presents it as `Bearer`.
+- The API server gives full toolset access incl. terminal — safe ONLY because
+  the pod is already tenant-isolated (vcluster) AND `terminal.backend` is pinned
+  `local` (commands run in-pod, no container shell-out). A `docker`/`singularity`
+  backend would shell out to a runtime the pod lacks — fail-closed at both render
+  (`config.ts`) and boot (`entrypoint.sh` assertion).
+- Flow key (`AGENTFLOW_FLOW_KEY`) is an env-ref `${AGENTFLOW_FLOW_KEY}` in
+  config.yaml (never the literal on disk); a missing key fails the agent closed.
+
+## What Phase 1 ships vs. remains
+Ships: the image (dual-runtime python+node), config render (model → flow router,
+`terminal.backend: local`, fail-closed on missing key / unsafe backend), the
+devices-ws bridge with `task_dispatch` → Hermes run → `task_complete`, the SSE
+`/v1/runs/:id/events` step feed with a `/v1/chat/completions` fallback, engine
+selection behind `FF_HERMES`, the CHECK-widen migration, and 17 unit tests
+(`tsc -b` clean). The `/v1/runs` + SSE exact event-name set is parsed
+defensively; the chat-completions path is the guaranteed round-trip.
+Remains (not yet verified live on ff-france): a live `dispatch_task` round-trip
+in-cluster (image must build via `build-hermes.yml` first), the exact SSE event
+schema confirmation against a running pod, `/live` ApprovalBar wiring, Hermes
+skills/memory, channel onboarding, PVC-persisted `~/.hermes` state.
+
+## Related
+- [OpenClaw pod engine](/subsystems/openclaw-pod-engine) (the gold template this mirrors)
+- Research: `agentflow-agents/.artifacts/picoclaw-hermes-engine-research.md`

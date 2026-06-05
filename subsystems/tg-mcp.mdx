@@ -1,6 +1,6 @@
 ---
 title: "TG MCP (Telethon pool)"
-description: "Python MCP сервер для MTProto-операций: 24 tools (send/receive/scrape/smoke_test), Telethon StringSession + Fernet-blob persistence, LRU pool."
+description: "Python MCP сервер для MTProto-операций: send/receive/scrape/smoke_test + channel admin (create/promote/photo/link), Telethon StringSession + Fernet-blob persistence, LRU pool."
 ---
 
 # TG MCP (Telethon pool)
@@ -16,8 +16,10 @@ description: "Python MCP сервер для MTProto-операций: 24 tools 
 | Repo / path | Что делает |
 |---|---|
 | `agentflow-tg-mcp/src/agentflow_tg_mcp/server.py:29` | `MCPAuthMiddleware` — raw-ASGI middleware, JWT-verify, exempt list. |
-| `agentflow-tg-mcp/src/agentflow_tg_mcp/server.py:105` | `_register_tools` — регистрирует 25 MCP tools (send_message, **send_file**, receive_message, scrape_chat, smoke_test_bot, click_button, forward_message, pin/unpin, react_to_message, search_messages, download_media, get_message_stats, join_channel, leave_channel, get_chat_members, view_channel, get_me, whoami, update_profile, get_full_user, download_profile_photo, …). |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/server.py:105` | `_register_tools` — регистрирует MCP tools (send_message, **send_file**, receive_message, scrape_chat, smoke_test_bot, click_button, forward_message, pin/unpin, react_to_message, search_messages, download_media, get_message_stats, create_channel, invite_to_channel, promote_channel_admin, **set_channel_photo**, **link_discussion**, toggle_channel_forum, create_channel_topic, join_channel, leave_channel, get_chat_members, view_channel, get_me, whoami, update_profile, get_full_user, download_profile_photo, …). |
 | `agentflow-tg-mcp/src/agentflow_tg_mcp/tools/messages.py` `send_file` | Upload binary artefact to peer: base64-decode `file_bytes_b64`, wrap in `BytesIO(name=filename)`, call `client.send_file(target, buf, file_name, caption)`. Used by agentflow-agents `tg.send_file` graph handler for promo-video DAG terminal step. Errors: `file_bytes_b64_missing`, `filename_missing`, `invalid_base64`, `empty_payload`, `account_not_found`, `flood_wait` + Telethon structured. |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/tools/channels.py:361` `set_channel_photo` | Set/replace a channel-or-supergroup avatar. Takes `image_b64` (preferred, MCP-envelope-safe) OR `image_path`; uploads via `client.upload_file` and binds with `channels.EditPhotoRequest` + `InputChatUploadedPhoto(file=…)`. Registered `server.py:567`. Returns `{ok, channel_id, photo_id?}`. Errors: `no_image_source`, `image_read_failed`, `empty_image`, `flood_wait`. Used to clone an owner-bot avatar onto freshly-created channels + their discussion chats (Golden Connect multi-country setup). |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/tools/channels.py:437` `link_discussion` | Attach a `megagroup=True` discussion chat (`chat_id`) to a broadcast channel (`channel_id`) so post comments route into the chat. Wraps `channels.SetDiscussionGroupRequest`; `chat_id=0` unlinks via `InputChannelEmpty`. Registered `server.py:591`. Returns `{ok, channel_id, chat_id}`. Both peers must be administered by the acting account. |
 | `agentflow-tg-mcp/src/agentflow_tg_mcp/server.py:597` | `build_app` — Starlette: mounts `/mcp` (streamable), `/sse` (SSE), `/health`, через `MCPAuthMiddleware`. |
 | `agentflow-tg-mcp/src/agentflow_tg_mcp/server.py:650` | `main` — uvicorn factory boot. |
 | `agentflow-tg-mcp/src/agentflow_tg_mcp/telethon_pool.py:20` | `TelethonPool` — LRU `max_size=32`, warm-set exempt. |
@@ -107,7 +109,7 @@ on real scrape request:
 - `GET /health` — exempt, returns `{ok: true}`.
 - `POST /mcp` — streamable HTTP transport (FastMCP streamable_app).
 - `GET /sse` / `POST /sse/messages` — SSE transport (FastMCP sse_app, messages path exempt).
-- 25 MCP tools — см. строки 105-469 server.py.
+- MCP tools registered in `_register_tools` (server.py:105+); channel-admin tools include `create_channel`, `promote_channel_admin`, `set_channel_photo` (server.py:567), `link_discussion` (server.py:591).
 
 **Callbacks → agentflow-agents:**
 - `POST /internal/tg-callbacks` (`agentflow-agents/src/routes/internal.ts:49`) — после получения нового сообщения через Telethon.
@@ -132,6 +134,7 @@ on real scrape request:
 | `send_file` returns `error=invalid_base64` | `invalid_base64` (literal) | Caller passed non-b64 string. Fix the upstream — `tg.send_file` graph handler always reads via `code-exec.read_file_b64` which returns clean b64. |
 | `send_file` returns `error=empty_payload` | `empty_payload` (literal) | Decoded to zero bytes. Source file was empty / pod path mismatch. Check upstream producer node output. |
 | `send_file` returns `error=flood_wait, seconds=N` | `flood_wait` from `_structured_error` | Account-level rate limit. tg.send_file handler does NOT retry (idempotent=false) — operator must re-queue manually after the flood window. |
+| `set_channel_photo` floods hard after ~10 edits in a burst | `caused by EditPhotoRequest` (Telethon `FloodWaitError`) | `EditPhotoRequest` is one of the most throttled MTProto writes. Bulk-setting avatars across many channels on ONE account trips a global ~700-900s wait after ~5 channels (×2 for channel+chat). Fix: pace to a handful per window and run a resumable driver that sleeps `FloodWaitError.seconds + buffer` and retries the same target. `SetDiscussionGroupRequest` shares the same per-account write budget — do photos and links in one paced pass, not two bursts. |
 
 ## Related
 

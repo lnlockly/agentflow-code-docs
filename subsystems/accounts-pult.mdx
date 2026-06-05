@@ -33,6 +33,13 @@ gated to owner approval.
 | `agentflow-agents/src/services/account-command.ts:60` | `DESTRUCTIVE_TOOLS` — per-MCP-server gate set (confirm-before-send) |
 | `agentflow-agents/src/services/account-command.ts:176` | `runAccountCommand` — native tool_use loop, server-side dispatch |
 | `agentflow-agents/src/services/account-command.ts:389` | `approveAccountCommand` — fire held draft, owner+account scoped |
+| `agentflow-agents/src/routes/me-accounts.ts` | `POST /me/accounts/:accountId/command/media` (multipart) — store a composer clip → `media_id` |
+| `agentflow-agents/src/services/account-command-media.ts` | `storeCommandMedia` / `loadCommandMedia` / `sweepExpiredMedia` — owner-scoped media store (bytea, ~24h TTL) |
+| `agentflow-agents/src/connector-core/connectors/telegram.ts` | `executeAction` ships attachments (voice→`send_voice`, video\|file→`send_file`) + `attachmentsPreviewLine` |
+| `agentflow-tg-mcp/src/agentflow_tg_mcp/tools/messages.py` | `send_voice` gained `file_bytes_b64` + `filename` (base64 byte source) |
+| `agentflow-landing/src/components/accounts/browse/DialogComposer.tsx` | composer records voice/video/file, shows upload state |
+| `agentflow-landing/src/components/accounts/browse/DialogView.tsx` | uploads each clip → `media_id` → command `attachments[]` |
+| `agentflow-landing/src/lib/agentsApi/accounts.ts` | `uploadCommandMedia` + `attachments` on `streamAccountCommand` |
 | `agentflow-agents/src/services/mcp-direct.ts:140` | `mcpDirect.listTools(server, ctx)` — platform tool discovery |
 | `agentflow-agents/src/mcp-servers/kwork-inbox.ts:3805` | kwork choke point now writes via `withAccountActionLog` (platform='kwork') |
 | `agentflow-agents/src/routes/me-integrations-kwork.ts:427` | `GET /me/integrations/kwork/actions` — kwork-filtered back-compat alias |
@@ -55,29 +62,59 @@ LOG     GET /me/accounts/actions?platform=&account_id=
           → AccountActionRow[] { id, platform, account_ref, kind, target, status,
                                  detail(string|null), created_at }
 
-CMD     POST /me/accounts/:accountId/command  { text, model }   (SSE)
+MEDIA   POST /me/accounts/:accountId/command/media  (multipart: file + kind)
+          → resolveOwnedAccount (owner-scope)
+          → storeCommandMedia → account_command_media (bytea, owner+account, ~24h TTL)
+          → { ok, media_id, kind, filename, mime, byte_size }   (≤ 25MB)
+
+CMD     POST /me/accounts/:accountId/command  { text, model, attachments? }   (SSE)
           → resolveOwnedAccount → { provider, account }
           → listPlatformTools(provider) → Anthropic tools[]
           → invokeAI(TEXT_LARGE) loop:
               safe tool      → mcpDirect.callTool(server) server-side → action_done + log row(ok|failed)
-              destructive    → HELD as pending draft → emit `draft` + log row(awaiting_approval)
+              destructive    → connector.buildAction (carries attachments) → arm()
+                               → emit `draft` + log row(awaiting_approval)
           SSE: thread · text · tool_use · draft · action_done · error · done
-APPROVE POST /me/accounts/:accountId/command/approve { action_id|draft_id, text? }
-          → fire held tool via mcpDirect.callTool → log row(ok|failed)
+
+APPROVE POST /me/approvals/:id/confirm    (connector path — the live one)
+          → atomic claim → connector.executeAction(action):
+              for each attachment: loadCommandMedia → tg-mcp send_voice|send_file (base64, direct MCP)
+              then text → send_message
+          (legacy POST …/command/approve fires in-memory drafts on platforms w/o a connector)
 ```
+
+## Composer media (voice / video / file)
+The dialog composer records a voice/video note (MediaRecorder) or picks a file.
+Each clip uploads to `…/command/media` FIRST; the bytes land in
+`account_command_media` (owner + account scoped, bytea, ~24h TTL) and only the
+returned `media_id` rides on the command's `attachments[]`. The connector's
+`buildAction` folds a glyph line into the draft preview (`🎤 голосовое`,
+`🎬 видео`, `📎 file.pdf`) and carries the pointers; nothing sends. On owner
+confirm, `connector.executeAction` reads the bytes back via `loadCommandMedia`
+and ships them over the **direct MCP transport** (a backend→MCP hop, base64 —
+NOT an LLM tool chain, so no prompt bloat): voice → `send_voice`
+(`file_bytes_b64`, waveform note), video/file → `send_file` (`file_bytes_b64`).
+Capability is declarative: `telegramDef.supportsMedia = true`; a connector
+without it fails the confirm with `unsupported_media` instead of dropping bytes.
 
 ## DB / Env / API
 - Tables: `account_action_log` (was `kwork_action_log`; migration
   `2026-06-02b-account-action-log.sql` RENAMEs it + adds `platform text NOT NULL
   DEFAULT 'kwork'`). Columns: `id, owner_user_id, platform, account_ref, kind,
   target, status, detail_json, created_at`.
+  `account_command_media` (migration `0090_account_command_media.sql`) — composer
+  clips. Columns: `id (uuid), owner_user_id, account_id, kind('voice'|'video'|'file'),
+  mime, filename, bytes (bytea), byte_size, created_at, expires_at (~24h)`.
 - Env: reuses LLM router (`invokeAI(ModelType.TEXT_LARGE)`), telegram MCP
   (`TG_MCP_URL` / `TG_MCP_TOKEN`), internal MCP secret (`INTERNAL_*`). No new env.
 - Routes: `GET /me/accounts`, `GET /me/accounts/actions`,
-  `POST /me/accounts/:accountId/command` (SSE),
-  `POST /me/accounts/:accountId/command/approve`. Back-compat alias
-  `GET /me/integrations/kwork/actions` (kwork-filtered, one release).
-- MCP tools: dispatched server-side via `mcpDirect.callTool('telegram'|'kwork-inbox', …)`.
+  `POST /me/accounts/:accountId/command` (SSE, now accepts `attachments[]`),
+  `POST /me/accounts/:accountId/command/media` (multipart upload → `media_id`),
+  `POST /me/accounts/:accountId/command/approve`,
+  `POST /me/approvals/:id/confirm` (connector confirm — runs `executeAction`).
+  Back-compat alias `GET /me/integrations/kwork/actions` (kwork-filtered).
+- MCP tools: dispatched server-side via `mcpDirect.callTool('telegram'|'kwork-inbox', …)`;
+  media ships via `send_voice` (`file_bytes_b64`) / `send_file` (`file_bytes_b64`).
 
 ## Failure modes
 | Symptom | Log signature for grep | Where to fix |
@@ -87,6 +124,9 @@ APPROVE POST /me/accounts/:accountId/command/approve { action_id|draft_id, text?
 | Approve says draft gone | `draft_not_found` (404) | `services/account-command.ts:389` (TTL 30 min / owner-mismatch) |
 | Action log read shows old kwork rows only | migration not applied | apply `2026-06-02b-account-action-log.sql` via postgres pod |
 | Drift test red after schema edit | `tests/ci-schema.sql is stale` | regenerate golden dump / keep `account_action_log` name |
+| Composer voice/video/file sends only text, clip never arrives | `media_not_found` on confirm | clip expired (>24h) or wrong owner/account — re-record; `services/account-command-media.ts` `loadCommandMedia` |
+| Approved media draft fails on a non-telegram account | `unsupported_media` (row → failed) | the connector lacks `def.supportsMedia` — only telegram ships media today; `approval/executor.ts` gate |
+| Voice note arrives as a plain audio file (no waveform) | `send_voice` got `file_bytes_b64` but old tg-mcp | deploy tg-mcp with the `file_bytes_b64` param; `tools/messages.py` `send_voice` |
 
 ## Confirm-before-send
 Destructive tools (`DESTRUCTIVE_TOOLS`, keyed by MCP server) never fire inside
