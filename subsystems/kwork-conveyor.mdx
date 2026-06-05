@@ -1,0 +1,117 @@
+---
+title: "Kwork freelance conveyor — relogin → order → agent → approval-gated delivery"
+description: "The last mile that ties the kwork connector, the proxied browser-login, and the freelance conveyor into one end-to-end loop: re-login on the residential IP, an order becomes a coder run, and the reply to the client is gated by the approval queue."
+---
+
+# Kwork freelance conveyor (last mile)
+
+## TL;DR
+
+Three existing pieces — the [kwork-connector](/subsystems/kwork-connector), the
+[proxied browser-login](/subsystems/proxied-browser-login), and the freelance
+conveyor (order → task → launch) — are wired into one loop. (1) `POST
+/me/integrations/kwork/relogin` mints a fresh kwork session inside an in-pod
+chromium behind the owner's sticky NodeMaven residential exit IP, and `…/relogin/
+verify` proves the inbox reads back non-empty entities on that IP. (2) A kwork
+order becomes a Plane task and `launchAgentOnTask` spawns a coder run on the
+order brief in a project pod (the existing conveyor). (3) The finished run's reply
+to the CLIENT is `arm()`-ed into the generic approval queue — the owner confirms
+it before any message leaves to the client. Nothing client-facing auto-sends.
+
+## Files (with line refs)
+
+### Relogin (mint on the residential IP + verify inbox)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/freelance/kwork-relogin.ts:136` | `startRelogin` — launches the proxied browser-login pinned to `platform=kwork`; reuses `ProxiedBrowserLoginService.startLogin` (no new chromium) |
+| `agentflow-agents/src/services/freelance/kwork-relogin.ts:166` | `verifyRelogin` — reads the inbox through the registry kwork connector and asserts `entityCount > 0` on the residential exit IP |
+| `agentflow-agents/src/services/freelance/kwork-relogin.ts:88` | `liveVerifyInbox` — `getConnector('kwork').listEntities('dialogs')`; a `reauth_required` ConnectorError → empty read (verify fails, not a 500) |
+| `agentflow-agents/src/routes/me-integrations-kwork-relogin.ts:103` | `POST /me/integrations/kwork/relogin` → `{ session_id, login_url, proxied, stream, warning? }`; `stream` points at the EXISTING browser-login screenshot/input/confirm endpoints |
+| `agentflow-agents/src/routes/me-integrations-kwork-relogin.ts:130` | `POST /me/integrations/kwork/relogin/verify` → `{ verified, entity_count, sample }` |
+| `agentflow-agents/src/server.ts:949` | `app.route('/', meIntegrationsKworkReloginApp)` mount |
+
+### Order → agent (the conveyor — pre-existing A15)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/freelance/conveyor.ts:126` | `orderToTask` — connector order → Plane issue, idempotent on `(connector, externalId)` |
+| `agentflow-agents/src/services/freelance/conveyor.ts:218` | `launchAgentOnTask` — spawns a coder run on the task brief via the injected `spawnRun` (the canonical `POST /me/projects` + `/approve` lifecycle), flips `run_status='running'` |
+| `agentflow-agents/src/routes/me-freelance-conveyor.ts:138` | `POST /me/freelance/tasks` — order → task |
+| `agentflow-agents/src/routes/me-freelance-conveyor.ts:162` | `POST /me/freelance/tasks/:taskId/launch` — spawn the run |
+
+### Approval-gated delivery (the new gate)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/freelance/conveyor-delivery.ts:94` | `queueDelivery` — drafts a `send` action via the registry connector's `buildAction` (`dryRun:true`) and `arm()`s it; refuses a non-dry-run draft (`draft_not_dry_run`) |
+| `agentflow-agents/src/routes/me-freelance-conveyor.ts:196` | `POST /me/freelance/tasks/:taskId/deliver { reply }` — gates the run's reply through the approval queue, returns `202 { approval_id }` (QUEUED, not sent) |
+| `agentflow-agents/src/approval/queue.ts:90` | `arm` — inserts one `armed` row (no side effects); the reply waits for the owner |
+| `agentflow-agents/src/approval/executor.ts:76` | `confirm` — the ONLY side-effecting path: atomic single-use claim → `getConnector('kwork').executeAction('send')` → `send_message` inside the dialog |
+
+### Tests (mocked connector + browser-login + Plane + spawn)
+| Path | Role |
+|---|---|
+| `agentflow-agents/tests/kwork-relogin.test.ts` | relogin starts the proxied login; verify reports ok on a non-empty inbox, NOT ok on an empty one |
+| `agentflow-agents/tests/conveyor-delivery.test.ts` | delivery ARMS the reply (never auto-sends); rejects unregistered connector / empty reply / missing target / non-dry-run draft |
+| `agentflow-agents/tests/kwork-conveyor-e2e.test.ts` | end-to-end: order → task → launch returns a run → delivery gated by approval (real DB, mocked Plane/spawn/connector/arm) |
+
+## Data flow
+
+```
+RE-LOGIN (mint on the residential exit IP)
+  POST /me/integrations/kwork/relogin
+    → startRelogin → ProxiedBrowserLoginService.startLogin(owner,'kwork')
+        (in-pod chromium behind sticky NodeMaven residential proxy → kwork login)
+    → { session_id, login_url, proxied, stream }
+        FE drives the EXISTING browser-login screenshot/input/confirm endpoints
+        → on logged-in signal the browser-login service captures cookies into the
+          user_credentials vault ON the residential IP (proxy_ref in meta)
+  POST /me/integrations/kwork/relogin/verify
+    → verifyRelogin → getConnector('kwork').listEntities('dialogs')  ← same IP
+        entityCount > 0  → { verified:true }   (the session is valid on this IP)
+        entityCount == 0 → { verified:false }  (still logged out / wrong IP / CAPTCHA)
+
+ORDER → AGENT → APPROVAL-GATED DELIVERY
+  kwork order  ─POST /me/freelance/tasks─▶ orderToTask → Plane issue + linkage row
+               ─POST /me/freelance/tasks/:id/launch─▶ launchAgentOnTask
+                   → spawnRun (POST /me/projects + /approve) → coder run in a pod
+                   → run_status='running'
+  run finishes ─POST /me/freelance/tasks/:id/deliver { reply }─▶ queueDelivery
+                   → connector.buildAction({type:'send', entityId:<dialog>}) (dryRun)
+                   → arm(owner, {action})  → entity_approval_queue (status='armed')
+                   → 202 { approval_id }            ← NOTHING sent to the client yet
+  owner        ─POST /me/approvals/:id/confirm─▶ confirm (atomic single-use claim)
+                   → getConnector('kwork').executeAction('send') ONCE → send_message
+```
+
+## DB / Env / API
+
+- **Tables:** `fl_conveyor_tasks` (the conveyor linkage, UNIQUE `(connector, external_id)`); `user_credentials` (vault the relogin captures into, sticky proxy ref in `meta.proxy_ref`); `entity_approval_queue` (the armed reply awaiting owner confirm).
+- **Env:** `NODEMAVEN_PROXY_USER` / `NODEMAVEN_PROXY_PASS` / `NODEMAVEN_PROXY_GATEWAY` (residential proxy; unset ⇒ `proxied:false` + `warning:'no_residential_proxy'`); `FF_FREELANCE=1` (conveyor surface); `INTERNAL_API_SECRET`; `DATABASE_URL`.
+- **Routes (owner-auth via `requireSession`):**
+  - `POST /me/integrations/kwork/relogin` → `{ session_id, login_url, proxied, stream, warning? }`
+  - `POST /me/integrations/kwork/relogin/verify` → `{ verified, entity_count, sample }`
+  - `POST /me/freelance/tasks` → order → task (idempotent)
+  - `POST /me/freelance/tasks/:taskId/launch` → spawn a coder run
+  - `POST /me/freelance/tasks/:taskId/deliver { reply }` → `202 { approval_id }` (gated)
+  - `POST /me/approvals/:id/confirm` → ships the reply once (existing approval queue)
+- **Connector contract:** the relogin verify and the delivery both resolve through the connector registry (`getConnector('kwork')`). Adding a second freelance source (vk, avito) is a connector row, never an `if (connector === …)` branch in the conveyor.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| relogin starts but mints on the pod IP | `no_residential_proxy` (warning in the start response) / `proxy_unconfigured` | NodeMaven env unset — `services/proxied-browser-login.ts:476`; set the proxy creds |
+| relogin verify always `verified:false` despite login | `reauth_required` from `listEntities` | cookies minted on the wrong IP / behind CAPTCHA — re-drive the browser-login on the residential proxy (`kwork-relogin.ts:88`) |
+| relogin start 503 | `browser_runtime_unavailable` | the in-pod chromium runtime is down — `proxied-browser-login.ts` driver / `BROWSER_RUNTIME_WS` |
+| relogin start 502 | `proxy_auth_failed` | the residential proxy refused the tunnel — check NodeMaven creds / sticky sid |
+| deliver 409 `connector_not_registered` | `connector_not_registered` | the order's connector has no registry row — `connector-core/bootstrap.ts` |
+| deliver 400 `empty_reply` / `missing_target` | `empty_reply` / `missing_target` | the run produced no reply text, or the conveyor row has no dialog id (the kwork order's `external_id`) |
+| deliver 400 `draft_not_dry_run` | `draft_not_dry_run` | a connector returned a live action from `buildAction` — drafts MUST be `dryRun:true` (`conveyor-delivery.ts`) |
+| reply sent without owner confirm | (must not happen — guarded) the deliver path only `arm()`s | `conveyor-delivery.ts:94` never calls `executeAction`; only `confirm` does |
+
+## Related
+- [kwork-connector](/subsystems/kwork-connector) — the read/exec adapter the relogin verify + delivery resolve through.
+- [proxied browser-login](/subsystems/proxied-browser-login) — mints the session on the residential IP the relogin reuses.
+- [per-account proxy session](/subsystems/per-account-proxy-session) — the sticky NodeMaven exit IP.
+- [Task Sources](/subsystems/task-sources) — pulls kwork orders into the conveyor.
+- [Approval queue](/subsystems/approval-queue) — the `armed → confirm` gate the delivery flows through.
+- [Freelance Jobs](/subsystems/freelance-jobs) — the adjacent jobs board.
