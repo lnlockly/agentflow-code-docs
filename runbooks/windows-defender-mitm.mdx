@@ -1,0 +1,76 @@
+---
+title: "Windows Defender MITM (SSL EOF in daemon)"
+description: "Defender's HTTPS scan breaks Python urlopen handshake; installer auto-adds an exclusion and the daemon falls back to system curl."
+---
+
+# Windows Defender MITM
+
+## TL;DR
+
+Windows Defender's outbound HTTPS inspection occasionally tears down Python's `urlopen` TLS handshake with `EOF occurred in violation of protocol (_ssl.c:2427)`, killing every LLM dispatch and the auto-updater. The installer now whitelists `%LOCALAPPDATA%\AgentFlow` plus both .exe names in Defender (one UAC prompt, idempotent). For users who installed before this landed, the tray gains a «Восстановить связь» entry that re-runs the exclusion step. The daemon also falls back to the system `curl.exe` when `urlopen` fails twice in a row — Schannel-backed curl survives the MITM that mangles Python's OpenSSL.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-computer-mcp/installer/setup_gui.py:349` | `_build_defender_command` — composes the idempotent PowerShell script that calls `Add-MpPreference` only when the path / process is missing from the current exclusion lists. |
+| `agentflow-computer-mcp/installer/setup_gui.py:391` | `add_defender_exclusion(install_dir, *, shell_executor)` — triggers a single UAC prompt via `ShellExecuteW("runas", ...)`. Returns `(True, "")`, `(False, "user_declined")`, `(False, "shellexecute_rc=<n>")`, or `(False, "not_windows")`. |
+| `agentflow-computer-mcp/installer/setup_gui.py:706` | `_run_install_steps` — step 5/6 calls the helper and logs the outcome. Non-blocking: a `user_declined` or `not_windows` result keeps the install going. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/winapp/actions.py:67` | `restore_connection(add_exclusion, notifier)` — tray entry point that re-runs the exclusion for already-installed daemons. Late-imports `setup_gui` so the tray .exe stays light. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/winapp/menu.py:75` | `build_menu(..., on_restore_connection)` — adds the «Восстановить связь» entry above «Выйти» when running on Windows. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/winapp/tray.py:75` | `_restore_connection` callback wired only when `os.name == "nt"`. Notifies the user via `pystray.Icon.notify`. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py:280` | `_curl_post_messages(url, api_key, body, timeout, runner)` — non-stream POST via system curl. Returns the parsed JSON or raises `LlmNetworkError`. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py:430` | `post_llm_cancellable` — catches `URLError / TimeoutError / OSError` after both urlopen retries fail, drops `stream=true` from payload, calls `_curl_post_messages`. SSE streaming path is bypassed on curl success. |
+
+## Data flow
+
+```
+installer wizard
+  └── _run_install_steps()
+        ├── 1. install_daemon_binary       → %LOCALAPPDATA%\AgentFlow\agentflow-desktop.exe
+        ├── 2. write_auth_file             → %USERPROFILE%\.agentflow\auth.json
+        ├── 3. register_scheduled_task     → schtasks /XML AgentFlowDesktop
+        ├── 4. add_defender_exclusion      ← ShellExecuteW("runas", "powershell.exe", ...)
+        │       └── UAC prompt → one click → Add-MpPreference for path + 2 exe names
+        ├── 5. launch_daemon
+        └── 6. install_tray_binary + register_tray_autostart
+
+tray (already installed v0.4.x users)
+  └── Right-click icon → «Восстановить связь»
+        └── actions.restore_connection()
+              └── add_defender_exclusion()
+                    └── UAC prompt → exclusion applied → balloon notification
+
+daemon (runtime LLM POST)
+  └── post_llm_cancellable()
+        ├── urlopen (TLS 1.2 min, retry once on EOF)
+        ├── if both attempts fail with URLError/OSError:
+        │     └── _curl_post_messages()   ← Schannel-backed curl.exe
+        │           └── returns non-stream JSON, caller skips SSE assembly
+        └── if curl also fails: raise LlmNetworkError → task_error frame
+```
+
+## DB / Env / API
+
+- Tables: none (no DB state involved).
+- Env: none new. Existing `AF_LLM_CONNECT_TIMEOUT_S`, `AF_LLM_STREAM_IDLE_TIMEOUT_S` still control urlopen + curl timeout (curl uses `--max-time = timeout`).
+- Routes: unchanged — same `POST /llm/v1/messages` on `agentflow.website`.
+- MCP tools: none.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Wizard step 5/6 says «отказался от UAC» | `пользователь отказался от UAC` | `installer/setup_gui.py:710` — re-run via tray. |
+| Defender disabled on host (corporate AV) | `defender_unavailable` or `shellexecute_rc=2` | `installer/setup_gui.py:430` — manual exclusion via Settings UI. |
+| ShellExecuteW fails import (no ctypes) | `ctypes_unavailable` | `installer/setup_gui.py:421` — sandboxed install runtime. |
+| Daemon LLM POST still EOF after exclusion | `llm connect failed (urlopen + curl fallback)` | `driver/loop.py:368` — both Python TLS + curl mangled, escalate. |
+| curl.exe missing (Windows 7 / minimal image) | `curl missing` | `driver/loop.py:332` — install `curl.exe` or upgrade host. |
+| curl times out | `curl timeout after <n>s` | `driver/loop.py:336` — raise `AF_LLM_CONNECT_TIMEOUT_S` env. |
+| curl returns non-JSON (Cloudflare 5xx HTML) | `curl returned non-JSON` | `driver/loop.py:355` — upstream LLM router down, retry. |
+
+## Related
+
+- [Scaffold hardening](/runbooks/scaffold-hardening) — same "wizard step must not abort install on failure" pattern lives there.
+- PR #72 (`fix(loop): retry urlopen on TLS EOF + force TLS1.2 min`) — predecessor patch this PR builds on.
+- PR `feat/installer-defender-exclusion-zero-config` — this work.

@@ -1,0 +1,78 @@
+---
+title: "TG beta gate"
+description: "Closed-beta gate the Telegram kickstart bot enforces on every message via /internal/tg/whoami. Allowlist OR active CryptoBot subscription auto-passes; everyone else sees the request-invite reply."
+---
+
+# TG beta gate
+
+## TL;DR
+
+`agentflow-bot` middleware (`agentflowMiddleware.ts:73`) calls `/internal/tg/whoami` on every incoming TG update. If the response says `in_beta:false`, the bot replies with the closed-beta "request invite @avsee4" message and aborts handling. `whoami` computes `in_beta = (tg_user_id in tg_beta_allowlist) OR (linked user has active cryptobot_subscriptions row with status='active' AND expires_at > now())`. CryptoBot top-ups stop being gated automatically — no separate allowlist write required.
+
+Whoami now falls back to `users.tg_id` when `tg_links` is empty, and auto-heals the `tg_links` row on first hit. Symptom of the pre-fix bug: paid customer signed up via Telegram (login widget set `users.tg_id` but never wrote `tg_links`), then paid via CryptoBot, then opened the bot → saw "invite only" even though they have an active subscription, because `tg_links` was missing the row. The fix INSERTs the missing `tg_links` row with `ON CONFLICT(tg_user_id) DO NOTHING` so subsequent calls hit the fast path.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-bot/src/bot/agentflowMiddleware.ts:73` | `makeAgentflowGate` — calls `whoami(tgUserId)` and short-circuits with the invite reply when `in_beta:false`. |
+| `agentflow-agents/src/routes/internal-tg.ts:42` | `isPayingSubscriber(userId)` — EXISTS check against `cryptobot_subscriptions` with `status='active' AND expires_at > now()`. Tolerant of missing table. |
+| `agentflow-agents/src/routes/internal-tg.ts:122` | `GET /internal/tg/whoami` — looks up allowlist + tg_links row, then OR with `isPayingSubscriber(linkRow.userId)` to produce `effectiveInBeta`. |
+| `agentflow-agents/src/routes/internal-tg.ts:106` | tg_beta_allowlist lookup (`betaRow`) — original gate, still authoritative for allowlist-only users (e.g. test accounts, comp'd betas). |
+| `agentflow-agents/src/routes/internal-tg.ts:71` | `findUserByTgId(tgUserId)` — `tg_links` empty → `SELECT FROM users WHERE tg_id = …` + ON CONFLICT-safe self-heal INSERT into `tg_links`. |
+| `agentflow-agents/src/services/cryptobot-billing.ts:486` | CryptoBot webhook upserts `cryptobot_subscriptions` on `invoice_paid`. This is the row the gate reads. |
+| `agentflow-agents/tests/whoami-paid-bypasses-beta.test.ts` | Source-contract guard + 4 live-DB cases (allowlist+nosub, paid+notlisted, linked+free, not_linked). |
+| `agentflow-agents/tests/whoami-fallback-users-tg-id.test.ts` | Source-contract guard for `findUserByTgId` + 3 live-DB cases (paid fallback, self-heal verified, unknown tg_user_id). |
+
+## Data flow
+
+```
+TG update → agentflow-bot pod
+   ↓
+makeAgentflowGate (agentflowMiddleware.ts:73)
+   ↓
+GET /internal/tg/whoami?tg_user_id=…  ──► agentflow-agents pod
+                                           ↓
+                              SELECT FROM tg_beta_allowlist  (inBeta)
+                              SELECT FROM tg_links            (linkRow)
+                              ↓
+                              if linked:
+                                EXISTS cryptobot_subscriptions
+                                  WHERE user_id = linkRow.userId
+                                    AND status='active'
+                                    AND expires_at > now()
+                                  → isPayingSubscriber
+                              ↓
+                              effectiveInBeta = inBeta OR isPayingSubscriber
+   ↓
+in_beta:true  → next()           (bot continues normal handling)
+in_beta:false → bot replies "🔒 Доступ к AgentFlow закрытый бета. Запроси приглашение @avsee4"
+```
+
+## DB / Env / API
+
+**Tables:**
+- `tg_beta_allowlist(tg_user_id PK, note)` — manual entries (test accounts, comp'd betas). Auto-populated on deeplink link (`internal-tg.ts:96`).
+- `tg_links(tg_user_id PK, user_id, tg_username, linked_at)` — TG → platform user mapping.
+- `cryptobot_subscriptions(user_id PK, tier, status, started_at, expires_at, …)` — written by CryptoBot webhook on successful `invoice_paid` (`services/cryptobot-billing.ts:486`).
+
+**Env:**
+- `INTERNAL_API_SECRET` — gates `/internal/tg/whoami`. Bot pod uses `AGENTS_INTERNAL_SECRET` to call it.
+
+**Routes:**
+- `GET /internal/tg/whoami?tg_user_id=…` — returns `{ ok, linked, user_id?, tg_username?, email?, in_beta }`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Paid customer told to "request invite @avsee4" after CryptoBot top-up | (no log — silent reject; reproduce via `curl /internal/tg/whoami` returning `in_beta:false` for a known-paid user) | `agentflow-agents/src/routes/internal-tg.ts:122` — confirm `isPayingSubscriber` path runs and `cryptobot_subscriptions` has a row with `status='active'` and `expires_at > now()` for that user. |
+| Expired subscription still passes gate | `expires_at < now()` check missing | `agentflow-agents/src/routes/internal-tg.ts:42` `isPayingSubscriber` — must keep `expires_at > now()`. |
+| Allowlist user blocked after fix | `tgBetaAllowlist` row deleted accidentally | `agentflow-agents/src/routes/internal-tg.ts:114` — `betaRow` lookup; verify allowlist entry exists. |
+| Unlinked TG user paid but still blocked | (expected — bypass requires `tgLinks` row OR matching `users.tg_id`) | User who signed up via the TG login widget will auto-resolve via the `users.tg_id` fallback. Only true strangers (no `tg_links`, no `users.tg_id`) need the deeplink path. |
+| TG-widget signup paid but bot says "invite only" | `[whoami-fallback] tg_links self-heal failed for tg_user_id=…` | `agentflow-agents/src/routes/internal-tg.ts:71` `findUserByTgId` — verify `users` row has matching `tg_id`; check the auto-heal INSERT permissions if log line appears. |
+
+## Related
+
+- [CryptoBot billing](/subsystems/cryptobot-billing) — webhook that populates `cryptobot_subscriptions`.
+- [Auth + access](/subsystems/auth-and-access) — `requireInternalSecret` middleware that gates whoami.

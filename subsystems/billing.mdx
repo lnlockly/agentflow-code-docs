@@ -9,18 +9,40 @@ description: "How user balance is computed: flow_ledger is the source of truth, 
 
 User balance lives in two Postgres tables. `flow_ledger` is the append-only journal — every credit/debit writes a row, and the user's balance equals `SUM(amount)` over their rows. `flow_balances` is a writer-maintained aggregate (one row per user, kept in sync by `creditUser()` / `debitUser()` inside the same TX as the ledger insert) used by the charge hot path under `SELECT ... FOR UPDATE` so concurrent turns don't race. Read-side helpers (`getBalance`, `isPaidUser`) sum the ledger directly so a stale or missing `flow_balances` row never lies to the user.
 
+## 3-API balance parity (May 2026 fix)
+
+After PR #310 switched `getBalance()` to `SUM(flow_ledger)`, three balance endpoints returned three different numbers for the same user:
+
+| Endpoint | Repo / file | Pre-fix source | Symptom |
+|---|---|---|---|
+| `GET /auth/me` | `agentflow-agents/src/routes/auth-password.ts:386` | hard-coded `balance_micro: 0` | AuthProvider bootstrap stuck at 0 |
+| `GET /_api/me` | `agentflow-api/src/routes/me.ts:39` | `SELECT balance FROM flow_balances` | shows writer-aggregate, misses ledger-only entries |
+| `GET /_agents/me/balance` | `agentflow-agents/src/routes/billing.ts:95` | `getBalance()` + user_credits | correct |
+
+Owner saw `-2458 USDF` on one rail, `+99.77` on another. Root cause: pre-#310 top-ups bumped `flow_balances` but never inserted a `flow_ledger` row, so the SUM-based read returned the wrong number for legacy users.
+
+Reconcile: a one-shot SQL inserts a `reconcile_legacy_balance` ledger row equal to `flow_balances.balance - SUM(flow_ledger.amount)` for every user where the diff exceeds 0.001 USDF and no prior `reconcile_legacy_balance` row exists. After reconcile, both `flow_balances.balance` and `SUM(flow_ledger.amount)` converge for legacy users.
+
+Fix (PRs `lnlockly/agentflow-agents#352` + `lnlockly/agentflow-api#2`): both `/auth/me` and `/_api/me` now compute `balance_micro` from `SUM(flow_ledger.amount)` (the same path `getBalance()` uses). `/_agents/me/balance` also exposes `balance_micro` so all three endpoints publish the same integer field for the same authenticated session.
+
 ## Files (with line refs)
 
 | Path | Role |
 |---|---|
 | `agentflow-agents/src/services/flow-meter.ts:229` | `getBalance(userId)` — sums `flow_ledger.amount`, returns USDF string |
 | `agentflow-agents/src/middleware/auth.ts:241` | `isPaidUser(userId)` — sums `flow_ledger.amount WHERE kind IN ('deposit','academy_purchase','plan_purchase','tier_purchase')` |
-| `agentflow-agents/src/routes/billing.ts:95` | `GET /me/balance` — calls `getBalance(session.sub)` + adds `user_credits.balance_cents` |
+| `agentflow-agents/src/routes/auth-password.ts:386` | `GET /auth/me` — calls `getBalance(row.id)` → `flowToMicro()` for `balance_micro` |
+| `agentflow-agents/src/routes/billing.ts:95` | `GET /me/balance` — calls `getBalance(session.sub)` + adds `user_credits.balance_cents`; exposes `balance_micro` |
 | `agentflow-agents/src/routes/billing.ts:260` | charge admin path — re-reads via `getBalance(userId)` |
 | `agentflow-agents/src/routes/billing-usage.ts:111` | usage panel — reads balance via `getBalance(userId)` |
 | `agentflow-agents/src/routes/internal.ts:382` | internal-secret balance endpoint, calls `getBalance(userId)` |
+| `agentflow-api/src/routes/me.ts:52` | `GET /me` — sums `flow_ledger.amount` (was: read `flow_balances.balance` directly) |
 | `agentflow-agents/src/services/flow-meter.ts:618` | `creditUser(args)` — INSERT `flow_ledger` + UPSERT `flow_balances` in one TX |
-| `agentflow-agents/src/services/flow-meter.ts:551` | settle-debit upsert on `flow_balances` (hot path) |
+| `agentflow-agents/src/services/flow-meter.ts:447` | `settle()` insufficient-funds gate (`SELECT … FOR UPDATE` reads `usdf_balance` before the debit) |
+| `agentflow-agents/src/services/flow-meter.ts:484` | settle-debit UPDATE on `flow_balances.usdf_balance` (dual-pool fix, migration 0021 follow-up) |
+| `agentflow-agents/src/services/flow-meter.ts:653` | `chargeFlat()` USDF debit — DesignAPI image/video, reflector, lessons |
+| `agentflow-agents/src/services/flow-meter.ts:1093` | `chargeLlmUsage()` USDF debit — Anthropic / OpenAI / GPT fallback per-turn |
+| `agentflow-agents/scripts/reconcile-negative-balances.ts` | one-shot ops script: zero out negative balances + write `credit_reconcile` ledger rows |
 | `agentflow-agents/src/services/promo-codes.ts:236` | promo `balance_topup` redeem — UPSERT `flow_balances` (writes ledger row separately, see file) |
 
 ## Data flow
@@ -43,6 +65,8 @@ User balance lives in two Postgres tables. `flow_ledger` is the append-only jour
 read path
 ─────────
   GET /me/balance ─► getBalance(userId) ─► SUM(flow_ledger.amount)
+  GET /auth/me    ─► getBalance(userId) ─► SUM(flow_ledger.amount)
+  GET /_api/me    ─► SUM(flow_ledger.amount) (post-PR #352)
   isPaidUser(userId)                   ─► SUM(flow_ledger.amount WHERE kind IN paid_kinds)
 ```
 
@@ -50,13 +74,14 @@ read path
 
 - Tables: `flow_ledger(user_id, amount, kind, ref_id, created_at, …)`, `flow_balances(user_id PK, balance NUMERIC(18,6))`
 - Env: none specific to balance read; schema detection via `flowSchemaReady()` (`flow-meter.ts:155`)
-- Routes: `GET /me/balance`, `POST /internal/users/:id/balance` (internal-secret guarded)
+- Routes: `GET /me/balance`, `GET /auth/me`, `GET /_api/me`, `POST /internal/users/:id/balance` (internal-secret guarded)
 - MCP tools: none direct; balance is exposed via `agentflow-mcp-server` `/me/balance` proxy
 
 ## Invariants
 
 - Every balance mutation goes through `creditUser()` / `debitUser()` (or `settle()` / `applyInvoicePaid()` / promo redeem, all of which update both tables in one TX). Raw `INSERT INTO flow_ledger` bypasses the `flow_balances` UPSERT and breaks any code path still reading the aggregate.
 - `getBalance()` and `isPaidUser()` use the same predicate family (sum of `flow_ledger.amount`). When they disagree, the ledger is right.
+- The three public balance endpoints (`/auth/me`, `/_api/me`, `/_agents/me/balance`) must all expose `balance_micro` derived from `SUM(flow_ledger.amount)`. A divergence is a bug.
 
 ## Failure modes
 
@@ -66,6 +91,45 @@ read path
 | Balance widget desyncs after manual SQL insert | `INSERT INTO flow_ledger` outside `flow-meter.ts` / `cryptobot-billing.ts` / `promo-codes.ts` | Remove the raw insert; use `creditUser()` |
 | `getBalance` returns `'Infinity'` on fresh DB | `flowSchemaReady` false | Run migrations; `flow_balances` table must exist (`flow-meter.ts:155`) |
 | Settle reports wrong balance after race | concurrent turns missing `FOR UPDATE` lock | Hot path stays on `flow_balances` row lock inside `settle()` TX (`flow-meter.ts:551`) |
+| User balance shows negative after LLM usage | `[internal/usage] settle insufficient` | `services/flow-meter.ts:399` (`settle()` gate). Run `npm run reconcile:negative-balances` once after fix deploys to zero existing negatives. |
+| 3 balance APIs disagree (`/auth/me=0`, `/_api/me=X`, `/_agents/me/balance=Y`) | `balance_micro: 0` hard-coded in `routes/auth-password.ts` + `SELECT balance FROM flow_balances` in `agentflow-api/src/routes/me.ts` | Reconcile legacy users via `reconcile_legacy_balance` ledger row, then point both endpoints at `SUM(flow_ledger.amount)` (see "3-API balance parity" section above). |
+| Phantom $900+ "LLM burn" TG alert with no matching debit rows | `llm-burn-alert: hourly warn threshold exceeded` followed by `lastWarnHourBucket` skipping subsequent ticks; ledger shows large `credit_reconcile` rows with negative `amount` | `services/pingers/llm-burn-alert.ts` must filter `kind = ANY(LLM_DEBIT_KINDS)` (PR #358). `credit_reconcile` writes are accounting clawbacks (see `scripts/reconcile-tier-overcredit.mjs:202`) — not LLM spend. |
+| Hot-loop burn outpaces the daily cap before `agent_runs.cost_cents` updates | `BudgetExceededError period=daily` or `period=monthly` from `services/llm-circuit-breaker.ts` | Short-window kill switch reads `flow_ledger` for the last hour. Env: `LLM_USER_HOURLY_CAP_USD` (default $5), `LLM_PLATFORM_HOURLY_CAP_USD` (default $20). `0` disables. |
+| LLM spend drains USDT top-up pool while USDF credits stay static | every `debit_anthropic` / `debit_other` / `debit_llm` ledger row has `meta` without `column: 'usdf_balance'` AND `flow_balances.balance` decremented while `usdf_balance` unchanged | **RESOLVED 2026-05-17 [PR #444](https://github.com/lnlockly/agentflow-agents/pull/444)**: `settle()`, `chargeFlat()`, `chargeLlmUsage()` in `services/flow-meter.ts` now debit `usdf_balance` (credits pool) instead of `balance` (USDT top-up pool). Migration 0021 follow-up landed. New ledger rows carry `meta.column='usdf_balance'` for audit. Regression pinned by `tests/unit/settle-debits-usdf-pool.test.ts`. |
+
+## Buy subscription from balance (May 2026)
+
+Owner directive 2026-05-17: payments must go through balance first. The old
+direct `/subscriptions/checkout` path is still available but no longer
+surfaced in the frontend. Users top up USDT first (CryptoBot / BEP-20 /
+Platega, all unchanged) then spend balance on a tier:
+
+| Route | Repo / file | Purpose |
+|---|---|---|
+| `POST /subscriptions/buy-from-balance` | `agentflow-api/src/routes/subscriptions.ts:239` | Debit balance + activate sub atomically in `db.transaction`. Single `flow_ledger` row `kind='debit_subscription_buy'`. No grant credit — `flow_balances.balance` is the FLOW-credits column and the tier value is captured in `meta.grant_flow` for audit. |
+| `GET /me/flow-balance` | `agentflow-api/src/routes/subscriptions.ts:601` | Read balance + last 20 ledger rows |
+| `GET /me/subscription` | `agentflow-api/src/routes/subscriptions.ts:560` | Latest sub row (status-priority ordered) |
+| `agentflow-landing/src/pages/AccountSubscription.tsx` | landing | UI for the two-step flow at `/account/subscription` |
+| `agentflow-landing/src/main.tsx:521` | route registration | `<Route path="/account/subscription" …>` |
+
+Tier matrix (`flow-credits.ts:125-138`): `plus=$20→20 USDF`, `pro=$100→100`,
+`max=$200→200`. The route inserts the subscription row with
+`payment_method='balance'` for audit.
+
+Insufficient-balance path returns HTTP **402** with
+`{ balance, required, topup_url:'/me/topup' }`. The frontend renders an
+inline "Не хватает X USDT" hint per tier card and offers a
+"Пополнить баланс" button that links to `/account/billing` (the existing
+top-up flow).
+
+### Failure modes (buy-from-balance)
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `/subscriptions/buy-from-balance` returns 402 but balance card shows enough | `insufficient_balance` in `agentflow-api/src/routes/subscriptions.ts:262` while `getBalance` reports balance >= price | Cabinet badge reads `/me/balance` (agentflow-agents), this route reads `getBalance` from `agentflow-api/src/services/flow-credits.ts:117` which hits its own connection. Confirm both pools point at the same `flow_balances` row. |
+| Buy succeeds but UI keeps showing old balance | no `invalidateQueries(['api-flow-balance'])` after POST | `AccountSubscription.tsx:buyFromBalance` must invalidate `api-flow-balance` AND `api-me-subscription` AND the agents-side `me-balance` query key |
+| Second buy → 500 with raw `duplicate key value violates unique constraint "uniq_active_sub_per_user"` | Postgres error leaks through default catch | **FIXED PR #9** (2026-05-17): handler now catches the constraint name + returns 409 `{ ok:false, error:'already_subscribed' }`. |
+| Buy returns 200 but balance unchanged | Both a `debit_subscription_buy` (`-20`) and a `subscription_grant` (`+20`) hit the same `flow_balances.balance` column | **FIXED PR #9** (2026-05-17): grant credit removed from this path. The grant pathway only applies to off-platform USDT payments via the legacy `/subscriptions/checkout` route (cryptobot/platega/bep20 webhook), where there's a separate USDT-in event. |
 
 ## Related
 

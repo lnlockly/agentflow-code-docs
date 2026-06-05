@@ -1,0 +1,68 @@
+---
+title: "Tenant NetworkPolicy reconciler"
+description: "Background pinger that enforces code-exec egress restrictions across every af-tenant-* namespace."
+---
+
+# Tenant NetworkPolicy reconciler
+
+## TL;DR
+Every 30 minutes the agents pod applies the `code-exec-host-egress` NetworkPolicy to each `af-tenant-<id>` host namespace. Closes the Audit-4 (2026-05-27) finding that 50/57 tenants ran code-exec containers without any host-CNI egress restriction. Idempotent — `kubectl apply` is a no-op when the policy already matches.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/pingers/tenant-netpol-reconcile.ts:147` | `runTenantNetpolReconcile()` tick body |
+| `agentflow-agents/src/services/pingers/tenant-netpol-reconcile.ts:55` | Inlined NetPol manifest (keep in sync with YAML) |
+| `agentflow-agents/k8s/code-exec-host-netpol.yaml:27` | Canonical YAML — rationale + comments |
+| `agentflow-agents/src/server.ts:172` | Pinger boot wiring (every 30 min) |
+| `agentflow-agents/k8s/agentflow-agents.yaml:60` | ClusterRole grants `networkpolicies` verbs |
+| `agentflow-agents/scripts/apply-netpol-all-tenants.sh:1` | One-shot bulk apply from host shell |
+
+## Data flow
+```
+setInterval (30 min, src/server.ts)
+   ↓
+runTenantNetpolReconcile()
+   ↓ kubectl get ns -o name
+   ↓ filter af-tenant-*
+   ↓ for each ns: kubectl -n <ns> apply -f - (NetPol manifest via stdin)
+   ↓
+log.info { totalNs, applied } on changes
+```
+
+The NetPol's `podSelector` matches every pod with `vcluster.loft.sh/managed-by` set AND `vcluster.loft.sh/namespace=default`. That covers all vcluster-synced project/runtime/warm-pool pods. CoreDNS (synced from `kube-system`) and the `user-X-0` vcluster control pod are not selected — they keep their default allow-all egress.
+
+## DB / Env / API
+- Tables: none
+- Env:
+  - `TENANT_NETPOL_RECONCILE_TICK_MS` — override tick interval (default 1_800_000 ms)
+  - `TENANT_NETPOL_RECONCILE_DISABLED=1` — skip the tick body (incident response knob)
+- Routes: none
+- RBAC: `networkpolicies` get/list/watch/create/update/patch + `namespaces` get/list/watch on the cluster role `agentflow-agents-expose`
+
+## Egress allowed by the policy
+- DNS (UDP/TCP 53 + 1053) to anywhere
+- East-west to any pod in the same `af-tenant-<id>` namespace
+- Cluster Service CIDR `10.43.0.0/16`
+- Postgres `franchise-factory/agentflow-postgres:5432`
+- Public Internet TCP all ports, with `except:` blocks for RFC1918, link-local/metadata (169.254/16), CGNAT (100.64/10), multicast/link-local
+
+Cross-tenant traffic is implicitly denied because `podSelector: {}` is namespace-scoped.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Tick errored before listing ns | `tenant-netpol-reconcile tick errored` | `src/services/pingers/tenant-netpol-reconcile.ts:163` |
+| One ns rejected apply (e.g. admission webhook) | `netpol apply failed` | check `kubectl describe networkpolicy code-exec-host-egress -n <ns>` |
+| Previous tick still running on next interval | `tick skipped, previous still running` | benign — wait one cycle |
+| Pinger never starts | check `RUN_WORKERS` env on agents pod | `src/server.ts:352` |
+
+## Bootstrap path on a fresh tenant
+1. `agentflow-api/tenant-provisioner.ts` creates the `af-tenant-<id>` namespace and helm-installs the vcluster.
+2. First reconciler tick after the namespace exists applies `code-exec-host-egress`.
+3. Worst-case lag: 30 minutes. For zero-lag, run `bash scripts/apply-netpol-all-tenants.sh` on ff-france (the canonical one-shot recipe).
+
+## Related
+- [Code-exec design](/code-exec-design)
+- [Pod GC pinger](/subsystems/pod-gc-pinger)
+- [Tenant quota verifier](/subsystems/tenant-quota-verifier)

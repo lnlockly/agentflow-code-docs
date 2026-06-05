@@ -74,6 +74,7 @@ handleKnowledgeMcp (knowledge.ts)
 
 **Routes:**
 - `POST /internal/mcp/knowledge/?agent=<slug>&token=<secret>` — JSON-RPC MCP transport. `agent` is required, missing → 400 `missing_agent_query`. Token mismatch → 401 `unauthorized`.
+- `POST /internal/mcp/knowledge/?agent=<slug>` with `x-mcp-auth: <INTERNAL_API_SECRET>` header — JSON-RPC MCP transport. `agent` is required, missing → 400 `missing_agent_query`. Wrong/absent header → 401 `unauthorized`. The secret is HEADER-ONLY: the legacy `?token=<secret>` query param is no longer accepted (it leaked the secret into nginx access logs, SECURITY.md M-3). A stale request still carrying `?token=` is rejected and logs a one-shot `rejected_query_token` — see `routes/internal-mcp.ts:readToken()`.
 
 **MCP tools:**
 - `search({ query: string (2-1000 chars), top_k?: integer (1-20, default 5) })` →
@@ -124,6 +125,38 @@ UPDATE agents
 
 The resolver inside `buildCharacter` rewrites the placeholder to a fresh `?agent=<slug>` URL the next time the agent is chatted.
 
+## Citation pills (2026-05-16)
+
+The chat route harvests `knowledge.search` results during the chat-tooluse
+loop and surfaces them as citation pills under the assistant bubble in the
+landing chat. Plumbing:
+
+- `agentflow-agents/src/routes/agents.ts` collects `{source_url, title, score}`
+  from each `knowledge.search` `tool_result` (dedup by `source_url`, highest
+  score wins), caps at the top 8, and emits them on the SSE `done` event as
+  `{ text, sources: [...] }`.
+- The agent message row is persisted with `meta: { sources: [...] }` so
+  reloading history keeps the pills visible across sessions.
+- `agentflow-landing/src/components/agents/AgentChatPanel.tsx` renders the
+  pills under each agent bubble — small rounded chip with `📖 host · title`,
+  links to `source_url` in a new tab.
+
+### Backfill researcher UUIDs (pre-#339 agents)
+
+Pre-PR #339 the seed-knowledge ingest fired before `agents.eliza_agent_id`
+was written back, so seed chunks landed under the deterministic UUID
+(`uuidFromAgentId(agentId)`) while later ingests landed under the canonical
+Eliza UUID. `knowledge.search` calls `resolveAgentUuid(elizaAgentId, id)`
+which prefers the Eliza UUID, so seed chunks were unreachable from chat
+retrieval. Run the one-shot script on existing rows:
+
+```bash
+tsx scripts/backfill-researcher-knowledge-uuid.ts        # apply
+tsx scripts/backfill-researcher-knowledge-uuid.ts --dry  # print only
+```
+
+Source: `agentflow-agents/scripts/backfill-researcher-knowledge-uuid.ts`.
+
 ## Failure modes
 
 | Symptom | Log signature for grep | Where to fix |
@@ -131,6 +164,7 @@ The resolver inside `buildCharacter` rewrites the placeholder to a fresh `?agent
 | Agent replies "Я не вижу прикреплённого документа" despite ingest | (no log — model hallucinated) | The agent's `character.settings.mcp.servers` lacks `knowledge`. Run the backfill UPDATE above. Source: `agent-provision.ts:55-104`. |
 | Mount returns `missing_agent_query` | `"missing_agent_query"` | URL lacks `?agent=<slug>`. Resolver should mint that — check `internal-mcp-resolver.ts:73-82` and `AGENT_SCOPED_KEYS`. |
 | Mount returns `unauthorized` | `unauthorized` | `?token=` doesn't match `INTERNAL_API_SECRET`. Token rotated since the URL was baked into `character.settings.mcp.servers`. The resolver rebuilds stale-token URLs on the next provision (`internal-mcp-resolver.ts:115`). Force a redeploy of the agent. |
+| Mount returns `unauthorized` | `unauthorized` | The `x-mcp-auth` header is missing or doesn't match `INTERNAL_API_SECRET`. A stale baked URL still using `?token=` is rejected (header-only since SECURITY.md M-3) and logs `rejected_query_token`. The resolver migrates `?token=` URLs to header form on the next provision (`internal-mcp-resolver.ts`, `urlMatchesCtx`). Force a redeploy of the agent. |
 | Search returns `agent_not_found` | `"error":"agent_not_found"` | Slug in URL has no row in `agents`. Agent was deleted but its baked URL is being hit by a stale chat session. |
 | Search returns `agent_tombstoned` | `"error":"agent_tombstoned"` | Agent was soft-deleted (`state='tombstoned'`); no further retrieval. |
 | Search returns empty items but ingest succeeded | (no error — empty array) | Either embed service is down (`[agent-memory] embed_error:` upstream) or the row has `embedding IS NULL`. Check `agent_memories` directly: `SELECT count(*) FROM agent_memories WHERE agent_id=? AND embedding IS NULL`. |

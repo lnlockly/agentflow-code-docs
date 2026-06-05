@@ -1,0 +1,182 @@
+---
+title: "Matrix Monitoring"
+description: "Prometheus metrics + Grafana dashboard for the chat stack — Dendrite, mautrix-telegram, agentflow-agents bot runner."
+---
+
+# Matrix Monitoring
+
+## TL;DR
+
+The chat stack exports three scrape targets — Dendrite homeserver, the mautrix-telegram bridge, and the agentflow-agents bot runner. `prom-client` ships the bot-runner metrics behind a bearer-gated `/metrics` endpoint; Dendrite and mautrix-telegram expose their own native `/metrics` over in-cluster Services. A `chat-stack.json` Grafana dashboard ties the three together with panels for active users, message rate, sync latency, bridged TG accounts, per-bot events-per-second, handler p95, errors, and pod restarts. Prometheus has an in-tree manifest at `k8s/prometheus.yaml` (see [prometheus-stack](./prometheus-stack.mdx)), **but as of 2026-05-30 it is NOT deployed** — `deploy.yml` never applies it, there is no `monitoring` namespace on prod, and `MATRIX_METRICS_AUTH_TOKEN` is unset so `/metrics` returns 404. The dashboards + scrape config below describe the intended topology, not the running state. To activate, wire the manifests into `deploy.yml` and set the metrics token (owner-gated).
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/matrix-bots/metrics.ts:1` | `prom-client` registry, three metric families, helpers `recordEvent` / `startHandlerTimer` / `setBotReady` |
+| `agentflow-agents/src/routes/metrics.ts:1` | Bearer-gated `GET /metrics`, 404 when token env empty |
+| `agentflow-agents/src/server.ts:594` | Mounts `/metrics` route under the public Hono app |
+| `agentflow-agents/src/services/env.ts:194` | `MATRIX_METRICS_AUTH_TOKEN` env declaration |
+| `agentflow-agents/src/services/matrix-bots/runner.ts:152` | `recordEvent('invite')` after `joinRoom` succeeds |
+| `agentflow-agents/src/services/matrix-bots/runner.ts:224` | Reaction dispatch — `recordEvent('reaction')` + handler timer |
+| `agentflow-agents/src/services/matrix-bots/runner.ts:367` | Message dispatch — `recordEvent('message')` + handler timer + error counter |
+| `agentflow-agents/src/services/matrix-bots/runner.ts:498` | Bots-ready gauge seeded after `ensureAllBots` |
+| `agentflow-agents/tests/matrix-bots/metrics.test.ts:1` | 8 unit tests covering counter, histogram, gauge, reset, prom-text format |
+| `agentflow-agents/k8s/monitoring.yaml:1` | Sibling Services `*-metrics` for Dendrite, mautrix-telegram, agentflow-agents with scrape annotations |
+| `agentflow-agents/k8s/grafana/dashboards/chat-stack.json:1` | Grafana dashboard JSON (9 panels) |
+| `agentflow-agents/k8s/dendrite-config.yaml:56` | `global.metrics.enabled: true` flip for Dendrite |
+| `agentflow-agents/k8s/mautrix-telegram-config.yaml:255` | `metrics.enabled: true` flip for mautrix-telegram |
+
+## Data flow
+
+```
+Prometheus (when installed)
+   │
+   ├──[scrape :4100/metrics]──> agentflow-agents
+   │     ├── Authorization: Bearer $MATRIX_METRICS_AUTH_TOKEN
+   │     ├── matrix_bots_events_total{bot, kind}
+   │     ├── matrix_bots_handler_duration_seconds{bot}
+   │     ├── matrix_bots_ready{bot}
+   │     └── prom-client default node_* metrics (cpu, mem, event loop lag)
+   │
+   ├──[scrape :8008/_dendrite/metrics]──> Dendrite (no auth, ClusterIP-only)
+   │     ├── dendrite_room_event_total{type="m.room.message"}
+   │     ├── dendrite_sync_request_duration_seconds (histogram)
+   │     └── dendrite_user_active_total / dendrite_clientapi_logins_total
+   │
+   └──[scrape :8001/metrics]──> mautrix-telegram (no auth, ClusterIP-only)
+         ├── bridge_logged_in_users
+         └── matrix_bridge_* family
+              │
+              └── exposed by `mautrix-telegram-metrics` Service (sibling)
+
+Grafana
+   └── chat-stack.json dashboard pulls all three families via the
+       prometheus datasource variable `$DS_PROMETHEUS`.
+```
+
+## Metrics catalog
+
+### agentflow-agents (`/metrics`, bearer-gated)
+
+| Metric | Type | Labels | Increment site |
+|---|---|---|---|
+| `matrix_bots_events_total` | counter | `bot`, `kind` ∈ {`message`,`reaction`,`invite`,`redaction`,`error`} | `runner.ts` — message dispatch, invite accept, reaction dispatch, redaction observe, handler throw |
+| `matrix_bots_handler_duration_seconds` | histogram (0.05/0.1/0.25/0.5/1/2/5/10s) | `bot` | `startHandlerTimer(bot)` around each handler call |
+| `matrix_bots_ready` | gauge | `bot` | `setBotReady(slug, true/false)` after `ensureAllBots` and at registration failure |
+| `process_*` / `nodejs_*` | (default prom-client) | — | `registerDefaultMetrics()` at route boot |
+
+### Dendrite (native `/_dendrite/metrics` on :8008)
+
+Names that the dashboard queries (presence/exact name varies between Dendrite versions; the dashboard PromQL uses `or` to fall back across known variants):
+
+- `dendrite_user_active_total` / `dendrite_users_active_total` / `dendrite_clientapi_logins_total` (active-user surrogate)
+- `dendrite_room_event_total{type="m.room.message"}` (message rate)
+- `dendrite_sync_request_duration_seconds_bucket` (sync latency histogram)
+
+### mautrix-telegram (native `/metrics` on :8001)
+
+- `bridge_logged_in_users` / `matrix_bridge_logged_in_users` (bridged account count — exact metric name shifts between mautrix-go versions; dashboard tries both)
+- Standard bridge counters: portal counts, puppet counts, event-dispatch counters
+
+## DB / Env / API
+
+### Env (agentflow-agents)
+- `MATRIX_METRICS_AUTH_TOKEN` — bearer token gating `/metrics`. Empty (default) → route returns 404. Set to a 32-byte hex string in prod; the Prometheus scrape job must present the same value in `Authorization`.
+
+### k8s manifests
+- `agentflow-agents-metrics` Service — `:4100/metrics`, annotated `prometheus.io/scrape=true` + `prometheus.io/path=/metrics`.
+- `dendrite-metrics` Service — `:8008/_dendrite/metrics`, scrape annotations.
+- `mautrix-telegram-metrics` Service — `:8001/metrics`, scrape annotations.
+
+### Dendrite ConfigMap flip
+`k8s/dendrite-config.yaml` `global.metrics.enabled: true`. Apply with `kubectl apply -f k8s/dendrite-config.yaml && kubectl -n franchise-factory rollout restart deploy/dendrite`. CI auto-rolls per the gap-fix from PR #655.
+
+### mautrix-telegram ConfigMap flip
+`k8s/mautrix-telegram-config.yaml` `metrics.enabled: true`. Container already exposes `containerPort: 8001 name: metrics` (verified live); no Deployment change needed. Apply + restart.
+
+### Routes
+- `GET /metrics` — bearer-gated prom-text scrape endpoint on agentflow-agents.
+
+## Grafana dashboard
+
+`agentflow-agents/k8s/grafana/dashboards/chat-stack.json` — 9 panels:
+
+1. **Active users (Dendrite)** — `sum(dendrite_user_active_total) or ... or sum(dendrite_clientapi_logins_total)`.
+2. **Message rate (5m, per minute)** — `sum(rate(dendrite_room_event_total{type="m.room.message"}[5m])) * 60`.
+3. **Bridged TG accounts** — `sum(bridge_logged_in_users) or sum(matrix_bridge_logged_in_users) or sum(mautrix_telegram_logged_in_users)`.
+4. **Bots ready** — bargauge of `matrix_bots_ready` per bot slug.
+5. **Sync latency p50/p95/p99** — `histogram_quantile(0.5/0.95/0.99, sum by (le) (rate(dendrite_sync_request_duration_seconds_bucket[5m])))`.
+6. **Events / sec per bot** — `sum by (bot) (rate(matrix_bots_events_total[1m]))`.
+7. **Bot handler p95** — `histogram_quantile(0.95, sum by (bot, le) (rate(matrix_bots_handler_duration_seconds_bucket[5m])))`.
+8. **Errors / sec per bot** — `sum by (bot) (rate(matrix_bots_events_total{kind="error"}[5m]))`.
+9. **Pod restarts (last 24h)** — `sum by (pod) (increase(kube_pod_container_status_restarts_total{namespace="franchise-factory", pod=~"dendrite-.*|agentflow-agents-.*|agentflow-workers-.*|mautrix-telegram-.*|element-web-.*"}[24h]))`.
+
+Load via:
+
+```bash
+kubectl -n franchise-factory create configmap grafana-dashboard-chat-stack \
+  --from-file=chat-stack.json=k8s/grafana/dashboards/chat-stack.json \
+  --dry-run=client -o yaml | \
+  kubectl apply -f -
+kubectl -n franchise-factory label cm grafana-dashboard-chat-stack \
+  grafana_dashboard=1 app.kubernetes.io/part-of=agentflow-chat --overwrite
+```
+
+When Grafana with the kiwigrid/k8s-sidecar provisioner runs, the dashboard auto-imports on label `grafana_dashboard=1`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `/metrics` returns 404 in prod | response body `{"ok":false,"error":"metrics_disabled"}` | `MATRIX_METRICS_AUTH_TOKEN` env unset on `deploy/agentflow-agents`. Set it on the `agentflow-agents-env` Secret + restart |
+| `/metrics` returns 401 | response body `{"ok":false,"error":"unauthorized"}` | Scrape job's `bearer_token` does not match `MATRIX_METRICS_AUTH_TOKEN`. Align both ends |
+| Dendrite scrape DOWN | Prometheus target `dendrite-metrics` UP=0 | `global.metrics.enabled: false` in `dendrite-config.yaml`, or the pod hasn't been rolled since the flip. `kubectl rollout restart deploy/dendrite` |
+| mautrix-telegram scrape DOWN | Prometheus target `mautrix-telegram-metrics` UP=0 | `metrics.enabled: false` in the bridge config, or container `metrics` port :8001 not exposed. Verify with `kubectl exec deploy/mautrix-telegram -- wget -qO- localhost:8001/metrics \| head` |
+| `matrix_bots_ready` flat at 0 for known-running bot | dashboard panel "Bots ready" shows 0 across the board | `ensureAllBots` failed silently. Check `[matrix-bots] ensure complete` log line for the `failed` array; common cause is `MATRIX_REGISTRATION_SHARED_SECRET` drift |
+| Events counter empty after rollout | dashboard "Events / sec per bot" all zero | Either `MATRIX_BOTS_ENABLED != 1` (runner never starts) or the runner is fine but no traffic has arrived since pod start. Tail `kubectl logs -l app=agentflow-agents \| grep matrix-bots` to confirm |
+| Handler p95 NaN | dashboard "Bot handler p95" panel empty | No histogram observations yet — handlers haven't been called since pod start. Once `events_total > 0`, p95 populates within 5 min |
+| Duplicate `process_*` metrics after hot-reload (dev) | route returns 500 `register already exists` | `prom-client` global registry doesn't survive multiple `collectDefaultMetrics` calls; `registerDefaultMetrics()` guards via a module-level flag. If still hit, kill stale tsx watcher and restart |
+
+## Verify
+
+```bash
+# 1. /metrics gated and returns prom format with bearer.
+curl -s -o /dev/null -w '%{http_code}\n' https://agentflow.website/_agents/metrics
+# → 401 (auth required when MATRIX_METRICS_AUTH_TOKEN set)
+
+curl -s https://agentflow.website/_agents/metrics \
+  -H "authorization: bearer $MATRIX_METRICS_AUTH_TOKEN" \
+  | grep '^matrix_bots_' | head
+# → matrix_bots_events_total{bot="af-helper",kind="message"} N
+# → matrix_bots_handler_duration_seconds_bucket{bot="af-claude",le="0.05"} M
+# → matrix_bots_ready{bot="af-claude"} 1
+
+# 2. Dendrite metrics endpoint reachable in-cluster.
+kubectl -n franchise-factory exec deploy/dendrite -- \
+  wget -qO- http://localhost:8008/_dendrite/metrics \
+  | grep -E '^dendrite_(room_event|sync_request|user_active)' | head
+
+# 3. mautrix-telegram metrics endpoint reachable.
+kubectl -n franchise-factory exec deploy/mautrix-telegram -- \
+  wget -qO- http://localhost:8001/metrics \
+  | grep -E '^(bridge|matrix_bridge)_' | head
+
+# 4. Run unit tests.
+cd agentflow-agents && node --import tsx --test tests/matrix-bots/metrics.test.ts
+# → 8 pass / 0 fail
+```
+
+## Non-goals (v1)
+
+- No alerting rules / PagerDuty wiring — separate ticket. Dashboards + metrics ship first.
+- No SLO definition (e.g. "p95 sync < 250ms").
+- No Loki / log aggregation.
+- No new Prometheus or Grafana install — uses what ops adds next.
+
+## Related
+
+- [Matrix Chat](/subsystems/matrix-chat) — Dendrite deployment + config
+- [Matrix Bots](/subsystems/matrix-bots) — bot runner and dispatcher loop being instrumented
+- [Matrix TG Bridge](/subsystems/matrix-tg-bridge) — mautrix-telegram bridge config
+- [Element Web](/subsystems/element-web) — frontend that drives bot traffic

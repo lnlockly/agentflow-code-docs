@@ -28,6 +28,8 @@ etc.).
 | `agentflow-landing/src/lib/agentsApi.ts:3686` | `hireAgentToProject(slug, projectId)` — parses 400 payload, exposes `project_slug` + `missing_secrets` |
 | `agentflow-landing/src/components/marketplace/HireDialog.tsx:75` | modal — on missing secrets, toast + `setTimeout(navigate(?tab=secrets), 1200)` |
 | `agentflow-landing/src/pages/WorkspaceV2.tsx:343` | reads `?tab=<id>` from `useSearchParams`, mirrors selection back via `setSearchParams(replace:true)` |
+| `agentflow-landing/src/pages/MarketplaceV2.tsx` | public `/marketplace` catalog — ElevenLabs-style dense list view (sticky filter bar with category chips + search + sort, table rows with 48px avatar+verified-check, name/tagline, tag dots, premium glyph, mono metadata cluster, category pill, action icons). Rows link to `MarketplaceDetail` where `HireDialog` lives. |
+| `agentflow-landing/src/styles/dark-tokens.css` | `.afm-*` token set powering MarketplaceV2 list (`.afm-list`, `.afm-row`, sticky bar, chip pills, mono meta, responsive grid reflow at 1023/640px). Uses `--af-accent`, `--af-secondary`, `--af-tertiary` only; no hardcoded brand colors. |
 
 ## Data flow
 
@@ -139,6 +141,7 @@ Side-effect: each entry in `missing` whose `key` did not already exist in
 | 404 `not_listed` for a private agent | Agent's `is_public_listing=false`. Use `/fork` instead (base templates) | check `agents.is_public_listing` for the slug |
 | 403 `forbidden` | Caller is not the project owner (collaborators can't hire) | by design — hire is a financial commitment, owner-only |
 | Unique-violation in logs on /hire retries | Two parallel hires racing on stub insert | benign — caught by `try/catch` at marketplace.ts:743 |
+| Detail-page pricing renders "—" for every platform-funded agent | Backend returns `price_per_message_micro_usd:0` for agents that use the shared DesignAPI key; landing helper collapses 0 and null/undefined to em-dash | `agentflow-landing/src/pages/MarketplaceDetail.tsx:53` — helper must split null→"—", 0→`marketplace.detail.price_platform` ("Platform-covered"), >0→USD (fixed in landing PR #282) |
 
 ## Related
 

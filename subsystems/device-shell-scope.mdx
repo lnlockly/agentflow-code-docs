@@ -1,0 +1,75 @@
+---
+title: "Device Shell Scope & Permissions"
+description: "How code_run_command is gated, the always-allowed safe baseline, and why the friendly permission toggles don't touch shell_whitelist."
+---
+
+# Device Shell Scope & Permissions
+
+## TL;DR
+A device's `code_run_command` is gated by `shell_whitelist` (the program — argv0 — must be allowed). A fixed `SAFE_BASELINE_PROGRAMS` set (read-only diagnostics + common dev toolchain) is allowed regardless of the stored whitelist, so a device never blocks `uname`/`ls`/`cat`. The configurable `shell_whitelist` EXTENDS that baseline for destructive or host-specific programs. The friendly cabinet «Разрешения» toggles (Файлы / Интернет / Память + «спрашивать перед важным») map to `allow_paths` / `confirm_before`, NOT `shell_whitelist` — which is why an owner who only flipped toggles previously saw `command not in shell_whitelist: uname`.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/config.py:33` | `SAFE_BASELINE_PROGRAMS` — always-allowed read-only + dev programs |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/config.py:54` | `DEFAULT_SHELL_WHITELIST` — sane default for a fresh device |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/config.py:130` | `Scope.shell_whitelist` default = `DEFAULT_SHELL_WHITELIST` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/scope.py:50` | `check_shell` — daemon-side gate (baseline ∪ shell_whitelist) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/scope.py:61` | baseline-or-whitelist allow check |
+| `agentflow-agents/src/routes/me-devices/shared.ts:62` | `DEFAULT_LOCAL_DEVICE_SCOPE` — seeded scope for new LOCAL devices |
+| `agentflow-agents/src/routes/me-devices/shared.ts:83` | `withDefaultShellWhitelist` — backfills empty scope at dispatch |
+| `agentflow-agents/src/routes/me-devices/crud.ts:160` | `POST /me/devices` seeds the default `scope_json` |
+| `agentflow-agents/src/routes/me-devices/task-dispatch.ts:538` | `dispatch_task` folds the default into the pushed scope |
+| `agentflow-agents/src/services/device-registry.ts:178` | `SHELL_SAFE_BASELINE` — server-side mirror of the daemon baseline |
+| `agentflow-agents/src/services/device-registry.ts:256` | `checkScope` shell gate (defence in depth) |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:248` | `HOSTED_DAEMON_DEFAULT_SCOPE` — hosted-pod counterpart |
+
+## Data flow
+```
+owner sets «Разрешения» toggles ──> allow_paths / confirm_before (NOT shell_whitelist)
+owner POST /me/devices/:id/scope ──> user_devices.scope_json (full scope incl. shell_whitelist)
+
+POST /me/devices/:id/dispatch_task
+  └─ merge device scope_json + per-task scope
+     └─ withDefaultShellWhitelist(): if no non-empty shell_whitelist, fold in DEFAULT_LOCAL_DEVICE_SCOPE
+        └─ checkScope() server-side gate: SHELL_SAFE_BASELINE ∪ shell_whitelist
+           └─ WS task_dispatch { scope } ──> daemon
+              └─ apply_task_scope() → scope_from_mapping(raw, base)
+                 └─ check_shell(): program ∈ SAFE_BASELINE_PROGRAMS ∪ scope.shell_whitelist ?
+```
+
+Two gates run the same policy: the agents-side `checkScope` (only for the
+`computer.shell.exec` MCP tool surface) and the daemon-side `check_shell`
+(every `code_run_command`). Both now allow the baseline.
+
+## DB / Env / API
+- Tables: `user_devices.scope_json` (JSONB, DB default `'{}'`)
+- Env: `AF_SHELL_WHITELIST` (hosted daemon baseline; EXTENDS the safe baseline)
+- Routes: `POST /me/devices` (seeds default scope), `POST /me/devices/:id/scope` (replace), `POST /me/devices/:id/dispatch_task` (pushes merged scope)
+- Local config: `~/.agentflow/computer-scope.toml` `shell_whitelist`
+
+## Safety model
+- Baseline = read-only inspection + common dev toolchain only (`uname`, `ls`, `cat`, `grep`, `find`, `git`, `node`, `npm`, `python3`, `curl`, …).
+- Destructive programs (`rm`, `dd`, `mkfs`, `shutdown`, `reboot`, `poweroff`, `kill`, `pkill`) are NOT baseline — they stay gated behind `shell_whitelist`.
+- `rm` keeps its argument-level recursive-flag guard in `check_shell` even when whitelisted.
+- Tradeoff: the baseline includes interpreters (`node`, `python3`) and fetchers (`curl`, `wget`) that can run arbitrary code. This is deliberate — a device agent is useless without them — and matches the trust model (the owner runs the agent on their own machine).
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Basic read-only command blocked | `command not in shell_whitelist: uname` | Pre-fix only. Now baseline-allowed. If a NEW read-only/dev tool is missing, add it to `SAFE_BASELINE_PROGRAMS` (`config.py:33`). |
+| Destructive program blocked with empty scope | `command not allowed: <prog> (not in safe baseline and shell_whitelist is empty)` | Intended. Add `<prog>` to `shell_whitelist` deliberately (`POST /me/devices/:id/scope`). |
+| Recursive rm refused even though `rm` whitelisted | `rm with recursive flag is denied` | Intended guard, `scope.py:check_shell`. |
+
+## Mac update note
+The daemon-side `check_shell` runs in the installed `.app` ON the Mac, so the
+SAFE_BASELINE change reaches an existing Mac only after the app updates. The
+platform's `withDefaultShellWhitelist` pushes a working `shell_whitelist` over
+WS at the next `dispatch_task`, so an already-enrolled Mac (stored scope `'{}'`)
+runs basics WITHOUT an app reinstall. A Mac whose scope was deliberately
+narrowed needs the app update or a scope edit.
+
+## Related
+- [Device Task Lifecycle](/subsystems/device-task-lifecycle)
+- [Hosted Daemon](/subsystems/hosted-daemon)
+- [Devices Unified](/subsystems/devices-unified)

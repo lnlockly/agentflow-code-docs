@@ -1,0 +1,90 @@
+---
+title: "Marketplace"
+description: "Public agent + template catalog, hire/fork funnel, detail pages with README + pricing."
+---
+
+# Marketplace
+
+## TL;DR
+
+Public catalog with two tabs: **Agents** (19 published listings from
+`agents_marketplace_listings` table) and **Templates** (68 static cards from
+`agentflow-landing/src/data/templates.ts`). List view fetched from
+`GET /_agents/marketplace?sort=hires|rating|recent[&q=&category=&capability=]`.
+Detail pages from `GET /_agents/marketplace/:slug`. Auth-gated CTAs:
+**Hire** (forks the preset into user's account, requires `useAuth().isAuthenticated`),
+**Fork-into-project**, **Playground**. Templates are anon-readable; agent
+hire is owner-only.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/pages/MarketplaceV2.tsx:453` | `/marketplace` page — list view with category/type filters, search, sort cycle. |
+| `agentflow-landing/src/pages/MarketplaceV2.tsx:478-500` | useEffect → `listMarketplace({q, sort})` debounced 250ms. |
+| `agentflow-landing/src/pages/MarketplaceV2.tsx:502-525` | `handleHire` — checks `isAuthenticated`, else navigates to `/account?next=/marketplace`. **Race condition: see Failure modes.** |
+| `agentflow-landing/src/pages/MarketplaceDetail.tsx:88` | Pulls `{ isAuthenticated, isLoading: authLoading }` from `useAuth()`. |
+| `agentflow-landing/src/pages/MarketplaceDetail.tsx:144-165` | `requireAuthOrQueue(action)` — central gate. Returns `queued` while `authLoading`, `redirected` when truly anon, `ready` when authed. |
+| `agentflow-landing/src/pages/MarketplaceDetail.tsx:239-262` | Drain `useEffect` — once `authLoading` flips false, replays the queued CTA or fires the `/login` redirect. |
+| `agentflow-landing/src/pages/MarketplaceV2.tsx:733-746` | Agent row renderer. **`afm-row__premium-col` only shows `$` icon, never the real price.** |
+| `agentflow-landing/src/pages/MarketplaceDetail.tsx` | `/marketplace/:slug` page — hero, README markdown, pricing chips ("$0.0015 / СООБЩ." or "Покрыто платформой"), Hire + Fork + Playground CTAs. |
+| `agentflow-landing/src/pages/Templates.tsx` | `/templates` page — 68 cards rendered from `TEMPLATES` data file. |
+| `agentflow-landing/src/pages/TemplateDetail.tsx` | `/templates/:slug` page — anon-readable clone form. |
+| `agentflow-landing/src/lib/agentsApi.ts:3957` | `listMarketplace({category?, capability?, q?, sort?})` → `GET /marketplace`. |
+| `agentflow-landing/src/lib/agentsApi.ts:3980` | `getMarketplaceListing(slug)` → `GET /marketplace/:slug`. |
+| `agentflow-agents/src/routes/marketplace.ts` | Hono routes — public, no requireSession. |
+| `agentflow-landing/src/data/templates.ts:50` | `TEMPLATES: Template[] = []` — empty array; the 68 templates rendered on /templates come from a separate fetch path (see Templates.tsx). Strapline on /marketplace lies about template count for this reason. |
+
+## Data flow
+
+```
+User → /marketplace
+       ↓
+       MarketplaceV2 mount → listMarketplace({q,sort}) → GET /_agents/marketplace
+       ↓
+       19 li.afm-row rendered (no price chip!)
+       ↓
+User clicks row → setSelectedAgent → in-page dialog OR
+User direct-nav → /marketplace/<slug>
+       ↓
+       MarketplaceDetail mount → getMarketplaceListing(slug) → GET /_agents/marketplace/<slug>
+       ↓
+       README + pricing chip rendered
+       ↓
+User clicks "Нанять в проект →"
+       ↓
+       handleHire: useAuth().isAuthenticated?
+         no  → /account?next=/marketplace/<slug>   (or /login?next=…)
+         yes → forkAgent({source_slug}) → POST /_agents/me/agents/from-preset
+              → navigate(`/account/agents/<new_slug>`)
+```
+
+## DB / Env / API
+
+- Tables: `agents_marketplace_listings`, `agents` (forked copy), `agent_pricing` (joined for `price_per_message_micro_usd`, `price_per_run_micro_usd`).
+- Routes:
+  - `GET /_agents/marketplace?sort=hires|rating|recent&q=&category=&capability=` — public.
+  - `GET /_agents/marketplace/:slug` — public, returns `listing` (full README, tools, secrets, examples).
+  - `POST /_agents/me/agents/from-preset` — auth-gated, forks the preset for the calling user.
+- Front routes:
+  - `/marketplace` → `MarketplaceV2`.
+  - `/marketplace/:slug` → `MarketplaceDetail`.
+  - `/templates` → `Templates` (anon).
+  - `/templates/:slug` → `TemplateDetail` (anon).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Hire button bounces authed user to /login | (client-only — no server log) | **RESOLVED 2026-05-17 PR #311** in `MarketplaceDetail.tsx` via `requireAuthOrQueue` gate + post-hydration drain `useEffect`. Click during hydration now stashes the action in `pendingCta` instead of navigating. Regression guard: `agentflow-landing/tests/hire-button-no-bounce-during-hydration.test.mjs`. |
+| Row cards show no pricing even for priced agents | n/a (UI bug) | `MarketplaceV2.tsx:787` — `afm-row__premium-col` only renders `$` icon for premium; needs to render `$X.XX / msg` or "Free" fallback. |
+| /marketplace silently navigates to /assistant or /studio within seconds | look for SSE response with `@ui-block` markers carrying `intent:{kind:'navigate'}` | FloatingGuide auto-greet sends a `navigate` ui-block. Fix in `agentflow-landing/src/lib/uiBlocks.ts:184` (require user gesture) or guide system prompt (forbid navigate-in-greeting). |
+| /auth/logout returns 200 but session stays alive | `Set-Cookie:` header missing on `POST /_agents/auth/logout` response | `agentflow-agents/src/routes/auth.ts` — logout handler must set `af_session=; Max-Age=0`. |
+| Catalog stat says "0 шаблонов" but /templates shows 68 | n/a | `MarketplaceV2.tsx:583` reads `TEMPLATES.length` from `src/data/templates.ts:50` which is `[]`. Replace with templates-API count or remove the strapline. |
+
+## Related
+
+- [Auth + access](/subsystems/auth-and-access) — session cookie behavior + logout bug.
+- [Template clone](/subsystems/template-clone) — /templates clone flow.
+- QA report: `qa-reports/2026-05-17/marketplace/report.html` — verdict Partial, 4 bugs filed.
+- QA issues: `qa-issues/2026-05-17-marketplace-*.md` (4 files).

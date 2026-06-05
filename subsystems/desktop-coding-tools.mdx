@@ -1,0 +1,124 @@
+---
+title: "Desktop coding tools + sub-agent spawn"
+description: "code_read/write/edit/run/list and af_spawn_subagent surface in the agentflow-desktop daemon."
+---
+
+# Desktop coding tools + sub-agent spawn
+
+## TL;DR
+Adds five IDE-shaped tools (`code_read_file`, `code_write_file`, `code_edit_file`, `code_run_command`, `code_list_dir`) and a `af_spawn_subagent` / `af_get_project_events` pair to the on-Mac daemon. The model can now write code in place when scope is small, or delegate a whole sub-project to the AgentFlow platform when scope is large, with progress streaming back into the cabinet action timeline.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/code.py:26` | `_shared_scope_check` reuses `check_path` for deny-list enforcement across all five code_* tools |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/code.py:31` | `read_file(path, scope, max_lines)` — returns content + total line count + truncation flag |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/code.py:52` | `write_file(path, content, scope, mode)` — replace/append, creates parent dirs |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/code.py:77` | `edit_file(path, find, replace, scope, count)` — find/replace; rejects when occurrences > count |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/code.py:119` | `run_command(command, scope, cwd, timeout)` — async subprocess, returns stdout/stderr/exit_code/duration_ms |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/code.py:156` | `list_dir(path, scope, depth, ignore_globs)` — depth-limited walk, default ignores `.git/node_modules/dist/.venv/__pycache__` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/server.py:43` | MCP TOOL_NAMES list adds five `computer.code.*` entries |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/server.py:116` | `@mcp.tool` registrations for `computer.code.{read_file,write_file,edit_file,run_command,list_dir}` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/server.py:213` | `_dispatch_tool` cases for the five tools (used by WS reverse-tunnel client) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/desktop_tools.py:479` | LLM tool descriptors for `code_read_file/write_file/edit_file/run_command/list_dir` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/desktop_tools.py:602` | `ToolExecutor.__init__` accepts `scope` + `state` (state used for pre-execute `update_live` frames) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/desktop_tools.py:625` | `_announce` pushes one-line `task_action` frame BEFORE long-running code tool dispatch |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/desktop_tools.py:694` | Executor dispatch cases for code_* tools, including confirm-dialog routing through `confirm()` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/af_client.py:87` | `AFClient.get_project_events(project_id, since_event_id, limit)` — pagination-aware events fetch |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/af_client.py:98` | `AFClient.spawn_project_task(brief, kind, auto_approve, poll_seconds)` — create + approve + poll up to 60s |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/af_client.py:299` | `af_spawn_subagent` LLM descriptor |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/af_client.py:316` | `af_get_project_events` LLM descriptor |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/af_client.py:366` | `dispatch_af_tool` routes `af_spawn_subagent` and `af_get_project_events` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py:65` | `intent_map` appended with «напиши код / сделай проект / запусти под-агента» mappings |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py:77` | `coding_workflow` subsection: read → edit → run → react / delegate when big |
+| `agentflow-computer-mcp/presets/desktop-tasks.yaml:91` | New presets: `Code review last commit`, `Add CI badge to README`, `Spawn AgentFlow project: <BRIEF>` |
+| `agentflow-computer-mcp/tests/test_coding_tools.py` | 26 tests — round-trips, scope denial, descriptors present, executor dispatch |
+
+## Data flow
+
+```
+Model (Claude) → ToolExecutor.execute(name, args) on agentflow-desktop
+   │
+   ├─ name in code_read_file/list_dir
+   │     └─ tools.code.read_file / list_dir
+   │           └─ scope.check_path → returns content/entries
+   │
+   ├─ name in code_write_file/edit_file
+   │     ├─ _announce("code_write_file", "path=...") → update_live → task_action frame
+   │     ├─ confirm dialog (osascript) if Scope.confirm_before contains computer.fs.write
+   │     └─ tools.code.write_file / edit_file → scope.check_path(write=True) + write text
+   │
+   ├─ name == code_run_command
+   │     ├─ _announce + confirm (shell.exec gate)
+   │     └─ tools.code.run_command → check_shell + asyncio subprocess → {stdout, stderr, exit_code, duration_ms}
+   │
+   └─ name == af_spawn_subagent
+         └─ AFClient.spawn_project_task(brief, kind)
+               ├─ POST /me/projects  {brief, kind_hint}
+               ├─ POST /me/projects/:id/approve  (auto_approve=true)
+               └─ poll GET /me/projects/:id/events ≤60s for project_ready/preview_ready
+                     └─ returns {project_id, slug, preview_url, status}
+   followed by af_get_project_events for ongoing progress streaming.
+```
+
+## DB / Env / API
+- Tables (consumer only): `projects`, `project_events` (read via `/me/projects/:id/events`).
+- Env: none new on the daemon side. AF API base = `https://agentflow.website/_agents`. Auth via `~/.agentflow/auth.json:api_key`.
+- Routes consumed:
+  - `POST /me/projects` — create from brief (existing).
+  - `POST /me/projects/:id/approve` — start build (existing).
+  - `GET /me/projects/:id/events?since_id&limit` — paged event tail (existing).
+  - `GET /me/projects/:id` — final status snapshot (existing).
+- MCP tools added:
+  - `computer.code.read_file(path, max_lines)`
+  - `computer.code.write_file(path, content, mode)` — gated by `confirm(computer.code.write_file)` reusing the `fs.write` deny-or-allow setting
+  - `computer.code.edit_file(path, find, replace, count)` — same gate
+  - `computer.code.run_command(command, cwd?, timeout)` — gated by `confirm(computer.code.run_command)` reusing `shell.exec` whitelist + dialog
+  - `computer.code.list_dir(path, depth, ignore_globs)`
+- LLM tools added: `code_read_file`, `code_write_file`, `code_edit_file`, `code_run_command`, `code_list_dir`, `af_spawn_subagent`, `af_get_project_events`.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `code_write_file` returns `{"ok": false, "error": "user denied code_write_file"}` | none — synchronous response | user clicked Deny on the native dialog; pass `confirm_before=()` only in test scopes |
+| `code_run_command` rejected with `ScopeDenied` | `shell_whitelist is empty; shell.exec disabled` | populate `shell_whitelist` in `~/.agentflow/computer-scope.toml` |
+| `code_run_command` rejected with `command not in shell_whitelist` | `command not in shell_whitelist` | add the binary name to `shell_whitelist` |
+| `code_edit_file` raises `find pattern appears N times, exceeds count=1` | `exceeds count` | retry with `count='all'` or extend the find string with surrounding context |
+| `code_read_file` raises `path denied by hard-coded fallback` | `path denied by hard-coded fallback` | path is under `~/.ssh`, `~/.config`, `~/Library/Keychains`, `~/.aws`, or `~/.gnupg` — never editable |
+| `af_spawn_subagent` returns `{"ok": false, "error": "create_failed: 401"}` | none — synchronous response | `~/.agentflow/auth.json:api_key` missing or rotated |
+| `af_spawn_subagent` returns ok but `status="pending"` after 60s | none — synchronous response | platform queue back-pressured; call `af_get_project_events` to keep streaming |
+| Action frame missing from cabinet timeline for a code_* tool | check that `ToolExecutor(state=state)` was passed at construction | `desktop_cli.py:cmd_run` and `cmd_drive` both pass `state=state` since this PR |
+
+## Screen recording
+
+The same daemon hosts a singleton `ScreenRecorder` that pipes JPEG frames from `streamer.fast_capture_jpeg()` into ffmpeg's stdin and produces a local `.mp4`. Use case: the model finishes a UI task and saves a 30s clip as proof / kwork delivery / demo hand-off. Hard cap on duration so a forgotten `stop()` cannot fill the disk.
+
+### Files
+| Path | Role |
+|---|---|
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/screen_record.py:46` | `find_ffmpeg()` — `shutil.which` → Playwright bundle (`~/Library/Caches/ms-playwright/ffmpeg-*/ffmpeg-mac`, Linux, Windows equivalents) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/screen_record.py:78` | `_check_output_path()` — allows `~/Movies`, `~/tmp`, `~/Downloads`, or any path with a `recordings/` segment; hard-denies `~/.ssh`, `~/.config`, `~/Library/Keychains`, `~/.aws`, `~/.gnupg`, `/etc`, `/usr`, `/bin`, `/sbin`, `/System` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/screen_record.py:139` | `ScreenRecorder.start(path, fps, width_cap, max_duration_s)` — spawns ffmpeg `-f mjpeg -framerate fps -i pipe:0 -c:v libx264 -pix_fmt yuv420p -preset veryfast -crf 28` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/screen_record.py:206` | `ScreenRecorder.stop()` — sets stop event, joins worker, closes stdin, waits 5s for ffmpeg to flush |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/screen_record.py:248` | `ScreenRecorder.status()` — `{recording, path, frames_written, elapsed_ms}` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/screen_record.py:263` | `_run()` worker loop — captures + writes at `1/fps`, schedules auto-stop at `max_duration_s` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/screen_record.py:318` | `get_recorder()` — process-wide singleton |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/server.py:166` | MCP tool registrations: `computer.screen_record.{start,stop,status}` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/server.py:283` | `_dispatch_tool` cases for the three screen_record tools (used by WS reverse-tunnel client) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/desktop_tools.py:566` | LLM descriptors `screen_record_start`, `screen_record_stop`, `screen_record_status` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/desktop_tools.py:822` | `ToolExecutor` dispatch for the three tools, with `_announce()` frames for the cabinet timeline |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py:118` | Intent map entry: «запиши видео экрана» → screen_record_start → task → screen_record_stop |
+| `agentflow-computer-mcp/tests/test_screen_record.py` | 12 tests — path scope, ffmpeg discovery, start/status/stop, double-start, auto-stop, singleton, live e2e (skipped without ffmpeg) |
+
+### Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `screen_record_start` returns `{"ok": false, "error": "ffmpeg_not_found"}` | none — synchronous response | install ffmpeg via brew/apt OR install Playwright (`pip install playwright && playwright install chromium`) so the vendored bundle exists |
+| Returns `{"ok": false, "error": "scope_blocked_path"}` | `scope_blocked_path` | path is outside allowed roots; pass `~/Movies/...`, `~/tmp/...`, `~/Downloads/...`, or include a `recordings/` segment |
+| Returns `{"ok": false, "error": "already_recording"}` | `already_recording` | call `screen_record_stop` before starting a new clip; only one recording per process |
+| Auto-stops mid-task | `[screen_record] auto_stop err` (rare) | `max_duration_s` reached — pass a larger value (recorder caps each call individually) |
+| ffmpeg starts but file is empty | `[screen_record] capture err` | display backend (Quartz/mss) is failing in headless context — same path as MJPEG stream; check `streamer.fast_capture_jpeg` |
+
+## Related
+- [Desktop / Computer-Agent bridge](/subsystems/computer-mcp) — WS tunnel + task dispatch this builds on
+- [Public LLM facade](/subsystems/public-llm-facade) — how the model fetches tools and posts messages
