@@ -53,6 +53,10 @@ A two-store goal engine. The desktop daemon keeps an authoritative local SQLite 
 | `agentflow-agents/src/services/autonomous-worker.ts:295` | `runReflectionPass` — `ModelType.TEXT_LARGE`, strict JSON `{reflection, score 0-10}` |
 | `agentflow-agents/src/services/autonomous-worker.ts:368` | `tick()` — 60s loop, idempotent via `dayKey:wake\|reflect` tag |
 | `agentflow-agents/src/services/autonomous-worker.ts:390` | `startAutonomousWorker()` — wired from `src/server.ts` |
+| `agentflow-agents/src/services/autonomous-auto-pause.ts:38` | `shouldAutoPause(scores)` — pure decision: ≥3 non-null scores all ≤3 → pause |
+| `agentflow-agents/src/services/autonomous-auto-pause.ts:130` | `maybeAutoPauseGoal(goalId, sql)` — idempotent `UPDATE … WHERE status='active' RETURNING` + owner TG notify |
+| `agentflow-agents/src/services/autonomous-auto-pause.ts:91` | `notifyOwnerAutoPause(title)` — POST to owner-notify bot (`8706270502:…`), `text` field, chat `1361064246` |
+| `agentflow-agents/migrations/2026-05-24b-autonomous-goals-auto-pause.sql` | ALTER autonomous_goals ADD paused_at, pause_reason + partial index |
 | `agentflow-agents/src/db/schema.ts:3842` | `autonomous_goals` table |
 | `agentflow-agents/src/db/schema.ts:3870` | `autonomous_milestones` table |
 | `agentflow-agents/src/db/schema.ts:3896` | `autonomous_daily_plans` table |
@@ -85,6 +89,14 @@ See [Cabinet Device Autonomous Tab](/subsystems/cabinet-device-autonomous-tab).
        UTC 23:00 ─────────────────┼──── runReflectionPass() ────►│ for each unreflected today's │
                                   │                              │ plan: useModel(TEXT_LARGE)   │
                                   │                              │ UPDATE reflection, score     │
+                                  │                              │ ─► maybeAutoPauseGoal:       │
+                                  │                              │     last 3 scores all ≤ 3?   │
+                                  │                              │     UPDATE goals SET         │
+                                  │                              │       status='paused'        │
+                                  │                              │       pause_reason='low_…'   │
+                                  │                              │     POST api.telegram.org    │
+                                  │                              │       /bot…/sendMessage      │
+                                  │                              │       {chat_id, text}        │
                                   │                              │                              │
        cabinet (CabinetDeviceDetail#tab=autonomous)              │                              │
                                   ◄────── GET /me/autonomous/goals ──────────────────────────────│
@@ -129,6 +141,9 @@ See [Cabinet Device Autonomous Tab](/subsystems/cabinet-device-autonomous-tab).
 | Budget alert never fires though spend > cap | none — `alert_if_over` returns `{triggered:true, dispatched:false, error:"no device_id/api_key wired"}` | `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/budget.py:139` — daemon was started without `auth.json`; rerun installer |
 | Goals show 0 milestones in cabinet though decompose succeeded | none | check `autonomous_milestones.user_id` matches caller — `persistMilestones` writes per-user, cross-user reads are blocked by the `WHERE user_id =` clause |
 | Goal card renders `NaN / NaN ступенек` or bare `target_value` without unit | none — pure UI; reproduces on any fresh goal where `milestone_count`/`completed_count` are null and `target_metric` is empty | `agentflow-landing/src/components/devices/DeviceAutonomousPanel.tsx` uses `deriveMilestoneProgress` + `formatTargetValue` from `agentflow-landing/src/lib/autonomousGoalFormat.ts` — null counts collapse to 0 with «Декомпозиция готовится…»; USD/RUB/EUR/% get unit suffixes; empty metric hides the «метрика:» row |
+| Goal auto-paused after 3 low-score days | `autonomous_goal_auto_paused` | expected — `agentflow-agents/src/services/autonomous-worker.ts` reflection-pass tail. Owner gets a TG ping. Resume from cabinet or `POST /me/autonomous/goals/:id/resume`. |
+| Auto-pause flipped status but owner never got the TG | `auto_pause_notify_failed` | `agentflow-agents/src/services/autonomous-auto-pause.ts:91` — TG outage or wrong bot token. Goal is already paused; manually verify and resend via the bot CLI. |
+| Auto-pause SELECT/UPDATE blew up | `auto_pause_check_failed` | `agentflow-agents/src/services/autonomous-worker.ts` — sweep is wrapped per-goal; reflection pass survives. Inspect `err`. |
 
 ## Related
 - [Desktop / Computer-Agent bridge](/subsystems/computer-mcp) — same daemon, transport layer

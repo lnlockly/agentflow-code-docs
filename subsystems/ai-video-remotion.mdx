@@ -1,0 +1,127 @@
+---
+title: "AI-Видео (brief → Remotion reel)"
+description: "POST /me/functions/video turns a brief into a real vertical MP4 via the Remotion runner."
+---
+
+# AI-Видео (brief → Remotion reel)
+
+## TL;DR
+
+`POST /me/functions/video { brief }` generates a short script via the flow LLM
+router, then renders one reusable Remotion composition (`brief-reel`, vertical
+1080x1920) on the standalone `agentflow-remotion-runner` pod. The render takes
+~2-3 min — past the ingress request cap (~60-100s) — so the endpoint is
+**async**: it returns a `job_id` fast, renders in the background, and the
+cabinet polls `GET /me/functions/video/:job_id` for the MP4. Job state lives in
+the shared `video_jobs` Postgres table so any of the multiple HPA replicas can
+answer the poll (REDIS_URL is not set on the agents Deployment). Reuses the
+renderer, MinIO upload, and designapi image path already documented in
+[Remotion renderer](/subsystems/remotion-renderer).
+
+## Files (with line refs)
+
+| Repo / path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-functions.ts:226` | `POST /me/functions/video` — validates + generates the script inline, then starts the render in the background and returns `{ job_id, status:'rendering' }`. |
+| `agentflow-agents/src/routes/me-functions.ts:275` | `runVideoRenderBackground` — slow path (optional images + `renderRemotion`) off the request lifecycle; settles the job to done/failed, never throws. |
+| `agentflow-agents/src/routes/me-functions.ts:332` | `GET /me/functions/video/:job_id` — owner-scoped poll → `rendering` / `done` / `failed`. |
+| `agentflow-agents/src/services/video-jobs.ts:58` | `VideoJobStore` interface + Postgres impl (`createJob`/`markDone`/`markFailed`/`getJob`). Shared store so any HPA replica answers the poll. |
+| `agentflow-agents/src/db/schema.ts:4448` | `videoJobs` drizzle table (`video_jobs`). |
+| `agentflow-agents/src/db/migrations/0082_video_jobs.sql` | Manual migration for `video_jobs` — CI does not run migrations. |
+| `agentflow-agents/tests/video-jobs.test.ts` | 6 tests — lifecycle (rendering→done/failed) + owner-scoping (foreign job → null → 404). |
+| `agentflow-landing/src/lib/agentsApi.ts:startFunctionVideo` | Cabinet client — POST → `job_id`, then `getFunctionVideo` polls every 5s. |
+| `agentflow-landing/src/pages/CabinetFunctions.tsx:VideoCard` | «Сделать видео» card — POST + poll, plays the mp4 / shows the failure reason. |
+| `agentflow-agents/src/services/video-script.ts:167` | `generateVideoScript` — brief → props via `invokeAI(ModelType.TEXT_LARGE)`. |
+| `agentflow-agents/src/services/video-script.ts:132` | `normalizeScript` — clamps scene count (1-6) + text lengths, hex validation. |
+| `agentflow-agents/src/services/video-script.ts:183` | `attachSceneBackgrounds` — optional designapi bg per scene (soft-fail). |
+| `agentflow-agents/src/services/remotion-runner-client.ts:61` | `renderRemotion` — server-side POST to the runner, normalises the envelope. |
+| `agentflow-agents/remotion-runner/src/compositions/brief-reel.tsx:413` | `BriefReel` composition — hero / scene / outro cards, vertical reel. |
+| `agentflow-agents/remotion-runner/src/compositions/brief-reel.tsx:483` | `briefReelDurationFrames` — frame count from card count. |
+| `agentflow-agents/remotion-runner/src/Root.tsx:87` | Registers `brief-reel` (1080x1920) + `calculateMetadata` from scene count. |
+| `agentflow-agents/src/server.ts:908` | Mounts `meFunctionsApp` at `/`. |
+| `agentflow-agents/tests/unit/video-script.test.ts` | 8 tests — normalisation, fenced-json parse, prop stripping. |
+| `agentflow-agents/tests/unit/remotion-runner-client.test.ts` | 5 tests — not_configured / happy / render-error / bad-response / unreachable. |
+
+## Data flow
+
+```
+POST /me/functions/video { brief }            (requireSession → session.sub)
+   │
+   ├─ brief? ──► generateVideoScript ──► invokeAI(ModelType.TEXT_LARGE)   [flow router, inline/fast]
+   │                └─ extractJson → normalizeScript (clamp scenes/text/hex)
+   │   script? ──► normalizeScript (skip LLM)
+   │
+   ├─ createJob() ──► INSERT video_jobs (status='rendering')              [shared store]
+   │
+   ├─ void runVideoRenderBackground(jobId, …)   ← NOT awaited (returns under ingress cap)
+   │      └─ with_images? ──► attachSceneBackgrounds (designapi, soft-fail)
+   │      └─ renderRemotion({ composition_id:'brief-reel', props })  (~2-3 min)
+   │            └─► POST http://agentflow-remotion-runner:4200/render → MinIO
+   │            ◄── { ok, mp4_url, duration_sec, size_bytes }
+   │      └─ markDone() / markFailed()  → UPDATE video_jobs
+   │
+   ◄── { ok, job_id, status:'rendering' }                                 (immediate)
+
+GET /me/functions/video/:job_id               (requireSession → owner-scoped)
+   └─ getJob(id, ownerUserId)  → null ⇒ 404 (missing OR not yours)
+   ◄── { status:'rendering' }
+     | { status:'done', mp4_url, duration_sec, width:1080, height:1920, script }
+     | { status:'failed', reason, detail }
+```
+
+## DB / Env / API
+
+- **Tables:** `video_jobs` (id TEXT pk, owner_user_id, status
+  rendering|done|failed, mp4_url, duration_sec, size_bytes, width, height,
+  composition_id, script jsonb, reason, detail, created_at, updated_at). Render
+  artifacts themselves live in MinIO under `remotion/brief-reel/<uuid>.mp4`. The
+  table exists because the agents pod runs MULTIPLE HPA replicas and the poll
+  can land on a different replica than the POST — an in-process Map would miss.
+  REDIS_URL is not set on the Deployment, so Postgres is the shared store.
+- **Env (agents pod):** `REMOTION_RUNNER_URL` (default
+  `http://agentflow-remotion-runner:4200`). Empty → `renderRemotion` returns
+  `remotion_runner_not_configured` (no HTTP attempted). LLM + image providers
+  resolve through the flow router (no model name hardcoded).
+- **Routes:**
+  - `POST /me/functions/video` — body `{ brief?, script?, with_images?, fps? }`,
+    requires `brief` OR `script`. Returns `{ ok:true, job_id, status:'rendering' }`
+    immediately (async). Validation / script-gen failures still return 400 / 502
+    inline before the job is created.
+  - `GET /me/functions/video/:job_id` — owner-scoped poll. `{ status:'rendering' }`
+    while rendering; `{ status:'done', mp4_url, duration_sec, width:1080,
+    height:1920, composition_id, script }` on success; `{ ok:false,
+    status:'failed', reason, detail }` on failure; `404 { error:'job_not_found' }`
+    for a missing OR foreign job_id.
+- **Composition props (`brief-reel`):**
+  `{ title, subtitle?, scenes:[{heading, body?, bgImage?}], cta?, brand?,
+  accentColor?, bgColor? }`. `bgImage` must be an absolute http(s) URL the
+  render pod can fetch; a dead URL falls back to the branded gradient.
+
+## Failure modes
+
+| Symptom | Log / response signature for grep | Where to fix |
+|---|---|---|
+| Cabinet «Видео» 502s at ~60-100s (pre-async, root cause) | ingress/proxy 502 while the render itself succeeds | Fixed: endpoint is async (job_id + poll). Do NOT re-introduce an awaited `renderRemotion` in the POST handler — it exceeds the ingress request cap. |
+| Missing brief and script | `400 { error:"validation_error" }` (before any job) | Caller — send `brief` or `script`. |
+| LLM returned no JSON | `502 { error:"script_generation_failed" }` (before any job); `video_script_no_json` thrown | Model regression — inspect `generateVideoScript` reply; retry. |
+| Empty LLM reply | `video_script_empty_llm_reply` | Flow router returned no text block — check provider health. |
+| Background render failed (any cause) | log `[video] background render failed`; poll → `{ status:'failed', reason, detail }` | grep the log line for `error`; `reason` carries the runner code (see below). |
+| Runner pod down / Service unreachable | poll → `failed reason:"remotion_runner_unreachable"` | `kubectl -n franchise-factory get pods -l app=agentflow-remotion-runner`. |
+| Render >5 min | poll → `failed reason:"remotion_runner_timeout"` | Shorten scenes; AbortSignal.timeout fires at 5 min in `renderRemotion`. |
+| Bad props / Chromium crash | poll → `failed reason:"render_failed"` | Inspect `detail`; usually a malformed prop or OOM. |
+| Runner URL unset | poll → `failed reason:"remotion_runner_not_configured"` (no HTTP) | Set `REMOTION_RUNNER_URL` on `deploy/agentflow-agents`. |
+| Background task threw (unhandled) | log `[video] background render failed`; poll → `failed reason:"render_crashed"` | The catch-all in `runVideoRenderBackground` records it so the job never sticks in `rendering`. Inspect the stack in pod logs. |
+| Poll returns 404 for a real job | `404 { error:"job_not_found" }` | Job belongs to another owner OR was pruned (>1h). `getJob` is owner-scoped on purpose. |
+| Image provider down (with_images) | warn `scene background generation failed` — render continues on gradient | Expected soft-fail; no action. |
+
+## Verification (real render)
+
+Rendered a coffee-shop brief on the live prod runner (2026-06-01). ffprobe:
+`h264 1080x1920 30fps duration=14.27 nb_frames=428 size=1411296
+format_name=mov,mp4,m4a`. Valid playable MP4, Cyrillic text rendered
+(fonts-noto in the runner image).
+
+## Related
+
+- [Remotion renderer](/subsystems/remotion-renderer) — the runner pod, MinIO
+  upload, and the `@agentflow-video` MCP tool this function shares.

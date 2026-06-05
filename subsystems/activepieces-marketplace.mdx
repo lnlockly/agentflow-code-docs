@@ -1,0 +1,243 @@
+---
+title: "Activepieces marketplace (Track B)"
+description: "Self-hosted Activepieces as the no-code automation marketplace, bridged to AgentFlow MCP + SSO."
+---
+
+# Activepieces marketplace
+
+## TL;DR
+Activepieces (MIT, self-hosted, 4 pods in `franchise-factory`) replaces the
+hand-written marketplace. Users build no-code flows from a 280+ piece catalog.
+A standalone `kwork-rest-bridge` pod exposes AgentFlow's MCP servers (Kwork +
+Telegram MTProto) to AP flows over plain HTTP. `POST /me/flows/sso` provisions
+an AP user per AgentFlow owner and returns a JWT.
+
+**SEAM 2 (2026-05-29):** the marketplace UI is a REBRANDED separate app at
+`flows.agentflow.website` reached via SSO **redirect**, NOT an iframe (AP embed
+mode is paid EE; iframe CSS-hacks break on upgrade + are bad on mobile). The
+cabinet `/flows` launcher calls `/me/flows/sso`, then redirects the browser to
+`flows.agentflow.website/sso-handoff#token=<jwt>&projectId=<id>`. A tiny nginx
+page (`flows-sso-handoff`) persists the token to `localStorage` (`token` +
+`projectId`) and redirects to `/`; the AP SPA's `AllowOnlyLoggedInUserOnlyGuard`
+sees a valid token and lands the user authenticated. Integration level =
+Level 1 (SSO + redirect).
+
+**SEAM 2b (2026-05-29):** the live `activepieces` Deployment (ns
+`franchise-factory`) now runs the **fork** image
+`ghcr.io/lnlockly/agentflow-flows:<sha>` (built by the `AgentFlow Flows CI`
+workflow on the self-hosted ff-france runner), NOT upstream
+`activepieces/activepieces:0.83.0`. The fork carries the rebrand (CE
+`defaultTheme` → websiteName `AgentFlow`, primary `#0a0a0a`, self-hosted
+`/agentflow-{favicon,full-logo}.svg`; tab title `AgentFlow · Автоматизации`;
+sidebar `← Кабинет` link → `https://agentflow.website/cabinet`) plus the
+flag-gated auth + billing patches. Deploy env (note the `AP_` prefix AP adds to
+every system prop): `AP_AGENTFLOW_AUTH_ENABLED=true` (registers managed-authn
+in CE — `/api/v1/managed-authn/external-token` returns 401 on a bad token, was
+404 on upstream), `AP_AGENTFLOW_AGENTS_URL=https://agents.agentflow.website`
+(public host — the billing client's `safeHttp` rejects private/loopback IPs),
+`AP_AGENTFLOW_INTERNAL_SECRET` from `secret/agentflow-flows-internal` (copy of
+agents `INTERNAL_API_SECRET`). Billing stays OFF
+(`AP_AGENTFLOW_BILLING_ENABLED` unset). The existing sign-up/sign-in SSO in
+`activepieces-sso.ts` is image-agnostic and unaffected. Tracked manifest:
+`agentflow-flows/deploy/agentflow-subdomain/activepieces-deployment.yaml`
+(uses `imagePullSecrets: ghcr-pull` — the fork image is private).
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-flows.ts:1` | `POST /me/flows/sso` + `GET /me/flows/whoami` |
+| `agentflow-landing/src/pages/FlowsLaunch.tsx:1` | SEAM 2 — `/flows` launcher: calls `flowsSso()`, redirects to the handoff page |
+| `agentflow-landing/src/lib/api/flows.ts` (`flowsSso`, `flowsHandoffUrl`) | typed SSO client + handoff-URL builder (token in URL fragment) |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx` (`AUTOMATIONS_NAV` `flows_app`) | cabinet nav entry «Автоматизации» → `/flows` |
+| `agentflow-flows/deploy/agentflow-subdomain/flows-subdomain.yaml` | SEAM 2 infra — `flows-sso-handoff` (ConfigMap+Deploy+Svc) + `flows-public` Ingress |
+| `agentflow-agents/k8s/agentflow-agents.yaml` (AP env block) | `FF_ACTIVEPIECES_ENABLED=1`, `AP_PUBLIC_URL`, `AP_PLATFORM_ID`, `AP_ADMIN_JWT` (secret) |
+| `agentflow-agents/src/services/activepieces-sso.ts:1` | AP user provisioning (invite→accept→sign-up) + re-sign-in |
+| `agentflow-agents/src/services/activepieces-install.ts:1` | SEAM 5 — `importFlowForOwner` (provision → create empty flow → IMPORT_FLOW) |
+| `agentflow-agents/src/routes/marketplace.ts` (`dispatchInstall`) | `POST /me/marketplace/:slug/install`: legacy clone vs AP IMPORT_FLOW |
+| `agentflow-agents/scripts/seed-ap-marketplace-templates.ts` + `scripts/fixtures/ap-kwork-lead-funnel.json` | `engine='activepieces'` seed (verified IMPORT_FLOW request) |
+| `agentflow-agents/src/db/schema.ts` (`apUserLinks`, `marketplaceTemplates.engine`, `marketplaceTemplateInstalls`) | SSO mapping + template engine + install link |
+| `agentflow-agents/migrations/2026-05-29a-ap-user-links.sql` | SSO table DDL (apply via psql — CI doesn't migrate) |
+| `agentflow-agents/migrations/2026-05-29b-marketplace-engine.sql` | `engine` column + `marketplace_template_installs` (apply via psql) |
+| `agentflow-agents/src/services/env.ts` (`ffActivepiecesEnabled`, `apBaseUrl`, `apPublicUrl`, `apPlatformId`, `apAdminJwt`) | AP config |
+| `activepieces-spike/kwork-rest-bridge/server.mjs` | REST→MCP bridge (kwork + `/tg/*`); `Bearer af_live_*` auth |
+| `activepieces-spike/kwork-rest-bridge/k8s.yaml` | bridge Deployment + Service |
+| `plans/autonomous/_activepieces-phase1.md` | Phase 1 live verification log |
+
+## Data flow
+
+```
+cabinet/flows
+   │  POST /me/flows/sso   (requireSession; af_live_* | bearer | cookie)
+   ▼
+agentflow-agents → activepieces-sso.provisionApUser(ownerUserId)
+   │  first call:  AP invite → accept → sign-up   (AP REST, invite-only)
+   │  later calls: AP sign-in (sealed password)
+   │  → ap_user_links { owner_user_id → ap_user_id, ap_project_id, sealed pw }
+   ▼
+{ jwt, apProjectId, publicUrl }
+   ▼  (SEAM 2 — redirect, NOT iframe)
+cabinet /flows (FlowsLaunch) → window.location.assign(
+     flows.agentflow.website/sso-handoff#token=<jwt>&projectId=<apProjectId> )
+   ▼
+flows-sso-handoff (nginx): localStorage.token = jwt; localStorage.projectId = id
+   → location.replace('/')  → AP SPA logged-in guard → flows dashboard (authed)
+
+flow run (AP worker pod)
+   │  HTTP piece → kwork-rest-bridge
+   │    auth: x-bridge-secret + (Bearer af_live_* | body.ownerUserId)
+   ▼
+   ├─ /kwork/*  → MCP /internal/mcp/kwork-inbox  (x-mcp-auth: INTERNAL_API_SECRET)
+   └─ /tg/*     → MCP agentflow-tg-mcp:4500/mcp  (x-mcp-auth: MCP_AUTH_SECRET)
+                    → Telethon MTProto → real Telegram
+```
+
+`Bearer af_live_*` → ownerUserId resolution: the bridge calls
+`GET /me/flows/whoami` with the key in `x-api-key` (cached). No HMAC secret is
+duplicated into the bridge.
+
+### Install (SEAM 5 — catalog → IMPORT_FLOW)
+
+```
+/marketplace  «Install»  →  POST /me/marketplace/:slug/install (requireSession)
+   │  load marketplace_templates row by slug
+   ▼
+ engine='legacy'        → clone studio graph into /me/flows (copy-to-studio)
+                          → { ok, engine:'legacy', flow:{slug}, studio_url }
+ engine='activepieces'  → activepieces-install.importFlowForOwner(ownerUserId, tmpl)
+                            │  provisionApUser(ownerUserId)  → { jwt, apProjectId }
+                            │  POST /api/v1/flows {projectId,displayName} → empty flow id
+                            │  POST /api/v1/flows/:id {type:'IMPORT_FLOW', request:tmpl.workflow.ap_flow}
+                            ▼  store marketplace_template_installs(owner,slug → apFlowId)
+                          → { ok, engine:'activepieces', apFlowId, editUrl, already }
+```
+
+Idempotent on `(owner_user_id, template_slug)` — a second install reuses the
+stored `ap_flow_id`. `engine='activepieces'` template `workflow` jsonb shape:
+`{ ap_flow:{ displayName, trigger }, edit_path?:'/flows/{flowId}' }`. The
+`ap_flow` is AP's own template export (`GET /api/v1/flows/:id/template` →
+`flows[0]`), replayed verbatim.
+
+## DB / Env / API
+- Tables: `ap_user_links` (owner_user_id PK, ap_user_id, ap_project_id, ap_email, ap_password_sealed); `marketplace_templates.engine` TEXT default `'legacy'` CHECK in (`legacy`,`activepieces`); `marketplace_template_installs` (owner_user_id, template_slug, ap_flow_id, ap_project_id, UNIQUE(owner,slug)).
+- Env (agentflow-agents): `FF_ACTIVEPIECES_ENABLED`, `AP_BASE_URL`, `AP_PUBLIC_URL` (now `https://flows.agentflow.website`), `AP_PLATFORM_ID` (`KlKlwWZ3P35JbzAdzdwws`), `AP_ADMIN_JWT` (from secret `activepieces-admin-jwt`, operator-provisioned — a spike-bot USER JWT obtained by password sign-in; a hand-minted token is REJECTED 401 on privileged ops), `AGENTS_MASTER_KEY` (seals the AP password). Install reuses the same env — AP branch is dormant until `FF_ACTIVEPIECES_ENABLED=1` + `AP_ADMIN_JWT` are set.
+- Env (bridge pod): `INTERNAL_API_SECRET`, `AP_BRIDGE_SECRET`, `TG_MCP_URL`, `TG_MCP_AUTH_SECRET` (from `agentflow-tg-mcp-env.MCP_AUTH_SECRET`).
+- Routes: `POST /me/flows/sso`, `GET /me/flows/whoami`, `POST /me/marketplace/:slug/install`; `POST|GET /me/automations`, `DELETE /me/automations/:apFlowId` (autopost-as-flow); `POST /internal/social/post`, `POST /internal/ai/generate-post` (requireInternalSecret — the bridge proxies here).
+- Bridge routes: `POST /kwork/{scan-dialogs,scan-projects,send-message,respond-to-project}`, `POST /tg/{send-message,list-dialogs,get-user}`, `POST /ai/generate-post`, `POST /social/post`, `GET /health`.
+- AP cluster: pods `activepieces`, `activepieces-worker` (2Gi), `activepieces-postgres-0`, `activepieces-redis`, `kwork-rest-bridge`, `flows-sso-handoff` (×2, nginx-unprivileged). Public UI/API `https://flows.agentflow.website` (Ingress `flows-public`, LE cert `flows-agentflow-tls`, `AP_FRONTEND_URL` set to match); legacy `https://flows.proj.agentflow.website` (wildcard cert) still resolves for debugging. v0.83.0. Internal `http://activepieces.franchise-factory.svc:80`. Image is upstream CE (`ghcr.io/activepieces/activepieces:0.83.0`) — the fork image is not built/rolled yet.
+
+### SEAM 2 — rebranded subdomain + SSO redirect (no iframe)
+
+```
+flows.agentflow.website (Ingress flows-public)
+  /sso-handoff  → flows-sso-handoff (nginx, writes localStorage, redirects /)
+  /             → activepieces Service (the SPA + API)
+```
+
+- DNS: `flows.agentflow.website  A  144.217.65.94` (Cloudflare, DNS-only/grey).
+- The handoff page + nginx.conf live in the `flows-sso-handoff` ConfigMap
+  (`agentflow-flows/deploy/agentflow-subdomain/flows-subdomain.yaml`). nginx runs
+  read-only-rootfs (`pid /tmp/nginx.pid`, temp paths under `/tmp`, listens 8080).
+- Token rides in the URL **fragment**, never the query — not sent to the server
+  or access log. AP SPA boot reads `localStorage['token']`/`['projectId']`
+  (`packages/web/src/lib/authentication-session.ts` `getToken`/`getProjectId`).
+- Rebrand: this cluster's nginx admission webhook DISABLES `configuration-snippet`,
+  so a reverse-proxy `sub_filter` of the "Activepieces" string is unavailable.
+  Rebrand is carried by the AgentFlow-branded handoff page + the fork frontend
+  theming once the fork image ships. Until then the AP SPA shows upstream
+  branding after the handoff.
+
+## Building flows programmatically
+Hand-built `UPDATE_TRIGGER`/`ADD_ACTION` envelopes fail AP's strict validator
+(`body/ Invalid input`). Use **`IMPORT_FLOW`** (`POST /api/v1/flows/{id}`
+`{type:'IMPORT_FLOW', request:{displayName, trigger:{…nextAction chain…}}}`) —
+the server decomposes it into validated ops. Then `LOCK_AND_PUBLISH` +
+`CHANGE_STATUS{status:'ENABLED'}`. Trigger `type` is the enum **value**
+`PIECE_TRIGGER`; action `type` is `PIECE`.
+
+**Verified live 2026-05-29 (AP v0.83.0).** Two more constraints that cause the
+`body/ Invalid input` 400 even with `IMPORT_FLOW`:
+- `trigger.settings.pieceVersion` MUST be an **exact** version (`"0.1.17"`), not
+  a `~`/`^` semver range. A range fails the validator.
+- `trigger.settings` MUST carry `inputUiInfo:{}` + `propertySettings:{}` next to
+  `pieceName/pieceVersion/triggerName/input`.
+
+The reliable source of a valid `request` is AP's own export
+`GET /api/v1/flows/:id/template` → `flows[0]` (displayName + full trigger chain).
+SEAM 5 stores that export verbatim as the template's `workflow.ap_flow` and
+replays it on install.
+
+## Autopost as an AP flow (`/me/automations`)
+
+The flow-path successor to the bespoke autopost runner (#1059). Instead of a
+seeded static template, a **server-side builder** assembles the IMPORT_FLOW
+envelope per-request from wizard parameters and feeds it to `importFlowForOwner`.
+
+```
+POST /me/automations { kind:'autoposting', brief, cron, targets?, channelOverride?, timezone? }
+  (requireSession)
+  → buildAutopostApFlow(...)               # services/automations/autopost-template.ts
+       Schedule trigger (@activepieces/piece-schedule 0.1.17, cron_expression)
+         └─ HTTP POST {AP_BRIDGE_URL}/ai/generate-post  { ownerUserId, brief }   → { text }
+              └─ HTTP POST {AP_BRIDGE_URL}/social/post  { ownerUserId,
+                    text:"{{generate.body.text}}", targets, channelOverride? }   → { status, results }
+       (both HTTP nodes carry header x-bridge-secret: AP_BRIDGE_SECRET, @activepieces/piece-http 0.11.9)
+  → importFlowForOwner(uid, { slug:'automation:autoposting', title:'Автопостинг', workflow })
+  → track in marketplace_template_installs (template_slug = 'automation:autoposting:<apFlowId>',
+       so one owner can hold many — the table is UNIQUE(owner,slug))
+  → 201-equiv { ok, apFlowId, editUrl }
+GET    /me/automations            → rows with slug LIKE 'automation:autoposting:%'
+DELETE /me/automations/:apFlowId  → remove the tracking row (owner-scoped) + best-effort AP DELETE
+```
+
+The bridge `/ai/generate-post` + `/social/post` routes **proxy** to
+agentflow-agents `/internal/ai/generate-post` + `/internal/social/post`
+(requireInternalSecret, header `x-agentflow-secret: INTERNAL_API_SECRET`). Those
+call the SAME `generatePost(brief, ownerUserId)` (`services/autopost/generate.ts`)
+and `dispatchPost({ownerUserId, text, targets, channelOverride})`
+(`services/cross-poster/dispatcher.ts`) the runner uses — **zero new send/generate
+logic**. `channelOverride:"me"` posts to the owner's TG Saved Messages; a blank
+override falls back to `account_labels.default_channel`; VK fans out to the wall.
+
+**Verified live 2026-05-31** (user 1, `channelOverride:"me"`): `generatePost` →
+real brief-derived RU post + `dispatchPost` → `posted:1, details:["me"]` (TG
+message landed in Saved Messages), run via the still-deployed runner's run-now,
+which calls the identical two functions. The new HTTP wiring (internal routes +
+bridge proxy routes) is unit-tested + `tsc -b` green; it lands live once the
+agents + `kwork-rest-bridge` images are rolled (see Deploy below).
+
+### Deploy — kwork-rest-bridge (new `/ai/*` + `/social/*` routes)
+The bridge is a standalone pod, source `activepieces-spike/kwork-rest-bridge/`.
+It runs the upstream image + `server.mjs`; rolling the new routes:
+```
+# build + push the bridge image, then:
+kubectl -n franchise-factory rollout restart deploy/kwork-rest-bridge
+```
+agents side rolls via normal CI (PR merge → ghcr → deploy). The bridge already
+has `INTERNAL_API_SECRET`, `AP_BRIDGE_SECRET`, `TG_MCP_AUTH_SECRET` mounted
+(verified 2026-05-31); no new env.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Flow run `INTERNAL_ERROR`, no steps | `Error: Authentication type is required` | HTTP piece `authType` must be `'NONE'` (uppercase); webhook trigger `authType` `'none'` |
+| Webhook 200 but no run created | (worker `EXECUTE_WEBHOOK` then nothing) | webhook trigger `input` missing `{authType:'none'}` |
+| Run stuck `RUNNING` then worker restart | `OOMKilled` on `activepieces-worker` | worker memory limit raised to 2Gi |
+| Approval step `FAILED` | `Bad Request: unsupported parse_mode` | `request_approval_message` `parse_mode` must be `'None'` (plain text) |
+| Bridge `Bearer` path 502 | `api_key_resolve_failed_404` | `/me/flows/whoami` not deployed yet (deploy agents) |
+| SSO 503 | `activepieces_disabled` / `ap_admin_jwt_not_configured` | set `FF_ACTIVEPIECES_ENABLED=1` + `AP_ADMIN_JWT` |
+| `/flows` shows "Автоматизации скоро откроются" | (FlowsLaunch catches AgentsApiError 503) | flag/admin-jwt not set — same fix as SSO 503 |
+| Handoff page shows "Не передан токен входа" | (handoff `fail()` — no `token` in fragment) | cabinet reached `/sso-handoff` directly; open Flows from the cabinet |
+| `flows-sso-handoff` CrashLoopBackOff | `open() "/run/nginx.pid" failed (30: Read-only file system)` | nginx.conf must set `pid /tmp/nginx.pid` + temp paths under `/tmp` (rootfs is read-only) |
+| AP redirects to `/sign-in` after handoff | (token expired / wrong key) | re-call `/me/flows/sso` for a fresh JWT; handoff writes keys `token`+`projectId` |
+| Install IMPORT_FLOW 400 | `ap_import_flow_failed_400_` + `body/ Invalid input` | template `workflow.ap_flow` has a `~`/`^` pieceVersion or missing `propertySettings`/`inputUiInfo` — re-export via `/template` |
+| Install 500 | `template_missing_ap_flow` | `engine='activepieces'` row missing `workflow.ap_flow.{displayName,trigger}` — fix the seed |
+| Install 503 | `activepieces_disabled` (from importFlowForOwner) | AP env not set on agents — set `FF_ACTIVEPIECES_ENABLED=1` + `AP_ADMIN_JWT` |
+| `/me/automations` 503 | `bridge_not_configured` | `AP_BRIDGE_URL`/`AP_BRIDGE_SECRET` unset on agents — set both (the builder refuses to emit a flow that can't reach the bridge) |
+| `/me/automations` 400 | `automation_empty_brief` / `invalid_cron` / `no_valid_targets` | wizard sent a blank brief, an unparseable cron, or only unknown networks |
+| autopost flow run — generate node 502 | `not_found` `path:"/internal/ai/generate-post"` (in the bridge's upstream error) | agents image not rolled yet — deploy agents so the internal routes exist |
+| autopost flow run — post node, nothing lands | `dispatch_failed` or status `Ничего не отправили — проверь привязки аккаунтов.` | owner has no active TG account / no `default_channel`; check `/tg/list-dialogs` returns an `account_id` |
+
+## Related
+- [tg-mcp](/subsystems/tg-mcp)
+- [marketplace](/subsystems/marketplace) (legacy, being replaced)
+- Plans: `plans/master-plan-v2-fix-lovable.md` §4, `plans/activepieces/*`

@@ -1,0 +1,90 @@
+---
+title: "Multi-agent self-test harness"
+description: "End-to-end pytest harness that boots the desktop daemon's multi-agent runtime in a child process and asserts lifecycle guarantees."
+---
+
+# Multi-agent self-test harness
+
+## TL;DR
+Pytest harness (#89) for `agentflow-computer-mcp`. Spawns the multi-agent
+runtime in an isolated child process, drives it over the UNIX control
+socket, and asserts: socket binds, two agents spawn + list, scope files
+are isolated per slot, pause/resume mutates only the target slot, killing
+one slot leaves the daemon and other slots alive. Wired into the
+self-hosted Linux CI as a gate that runs after the unit-test job.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-computer-mcp/tests/integration/runtime_harness.py:1` | Child-process entry: boots `agents._runtime.maybe_start_runtime` under isolated `HOME` + socket path |
+| `agentflow-computer-mcp/tests/integration/conftest.py:30` | `DaemonHandle` dataclass (spawn/list/pause/resume + kill helpers) |
+| `agentflow-computer-mcp/tests/integration/conftest.py:67` | `_wait_for_socket` exponential backoff up to 10s, plus a real `connect()` probe |
+| `agentflow-computer-mcp/tests/integration/conftest.py:87` | `daemon` fixture: subprocess + isolated env + teardown |
+| `agentflow-computer-mcp/tests/integration/test_multi_agent_lifecycle.py:29` | `test_daemon_starts_and_socket_appears` |
+| `agentflow-computer-mcp/tests/integration/test_multi_agent_lifecycle.py:35` | `test_spawn_two_agents_lists_both` |
+| `agentflow-computer-mcp/tests/integration/test_multi_agent_lifecycle.py:45` | `test_dispatch_routes_by_agent_id` |
+| `agentflow-computer-mcp/tests/integration/test_multi_agent_lifecycle.py:57` | `test_pause_then_resume_round_trip` |
+| `agentflow-computer-mcp/tests/integration/test_multi_agent_lifecycle.py:73` | `test_kill_one_other_survives` |
+| `agentflow-computer-mcp/tests/integration/test_multi_agent_lifecycle.py:99` | `test_scope_isolation_via_create` |
+| `agentflow-computer-mcp/tests/integration/test_multi_agent_lifecycle.py:130` | `test_socket_env_override_honored` |
+| `agentflow-computer-mcp/tests/integration/test_multi_agent_lifecycle.py:144` | `test_clean_teardown_releases_socket` |
+| `agentflow-computer-mcp/.github/workflows/ci.yml:multi-agent-selftest` | CI job, `needs: test-linux`, `runs-on: self-hosted` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/agents/_runtime.py:67` | `maybe_start_runtime` — the production glue the harness exercises |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/agents/socket.py:32` | `DEFAULT_SOCKET_PATH = "/tmp/agentflow.sock"` (env override at `_runtime.py:92`) |
+
+## Data flow
+
+```
+pytest worker                                child subprocess
+  │                                            │
+  │  spawn (env: HOME=tmp,                     │
+  │         AGENTFLOW_MULTI_AGENT=1,           │  python -m tests.integration.runtime_harness
+  │         AGENTFLOW_AGENT_SOCKET=/tmp/af-x)  │
+  │ ──────────────────────────────────────────►│
+  │                                            │  agents/_runtime.maybe_start_runtime():
+  │                                            │   ├─ discover_slots() — ~/.agentflow/agents/*
+  │                                            │   ├─ AgentRouter(slots, _placeholder_handler)
+  │                                            │   └─ AgentSocket(router, path=$ENV).serve()
+  │                                            │
+  │ _wait_for_socket: poll + connect probe ───►│ bind /tmp/af-x.sock
+  │ ◄──────────────────────────────────────────┤
+  │                                            │
+  │ socket_client.call("create", ...) ────────►│ AgentSocket._dispatch → bootstrap.create_slot_dir
+  │ ◄──── {"ok": true, "result": {...}} ───────┤
+  │                                            │
+  │ fixture teardown: SIGTERM ────────────────►│ handle.stop(): socket.stop() + router.stop()
+```
+
+## DB / Env / API
+- **Env input (child):**
+  - `HOME` — temp dir; `AGENTFLOW_DIR = ~/.agentflow` follows from it
+  - `AGENTFLOW_MULTI_AGENT=1` — required for `discover_slots` to register non-default dirs
+  - `AGENTFLOW_AGENT_SOCKET` — full socket path (overrides `/tmp/agentflow.sock`)
+  - `AGENTFLOW_HARNESS_READY` — optional ready-file path
+- **Socket methods exercised:** `list`, `create`, `pause`, `resume`
+- **Filesystem writes (under temp HOME):** `~/.agentflow/agents/<slot>/{persona.txt, scope.toml, logs/}`
+- **No network.** No WS, no AF API, no LLM router.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `daemon socket did not bind at /tmp/af-…` | `daemon socket did not bind` | child stderr captured by conftest; usually missing `AGENTFLOW_MULTI_AGENT=1` or `discover_slots` returning `[]` |
+| `maybe_start_runtime returned None` | `maybe_start_runtime returned None` | `agents/bootstrap.py:75` — env flag flipped off or agents dir empty |
+| Test sees stale slot from prior run | (any `id` other than the ones the test created) | fixture `HOME=tmp_path/home` isolation broken; check `subprocess.Popen(env=...)` |
+| `AF_UNIX path too long (>104 chars on Mac)` | `OSError: [Errno 63] File name too long` | move socket back under `/tmp/` (current harness already does) |
+| One test contaminates the next | two tests share a socket file | fixture must unlink + use per-test uuid; current code at `conftest.py:134` does this |
+
+## How to extend
+1. New socket method on `AgentSocket._dispatch` → add a helper to
+   `DaemonHandle` (`conftest.py:30`), add a test in
+   `test_multi_agent_lifecycle.py`.
+2. New env override on the runtime → assert it the same way
+   `test_socket_env_override_honored` does.
+3. New crash semantics (hard-kill a slot consumer when v2 lands)
+   → upgrade `test_kill_one_other_survives` from the v1 pause-proxy
+   to a real consumer cancellation assertion.
+
+## Related
+- [Computer-MCP daemon](/subsystems/computer-mcp)
+- [Desktop CLI](/subsystems/agentflow-cli)
+- [Agents runtime](/subsystems/agents)

@@ -1,0 +1,96 @@
+---
+title: "Matrix Bridge Wizard (shared TG + IG)"
+description: "Single bridgev2 login-wizard + multi-account handler set shared by mautrix-telegram and mautrix-meta (Instagram)."
+---
+
+# Matrix Bridge Wizard — shared TG + IG handler set
+
+> **Status: shipped 2026-05-28** — `/me/chat-bridges/:platform/*` router live, `/me/chat/{tg,ig}/*` kept as DEPRECATED aliases for one release cycle.
+
+## TL;DR
+
+mautrix-telegram and mautrix-meta (Instagram) expose the same bridgev2
+provisioning state machine. Two near-identical route files
+(`me-chat-tg.ts` 1052 LoC, `me-chat-ig.ts` 749 LoC) used to carry parallel
+implementations of the wizard + multi-account manager. This PR collapses
+the duplication: shared handlers live in `services/matrix-bridges/wizard.ts`,
+each platform plugs in a tiny adapter, and `/me/chat-bridges/:platform/*`
+is the new public surface.
+
+Old per-platform paths (`/me/chat/tg/status`, etc.) keep working through
+alias routes registered in `me-chat-tg.ts` / `me-chat-ig.ts`. Remove the
+aliases after `agentflow-landing/src/chat/use{Telegram,Instagram}Link.ts`
+migrate.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/matrix-bridges/wizard.ts:1` | Generic handlers (`handleStatus` … `handleLabel`), pure parsers, `BridgeAdapter` interface |
+| `agentflow-agents/src/services/matrix-bridges/tg.ts:1` | TG adapter — wires `mautrix-tg-bridge.ts` + `chat_tg_links` into the wizard |
+| `agentflow-agents/src/services/matrix-bridges/ig.ts:1` | IG adapter — wires `mautrix-meta-bridge.ts` + `chat_ig_links` |
+| `agentflow-agents/src/routes/me-chat-bridges.ts:1` | New unified router. 7 routes under `/me/chat-bridges/:platform/*` |
+| `agentflow-agents/src/routes/me-chat-tg.ts:1` | DEPRECATED aliases + TG-only Matrix helpers (`/portal/{leave,delete}`, `/message/delete`) |
+| `agentflow-agents/src/routes/me-chat-ig.ts:1` | DEPRECATED aliases + IG-only bookmarklet handlers |
+
+## Data flow
+
+```
+landing /chat hooks               agentflow-agents
+                              ┌──────────────────────────┐
+useTelegramLink.ts ─── POST ──┤ /me/chat/tg/start          │  ──┐
+                              │ (DEPRECATED alias)         │    │
+                              └────────┬───────────────────┘    │
+                                       │ delegates              │
+useInstagramLink.ts ── POST ──┐        ▼                        ▼
+                              │  buildHandlerCtx(tgAdapter)  → handleStart(c, ctx)
+                              │  buildHandlerCtx(igAdapter)  ┘
+                              │
+new code           ── POST ──→│  /me/chat-bridges/:platform/start
+                              │  resolveAdapter(platform)    → handleStart(c, ctx)
+                              └──────────────────────────────┘
+                                                │
+                                                ▼
+                              services/matrix-bridges/wizard.ts
+                                                │
+                          ┌─────────────────────┴─────────────────────┐
+                          ▼                                           ▼
+                  adapter.loginStart                    adapter.upsertLink
+                  → mautrix-tg-bridge.ts                → chat_tg_links
+                  → mautrix-meta-bridge.ts              → chat_ig_links
+```
+
+## DB / Env / API
+
+- **Tables:** `chat_tg_links`, `chat_ig_links` (unchanged from before — adapter maps `telegramUserId` / `instagramUserId` onto the shared `remoteUserId` slot).
+- **Env:** `MAUTRIX_TG_INTERNAL_URL`, `MAUTRIX_TG_PROVISIONING_SECRET`, `MAUTRIX_META_INTERNAL_URL`, `MAUTRIX_META_PROVISIONING_SECRET`, `MATRIX_SERVER_NAME`, `MATRIX_HOMESERVER_PUBLIC`.
+- **Routes (new):** `GET/POST /me/chat-bridges/:platform/{status,start,step,logout,accounts,set-primary,label}` where `:platform ∈ {tg,ig}`.
+- **Routes (DEPRECATED, kept):** `/me/chat/tg/*`, `/me/chat/ig/*` — alias to the same handler set.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| 404 `unknown_platform` on `/me/chat-bridges/foo/status` | `unknown_platform` | Add platform to `SUPPORTED_BRIDGE_PLATFORMS` in `src/routes/me-chat-bridges.ts` + build an adapter |
+| 503 `mautrix_tg_not_configured` | `mautrix_tg_not_configured` | env vars missing for TG bridge |
+| 503 `mautrix_meta_not_configured` | `mautrix_meta_not_configured` | env vars missing for IG bridge |
+| 409 `no_active_login` on step | `no_active_login` | `chat_<platform>_links.login_process_id` is null — caller must hit `/start` first |
+| 502 `bridge_no_step_id` | `bridge_no_step_id` | mautrix-meta `/v3/login/start/cookies` returned no `step_id` (rare — check bridge logs) |
+
+## Out of scope (not migrated to the unified router)
+
+These keep their own route files because the surface diverges enough that
+forcing it through `:platform` would grow code, not shrink it:
+
+- `me-chat-discord.ts` — single-call connect/disconnect, no multi-step
+- `me-chat-vk.ts` — multi-account but uses access_token + cookies subflows, numeric `vk_user_id` per row
+- `me-chat-whatsapp.ts` — QR vs pair-code login surface, returns `{linked, phone}` directly
+- `me-chat-reddit.ts` — OAuth2 redirect flow with callback handler
+- `me-chat-whispers.ts` — Mode-C suggestions reader, not a bridge
+- `me-chat-rooms.ts`, `me-chat-contacts.ts` — cross-platform aggregators
+
+## Related
+
+- [Matrix TG Bridge](/subsystems/matrix-tg-bridge)
+- [Matrix IG Bridge](/subsystems/matrix-ig-bridge)
+- [mautrix Discord Bridge](/subsystems/mautrix-discord-bridge)

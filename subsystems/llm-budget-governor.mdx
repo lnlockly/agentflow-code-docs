@@ -70,5 +70,9 @@ invokeAI(modelType, params, ctx)
 
 - [LLM router](/subsystems/llm-router)
 - `services/llm-budget.ts` — cumulative monthly/daily cap
-- `services/llm-circuit-breaker.ts` — hourly platform + per-user
+- `services/llm-circuit-breaker.ts` — hourly platform + per-user, **and (2026-05-30) a platform-wide DAILY cap** (`LLM_DAILY_CAP_USD`, shared with `gpt-fallback.checkDailyCap` + `owner-alerts.probeFlowBalance`) enforced in `assertHourlyCircuit` for every provider path incl. `userId=null` system calls. `0` = disabled (current prod value). Greppable log: `platform_daily_circuit`
 - `services/pingers/llm-burn-alert.ts` — 5-min poll of `flow_ledger` for global burn rate
+
+:::caution[Caps DISABLED in prod (verified 2026-05-30)]
+`LLM_DAILY_CAP_USD=0`, `LLM_PLATFORM_HOURLY_CAP_USD=0`, `LLM_USER_HOURLY_CAP_USD=0`, `LLM_BURN_ALERT_DAILY_USD=0` on the agents Deployment — the $3000-burn protection is coded but switched off. Only the per-user daily governor (`LLM_BUDGET_PER_USER_USD`, default $20) is active, and it bypasses `userId=null` system calls + owner id 1. Owner-gated: set sane ceilings. See `plans/autonomous/_cost-guardrails-audit-2026-05-30.md`.
+:::

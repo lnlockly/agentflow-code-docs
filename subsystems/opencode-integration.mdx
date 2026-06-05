@@ -1,0 +1,169 @@
+---
+title: "OpenCode installer + LLM gateway integration"
+description: "Daemon tools that install the OpenCode CLI and patch its config to route through the AgentFlow LLM facade."
+---
+
+# OpenCode installer + LLM gateway integration
+
+## TL;DR
+
+Two MCP tools land on the desktop daemon: `computer.opencode.install` (downloads
+the `sst/opencode` release archive matching the host OS+arch into
+`~/.agentflow/bin/opencode`) and `computer.opencode.patch_config` (writes/merges
+`~/.config/opencode/opencode.json` so OpenCode talks to AgentFlow's public LLM
+facade at `https://agentflow.website/_agents/llm/v1`). Users get a third-party
+coding assistant they already know, but billed through their AgentFlow balance
+via the existing `public-llm-billing` pipeline.
+
+The patched config registers two providers — `agentflow` (Anthropic-format,
+backs Claude models) and `agentflow-openai` (OpenAI-compatible, backs GPT
+models) — so `opencode` can pick either family while routing through the same
+facade. Existing user providers (openrouter, anthropic upstream, MCP servers
+like Pencil) are preserved verbatim.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/opencode_installer.py:62` | `detect_platform()` — host OS+arch → `(darwin|linux|windows, arm64|x64)`. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/opencode_installer.py:87` | `opencode_install_dir()` — `~/.agentflow/bin`. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/opencode_installer.py:94` | `opencode_config_path()` — `~/.config/opencode/opencode.json` (Unix) or `%APPDATA%\opencode\opencode.json` (Windows). |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/opencode_installer.py:163` | `install_opencode(version)` — resolve release via GitHub API, download asset, extract, set exec bit. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/opencode_installer.py:225` | `patch_opencode_config(api_key, base_url?, model?)` — merge `provider` + `model` keys; preserve existing config. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/server.py:43` | `TOOL_NAMES` extended with `computer.opencode.{install,patch_config,status}`. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/server.py:191` | `build_mcp` registers the three MCP tools (FastMCP `@mcp.tool` decorators). |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/server.py:340` | `_dispatch_tool` cases — used by the WS reverse-tunnel client. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/desktop_tools.py:921` | LLM tool descriptors `opencode_install`, `opencode_patch_config`, `opencode_status`. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/desktop_tools.py:1326` | `ToolExecutor` dispatch cases (announce frame + dispatch). |
+| `agentflow-computer-mcp/tests/test_opencode_installer.py` | 29 tests — platform detection, asset picking, mocked download (zip + tar.gz), config merge, descriptor registration. |
+| `agentflow-agents/src/routes/public-llm.ts:99` | `/llm/v1/chat/completions` — OpenAI-format upstream consumed by `agentflow-openai` provider. |
+| `agentflow-agents/src/routes/public-llm.ts:157` | `/llm/v1/messages` — Anthropic-format upstream consumed by `agentflow` provider. |
+
+## Data flow
+
+```
+LLM / cabinet
+    │ "install OpenCode and wire it to AgentFlow"
+    ▼
+ToolExecutor.execute("opencode_install", {})
+    │ urllib.urlopen(api.github.com/repos/sst/opencode/releases/latest)
+    │ pick asset by (os_slug, arch_slug)
+    │ urllib.urlopen(asset.browser_download_url) → tempfile
+    │ zipfile.extractall | tarfile.extractall(filter="data") → tempdir
+    │ shutil.move(extracted/opencode → ~/.agentflow/bin/opencode)
+    │ chmod +x  (Unix)
+    ▼ {ok, version, binary_path, bytes, asset}
+
+ToolExecutor.execute("opencode_patch_config", {api_key?})
+    │ api_key := args.api_key OR AFClient._key OR auth.json
+    │ read existing ~/.config/opencode/opencode.json (or empty)
+    │ provider["agentflow"] = {npm:@ai-sdk/anthropic, baseURL:.../llm/v1, apiKey}
+    │ provider["agentflow-openai"] = {npm:@ai-sdk/openai-compatible, baseURL:.../llm/v1, apiKey}
+    │ model := "agentflow/claude-opus-4-7" (only if empty or already agentflow*)
+    │ atomic write via .json.tmp + replace
+    ▼ {ok, config_path, provider, model, base_url}
+
+opencode run "hello" --model agentflow/claude-haiku-4-5
+    │ @ai-sdk/anthropic builds POST https://agentflow.website/_agents/llm/v1/messages
+    │   headers: x-api-key: af_live_...
+    ▼
+public-llm.ts authGate → validateApiKey → exceededSpendCap check
+    │ pickUpstreamForAnthropicRequest("claude-haiku-4-5")
+    ▼
+east-api-3 proxy (anthropic-compat) → real Claude
+    │ stream tokens back through teeSseWithObserver
+    │ recordUsage({key, endpoint, model, tokensIn, tokensOut})
+    ▼
+SSE stream to opencode TUI
+```
+
+## DB / Env / API
+
+**Daemon:**
+- No new env vars.
+- New paths: `~/.agentflow/bin/opencode[.exe]` (binary), `~/.config/opencode/opencode.json` (Unix config), `%APPDATA%\opencode\opencode.json` (Windows config).
+- API key read order: explicit `api_key` arg → `AFClient._key` → `auth.json:api_key`.
+
+**Backend:** no changes. Existing `/llm/v1/chat/completions` + `/llm/v1/messages` carry all traffic — facade was shipped before this PR (see `routes/public-llm.ts`).
+
+**MCP tools:**
+- `computer.opencode.install({version?: str = "latest"})` → `{ok, version, binary_path, bytes, asset, os, arch}`
+- `computer.opencode.patch_config({api_key?: str, base_url?: str, model?: str})` → `{ok, config_path, provider, model, base_url}`
+- `computer.opencode.status({})` → `{binary_path, binary_present, config_path, config_present}`
+
+**LLM-visible tool names** (driver/desktop_tools.py): `opencode_install`, `opencode_patch_config`, `opencode_status`.
+
+## Provider config shape written by patch_opencode_config
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "agentflow/claude-opus-4-7",
+  "provider": {
+    "agentflow": {
+      "npm": "@ai-sdk/anthropic",
+      "name": "AgentFlow (Claude)",
+      "options": {
+        "baseURL": "https://agentflow.website/_agents/llm/v1",
+        "apiKey": "af_live_..."
+      },
+      "models": {
+        "claude-opus-4-7": {"name": "Claude Opus 4.7 (AgentFlow)"},
+        "claude-haiku-4-5": {"name": "Claude Haiku 4.5 (AgentFlow)"}
+      }
+    },
+    "agentflow-openai": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "AgentFlow (GPT)",
+      "options": {
+        "baseURL": "https://agentflow.website/_agents/llm/v1",
+        "apiKey": "af_live_..."
+      },
+      "models": {
+        "gpt-5.4": {"name": "GPT-5.4 (AgentFlow)"},
+        "gpt-5.5": {"name": "GPT-5.5 (AgentFlow)"},
+        "gpt-5.3-codex": {"name": "GPT-5.3 Codex (AgentFlow)"}
+      }
+    }
+  }
+}
+```
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Install fails with `unsupported_os:` or `unsupported_arch:` | `unsupported_os` / `unsupported_arch` | host runs FreeBSD / 32-bit / exotic CPU — not supported by upstream releases. |
+| Install fails with `no_matching_asset` | `no_matching_asset for darwin/arm64` | sst/opencode dropped a target in the new release — patch `ASSET_PREFERENCE` in `tools/opencode_installer.py:51` with the new filename. |
+| Install hangs > 2 min | none — synchronous `urlopen(timeout=120)` | network egress blocked or GitHub LFS slow; tool returns `download_failed` after 120s. |
+| `binary_not_found_in_archive` | `binary_not_found_in_archive: opencode-*.zip` | sst/opencode changed archive layout (e.g. nested `bin/`) — extend the `rglob("*")` walk in `_extract`. |
+| `opencode run` returns 401 from the gateway | `recordUsage` skipped, response body `{"error":{"type":"authentication_error"}}` | rotate `af_live_*` key in `~/.config/opencode/opencode.json` (run `opencode_patch_config` again with fresh key). |
+| `opencode run` returns 402 spend cap | `Spend cap reached: $X.XX of $Y.YY` | top up balance in cabinet OR raise cap in `users.budget_cents_remaining`. |
+| Claude model errors `uses the Anthropic wire format. Call POST /v1/messages instead.` | `invalid_request_error` | user has `model: "agentflow/claude-*"` but provider entry uses `@ai-sdk/openai-compatible` — re-run `patch_opencode_config` to restore the dual-provider setup. |
+| GPT-5.4 returns `insufficient_user_quota` | `预扣费额度失败` from upstream (designapi) | account balance below per-request reserve; top up or pick a cheaper model. |
+| Patch destroys an existing user provider | none — overwrite | patcher only writes `agentflow` and `agentflow-openai` keys; other providers are preserved. If you see loss, check that `_read_existing_config` returned `{}` due to corrupt JSON — the corrupt file is saved as `opencode.json.broken` next to the new one. |
+
+## Verified on this Mac (2026-05-25)
+
+```
+$ ~/.agentflow/bin/opencode --version
+1.15.10
+
+$ ~/.agentflow/bin/opencode models | grep agentflow
+agentflow/claude-haiku-4-5
+agentflow/claude-opus-4-7
+agentflow-openai/gpt-5.3-codex
+agentflow-openai/gpt-5.4
+agentflow-openai/gpt-5.5
+
+$ cd /tmp && ~/.agentflow/bin/opencode run "say only the word PONG" \
+    --model agentflow/claude-haiku-4-5
+> build · claude-haiku-4-5
+PONG
+```
+
+## Related
+
+- [LLM router](/subsystems/llm-router) — upstream provider resolution behind `/llm/v1/*`.
+- [Desktop coding tools](/subsystems/desktop-coding-tools) — sibling daemon tools (`code_read_file`, `code_run_command`, etc.).
+- [Public LLM facade](/subsystems/public-llm-facade) — billing + auth on `/llm/v1/*`.

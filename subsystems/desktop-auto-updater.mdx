@@ -8,6 +8,8 @@ description: "Frozen daemon self-update via /releases/latest redirect + SHA256SU
 ## TL;DR
 The PyInstaller-frozen `agentflow-desktop` daemon checks for a new release by following the public `releases/latest` HTTP redirect (which exposes the tag in its `Location`), then downloads a published `SHA256SUMS` asset to verify the installer digest. No authenticated GitHub API call, so the updater survives un-authenticated daemons behind shared/corporate NAT IPs. Runs only when frozen; doubles the poll interval on every failed probe (cap 24h) and resets to the configured interval after a clean probe.
 
+**v0.5.0** — release adds a second asset `agentflow-tray.exe` next to the existing installer. The updater still watches `agentflow-desktop-setup.exe` for the version probe; the tray binary updates lock-step because the setup wizard re-runs after the user reboots and refreshes both .exes from the same release. Sharp edge: a tray that's already running when the daemon hot-swaps stays on the old binary until next logon. Documented intentionally for v0.5.0; the auto-respawn path is on the v0.5.x backlog.
+
 ## Files (with line refs)
 
 | Path | Role |
