@@ -1,0 +1,75 @@
+---
+title: "Studio Automate: run + stream"
+description: "Studio fires the built flow, polls SSE for step logs. POST /me/flows/:slug/run returns run_id, GET /me/flow-runs/:id/stream replays step_logs."
+---
+
+# Studio Automate: run + stream
+
+## TL;DR
+
+After Studio builds an Automate-mode flow (`POST /me/flows/preview` → graph
+on canvas → `POST /me/flows/create-from-graph` → `flows` row), the green
+"Запустить команду" CTA calls `runFlow(slug)` which POSTs
+`/me/flows/:slug/run`, then opens an SSE stream at
+`/me/flow-runs/:id/stream` to replay step logs and surface a terminal
+`done` event. The run-route response must include `run_id` at the top
+level — Studio reads `resp.run_id` straight into `streamFlowRun(run_id,
+…)`.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/pages/Studio.tsx:547` | `handleRun` — clicks CTA, calls `runFlow`, opens `streamFlowRun`. |
+| `agentflow-landing/src/lib/agentsApi.ts:1039` | `runFlow(slug)` — POSTs to `/me/flows/:slug/run`, returns `{ run_id }`. |
+| `agentflow-landing/src/lib/sseClient.ts:327` | `streamFlowRun(runId, handlers)` — GET `/me/flow-runs/:runId/stream`. |
+| `agentflow-landing/src/components/studio/PromptBar.tsx:443` | `pb-error` badge — surfaces `HTTP <status>` when SSE call fails. |
+| `agentflow-agents/src/routes/flows.ts:247` | `POST /me/flows/:slug/run` — invokes `executeFlow`, returns `{ ok, run_id, run }`. |
+| `agentflow-agents/src/routes/flows.ts:332` | `GET /me/flow-runs/:id/stream` — SSE replay of persisted `step_logs`. |
+| `agentflow-agents/src/services/flow-executor.ts:1012` | `executeFlow` — sync executor, writes `flow_runs.step_logs`. |
+| `agentflow-agents/tests/unit/flows-run-stream-shape.test.ts` | Asserts wire shape + SSE event order. |
+
+## Data flow
+
+```
+Studio click "Запустить команду"
+  └─ POST /me/flows/<slug>/run
+       └─ executeFlow → INSERT flow_runs(status=running)
+            ├─ run each step → push to step_logs[]
+            └─ UPDATE flow_runs SET status=done|failed, ms, step_logs
+       ← { ok:true, run_id, run }
+  └─ streamFlowRun(run_id, handlers)
+       └─ GET /me/flow-runs/<run_id>/stream  (SSE)
+            ├─ event: step  (one per step_logs entry)
+            ├─ event: done  (status, total_ms)
+            └─ event: error (only on row.status='failed')
+```
+
+## DB / Env / API
+
+- Tables: `flows`, `flow_runs` (jsonb `step_logs` column).
+- Env flags: `FF_FLOWS=1` gates the whole flows router (503 if off).
+  `FF_STUDIO_AUTOMATE_MODE=1` gates only the preview/refine/create-from-graph
+  trio used during graph construction — run + stream are not gated.
+- Routes:
+  - `POST /me/flows/:slug/run` → `{ ok:true, run_id:number, run:ExecuteFlowResult }`
+  - `GET  /me/flow-runs/:id/stream` → `text/event-stream`
+- SSE event shapes match `FlowRunStep` in `agentflow-landing/src/lib/sseClient.ts:283`:
+  - `step` → `{ node_id, status: 'done'|'failed'|'skipped', output?, error? }`
+  - `done` → `{ status: 'done'|'failed', total_ms:number }`
+  - `error` → `{ code, message }`
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Studio refine bar shows red `HTTP 404` after clicking "Запустить команду". | `GET /_agents/me/flow-runs/undefined/stream` in browser network log; `error: 'invalid_id'` in agentflow-agents pino. | `agentflow-agents/src/routes/flows.ts:275` — must return `run_id: result.runId`. Regression test: `tests/unit/flows-run-stream-shape.test.ts`. |
+| SSE stream connects but emits no `step` events. | server: `flow-runs/stream enqueue failed` warn. | Check `flow_runs.step_logs` is non-empty; legacy executor may write to a different column. |
+| SSE returns 503 `feature_disabled`. | `error: 'feature_disabled'` from `/me/flow-runs/:id/stream`. | Set `FF_FLOWS=1` in deployment env. |
+| Race when client opens stream before executor finishes. | tail loop logs `flow-runs/stream enqueue failed` after `controller.close`. | Polling loop already terminates on `done`/`failed`/`AbortSignal`; if seen, check that `flow_runs.status` actually flips. |
+
+## Related
+
+- [Graph executor](/architecture/graph-executor)
+- [Graph handlers](/subsystems/graph-handlers)
+- [Feature flags](/subsystems/feature-flags)
