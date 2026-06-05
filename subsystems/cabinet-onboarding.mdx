@@ -1,0 +1,90 @@
+---
+title: "Cabinet onboarding wizard"
+description: "4-step conversion funnel shown once after signup. Demo agent → TG farm → Desktop daemon install → Done. State persisted in localStorage."
+---
+
+# Cabinet onboarding wizard
+
+## TL;DR
+
+`/onboarding` is the post-signup wizard. Before 2026-05-23 it was 3 steps
+(demo agent → TG farm → done). The new Step 3 surfaces AgentFlow Desktop —
+mints a one-time enrollment token via `POST /me/devices`, shows an
+OS-matched download CTA, and polls `GET /me/devices` for the handshake.
+First-time owners now discover the autonomous-mode entry point without
+hunting through the `/desktop` landing.
+
+State sentinel is the `af_onboarding_done=1` localStorage flag — read by
+the post-login redirect to avoid re-showing the wizard.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/pages/OnboardingWizard.tsx:1` | Wizard entry (4 steps) |
+| `agentflow-landing/src/pages/OnboardingWizard.tsx:124` | `Step1` — SEO Writer demo (first project) |
+| `agentflow-landing/src/pages/OnboardingWizard.tsx:293` | `Step2` — Telegram connect for the farm |
+| `agentflow-landing/src/pages/OnboardingWizard.tsx:430` | `StepDesktop` — desktop install + handshake (this PR) |
+| `agentflow-landing/src/pages/OnboardingWizard.tsx:1020` | `StepDone` — feature summary |
+| `agentflow-landing/src/main.tsx:690` | Route `/onboarding` → wizard (RequireAuth) |
+| `agentflow-landing/src/lib/devicesApi.ts:34` | `devicesApi.create(name)` → `{ id, enrollment_token, device }` |
+| `agentflow-landing/src/lib/devicesApi.ts:27` | `devicesApi.list()` → poll target for handshake |
+| `agentflow-landing/src/i18n/ru.json` | `wizard.step_desktop.*` keys (20 entries) |
+
+## Data flow
+
+```
+/onboarding mount
+  └─► track('onboarding_started')
+
+Step 1 (demo)            → /studio?template=seo-writer  | Skip
+Step 2 (TG farm)         → /farm                        | Skip
+Step 3 (desktop install) ─┐
+  detectPlatform(userAgent) → 'mac' | 'win' | 'linux'
+  user picks OS tab (or accepts detection)
+  user clicks "Скачать ..." CTA
+    ├─► track('onboarding_desktop_download_clicked', { platform })
+    ├─► POST /me/devices { name: "My <OS>" }
+    │     └─► returns enrollment_token (16 chars)
+    └─► poll GET /me/devices every 3s for 60s
+          └─► first NEW item with status='online' → setConnectedDevice
+              ├─► track('onboarding_desktop_connected', { device_id })
+              └─► auto-advance to Step 4 after 1.4s
+  user clicks "Пропустить — поставлю позже" → Step 4
+Step 4 (done)            → /projects  | track('onboarding_completed')
+```
+
+Baseline device-IDs snapshot taken on Step 3 mount so the handshake fires
+only for the newly enrolled device, not pre-existing rows from another
+machine.
+
+## DB / Env / API
+
+- Env: none new (download URLs hardcoded as constants, OS-keyed map).
+- Download targets (verified live 2026-05-23):
+  - Windows: `https://github.com/lnlockly/agentflow-computer-mcp/releases/latest/download/agentflow-desktop-setup.exe` (302 to release asset)
+  - macOS/Linux: `https://raw.githubusercontent.com/lnlockly/agentflow-computer-mcp/main/install.sh`
+  - One-liner for macOS/Linux: `curl -fsSL <install.sh> | bash`
+- Backend routes consumed:
+  - `POST /me/devices` (existing — issues `enrollment_token`)
+  - `GET /me/devices` (existing — list; polled on handshake)
+- LocalStorage keys: `af_onboarding_done`, `agentflow_lang_v2`.
+- Funnel events: `onboarding_started`, `onboarding_step`,
+  `onboarding_desktop_download_clicked`, `onboarding_desktop_connected`,
+  `onboarding_skipped`, `onboarding_completed`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Token request fails | `wizard.step_desktop.token_error` rendered (red text under code box) | Inspect `POST /me/devices` 4xx/5xx in `agentflow-agents/src/routes/devices.ts` |
+| Handshake never resolves | Banner stuck on "Жду подключения устройства" past 60s | Daemon never called `/devices/enroll` — check installer log on user's machine; the device row should flip `status` to `online` |
+| OS tab detected wrong | User on Win sees Mac tab pre-selected | `detectPlatform` userAgent regex in `OnboardingWizard.tsx:454` — extend pattern |
+| Skip leaves wizard re-showing | `af_onboarding_done` never set on skip path | Confirm `markOnboardingDone()` runs in `skipAll` (line 581) |
+
+## Related
+
+- [Computer MCP](/subsystems/computer-mcp.mdx) — desktop daemon protocol.
+- [Cabinet device autonomous tab](/subsystems/cabinet-device-autonomous-tab.mdx) — where the connected device lands after handshake.
+- [Funnel analytics](/subsystems/funnel-analytics.mdx) — `track()` event sinks.
+- [Onboarding quests](/subsystems/onboarding-quests.mdx) — separate `/start` gamification page.

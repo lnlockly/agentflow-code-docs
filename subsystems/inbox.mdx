@@ -1,0 +1,101 @@
+---
+title: "Unified inbox"
+description: "Cross-network DM aggregator at /inbox. Matrix /sync is the source of truth — no new DB."
+---
+
+# Unified inbox
+
+## TL;DR
+`/inbox` is a virtualised view over Matrix `/sync` for the AF user's account.
+Every conversation is a Matrix room; every message is an event. Bridges
+(mautrix-telegram, mautrix-meta, vk-bridge-loop, reddit-bridge-loop) write a
+`fi.mau.bridge` state event on each portal room — the reader uses
+`protocol.id` / `network.id` to badge rows as `TG / IG / VK / Reddit`. Rooms
+with no bridge state fall through to `AF` (in-product DM). No new DB tables.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-inbox.ts:1` | New Hono router. Threads / messages / reply / status routes. |
+| `agentflow-agents/src/server.ts:39` | Imports `meInboxApp`. |
+| `agentflow-agents/src/server.ts:635` | `app.route('/', meInboxApp)` wiring. |
+| `agentflow-agents/src/services/matrix-bridge.ts:101` | `issueMatrixTokenForAfUser` — owner Matrix token. |
+| `agentflow-agents/src/services/vk-bridge-loop.ts:163` | Writes `fi.mau.bridge` state on VK portal create. |
+| `agentflow-agents/src/services/reddit-bridge-loop.ts:208` | Writes `fi.mau.bridge` state on Reddit portal create. |
+| `agentflow-landing/src/pages/Inbox.tsx:1` | `/inbox` page (thread list + viewer + composer). |
+| `agentflow-landing/src/main.tsx:135` | `<Route path="/inbox" element={<InboxPage/>} />`. |
+| `agentflow-landing/src/components/NavBar.tsx:50` | Logged-in users see Inbox link + unread badge. |
+
+## Data flow
+
+```
+Browser /inbox
+  └── GET /me/inbox/threads?filter=tg
+       └── agents pod
+            ├── issueMatrixTokenForAfUser(af_id)   ← matrix-bridge.ts
+            └── GET /_matrix/client/v3/sync?filter=...&timeout=0   ← Dendrite
+                 ↳ joined rooms[] with state + 20-event timeline
+                    + fi.mau.bridge for badge
+                    + m.tag account_data for status
+```
+
+Reply path mirrors `me-chat-tg.ts` — `PUT /rooms/:room/send/m.room.message/:txn`
+with the owner's Matrix token. mautrix-telegram / mautrix-meta observe the
+event and forward to upstream TG / IG. VK and Reddit portals are AF-owned and
+read-only in v1 (loops don't have outbound implemented), so the composer
+shows a read-only notice for those badges.
+
+## DB / Env / API
+
+- Tables: NONE (Matrix is the source of truth).
+- Env (already present): `MATRIX_HOMESERVER_INTERNAL`, `MATRIX_HOMESERVER_PUBLIC`,
+  `MATRIX_SERVER_NAME`, `MATRIX_AUTH_KEY`, `MATRIX_REGISTRATION_SHARED_SECRET`.
+- Routes:
+  - `GET  /me/inbox/threads?filter=tg|ig|vk|reddit|af|unread|in_work|archive|all&limit=80`
+  - `GET  /me/inbox/threads/:room_id/messages?limit=60`
+  - `POST /me/inbox/threads/:room_id/reply` — body `{ body: "text" }`
+  - `POST /me/inbox/threads/:room_id/status` — body `{ status: "in_work"|"archive"|"idle" }`
+- Bridge state event:
+  - `type: "fi.mau.bridge"`, `state_key: <room_id>`,
+    `content: { protocol: { id: "telegram"|"meta"|"vk"|"reddit", ... } }`.
+
+## Badge derivation
+
+```
+fi.mau.bridge content.network.id  →  badge
+  telegram / *telegram*           →  TG
+  meta / instagram / facebook     →  IG
+  vk / vkontakte                  →  VK
+  reddit / *reddit*               →  Reddit
+  (no state event)                →  AF
+```
+
+Falls back to `protocol.id` when `network.id` is missing (older mautrix
+versions emit only `protocol`).
+
+## Status / tags
+
+| Status | Matrix tag |
+|---|---|
+| `idle` | (no AF tag) |
+| `in_work` | `agentflow.in_work` |
+| `archive` | `m.archive` (Element-compatible) |
+| `unread` | derived from `unread_notifications.notification_count > 0` |
+
+`/me/inbox/threads/:room/status` clears both AF tags then sets the target —
+two best-effort DELETEs + one PUT against
+`/_matrix/client/v3/user/:mxid/rooms/:room/tags/:tag`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Inbox empty for logged-in user | `matrix_sync_` (from `me-inbox.ts`) | Dendrite is down or `MATRIX_HOMESERVER_INTERNAL` unset. |
+| VK / Reddit rooms badged as AF | (no log; check `fi.mau.bridge` state) | vk-bridge-loop / reddit-bridge-loop wasn't redeployed after the state-event patch — fix is to recreate the portal room or PUT the state by hand. |
+| Reply 502 `matrix_send_failed` | `matrix_send_failed` | Owner Matrix token rejected by Dendrite. Check `MATRIX_AUTH_KEY` rotation incident — re-derive password via `deriveInternalPassword`. |
+| Nav badge stale | (no log) | NavBar polls every 30s — refresh page if needed. |
+
+## Related
+- [matrix-tg-bridge](/subsystems/matrix-tg-bridge) — outbound reply path.
+- [matrix-chat](/subsystems/matrix-chat) — owner Matrix token issuance.
+- [vk-bridge](/subsystems/vk-bridge) — VK portal-room creation.

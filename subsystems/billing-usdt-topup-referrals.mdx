@@ -1,0 +1,115 @@
+---
+title: "USDT topup + 10-level referrals"
+description: "Pay-as-you-go billing rail: $10 USDT topup → 1:1 USDF + 10-level partner payout chain. Replaces subscription model."
+---
+
+# USDT topup + 10-level referrals
+
+## TL;DR
+Owner brief 2026-05-28 retired the subscription model. New model: user pays USDT (min $10) via CryptoBot, webhook auto-converts 1:1 to USDF on `flow_balances.usdf_balance`, and walks `users.invited_by_user_id` up to 10 levels paying out 30% total (7/5/4/3/3/2/2/2/1/1%) onto each ancestor's USDT balance. Missing levels overflow to admin (user_id=1).
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/db/migrations/0076_usdt_balance_referral_payouts.sql` | Adds `flow_balances.usdt_balance` + `referral_payouts` table |
+| `agentflow-agents/src/services/referral-payouts.ts:36` | `LEVEL_BP` constant — basis-point schedule |
+| `agentflow-agents/src/services/referral-payouts.ts:99` | `walkAndPay(tx, …)` — chain walker, admin overflow |
+| `agentflow-agents/src/services/cryptobot-billing.ts:679` | `applyTopupInvoicePaid` — credits `usdf_balance`, calls walker in same TX |
+| `agentflow-agents/src/routes/billing-cryptobot.ts:258` | Min topup floor $10 (was $1) |
+| `agentflow-agents/src/routes/gamification.ts` (`/me/referrals/v2`) | 10-level panel feed (recursive CTE + payouts join) |
+| `agentflow-agents/src/middleware/require-paid-account.ts:60` | Lockdown gate now admits `usdf_credit` + `topup_history` |
+| `agentflow-landing/src/pages/CabinetReferrals.tsx` | `/account/referrals` page |
+| `agentflow-landing/src/pages/AccountBilling.tsx:75` | Min topup floor $10 (was $1) |
+
+## Data flow
+
+```
+user clicks "Pay $X USDT"
+  └─ POST /me/billing/cryptobot/create-topup-invoice  (≥$10)
+       └─ creates CryptoBot invoice + recordPendingTopup row
+            └─ user pays in TG / CryptoBot
+                 └─ webhook POST /webhooks/cryptobot (HMAC-verified)
+                      └─ applyTopupInvoicePaid (TX):
+                          1. update cryptobot_payments.status=completed
+                          2. insert flow_ledger kind='topup_cryptobot'
+                          3. UPSERT flow_balances.usdf_balance += X
+                          4. walkAndPay(tx, {payer, X, event_id}):
+                              for each ancestor in users.invited_by_user_id chain (≤10):
+                                 - insert referral_payouts (ON CONFLICT DO NOTHING)
+                                 - UPSERT flow_balances.usdt_balance += X * bp / 10000
+                              if chain < 10 levels: overflow row at level=11 → admin (user 1)
+```
+
+## DB / Env / API
+
+### Tables
+- `flow_balances(user_id, balance, usdf_balance, usdt_balance, updated_at)` — three-pool wallet. `balance` = legacy FLOW (deprecated). `usdf_balance` = credit pool (what users spend). `usdt_balance` = referral earnings (eventual external withdraw).
+- `referral_payouts(id, payer_user_id, payee_user_id, conversion_event_id, level, percentage_bp, amount_usdt, created_at)`. UNIQUE on `(conversion_event_id, level)` is the idempotency key. `level ∈ [1, 11]`; level 11 = admin overflow.
+- `users.invited_by_user_id` (pre-existing) is the walked chain.
+- `users.ref_code` (pre-existing) — share link key.
+
+### Env vars
+| Name | Purpose | Prod value |
+|---|---|---|
+| `WELCOME_USDF_AMOUNT` | Welcome USDF grant on signup, gives fresh users a positive USDF balance so the lockdown gate's `usdf_credit` reason fires | `"5"` (re-enabled 2026-05-28 after PR #936) |
+| `ACCOUNT_LOCKDOWN_ALLOWLIST` | CSV user ids that bypass the gate | unset by default |
+| `CRYPTO_BOT_TOKEN` | CryptoBot API + webhook HMAC | required for topup |
+
+### Routes
+- `POST /me/billing/cryptobot/create-topup-invoice` — body `{amount_usd, asset?}`. 400 when `amount_usd < 10`.
+- `POST /webhooks/cryptobot` — public, HMAC-gated, dispatches by payload kind (`subscription` legacy / `topup` current).
+- `GET /me/referrals/v2` — wire format documented in `routes/gamification.ts`. Returns `ref_code, ref_link, counts_by_level[1..10], team_total, earned_usdt_total, earned_by_level[], recent_payouts[]`.
+- `GET /me/balance` — surfaces `usdf_balance` + `usdt_balance` (frontend reads both).
+
+### Basis-points table
+
+| Level | bp | % |
+|---|---|---|
+| 1 | 700 | 7 |
+| 2 | 500 | 5 |
+| 3 | 400 | 4 |
+| 4 | 300 | 3 |
+| 5 | 300 | 3 |
+| 6 | 200 | 2 |
+| 7 | 200 | 2 |
+| 8 | 200 | 2 |
+| 9 | 100 | 1 |
+| 10 | 100 | 1 |
+| 11 (admin overflow) | TOTAL_BP − Σ paid | 30 − Σ% |
+
+`TOTAL_BP = 3000`. Integer math throughout (`BigInt` micros) — no fp drift.
+
+## Lockdown gate (paid-account middleware)
+
+`decidePaidStatus` order of green-lights (first hit wins):
+
+1. `admin` — `users.is_admin = true`
+2. `legacy_sub` — active row in `subscriptions`
+3. `crypto_sub` — `cryptobot_subscriptions.expires_at > now()` (active)
+4. **`usdf_credit`** — `flow_balances.usdf_balance > 0`. Welcome grant alone satisfies this.
+5. **`topup_history`** — any prior `flow_ledger` row with `kind IN ('topup_cryptobot','topup_usdt','topup_stars')`.
+6. `allowlist` — user id in CSV env `ACCOUNT_LOCKDOWN_ALLOWLIST`.
+7. fallthrough → `locked` → 403 `account_locked` redirecting to `/account/billing`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Webhook double-credits referrer | `duplicate key value violates unique "uq_referral_payouts_event_level"` | UNIQUE protects; investigate if non-cryptobot rail forgot to pass a stable `conversionEventId` |
+| Chain stuck in a cycle | Walker exits with `chainCycled: true` (no log line yet — add when noisy in prod) | `walkAndPay` self-ref guard at `referral-payouts.ts:130` |
+| Admin overflow missing | Manually inspect `referral_payouts WHERE level=11 AND conversion_event_id='cryptobot_invoice:<id>'` | walker skips overflow when chain already terminates AT admin |
+| Lockdown still 403 with $5 grant | `paid_subscription_required` in response | Verify `WELCOME_USDF_AMOUNT` env (must be `"5"`, not `"0"`) AND that signup path calls `grantWelcomeUsdf` |
+| Topup ≥$10 rejected | `amount_usd must be between 10 and 10000` | Floor in `billing-cryptobot.ts:258` matches landing in `AccountBilling.tsx:75` |
+| Referral counts mismatch | recursive CTE in `routes/gamification.ts /me/referrals/v2` walks `invited_by_user_id`; old `referrals` table is unrelated (3-level legacy quest flow) | Compare `SELECT COUNT(*) FROM users WHERE invited_by_user_id=<id>` vs L1 count |
+
+## Migration sequence
+
+1. `0076_usdt_balance_referral_payouts.sql` — additive. Apply BEFORE the agents deploy that calls `walkAndPay` (otherwise `applyTopupInvoicePaid` throws `relation referral_payouts does not exist`).
+2. After 1, deploy the agents image with PRs #936 + #937.
+3. After 2, deploy landing PR for `/account/referrals` + $10 floor.
+4. (Phase 2, deferred) Archive `subscriptions` once the last `cryptobot_subscriptions.expires_at` passes. Owner policy 2026-05-28: existing subs keep running, no new sales.
+
+## Related
+- [Account lockdown gate](/subsystems/lockdown-gate) (deprecated standalone; merged here)
+- [CryptoBot rail](/subsystems/cryptobot-billing)
+- [Welcome grant](/subsystems/welcome-grant)

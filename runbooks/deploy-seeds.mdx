@@ -1,0 +1,62 @@
+---
+title: "Deploy seeds — auto-applied DB seeds on every rollout"
+description: How idempotent seed scripts self-apply via GitHub Actions so preset/boilerplate code changes reach prod without manual psql.
+---
+
+# Deploy seeds
+
+## TL;DR
+GitHub Actions runs idempotent seed scripts inside the freshly-rolled-out
+`agentflow-agents` pod after every deploy. Code changes to boilerplate
+workflow schemas, canonical roles, coder-landing skills, and eliza system
+prompts reach prod with zero manual steps. Non-idempotent seeds are
+deliberately excluded.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/.github/workflows/deploy.yml:260` | `Apply idempotent seed scripts (post-rollout)` step |
+| `agentflow-agents/src/scripts/seed-boilerplate-workflows.ts:336` | UPDATE `agent_boilerplates.workflow_schema` per (kind, name) |
+| `agentflow-agents/src/scripts/seed-canonical-roles.ts:1` | Idempotent — skip owners that already have role-agent |
+| `agentflow-agents/src/scripts/seed-coder-landing-skills.ts:1` | Idempotent — `recordSkill` supersedes by embedding |
+| `agentflow-agents/src/scripts/seed-eliza-system-prompts.ts:1` | Idempotent — skip if Eliza `system` already matches |
+
+## Data flow
+```
+push main → build+push image → kubectl set image → rollout status →
+  kubectl exec deploy/agentflow-agents -- node dist/scripts/<name>.js
+```
+
+Compiled `dist/scripts/*.js` is the call target — the runtime image runs
+`npm ci --omit=dev`, so `tsx` is absent.
+
+The exec runs against the **new** pod (rollout already complete), so seeds
+see the latest code + the latest migrations (`migrations-runner` runs at
+pod boot before any DB write).
+
+## DB / Env / API
+- Tables touched: `agent_boilerplates`, `agents`, `agent_skills`, plus
+  Eliza-side `agents.system`.
+- Step uses `continue-on-error: true` plus per-script `|| echo …` so a
+  single failed seed warns but does not block the release.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Seed shipped in code but row still stale | `[seed] boilerplate-workflows FAILED` in GHA log | check pod logs, re-run `kubectl -n franchise-factory exec deploy/agentflow-agents -- node dist/scripts/seed-boilerplate-workflows.js` |
+| New seed script not picked up | script missing from `deploy.yml:260` block | add new `echo + npx tsx` line under the existing block (verify idempotency first) |
+
+## Why these four and not all of `src/scripts/*`
+- `seed-tg-bot-knowledge.ts` is **NOT** idempotent ("re-running inserts
+  duplicates" — see header comment). Running on every deploy would bloat
+  `agent_memories`. Excluded.
+- `fix-stuck-projects.ts`, `retry-failed-projects.ts`,
+  `backfill-agent-embeddings.ts`, `bootstrap-marketplace.ts`,
+  `dump-presets-to-json.ts`, `re-instantiate-presets-from-json.ts`,
+  `apply-preset-migration.ts` — one-shot ops scripts, not seeds. Run by
+  hand only when needed.
+
+## Related
+- PR `fix/deploy-seed-hook-2026-05-18` — wired the step.
+- PR #469 (`fix(landing): collapse 4-node graph`) — the change that
+  exposed the gap. Code shipped, DB stayed stale until manual SQL patch.

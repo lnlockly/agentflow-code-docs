@@ -1,0 +1,207 @@
+---
+title: "Matrix Casino"
+description: "@af-casino — Coin Flip game inside Element rooms with commit-reveal RNG and fake-economy v1."
+---
+
+# Matrix Casino
+
+> **Status: shipped 2026-05-24 (PR-1, bot-only).** Widget pane lands in PR-2. v1 uses
+> fake `coins` — real-token escrow is v2.
+
+## TL;DR
+
+`@af-casino` is the eleventh Matrix bot. Slash commands inside any room it lives in:
+`/flip <amount> <heads|tails>`, `/balance`, `/history`, `/start`, `/help`. Bets are placed
+ONLY via Matrix (REST never accepts bets) and recorded in `chat_game_bets` inside a
+single `BEGIN; SELECT … FOR UPDATE` transaction so two concurrent `/flip` from the same
+user can't spend the same coin. Round lifecycle is a 1s `setInterval` ticker that scans
+`chat_game_rounds WHERE status='open' AND bets_close_at <= NOW()`, reveals the seed,
+pays out pro-rata, and (when `auto_continue=true`) opens the next round. RNG is
+commit-reveal: bot posts `seed_hash` before bets close, `seed` after — anyone can verify
+`sha256(seed + ':' + round_no) == seed_hash`.
+
+Master switch: `CASINO_ENABLED=1`. Default is `0` — the bot stays registered but answers
+«казино пока выключено» so we can ship safely.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/casino/engine.ts:1` | Pure module — `generateSeed`, `seedHash`, `resolveCoinflip`, `parseFlipArgs`, `parseCasinoCommand`, `clampBet`, `computePayout` |
+| `agentflow-agents/src/services/casino/scheduler.ts:1` | 1s `setInterval` ticker; per-round `SELECT … FOR UPDATE` settle + auto-continue |
+| `agentflow-agents/src/services/matrix-bots/handlers/casino.ts:1` | Slash-command dispatch + bet transaction |
+| `agentflow-agents/src/services/matrix-bots/lib.ts` (`BOT_SLUGS`) | Adds `'af-casino'` slug |
+| `agentflow-agents/src/services/matrix-bots/register.ts` (`DISPLAY_NAMES['af-casino']`) | `'🎰 AF Casino'` |
+| `agentflow-agents/src/services/matrix-bots/runner.ts` (`HANDLERS['af-casino']`, scheduler bootstrap) | Wires handler + starts ticker when `casinoEnabled=true` |
+| `agentflow-agents/src/services/matrix-onboarding.ts` (`BOT_DM_NAMES`/`BOT_DM_INTROS`) | First-bounce intro copy |
+| `agentflow-agents/src/routes/me-casino.ts:1` | REST: `GET /me/casino/balance`, `GET /me/casino/state?room=`, `POST /me/casino/grant` |
+| `agentflow-agents/migrations/2026-05-24d-chat-games.sql:1` | DDL for 4 tables |
+| `agentflow-agents/src/db/schema.ts` (`chatGameBalances`, `chatGameRounds`, `chatGameBets`, `chatGameRooms`) | drizzle defs |
+| `agentflow-agents/src/services/bootstrap-schema.ts` | Idempotent `CREATE TABLE IF NOT EXISTS` for fresh-pod boot |
+| `agentflow-agents/src/services/env.ts` (`casinoEnabled` + 6 others) | `CASINO_*` env knobs |
+| `agentflow-agents/tests/casino-engine.test.ts:1` | 39 pure-engine tests (RNG fairness, payout, parser) |
+
+## Data flow
+
+```
+Element (Matrix room with @af-casino)
+   │
+   │  /flip 10 heads
+   ▼
+@af-casino /sync runner → handleCasinoMessage (handlers/casino.ts)
+   │
+   ├─ parseCasinoCommand({body, slug, server})  →  {kind:'flip', amount, side}
+   ├─ parseOwnerMxid(sender)                    →  af_user_id  (silently drop non-AF mxids)
+   │
+   ├─ ensureBalance(af_user_id)  ON CONFLICT DO UPDATE  (first-touch grant)
+   │
+   ▼
+   BEGIN
+     findOrOpenRound(roomId)
+        ├─ open round in window → reuse
+        └─ else INSERT chat_game_rounds (status='open', seed, seed_hash) ON CONFLICT … DO NOTHING
+     SELECT coins FROM chat_game_balances WHERE af_user_id=? FOR UPDATE
+     IF coins < amount → throw 'INSUFFICIENT:…'
+     SELECT COUNT(*) FROM chat_game_bets WHERE round_id AND af_user_id  → cap check
+     UPDATE balance − amount
+     INSERT chat_game_bets (round_id, af_user_id, amount, side)
+     IF first bet in round → bot posts `🎰 Round #N открыт. seed_hash=… closes in Xs`
+   COMMIT
+   │
+   ▼
+   bot posts `🪙 Принято: <amount> на <side>.`
+
+Scheduler tick (1s)
+   │
+   ├─ SELECT id FROM chat_game_rounds WHERE status='open' AND bets_close_at <= NOW() LIMIT 25
+   │
+   ▼   for each:
+   BEGIN
+     SELECT * FROM chat_game_rounds WHERE id=? AND status='open' FOR UPDATE
+     resolveCoinflip(seed) → 'heads' | 'tails'
+     SELECT bets WHERE round_id  → engine.computePayout(bets, result)
+     for each payout:
+        winners get back  amount + share-of-loser-pot   (UPDATE balances += …)
+        losers got debited at bet time, nothing returned
+        UPDATE chat_game_bets SET payout = pnl
+     UPDATE round SET status='settled', result, revealed_at, settled_at
+     IF auto_continue AND bets.length > 0 → INSERT next round
+   COMMIT
+   │
+   ▼
+   bot posts reveal message: `🪙 Round #N: HEADS \n seed: … sha256(seed:N)==…\n ✅ Победили: <@uid> +X\n ❌ Проиграли: <@uid> -Y`
+   bot posts next-round announce (when auto_continue fires)
+```
+
+## DB / Env / API
+
+### Tables
+- `chat_game_balances (af_user_id PK, coins, last_grant, updated_at)`
+- `chat_game_rounds (id, room_id, round_no, game, status, seed, seed_hash, result, bets_open_at, bets_close_at, revealed_at, settled_at, UNIQUE(room_id, round_no))`
+- `chat_game_bets (id, round_id FK, af_user_id, amount, side, payout, placed_at)`
+- `chat_game_rooms (room_id PK, enabled, auto_continue, round_seconds, created_at)`
+
+Partial index `idx_chat_game_rounds_close ON (bets_close_at) WHERE status='open'` keeps the scheduler scan O(open rounds) instead of O(history).
+
+### Env
+
+| Var | Default | Purpose |
+|---|---|---|
+| `CASINO_ENABLED` | `0` | Master switch. `0` → bot replies «казино пока выключено» and scheduler doesn't tick |
+| `CASINO_DEFAULT_ROUND_SECONDS` | `30` | Round length when `chat_game_rooms` row absent |
+| `CASINO_START_BALANCE` | `100` | First-touch grant |
+| `CASINO_DAILY_GRANT` | `50` | Top-up when `coins < CASINO_DAILY_GRANT_THRESHOLD` and >24h since last grant |
+| `CASINO_DAILY_GRANT_THRESHOLD` | `10` | Trigger threshold |
+| `CASINO_MAX_BET` | `100` | Cap per bet (engine `clampBet` + DB `CHECK amount <= 100`) |
+| `CASINO_MAX_BETS_PER_USER_PER_ROUND` | `10` | Anti-spam cap |
+| `CASINO_GRANT_SECRET` | (empty) | Bearer for dev-only `POST /me/casino/grant`. Empty disables route (404) |
+
+### REST
+
+- `GET  /me/casino/balance` — `{ ok, coins, last_grant }`
+- `GET  /me/casino/state?room=!xyz` — `{ ok, current_round{id, round_no, status, seed_hash, bets_close_at, my_bet?}, last_rounds[10], balance }`
+- `POST /me/casino/grant` — bearer-gated `{ coins }` dev helper
+
+All return 503 `casino_disabled` when `CASINO_ENABLED=0`.
+
+### Matrix wire
+
+Bets are placed via room messages (`/flip <amount> <side>`). Reveal posts include the
+seed inline so anyone with the timeline can verify fairness — same provability model as
+Stake.com / BC.Game commit-reveal, only the commitment lives in a Matrix `m.room.message`
+event instead of a custom backend log.
+
+## RNG fairness model (commit-reveal)
+
+```ts
+// at round open:
+seed       = randomBytes(32).toString('hex')          // 64 hex chars
+seed_hash  = sha256(`${seed}:${round_no}`)            // 64 hex chars
+
+// bot posts to room:                                  // pre-bets
+//   🎰 Round #42 открыт. seed_hash: ab12cd34…
+
+// at round close:
+result     = parseInt(seed.slice(0,2), 16) % 2 === 0 ? 'heads' : 'tails'
+
+// bot posts to room:                                  // post-bets
+//   🪙 Round #42: HEADS
+//   seed: c3f0... (sha256(seed:42) == ab12cd34…)
+```
+
+Server cannot retroactively pick a seed that makes a desired side win — `seed_hash`
+is published before bets close in a Matrix event that's immutable. v2 path: VRF
+on-chain (TON / Chainlink) so even the server doesn't know the seed.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Bot replies «казино пока выключено» on every `/flip` | (no log) | `CASINO_ENABLED=0`. Flip the env var on the deployment |
+| Scheduler never ticks | `[af-casino-scheduler] started` missing | `MATRIX_BOTS_ENABLED=0` OR `casinoBot` row absent OR `casinoEnabled=false` |
+| Round stuck `status='open'` after `bets_close_at` | scheduler runs but logs `settle_failed` | inspect inner `err`. Most likely `pq: connection refused` — Postgres flap |
+| Two pods double-settle | (would not happen — `SELECT … FOR UPDATE` on round) | If it does, the FOR UPDATE was dropped — re-add |
+| Bet accepted but balance not debited | `[af-casino] place_bet failed` | Postgres FK violation / connection drop mid-transaction — transaction rolled back, no orphan |
+| User spams `/flip` when broke | bot reply contains `Недостаточно coins` | Expected. After 24h with `<CASINO_DAILY_GRANT_THRESHOLD` coins, `/balance` triggers grant |
+| User got 2x daily grant | (would not happen — `last_grant` checked) | If it does, race on `applyDailyGrant`. Add row-level lock |
+| Reveal message missing | `[af-casino-scheduler] reveal_send_failed` | Matrix 5xx during send. Settlement still committed; the missing post is permanent unless retried by hand |
+| Next round didn't open | `[af-casino-scheduler] settle_failed` (transaction rolled back) | Inspect inner err. Run `psql -c "SELECT * FROM chat_game_rounds WHERE room_id=? ORDER BY round_no DESC LIMIT 5"` |
+| Empty rounds keep auto-opening | (would not happen — `bets.length > 0` gate) | If it does, gate regression. Scheduler should idle empty rooms |
+| `/me/casino/state` returns 400 `room_required` | (no log) | Client forgot `?room=!xyz` query — verify widget URL templating |
+
+## Provably-fair verification
+
+Owner / curious user can verify any past round:
+
+```bash
+# from psql
+psql -c "SELECT round_no, seed, seed_hash FROM chat_game_rounds WHERE id=42"
+# round_no | seed              | seed_hash
+# 42       | c3f0…(64 chars)   | ab12cd34…(64 chars)
+
+# in shell
+echo -n "c3f0…:42" | sha256sum
+# ab12cd34…  -    ← matches seed_hash → game was honest
+```
+
+## Non-goals (v1)
+
+- Real money / token ledger — coins are an in-DB integer. v2 wires escrow contract +
+  wallet linking.
+- Multiple game types — only Coin Flip ships. Dice / Crash / Mines / Poker are PR-N
+  clones of the same scheduler/engine pattern.
+- Widget pane — PR-2. Until then players see only the bot's `m.room.message` events.
+- KYC / geo-block — punt until real money. Before v2 ships, gate
+  `POST /me/casino/deposit` by `X-Forwarded-For` country and surface a disclaimer.
+- PvP / no-bot mode — every round resolves against the random side, not against a
+  specific opponent. Pro-rata payouts naturally make it pseudo-PvP when ≥2 players
+  bet opposite sides.
+- E2EE rooms — runner skips `m.room.encrypted`, same pattern as @af-helper.
+
+## Related
+
+- [Matrix Bots](/subsystems/matrix-bots) — 10 sibling platform bots + dispatch
+- [Matrix Chat](/subsystems/matrix-chat) — Dendrite homeserver + lobby + space
+- [Element Web](/subsystems/element-web) — where players type `/flip`
+- [Matrix Monitoring](/subsystems/matrix-monitoring) — prom-client metrics will pick
+  up `matrix_bots_events_total{slug="af-casino"}` automatically
