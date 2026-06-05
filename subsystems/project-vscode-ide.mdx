@@ -1,0 +1,171 @@
+---
+title: "Project browser VS Code (per-project code-server + live in-pod Claude: lazy + hibernated + owner-gated)"
+description: "GET /me/projects/:id/ide brings up a per-project code-server in the same project pod, installs Claude Code and starts an attachable live `claude` session, waits for a real HTTP 200, gates it to the owner, and reaps it when idle."
+---
+
+# Project browser VS Code
+
+## TL;DR
+
+Every project pod can serve a second long-lived service next to its app
+preview: `code-server` bound to the project `/workspace`, exposed at
+`ide-<slug>-u<owner>.proj.agentflow.website` under the same wildcard TLS +
+per-host Ingress as the preview. `GET /me/projects/:id/ide` lazily brings it up
+(`ensureProjectIde`), **waits until the public ide host actually answers an
+HTTP status < 500** before reporting `ready:true`, gates the editor to the
+project owner with a per-project `--auth password`, and an idle reaper stops
+the code-server after `IDE_IDLE_TIMEOUT_MS` (default 20 min) so VS Code for
+every user does not exhaust node resources. The workspace PVC + the
+`/workspace/.code-server` install survive a reap, so reopening is fast.
+
+Once the editor is up and pod-tools wrote the per-user flow env, the same route
+also installs **Claude Code into the pod** and starts an **attachable, live
+`claude` session** (`ensureClaudeSession`): a self-respawning `tmux` session
+named `work` runs `claude` in the project workspace. The owner opens the
+code-server integrated terminal (which lands in `<workspaceDir>`) and
+`tmux attach -t work` drops them into the running claude — they watch it work
+and type to direct it. claude authenticates via the flow facade
+(`ANTHROPIC_BASE_URL=<flow facade>` + the per-user `af_live_*` key sourced from
+`.agentflow/flow.env`) — **never a real Anthropic/OpenAI key**. The route reports
+`claudeReady:boolean` + `claudeAttach` so the FE knows the live terminal is up.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/project-ide.ts:253` | `ensureProjectIde` — idempotent start_service + expose_ide, then wait-for-200 on the public host; degrades to `{ ready:false, reason }` |
+| `agentflow-agents/src/services/project-ide.ts:344` | wait-for-200 loop — promotes to `ready:true` only on HTTP status `>0 && <500` from the ide host |
+| `agentflow-agents/src/services/project-ide.ts:165` | `ideAuthPassword` — HMAC(`INTERNAL_API_SECRET`, `ide:<owner>:<slug>`) → stable per-project login secret, owner-scoped |
+| `agentflow-agents/src/services/project-ide.ts:184` | `buildIdeStartCommand` — installs code-server once, writes flow-wired settings.json, runs `--auth ${IDE_AUTH:-password}` reading `$IDE_PASSWORD` |
+| `agentflow-agents/src/services/project-ide.ts:390` | `markIdeActivity` — records ide traffic in the in-process activity map |
+| `agentflow-agents/src/services/project-ide.ts:424` | `reapIdleProjectIdes` — sweeps the map, `stop_service` for entries past the idle window (owner ctx) |
+| `agentflow-agents/src/services/project-claude-session.ts:225` | `ensureClaudeSession` — idempotent `exec`: install Claude Code + start the attachable self-respawning `work` tmux session; returns `{ ok, claudeReady, attachCommand }` |
+| `agentflow-agents/src/services/project-claude-session.ts:95` | `buildClaudeSessionCommand` — native installer gated on `command -v claude`, verify `claude --version`, `tmux new-session -d -s work` running `while true; do claude` in the workspace, sources `.agentflow/flow.env` for flow auth |
+| `agentflow-agents/src/services/project-claude-session.ts:162` | `autoAttachLine` — rc guard that lands an interactive code-server terminal in the live `work` session |
+| `agentflow-agents/src/services/project-claude-session.ts:175` | `buildClaudeProbeCommand` / `probeClaudeReady:278` — read-only `tmux has-session -t work` re-check (no install) |
+| `agentflow-agents/src/routes/projects.ts:1919` | `GET /me/projects/:id/ide` — owner-gated route; marks activity, returns `{ ok, ready, ideUrl, previewUrl, reason, idePassword, claudeReady, claudeAttach }` |
+| `agentflow-agents/src/routes/projects.ts:1970` | route marks ide activity for the reaper on every authorised GET |
+| `agentflow-agents/src/routes/projects.ts:2014` | route calls `ensureClaudeSession` AFTER pod-tools wrote `.agentflow/flow.env`, surfacing `claudeReady` + `claudeAttach` |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts:3018` | `expose_ide` tool — ClusterIP svc + bridge + per-host Ingress under wildcard TLS, pinned to the project owner's vcluster |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts:2061` | `start_service` optional `env` — merges caller env (e.g. `IDE_PASSWORD`) into the launch prefix; NEVER written to the recorded `cmd` file |
+| `agentflow-agents/src/server.ts:420` | idle reaper cron — `reapIdleProjectIdes()` every 5 min |
+| `agentflow-agents/src/services/env.ts:215` | `ideIdleTimeoutMs` env (`IDE_IDLE_TIMEOUT_MS`, default 1200000) |
+
+## Data flow
+
+```
+FE  ──GET /me/projects/:id/ide──►  requireProjectAccess('view')   (owner / collaborator)
+                                        │
+                                        ├─ markIdeActivity(slug, owner)   ← reaper keep-alive
+                                        ▼
+                                 ensureProjectIde
+                                        │
+        start_service(code-server, port 8081, env:{IDE_PASSWORD})  (idempotent — already_running)
+                                        │
+        expose_ide(port 8081) → ClusterIP svc + bridge + per-host Ingress (owner vcluster)
+                                        │
+        probe https://ide-<slug>-u<owner>.proj.agentflow.website  (≤8× / 1.5s)
+                                        │
+              status <500 ──► { ready:true,  reason:'ok' }
+              never up    ──► { ready:false, reason:'code_server_starting' }
+              pod down    ──► { ready:false, reason:'pod_not_ready' }
+                                        │
+                          ready:true ──► provisionProjectIdePodTools   (writes .agentflow/flow.env)
+                                        │
+                                ensureClaudeSession   (one idempotent exec)
+                                        │
+        install Claude Code (native installer, gated on `command -v claude`)
+        verify `claude --version`
+        tmux new-session -d -s work -c <workspaceDir>  →  while true; do claude; done   (respawn)
+        (already has-session → no second start; echoes af_claude_work_ready)
+                                        │
+              session live ──► claudeReady:true,  claudeAttach:'tmux attach -t work'
+              no tmux/fail ──► claudeReady:false  (editor still usable, run claude manually)
+                                        ▼
+   { ok, ready, ideUrl, previewUrl, reason, idePassword, claudeReady, claudeAttach }  ◄── idePassword owner-only
+
+owner ──open IDE──► code-server integrated terminal (cwd = <workspaceDir>)
+                    rc auto-attach guard (or `tmux attach -t work`) ──► LIVE claude (watch + type)
+
+reaper cron (5 min) ──► reapIdleProjectIdes ──► stop_service(code-ide) for entries idle > IDE_IDLE_TIMEOUT_MS
+                                                 (workspace PVC + .code-server install kept → fast reopen)
+```
+
+## DB / Env / API
+
+- Tables: none (activity is an in-process map; the password is derived, not stored).
+- Env: `INTERNAL_API_SECRET` (HMAC key for `ideAuthPassword`), `IDE_IDLE_TIMEOUT_MS`
+  (idle window, default `1200000`), `IDE_AUTH` (operator override; defaults to
+  `password`), `AGENTS_PUBLIC_BASE_URL` (in-editor flow facade base),
+  `ANTHROPIC_LARGE_MODEL` (the `flow` alias the editor sends).
+- Routes: `GET /me/projects/:id/ide` →
+  `{ ok, ready, ideUrl, previewUrl, reason, idePassword, claudeReady, claudeAttach }`.
+  `reason ∈ { ok, pod_not_ready, code_server_starting }`. `claudeReady:true`
+  means the attachable in-pod `work` session is live; `claudeAttach` is the
+  exact attach command (`tmux attach -t work`).
+- MCP tools: `expose_ide` (publish ide host), `start_service` (now accepts an
+  optional `env` object), `stop_service` (reaper), `list_services`, `exec`
+  (install Claude Code + start the `work` session, both idempotent).
+- Host: `ide-<slug>-u<owner>.proj.agentflow.website` (distinct subdomain from
+  the preview `<slug>-u<owner>.proj.agentflow.website`), shared wildcard TLS.
+
+## Live in-pod Claude (attachable work session)
+
+After the editor is up and `provisionProjectIdePodTools` wrote
+`<workspaceDir>/.agentflow/flow.env` (the per-user `af_live_*` key +
+`ANTHROPIC_BASE_URL=<flow facade>`), the route calls `ensureClaudeSession`. One
+idempotent `exec` into the project pod:
+
+1. Installs Claude Code with the native installer
+   (`curl -fsSL https://claude.ai/install.sh | bash`, PATH += `~/.local/bin`),
+   skipped when `command -v claude` already resolves; then verifies
+   `claude --version` runs.
+2. Starts a detached `tmux` session `work` in `<workspaceDir>` running
+   `while true; do claude; done` so the interactive claude respawns if the owner
+   `/exit`s or it crashes. `tmux has-session -t work` guards against a second
+   start (idempotent).
+3. Appends an rc auto-attach guard so the code-server integrated terminal (which
+   opens in `<workspaceDir>`) lands the owner straight in the live claude.
+
+**How the owner reaches the live Claude:** open the project IDE → open the
+code-server integrated terminal (it opens in `<workspaceDir>`) → the shell rc
+auto-attaches to `work`; the explicit command is **`tmux attach -t work`** (also
+returned as `claudeAttach`). The owner watches claude work and types to direct
+it.
+
+**Auth is flow-only.** claude sources `.agentflow/flow.env`, so
+`ANTHROPIC_BASE_URL` is the flow facade and `ANTHROPIC_AUTH_TOKEN` is the
+per-user `af_live_*` key — **never `api.anthropic.com` / `api.openai.com` and
+never a real provider key**. The model is the logical `flow` alias
+(`AF_FLOW_MODEL`), resolved by the gateway. No key literal is baked into the
+recorded command.
+
+## Auth model
+
+The ide host is a guessable subdomain, so the editor is NOT world-open. code-server
+runs `--auth password` with a per-project password derived from
+`HMAC-SHA256(INTERNAL_API_SECRET, "ide:<owner>:<slug>")` (hex, 32 chars). The
+password is returned ONLY in the `requireProjectAccess('view')`-gated route
+response (`idePassword`) — the same access model that gates every other
+`/me/projects/:id/*` surface — and is injected into the pod as a transient
+`start_service` `env` (never baked into the recorded `cmd` file). The
+subdomain + bridge are pinned to the project OWNER's vcluster, so a collaborator
+opening the ide lands in the owner's pod, not their own.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| FE shows blank iframe / dead ide URL | route returns `reason:'code_server_starting'` (editor not up yet — FE must re-poll, not render) | `src/services/project-ide.ts:344` |
+| ide URL 404 right after approve | `reason:'pod_not_ready'` (status not in approved/running/done, or `unknown_project`) | `src/routes/projects.ts:1947`, `src/services/project-ide.ts:253` |
+| `ide_service_not_synced` on first open | vcluster syncer still mirroring the ide Service — FE re-poll resolves it | `src/mcp-servers/code-exec/index.ts:3098` |
+| node CPU creeps from abandoned editors | `project-ide: reaped idle editors` (reaper working) / absent (reaper not firing) | `src/server.ts:420`, `src/services/project-ide.ts:424` |
+| editor opens with no password prompt | `--auth none` only if `IDE_AUTH=none` set — default is `password` | `src/services/project-ide.ts:220` |
+| terminal opens to a plain shell, no live claude | route reported `claudeReady:false` (`af_claude_install_failed` = CLI did not run, or `af_claude_no_tmux` = tmux missing in the pod image) | `src/services/project-claude-session.ts:225` |
+| claude hits api.anthropic.com instead of flow | `.agentflow/flow.env` not written/sourced — pod-tools ran before the session, env has no `ANTHROPIC_BASE_URL` | `src/services/project-ide-pod-tools.ts:207`, `src/services/project-claude-session.ts:95` |
+| second claude session spawned on reopen | missing `tmux has-session -t work` guard (regression) — must short-circuit | `src/services/project-claude-session.ts:128` |
+
+## Related
+
+- [Project Preview](/subsystems/project-preview) — the sibling app-preview host on the same wildcard.
+- [Cloud IDE](/subsystems/cloud-ide) — the standalone platform-repo code-server (is_platform projects point here).
