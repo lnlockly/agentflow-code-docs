@@ -7,14 +7,25 @@ description: "Customer-facing cabinet that surfaces API keys, usage, model catal
 
 ## TL;DR
 
-`/llm-cabinet` (titled «Баланс и AI») is the standalone cabinet shipped in
-`agentflow-landing`. Six tabs split into two groups in the top-nav: primary
-**Кабинет** (wallet dashboard — balance + spend + usage tiles) and **История**
-(per-request log); then a «Для разработчиков» divider fronting **Модели**
-(catalog driven by `/llm/v1/models`), **Псевдонимы** (model aliases), **API**
-(key CRUD + curl examples), **Инструкции** (quickstart recipes). All six stay
-deep-linkable via `?tab=`. The Models tab reads live from the public LLM facade
-so the UI never drifts from the actually-enabled provider set.
+`/llm-cabinet` (titled «Баланс и AI») renders inside **AppShellV2** — the
+common cabinet shell (sidebar nav + topbar + avatar + dual-balance card) used
+by every other cabinet page. As of PR #569 it no longer ships its own top-nav:
+the bespoke `CabinetTopNav`, «← AgentFlow» back-pill, mini-balance pill, and
+custom avatar were removed because AppShellV2 already supplies them. The
+«Баланс и AI» item in AppShellV2 `CORE_NAV` (`/llm-cabinet`) highlights on this
+route. Six tabs become **in-page sub-tabs** at the top of the content area:
+primary **Кабинет** (wallet dashboard — balance + spend + usage tiles) and
+**История** (per-request log); then a «Для разработчиков» divider fronting
+**Модели** (catalog driven by `/llm/v1/models`), **Псевдонимы** (model
+aliases), **API** (key CRUD + curl examples), **Инструкции** (quickstart
+recipes). All six stay deep-linkable via `?tab=`. The Models tab reads live
+from the public LLM facade so the UI never drifts from the actually-enabled
+provider set.
+
+Mobile (390/360px): the sidebar collapses to the AppShellV2 drawer +
+bottom-nav, and the `.lc-tabs` sub-tab row left-aligns at the top of the
+content and horizontal-scrolls so the «Для разработчиков» group stays reachable
+without page overflow.
 
 The page is re-skinned onto the shared cabinet design system
 (`dark-tokens.css` / `cabinet-dashboard.css`): the scoped `--lc-*` variables
@@ -27,9 +38,12 @@ component markup changed for the colour pass — only the token map.
 
 | Path | Role |
 |---|---|
-| `agentflow-landing/src/pages/LlmCabinet.tsx` | route entry, renders `LlmCabinetShell` |
-| `agentflow-landing/src/sections/llm-cabinet/LlmCabinetShell.tsx:37` | `PRIMARY_TABS` (dashboard / history) |
-| `agentflow-landing/src/sections/llm-cabinet/LlmCabinetShell.tsx:44` | `DEVELOPER_TABS` (models / aliases / api / instructions) — rendered after the `.lc-tabs-group` «Для разработчиков» divider (line 114) |
+| `agentflow-landing/src/pages/LlmCabinet.tsx` | route entry (`useHead` + JSON-LD), renders `LlmCabinetShell` |
+| `agentflow-landing/src/sections/llm-cabinet/LlmCabinetShell.tsx:113` | `<AppShellV2 breadcrumbs={[{ label: t('app.shell.nav.llm_cabinet') }]}>` wraps the page; `.lc-page` holds the tab row + `.lc-shell` body |
+| `agentflow-landing/src/sections/llm-cabinet/LlmCabinetShell.tsx:31` | `PRIMARY_TABS` (dashboard / history) |
+| `agentflow-landing/src/sections/llm-cabinet/LlmCabinetShell.tsx:38` | `DEVELOPER_TABS` (models / aliases / api / instructions) — rendered after the `.lc-tabs-group` «Для разработчиков» divider (line 104) |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:129` | `CORE_NAV` «Баланс и AI» entry (`/llm-cabinet`) — highlights on this route |
+| `agentflow-landing/src/styles/llm-cabinet.css:10` | `.lc-page` — palette tokens + content width inside `.af-body` (replaced the full-page `.lc-root`); `.lc-tabs` in-page sub-tab row below it |
 | `agentflow-landing/src/sections/llm-cabinet/tabs/DashboardTab.tsx:85` | calls `agentsGet('/me/billing/usage?range=7d')` for tiles; spend tile («Расход за 7 дней») leads at line 120 |
 | `agentflow-landing/src/sections/llm-cabinet/components/LcApiKeyCard.tsx:73` | `developerNote` muted caption frames the key block as developer-optional |
 | `agentflow-landing/src/sections/llm-cabinet/tabs/HistoryTab.tsx:107` | calls `apiGet('/me/api-keys/:id/recent?limit=100')` |
