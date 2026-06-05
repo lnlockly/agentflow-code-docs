@@ -1,0 +1,154 @@
+---
+title: "Desktop-agent attach flow"
+description: "Marketplace → 'Attach to my Mac' → device picker → session start → Eliza tool loop on the user's machine."
+---
+
+# Desktop-agent attach flow
+
+## TL;DR
+
+Юзер находит в `/marketplace` карточку агента с `kind=desktop_agent` (например `desktop-assistant`), жмёт **Attach to my Mac**, выбирает один из своих зарегистрированных Mac'ов (или сначала регистрирует через `/cabinet/devices`), и попадает в workspace проекта со live-view сессии. На стороне сервера: создаётся `projects` row с `kind=desktop_agent`, graph-executor выполняет единственный node `attach_computer_tools` — он проверяет что device online, создаёт `device_sessions` row, инжектит scope в runtime-контекст. Дальше Eliza-агент крутит цикл `screen.capture → reason → mouse/keyboard/...` пока не достигнет цели / max_actions / budget / юзер не нажмёт Revoke.
+
+## Files
+
+| Repo / path | Role |
+|---|---|
+| `agentflow-landing/src/pages/MarketplaceDetail.tsx:(line TBD — Agent C PR not yet merged)` | "Attach to my Mac" button (visible when `agent.kind === 'desktop_agent'`). |
+| `agentflow-landing/src/components/marketplace/AttachToMacDialog.tsx:(line TBD)` | Modal: pick device → POST /me/projects. |
+| `agentflow-landing/src/lib/agentsApi.ts:(line TBD)` | `attachAgentToDevice(agentSlug, deviceId)` — wraps `POST /me/projects`. |
+| `agentflow-agents/src/routes/projects.ts:(line TBD)` | `POST /me/projects` accepts `{kind:'desktop_agent', agent_id, device_id}`. |
+| `agentflow-agents/src/services/projects.ts:(line TBD)` | `runProjectApprovalBackground` — branch for desktop_agent skips pod / coder / preview. |
+| `agentflow-agents/src/services/graph-executor/kinds/desktop-agent.ts:(line TBD)` | `attach_computer_tools` node. |
+| `agentflow-agents/src/mcp/bridge.ts:(line TBD)` | `ComputerDeviceProvider.toolsFor(scope)` — filters tool list by allowed_tools. |
+| `agentflow-landing/src/pages/WorkspaceV2.tsx:(line TBD)` | Renders `<DeviceLiveSession deviceId sessionId />` instead of preview iframe when `project.kind === 'desktop_agent'`. |
+| `agentflow-landing/src/components/devices/DeviceLiveSession.tsx:(line TBD)` | SSE subscriber + chat-like timeline. |
+| `agentflow-agents/src/routes/me/devices.ts:(line TBD)` | `GET /me/devices/:id/sessions/:sid/stream` (SSE source). |
+
+## Sequence
+
+```
+┌────────────────┐    ┌────────────────┐    ┌─────────────────────┐    ┌──────────┐
+│  Browser       │    │  agentflow-    │    │  graph-executor +   │    │  User's  │
+│  (cabinet UI)  │    │  agents Hono   │    │  mcp-bridge + Eliza │    │   Mac    │
+└────────┬───────┘    └────────┬───────┘    └──────────┬──────────┘    └─────┬────┘
+         │                     │                       │                     │
+  1. open /marketplace/desktop-assistant                │                     │
+         │                     │                       │                     │
+  2. click "Attach to my Mac"  │                       │                     │
+         │ → modal: GET /me/devices                    │                     │
+         │ ─────────────────► │                        │                     │
+         │ ◄───────────────── list (online ones first)│                     │
+         │                     │                       │                     │
+  3. pick device, submit       │                       │                     │
+         │ POST /me/projects   │                       │                     │
+         │ {kind:'desktop_agent',│                     │                     │
+         │  agent_id, device_id, brief}                │                     │
+         │ ─────────────────► │                        │                     │
+         │                     │ INSERT projects       │                     │
+         │                     │ INSERT project_agents │                     │
+         │                     │ status='approved'     │                     │
+         │ ◄────── 201 {id}    │                       │                     │
+         │                     │                       │                     │
+         │                     │ runProjectApproval-   │                     │
+         │                     │ Background (no pod,   │                     │
+         │                     │ no coder)             │                     │
+         │                     │ ─────────────────────►│                     │
+         │                     │                       │ kinds/desktop-      │
+         │                     │                       │  agent.ts           │
+         │                     │                       │ ─ check device      │
+         │                     │                       │   online (SELECT)   │
+         │                     │                       │ ─ INSERT device_    │
+         │                     │                       │   sessions          │
+         │                     │                       │ ─ register tool     │
+         │                     │                       │   filter            │
+         │                     │                       │ ─ start agent loop  │
+         │                     │                       │                     │
+  4. browser redirect to /account/projects/:id        │                     │
+         │ GET /me/projects/:id│                       │                     │
+         │ ─────────────────► │ kind=desktop_agent     │                     │
+         │ ◄── workspace + ws  │                       │                     │
+         │                     │                       │                     │
+  5. WorkspaceV2 mounts        │                       │                     │
+         │  <DeviceLiveSession │                       │                     │
+         │     deviceId sid /> │                       │                     │
+         │ GET /me/devices/:id/sessions/:sid/stream (SSE)                    │
+         │ ─────────────────► │                        │                     │
+         │                     │                       │                     │
+                       ── Eliza agent tool loop ──                          │
+                                                       │                     │
+                       agent.callTool('computer.screen.capture')             │
+                                                       │ mcp-bridge          │
+                                                       │ scope check OK      │
+                                                       │ forward over WS ──► │
+                                                       │                     │ tools/screen.py
+                                                       │                     │ Quartz capture
+                                                       │                     │ → PNG b64
+                                                       │ ◄── tool_call_result│
+                                                       │ INSERT device_      │
+                                                       │  action_log row     │
+                                                       │ SSE push to browser │
+         │ ◄─ event: action     │                       │                     │
+         │   { ts, tool:'screen.capture', screenshot_url, ...}               │
+         │                     │                       │                     │
+                       agent reasons → callTool('computer.mouse.click',{x,y})│
+                                                       │ ... same path ...   │
+         │ ◄─ event: action (mouse.click)              │                     │
+         │                     │                       │                     │
+   loop until:                 │                       │                     │
+     - task.complete()         │ UPDATE device_sessions SET ended_at, status │
+     - max_actions reached     │   ='complete'|'aborted'                     │
+     - budget_usd exceeded     │                       │                     │
+     - user clicks Revoke      │                       │                     │
+         │ DELETE /me/devices/:id (or /sessions/:sid/abort)                  │
+         │                     │                       │                     │
+   6. session end              │                       │                     │
+         │ ◄─ event: session_end (final cost, actions_used)                  │
+```
+
+## DB / Env / API
+
+**Tables touched (in order):**
+
+- `user_devices` — read (SELECT for online check).
+- `projects` — INSERT (`kind='desktop_agent'`, `status='approved'`).
+- `project_agents` — INSERT (`project_id`, `agent_id`).
+- `device_sessions` — INSERT (`device_id`, `agent_id`, `project_id`, `status='active'`).
+- `device_action_log` — INSERT one row per tool call (immutable).
+- `project_events` — INSERT (`kind: 'desktop_session_started'`, `desktop_session_ended'`).
+
+**Routes:**
+
+- `GET    /me/devices` — picker source.
+- `POST   /me/projects` — body `{kind:'desktop_agent', agent_id, device_id, brief}`.
+- `POST   /me/projects/:id/approve` — auto-fires for desktop_agent (no manual approve).
+- `GET    /me/devices/:id/sessions/:sid/stream` — SSE.
+- `POST   /me/devices/:id/sessions/:sid/abort` — manual revoke from workspace UI.
+
+**Frontend routes:**
+
+- `/marketplace/:slug` → "Attach to my Mac" → modal.
+- `/account/projects/:id` — workspace, renders `<DeviceLiveSession />` when `kind=desktop_agent`.
+- `/cabinet/devices/:id` — also shows the same session list, drilldown.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| "Attach to my Mac" 400 — no device picked | (frontend validation) | `AttachToMacDialog.tsx:(TBD)` requires `device_id` |
+| 400 `device_offline` on approve | `[desktop_agent] device_offline device_id=` | `kinds/desktop-agent.ts:(TBD)` — tell user to start launchd job |
+| 400 `device_not_owned` | `[desktop_agent] device_not_owned` | UI bug — frontend sent device_id belonging to another user |
+| 403 `forbidden` on hire | `marketplace_hire forbidden caller=` | Project owner check — only owner can attach |
+| Session created but live view stuck spinning | SSE 401 / CORS reject | `routes/me/devices.ts:(TBD)` — SSE auth header propagation |
+| Agent loops forever, ignores task.complete | `device_session actions_used >= max_actions` | Preset bug — agent doesn't call task.complete; raise `max_actions` or fix preset |
+| Cost spikes past `budget_usd` | `[device] budget exceeded session=` then session aborted | Working as designed — informs user, raise budget if needed |
+| `screen.capture` returns empty / black image | `Screen Recording permission denied` in `~/Library/Logs/agentflow-computer-mcp.log` | macOS permission not granted; see [Device registration runbook](/runbooks/device-registration) |
+
+(Substrings to be backfilled.)
+
+## Related
+
+- [Computer MCP (desktop agent)](/subsystems/computer-mcp)
+- [Desktop-agent kind](/subsystems/desktop-agent-kind)
+- [Marketplace hire flow](/flows/marketplace-hire) — sibling for non-desktop agents
+- [Runbook: Device registration](/runbooks/device-registration)
+- [Runbook: Device offline debug](/runbooks/device-offline-debug)

@@ -1,0 +1,110 @@
+---
+title: "Landing pipeline (Vue variant)"
+description: "Second landing boilerplate on Vue 3 + shadcn-vue + Tailwind 4. Routed by brief keyword; identical config contract to the React variant."
+---
+
+# Landing pipeline (Vue variant)
+
+## TL;DR
+
+`kind=landing` now resolves to one of two boilerplates: `landing-boilerplate` (React 19) is the historic default; `landing-boilerplate-vue` (Vue 3 + shadcn-vue + Tailwind 4) wins when the brief contains Vue cues ("на Vue", "Vue 3", "shadcn-vue", "composition api"). Both boilerplates expose the same `src/config/landing.config.ts` schema, so `landing-config-prefill.ts` is shared unchanged. The Vue variant adds a parallel handler `render_landing_vue` that clones a different repo and invokes a different coder slug.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/graph-executor/handlers/landing.ts:427` | React variant — registers `render_landing` node + clones `lnlockly/landing-boilerplate` |
+| `agentflow-agents/src/services/graph-executor/handlers/landing-vue.ts:160` | Vue variant — registers `render_landing_vue` node + clones `lnlockly/landing-boilerplate-vue` |
+| `agentflow-agents/src/services/graph-executor/handlers/landing-config-prefill.ts:803` | Shared prefill — overwrites `/workspace/src/config/landing.config.ts` for both variants |
+| `agentflow-agents/src/services/graph-executor/pick-workflow-schema.ts:175` | `landingBriefPrefersVue(brief)` — keyword detector |
+| `agentflow-agents/src/services/graph-executor/pick-workflow-schema.ts:393` | `pickLandingSchema` — DB lookup + React/Vue dispatch |
+| `agentflow-agents/presets/coder-landing.json` | React coder preset (slug `coder-landing`) |
+| `agentflow-agents/presets/coder-landing-vue.json` | Vue coder preset (slug `coder-landing-vue`) |
+| `agentflow-agents/src/scripts/seed-boilerplate-workflows.ts:60` | Seeds React row `landing-boilerplate` |
+| `agentflow-agents/src/scripts/seed-boilerplate-workflows.ts:88` | Seeds Vue row `landing-vue-boilerplate` |
+
+## Data flow
+
+```
+brief
+  │
+  ▼
+POST /me/projects → kind classifier → kind='landing'
+  │
+  ▼
+pickWorkflowSchema({kind:'landing', brief})
+  ├── landingBriefPrefersVue(brief) === true ∧ Vue row in DB
+  │     → reason='landing_vue_route', schema=[render_landing_vue, deploy_caddy]
+  └── otherwise
+        → reason='landing_react_default', schema=[render_landing, deploy_caddy]
+  │
+  ▼
+approve → graph-executor walks schema
+  │
+  ▼ (Vue path)
+render_landing_vue handler
+  1. git clone lnlockly/landing-boilerplate-vue → /workspace
+  2. landing-config-prefill: deriveLandingContent(brief) → applyLandingContent
+  3. coderInvoke({slug: 'coder-landing-vue'}) — coder edits src/config/landing.config.ts
+  4. SHA1 probe + sentinel grep gate (BrandX/Acme/AgentFlow → fail)
+  5. expects=['src/config/landing.config.ts'] file-exists gate
+  │
+  ▼
+deploy_caddy (shared with React) → Caddy serves /workspace/dist/
+```
+
+## Boilerplate contract
+
+Both repos ship the same files at the same paths:
+
+| Path | Role |
+|---|---|
+| `src/config/landing.config.ts` | The ONLY file coder edits |
+| `src/config/schema.ts` | Zod schema enforced at runtime |
+| `src/i18n/{ru,en}.json` | Translation dictionaries |
+| `src/build/seo-inject-plugin.ts` | Vite plugin — rewrites `<title>`, `og:*` at build time |
+| `Procfile` | `web: npx vite preview --host 0.0.0.0 --port 8080 --strictPort` |
+
+`src/components/sections/` (React TSX vs Vue SFC) and `src/components/ui/` (shadcn-react vs shadcn-vue) differ but coder never touches them.
+
+## DB / Env / API
+
+- DB table: `agent_boilerplates`. Two rows for `kind='landing'`:
+  - `name='landing-boilerplate'`
+  - `name='landing-vue-boilerplate'`
+- Constants for grep: `LANDING_REACT_BOILERPLATE_NAME`, `LANDING_VUE_BOILERPLATE_NAME` in `pick-workflow-schema.ts`.
+- Env: same as the React path — `AGENTFLOW_INTERNAL` for the coder MCP gateway, `OPENROUTER_API_KEY` via `useModel(ModelType.TEXT_LARGE)` for `deriveLandingContent`.
+- Routes: no new route — reuses `POST /me/projects` and `POST /me/projects/:id/approve`.
+- Graph nodes: `render_landing_vue` registered in `defaultRegistry` via `handlers/index.ts:16`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Vue boilerplate clone fails | `landing_vue_boilerplate_clone_failed:render_landing_vue` | `handlers/landing-vue.ts:179` — check repo availability + network |
+| `src/config/landing.config.ts` missing after clone | `landing_vue_boilerplate_clone_incomplete:render_landing_vue` | `handlers/landing-vue.ts:196` — boilerplate dirty / dot-glob trap |
+| Coder skipped, prefill skipped | `coder_landing_vue_did_nothing:render_landing_vue` | `handlers/landing-vue.ts:251` — check coder-landing-vue preset registration |
+| File listed in expects[] not on disk | `coder_landing_vue_missing_expected_files:render_landing_vue` | `handlers/landing-vue.ts:262` — coder wrote to wrong path |
+| Upstream BrandX/Acme defaults survived | `coder_landing_vue_left_boilerplate:render_landing_vue` | `handlers/landing-vue.ts:273` — prefill missed, coder lazy |
+| Vue brief routed to React | grep `landing_react_default` in project_events when brief mentions Vue | `pick-workflow-schema.ts:175` — extend `landingBriefPrefersVue` regex |
+
+## Routing decisions
+
+`landingBriefPrefersVue` is conservative on purpose. Triggers:
+
+- `на vue`, `vue 3`, `vue.js`, `shadcn-vue`, `composition api` — direct hit.
+- Bare `vue` as a standalone word — counts unless preceded by `revue` or followed by `value`.
+
+Triggers the picker discards (false positives we explicitly guard against):
+
+- `value proposition` — bare `value` is not Vue.
+- `press revue` — French "revue" never means Vue.
+
+If owner says "плевать какой стек, на твоё усмотрение" the picker defaults to React.
+
+## Related
+
+- [`graph-handlers`](/subsystems/graph-handlers) — registry contract and walker
+- [`presets`](/subsystems/presets) — coder preset loading
+- [`caddy-preview`](/subsystems/caddy-preview) — `dist/` serving
+- Sister repo: `lnlockly/landing-boilerplate-vue` on GitHub

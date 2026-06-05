@@ -1,11 +1,15 @@
 ---
 title: "Graph executor (contract & spec)"
-description: "Every AgentFlow project is a DAG walk. Typed node handlers dispatch deterministic work; the coder-agent is the last resort, not the default."
+description: "Legacy DAG walker — unwired from the lifecycle 2026-05-28 (PR #917), slated for full removal in Phase 3."
 ---
 
 # Graph executor
 
-## Implementation status (2026-05-14)
+:::danger[Unwired from lifecycle — 2026-05-28]
+PR #917 deleted `services/kind-classifier.ts` + `approveProject` + `runProjectApprovalBackground` — the call sites that dispatched into this DAG walker. The handlers below remain in `src/services/graph-executor/handlers/` as orphaned code and the per-kind boilerplate rows still seed graphs, but lifecycle traffic does not reach them; unknown node ids fall through to `__coder__` silently. Phase 3 of REFACTOR-AUDIT-2026-05-27 removes the executor entirely and collapses the `kind` enum into 3-value `runtime_class` (`web | tg_bot | workspace`). The content below is preserved for archival reasons.
+:::
+
+## Implementation status (historical — 2026-05-14)
 
 Walker + registry + coder-fallback shipped. Master switch + per-kind
 allowlist now live in the DB-driven `feature_flags` table —

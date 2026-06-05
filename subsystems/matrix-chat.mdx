@@ -26,6 +26,12 @@ Self-hosted Dendrite homeserver на k3s + кастомный React UI пове�
 | `agentflow-agents/src/services/matrix-bridge.ts` | Auto-provision + deterministic password + Matrix id derivation helpers |
 | `agentflow-landing/src/chat/ChatPage.tsx` *(Phase 3)* | `/chat` route component |
 | `agentflow-landing/src/chat/ChatClientContext.tsx` *(Phase 3)* | matrix-js-sdk wrapper |
+| `agentflow-agents/src/routes/chat.ts` | `POST /me/chat/token` SSO bridge |
+| `agentflow-landing/src/chat/ChatPage.tsx` | `/chat` route component |
+| `agentflow-landing/src/chat/matrixApi.ts` | thin Matrix client (sync, send, upload, mxcToHttp) |
+| `agentflow-landing/src/chat/useMatrixChat.ts` | hook with send / sendAttachment / typing / createRoom |
+| `agentflow-landing/src/chat/Composer.tsx` | textarea + paperclip + drag-drop, 50 MiB cap |
+| `agentflow-landing/src/chat/RoomView.tsx` | timeline rendering, image thumbnails, file cards |
 
 ## Data flow
 
@@ -82,8 +88,17 @@ Browser /chat
 
 ### Matrix endpoints (наружу)
 - `https://matrix.agentflow.website/_matrix/client/v3/*` — standard Matrix Client-Server API
+- `https://matrix.agentflow.website/_matrix/media/v3/upload?filename=<...>` — binary upload, `Content-Type: <mime>` + raw body, returns `{ content_uri: "mxc://agentflow.website/<id>" }`
+- `https://matrix.agentflow.website/_matrix/client/v1/media/download/agentflow.website/<id>` — authenticated full-size fetch (v1.11+ requires `Authorization` header or `access_token` query)
+- `https://matrix.agentflow.website/_matrix/client/v1/media/thumbnail/agentflow.website/<id>?width=&height=&method=scale` — authenticated server-rendered thumbnail
 - `https://agentflow.website/.well-known/matrix/server` — server discovery
 - `https://agentflow.website/.well-known/matrix/client` — client discovery
+
+### Attachment flow (m.image / m.file)
+1. Browser `POST /_matrix/media/v3/upload` with file body → `mxc://...`.
+2. Browser `PUT /_matrix/client/v3/rooms/{id}/send/m.room.message/{txn}` with `{ msgtype: "m.image" | "m.file", body: <filename>, url: <mxc>, info: { mimetype, size, w?, h? } }`.
+3. Other clients see the event via /sync; `agentflow-landing/src/chat/matrixApi.ts#parseSync` builds `MatrixAttachment` with `thumbnailUrl` + `downloadUrl` already auth-stamped.
+4. `<img src={thumbnailUrl}>` works because `mxcToHttp` embeds `access_token` as query param (browsers can't attach Authorization to plain img tags).
 
 ## Failure modes
 
@@ -97,6 +112,8 @@ Browser /chat
 | `.well-known/matrix/server` 404 | `404 GET /.well-known/matrix/server` в landing logs | `agentflow-landing/public/.well-known/matrix/` не задеплоен или Vite plugin не копирует |
 | User auto-provision 409 conflict | `M_USER_IN_USE` в bridge logs | Race condition при первом одновременном логине — добавить retry на GET после 409 |
 | Voice/video не работает | `WebRTC: no ICE candidates` | Phase 2+, TURN не настроен (coturn out of scope MVP) |
+| Image preview blank, dev tools показывают 401 | `401 M_MISSING_TOKEN` на `/media/thumbnail/...` | `mxcToHttp` должен добавлять `access_token` query (Authorization header нельзя на `<img>`) — Dendrite v1.11+ media auth обязателен |
+| Upload падает 413 на >50 MiB | `413 Request Entity Too Large` в browser console | Composer cap = 50 MiB, совпадает с ingress `proxy-body-size`. Поднять оба, если меняем cap |
 | Dendrite CrashLoopBackOff после bridge PR | `Invalid config file: open /etc/dendrite/appservices/<bridge>.yaml: no such file or directory` | `app_service_api.config_files` в `k8s/dendrite-config.yaml` ссылается на bridge registration, но Secret `mautrix-<bridge>-registration` не создан. `optional: true` на projected volume позволяет поду стартовать БЕЗ Secret'а, но Dendrite фаталит на отсутствующий файл. Fix: либо закончить bootstrap bridge (см. `k8s/mautrix-<bridge>.yaml` header — создать DB, secrets, apply manifest), либо убрать строку из `config_files` до bootstrap. **Никогда не добавляй новую строку в `config_files` пока `kubectl get secret mautrix-<bridge>-registration` не вернёт ресурс.** Инцидент 2026-05-22: whatsapp.yaml |
 
 ## Lobby room (`#lobby:agentflow.website`)
@@ -240,5 +257,6 @@ kubectl -n franchise-factory logs -l app=agentflow-agents --tail=400 | grep '\[b
 - [Architecture overview](/architecture/overview)
 - [Auth and access](/subsystems/auth-and-access) — AF JWT источник identity для SSO
 - [MinIO storage](/subsystems/farm) — переиспользуется для Dendrite media repo
+- [Matrix Telegram Bridge](/subsystems/matrix-tg-bridge) — `mautrix-telegram` мостит TG в Dendrite
 - [Matrix Bots](/subsystems/matrix-bots) — five platform service bots running on the same homeserver
 - [Matrix Monitoring](/subsystems/matrix-monitoring) — Prometheus metrics + Grafana dashboard for Dendrite + bridge + bot runner
