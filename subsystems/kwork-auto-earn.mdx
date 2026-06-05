@@ -1,23 +1,37 @@
 ---
-title: "Kwork auto-earn DM loop"
-description: "Cron-driven bid monitor that scans /projects, classifies wants, drafts personalised offers, and DMs buyers — with closed-inbox skip + confidence gating."
+title: "Kwork auto-earn loop: canon respond + DM fallback"
+description: "Cron-driven bid monitor that scans /projects, classifies wants, drafts personalised offers, fires a canonical /new_offer bid for the highest-confidence want, then DMs everyone else — with budget guard, closed-inbox skip, and confidence gating."
 ---
 
-# Kwork auto-earn DM loop
+# Kwork auto-earn loop: canon respond + DM fallback
 
 ## TL;DR
 Every 30 minutes the `kwork-bid-monitor-basic` flow reads the public Kwork
 wants feed, classifies each want into one of our gig kinds, writes a
-per-want LLM pitch, and DMs the buyer via `/sendmessage`. Closed-inbox
-buyers and low-confidence classifications get filtered BEFORE the send so
-we don't burn the daily DM quota on guaranteed rejections.
+per-want LLM pitch, then runs **two outreach paths in sequence**:
+
+1. **Canonical respond** — for the single highest-confidence want, POST a
+   "Предложить услугу" bid to `/new_offer/save`. Lands in the buyer's
+   "Предложения" tab (~3x conversion). Burns one of the seller's 30 monthly
+   connects, capped at 15 per refill by `kwork-connects-budget`.
+2. **DM fallback** — for everything else (and for budget-blocked wants),
+   DM the buyer via `/sendmessage`. No connect cost.
+
+Closed-inbox buyers and low-confidence classifications get filtered BEFORE
+the send so we don't burn quota on guaranteed rejections.
 
 ## Files (with line refs)
 | Path | Role |
 |---|---|
-| `agentflow-agents/src/services/studio-flow-templates.ts:841` | `kworkBidMonitorFlow` graph (cron → scan_wants → classify → draft_offer → send_offer → send_card). |
+| `agentflow-agents/src/services/studio-flow-templates.ts:931` | `kworkBidMonitorFlow` graph (cron → scan_wants → classify → draft_offer → canon_respond → send_offer → send_card). |
 | `agentflow-agents/src/services/graph-executor/handlers/kwork-scan-wants.ts` | `kwork.scan_wants` — reads `/projects` feed via `kwork-inbox.list_wants`. |
 | `agentflow-agents/src/services/graph-executor/handlers/ai-classify-wants.ts` | `ai.classify_wants` — buckets each want into `{ai_agent_tg, kwork_parser, remotion_video, skip}` with a 0-1 confidence + `why`. |
+| `agentflow-agents/src/services/graph-executor/handlers/ai-draft-offer.ts` | `ai.draft_offer` — per-want LLM pitch generation with anti-slop sanitisation. |
+| `agentflow-agents/src/services/graph-executor/handlers/kwork-respond-to-want.ts` | `kwork.respond_to_want` — canonical /new_offer bid, gated by connect budget, conf ≥ 0.7, hard cap 1/tick. |
+| `agentflow-agents/src/services/graph-executor/handlers/kwork-send-offer.ts` | `kwork.send_offer` — DM fallback, pre-skip closed inboxes, gate by conf ≥ 0.6, max_send=3. |
+| `agentflow-agents/src/services/kwork-connects-budget.ts` | Budget service (`tryConsumeConnect`, `refundConnect`, `getBudget`, `setBudget`). |
+| `agentflow-agents/src/mcp-servers/kwork-inbox.ts` | `kwork-inbox` MCP: `list_wants`, `get_want`, `respond_to_want` (NEW — canonical /new_offer flow), `send_message`. |
+| `agentflow-agents/src/routes/me-integrations-kwork.ts` | `GET/POST /me/integrations/kwork/connects` — owner-facing budget knob (re-seed after kwork's monthly refill). |
 | `agentflow-agents/src/services/graph-executor/handlers/ai-draft-offer.ts` | `ai.draft_offer` — per-want LLM pitch generation with anti-slop sanitisation. Owner reversed AgentFlow promo 2026-05-22: drafts now open with the action ("Соберу JSON-выгрузку по вашему списку…"), name one detail from the brief, close with a specific next step ("скиньте список — пришлю sample за полчаса"). ≤500 chars, exactly one external URL (gig URL), no AgentFlow/agentflow.website mentions. |
 | `agentflow-agents/src/services/graph-executor/handlers/ai-draft-offer.ts:stripAgentFlowMentions` | Sanitiser pass that strips `AgentFlow` brand mentions + `https://agentflow.website` URLs. Idempotent. |
 | `agentflow-agents/src/services/graph-executor/handlers/ai-draft-offer.ts:stripRecapOpener` | Sanitiser pass that drops banned recap openers (`Видел задачу`, `Заметил`, `По вашему`, `Здравствуйте, видел`). Buyer already knows what they posted; recap reads as AI-generated. |
@@ -37,8 +51,12 @@ cron 30m
   └─> kwork.scan_wants (list_wants @ /projects feed)
         └─> ai.classify_wants (TEXT_LARGE, 1 call per tick)
               └─> ai.draft_offer (TEXT_LARGE, 1 call per non-skip want, fan-out 4)
-                    └─> kwork.send_offer (closed-inbox pre-skip + conf >= 0.6, max_send=3)
-                          └─> tg-bot.send_card (summary to owner bot)
+                    ├─> kwork.respond_to_want (canon, max_send=1, conf >= 0.7)
+                    │     └─ budget check → connect consume → /new_offer/save POST
+                    │     └─ refund on transport failure (http_error/captcha/etc)
+                    └─> kwork.send_offer (DM fallback, max_send=3, conf >= 0.6)
+                          └─ auto-skips wants already covered by canon ok=true row
+                                └─> tg-bot.send_card (canon + DM summary)
 ```
 
 ## DB / Env / API
@@ -53,6 +71,18 @@ cron 30m
     `2026-06-02a` manually via the postgres pod after merge.**
   - `kwork_want_responses` — anti-double-send ledger. Unique on
     `(owner_user_id, want_id, buyer_user_id)`. Columns: `ok`, `error`,
+    `pre_skipped`, `confidence`, `respond_kind` (`canon` | `dm`, migration
+    `2026-05-22d-kwork-connects-state.sql`).
+  - `kwork_connects_state` — singleton per owner, tracks remaining connect
+    budget + daily/weekly counters. Migration
+    `2026-05-22d-kwork-connects-state.sql` seeds owner 1 (avsee4) to 21
+    remaining / next refill 2026-06-15.
+- Env: `KWORK_CONNECT_DAILY_CAP` (default 1), `KWORK_CONNECT_WEEKLY_CAP`
+  (default 7). `KWORK_SESSION_JSON` continues in `project_secrets`.
+- Routes: `GET /me/integrations/kwork/connects` (snapshot),
+  `POST /me/integrations/kwork/connects {remaining?, next_refill_at?}`.
+- MCP tools: `kwork-inbox.list_wants`, `kwork-inbox.get_want`,
+  `kwork-inbox.respond_to_want` (NEW), `kwork-inbox.send_message`,
     `pre_skipped`, `confidence` (forensics — migration
     `2026-05-23a-kwork-want-responses-forensics.sql`).
 - Routes:
@@ -65,9 +95,28 @@ cron 30m
 - MCP tools: `kwork-inbox.list_wants`, `kwork-inbox.get_want` (now returns
   `buyer_inbox_open: boolean | null`), `kwork-inbox.send_message`,
   `kwork-inbox.list_my_kworks`.
-- Gig PIDs (hard-coded in `kwork-send-offer.ts`):
+- Gig PIDs (mirrored in both handlers):
   `ai_agent_tg=52123577`, `kwork_parser=52123887`,
   `remotion_video=52124069`.
+
+## Connect budget mechanics
+- **Seller quota**: kwork gives 30 monthly free connects on the avsee4
+  account; refill rolls every ~30 days (no fixed monthly anchor).
+- **Our cap**: 15 per refill, leaving 5 reserved for owner-driven manual
+  sends. Soft-tuned to stretch across ~22 days between refills.
+- **Per-tick cap**: 1 canon respond. The second-highest-confidence want on
+  the same tick routes to DM fallback.
+- **Daily cap**: 1 (env `KWORK_CONNECT_DAILY_CAP`).
+- **Weekly cap**: 7 (env `KWORK_CONNECT_WEEKLY_CAP`).
+- **Refill detection**: kwork does NOT expose a remaining-connects API —
+  the owner re-seeds via `POST /me/integrations/kwork/connects` after
+  each kwork-side refill.
+- **Refund rules**: refund on transport failures (`http_error`,
+  `network_error`, `rate_limited`, `captcha`, `banned`, `auth_expired`,
+  `unexpected_response`, `csrf_token_not_found`, `no_active_gig`) AND on
+  `connects_exhausted` (kwork never charged us in either case). Do NOT
+  refund on `kwork_rejected` / `already_responded` / `validation` — kwork
+  processed and refused, the connect is gone.
 
 ## Failure modes
 | Symptom | Log signature for grep | Where to fix |
@@ -76,6 +125,10 @@ cron 30m
 | Boilerplate template instead of LLM draft | `drafts[i].text === ''` + `llm_ok=false` in `ai.draft_offer` output | `ai-draft-offer.ts:generateDraftForWant` — LLM error path; check `useModel(ModelType.TEXT_LARGE)` is healthy. |
 | Low-fit pitches sent (poor reply rate) | `confidence < 0.6` rows with `ok=true` in ledger | Raise `confidence_threshold` in flow node or tighten classifier prompt in `ai-classify-wants.ts`. |
 | All wants skipped (`sent_count=0`, `skipped_count=N`) | `pre_skipped_count + skipped_count === wants.length` | Expected when every buyer's inbox is closed for the tick; not a bug. |
+| Canon respond never fires despite remaining=21 | `budget_blocked_per_tick_cap` in ledger error | Cron is firing faster than 60s — verify trigger.cron `interval_seconds >= 1800`. |
+| Canon respond keeps refunding on `unexpected_response` | grep `unexpected_response` in `kwork_want_responses.error` | Kwork rolled the `/new_offer/save` shape. Check `respond_to_want` MCP candidate list against fresh network tab capture. |
+| Connect counter drifts from kwork's reality | owner runs `POST /me/integrations/kwork/connects {remaining: X}` and counter resets | Working as designed — re-seed is the supported sync path. |
+| `csrf_token_not_found` on every canon respond | grep `csrf_token_not_found` | Kwork rolled the form HTML. Update regexes in `kwork-inbox.ts:respond_to_want` GET-page parser. |
 | Sent DM contains AgentFlow brand or link | grep `kwork_want_responses` row text — any `agentflow` / `agentflow.website` substring | `ai-draft-offer.ts:stripAgentFlowMentions` — sanitiser must strip both the bare brand and the URL before send. Owner reversed promo policy 2026-05-22. |
 | Sent DM opens with "Видел задачу…" / "Заметил…" / "По вашему…" recap | grep ledger text starts with `Видел` / `Заметил` / `По вашему` / `Здравствуйте, видел` | `ai-draft-offer.ts:stripRecapOpener` — extend the banned-opener regex list if a new variant slips through. Buyer already knows what they posted; recap reads as AI-generated. |
 | `respond_to_want` returns `anti_bot_html` — kwork returned `<title>Технические работы</title>` on authenticated POST | grep step output for `anti_bot_html` or `shielded_paths` in flow_runs `kwork.respond_to_want` result | `kwork-inbox.ts:submitOfferViaCandidates` — every candidate (canonical `/api/offer/createoffer` + 4 legacy) was shielded. Body still contains `window.unreadDialogCount` proving session valid → it's an anti-bot rate-limit on the seller IP / profile, NOT `auth_expired`. Options: rotate egress IP (warmup-pool), slow the bid cadence, or back off until the shield window expires. |

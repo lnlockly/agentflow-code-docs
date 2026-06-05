@@ -1,4 +1,44 @@
 ---
+title: "Computer MCP (desktop agent)"
+description: "Local MCP server on the user's Mac exposing screen / mouse / keyboard / fs / shell tools to AgentFlow Eliza agents via WebSocket reverse-tunnel."
+---
+
+# Computer MCP (desktop agent)
+
+## TL;DR
+
+Локальный Python MCP-сервер (`agentflow-computer-mcp`) ставится юзеру на Mac через `install.sh`, поднимается launchd-юнитом и держит WSS reverse-tunnel на `wss://agentflow.website/_devices/connect`. На стороне agentflow-agents активный коннект регистрирует `computer.*` тулы в `mcp-bridge` per-user — любой Eliza-агент из marketplace, прикреплённый к проекту `kind=desktop_agent`, может звать `computer.screen.capture`, `computer.mouse.click`, `computer.keyboard.type`, `computer.fs.read` (scoped), `computer.shell.exec` (whitelisted) и т.д.
+
+Reverse-tunnel выбран чтобы обойти NAT/firewall на стороне юзера. Скоп enforcing на двух слоях: клиент проверяет args против `~/.agentflow/computer-scope.toml`, сервер — против `user_devices.scope_json`. `fs.write` и `shell.exec` всегда показывают native macOS confirm dialog даже если скоп их разрешает.
+
+## Files
+
+| Repo / path | Role |
+|---|---|
+| `agentflow-computer-mcp/pyproject.toml:1` | Python package: mcp[cli]>=1.2, pyautogui, websockets, pyobjc-Quartz, Pillow. Entry point `agentflow-computer-mcp = agentflow_computer_mcp.__main__:main`. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/server.py:(line TBD — Agent A PR not yet merged)` | MCP server entry, dual mode (stdio + WS reverse-tunnel). |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_client.py:(line TBD)` | Reverse-tunnel client. Connects to `/_devices/connect`, reads `{type:"tool_call_request",...}`, dispatches to tool impl, sends `{type:"tool_call_result",...}`. 15s heartbeat. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/scope.py:(line TBD)` | Client-side scope loader (`~/.agentflow/computer-scope.toml`) + arg validator. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/confirm.py:(line TBD)` | Native macOS dialog (`osascript -e 'display dialog ...'`) gate for `fs.write` / `shell.exec` / any tool in `confirm_before`. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/screen.py:(line TBD)` | `computer.screen.capture(region?)` via `Quartz.CGWindowListCreateImage` → PNG → base64. Default resize to 1280px wide. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/mouse.py:(line TBD)` | `computer.mouse.click/move/scroll` via pyautogui. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/keyboard.py:(line TBD)` | `computer.keyboard.type/key/shortcut` via pyautogui (typewrite/press/hotkey). |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/window.py:(line TBD)` | `computer.window.list/focus` via Quartz window enumeration + AppleScript focus. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/fs.py:(line TBD)` | `computer.fs.read/list/write` — pathlib, scope-checked against `allow_paths` / `deny_paths`. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/shell.py:(line TBD)` | `computer.shell.exec` — `subprocess.run` against `shell_whitelist`. |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/clipboard.py:(line TBD)` | `computer.clipboard.read/write` via pbcopy / pbpaste. |
+| `agentflow-computer-mcp/install.sh:(line TBD)` | One-liner installer: `pip install`, mkdir `~/.agentflow`, write default `computer-scope.toml` + `auth.json` (mode 0600), drop launchd plist into `~/Library/LaunchAgents/`. |
+| `agentflow-computer-mcp/launchd/com.agentflow.computer-mcp.plist:(line TBD)` | launchd job: KeepAlive=true, RunAtLoad=true, stdout/err → `~/Library/Logs/agentflow-computer-mcp.log`. |
+| `agentflow-agents/src/routes/me/devices.ts:(line TBD — Agent B PR not yet merged)` | REST CRUD: `GET /me/devices`, `POST /me/devices`, `POST /me/devices/:id/scope`, `DELETE /me/devices/:id`, `GET /me/devices/:id/sessions`, `GET /me/devices/:id/sessions/:sid/log`, `GET /me/devices/:id/sessions/:sid/stream` (SSE). |
+| `agentflow-agents/src/routes/devices-ws.ts:(line TBD)` | WS upgrade endpoint `/_devices/connect`. Validates `x-api-key` + `x-device-id` + `x-enrollment-token` (one-time, 24h TTL) → exchanges for long-lived `device_secret`. Heartbeat timeout 30s → mark offline. |
+| `agentflow-agents/src/mcp/bridge.ts:(line TBD)` | `ComputerDeviceProvider` — per-user dynamic tool registration on WS connect, unregister on disconnect / heartbeat timeout. Forwards tool calls over WS with 60s timeout + 1 retry. |
+| `agentflow-agents/db/schema/devices.ts:(line TBD)` | Drizzle schema: `user_devices`, `device_sessions`, `device_action_log`. |
+| `agentflow-agents/src/services/graph-executor/kinds/desktop-agent.ts:(line TBD)` | `kind=desktop_agent` handler. Single node `attach_computer_tools`: verifies device online, creates `device_sessions` row, injects scope+session_id into agent runtime context. See [Desktop-agent kind](/subsystems/desktop-agent-kind). |
+| `agentflow-agents/src/presets/desktop-assistant.json:(line TBD)` | Default Eliza preset: personality (helpful, narrates observations, asks before risky), `allowed_tools=["computer.screen.*","computer.mouse.*","computer.keyboard.*","computer.window.*","computer.fs.read","computer.fs.list","computer.clipboard.*"]`, default `max_actions=50`, `budget_usd=2`. |
+| `agentflow-landing/src/pages/cabinet/Devices.tsx:(line TBD — Agent C PR not yet merged)` | `/cabinet/devices` list page (online dot, last_seen, scope summary, Add device modal). |
+| `agentflow-landing/src/pages/cabinet/DeviceDetail.tsx:(line TBD)` | `/cabinet/devices/:id` — scope editor + sessions list + revoke button. |
+| `agentflow-landing/src/components/devices/DeviceLiveSession.tsx:(line TBD)` | Live session viewer: SSE subscribe to `/me/devices/:id/sessions/:sid/stream`, chat-like timeline of screenshot thumbs + actions + results. |
+| `agentflow-agents/packages/shared-types/devices.ts:(line TBD)` | TS contract types: `Device`, `DeviceScope`, `ToolCallReq`, `ToolCallRes`. Agent B publishes first, Agent C imports. |
 title: "Desktop / Computer-Agent bridge"
 description: "Server side of the agentflow-desktop daemon: WS tunnel, task dispatch, MJPEG proxy."
 ---
@@ -55,6 +95,134 @@ task_error` to `device_action_log`, and proxies the daemon's local MJPEG capture
 ## Data flow
 
 ```
+User's Mac (agentflow-computer-mcp launchd job)
+   │
+   │  ws_client.connect(wss://agentflow.website/_devices/connect,
+   │     headers={x-api-key, x-device-id, x-enrollment-token})
+   ▼
+agentflow-agents devices-ws (/_devices/connect)
+   │
+   ├─ validate headers → exchange enrollment_token → device_secret
+   ├─ INSERT/UPDATE user_devices SET status='online', last_seen=now()
+   ├─ register ComputerDeviceProvider for user_id in mcp-bridge
+   │     (computer.screen.*, computer.mouse.*, ... — list filtered by scope.allowed_tools)
+   └─ start heartbeat loop (timeout 30s → mark offline + unregister)
+
+Eliza agent inside project (kind=desktop_agent) runtime
+   │  agent.callTool('computer.screen.capture', {})
+   ▼
+mcp-bridge.callTool
+   │
+   ├─ lookup ComputerDeviceProvider for caller user_id + device_id
+   ├─ scope check args vs user_devices.scope_json  → 403 scope_denied
+   ├─ forward over WS: { type: 'tool_call_request', id: uuid, name, args }
+   │     (await result, timeout 60s, retry 1)
+   ▼
+ws_client (on Mac)
+   │
+   ├─ scope check args again (defense in depth)
+   ├─ if tool ∈ confirm_before → osascript display dialog, abort on cancel
+   ├─ dispatch to tool impl (tools/screen.py etc)
+   └─ send: { type: 'tool_call_result', id, result|error }
+   ▼
+mcp-bridge
+   │
+   ├─ INSERT device_action_log (session_id, ts, tool, args, result, screenshot_url?)
+   └─ return result to agent
+```
+
+## DB / Env / API
+
+**Tables (drizzle, agentflow-agents schema):**
+
+- `user_devices` — `id, user_id, name, last_seen, scope_json jsonb, status (online|offline), device_secret_hash, created_at, deleted_at`. Indexes: `(user_id, status)`.
+- `device_sessions` — `id, device_id, agent_id, project_id, started_at, ended_at, tokens_used, cost_usd, max_actions, actions_used, status (active|complete|aborted)`.
+- `device_action_log` — `id, session_id, ts, tool, args jsonb, result jsonb, screenshot_url, error`. Indexes: `(session_id, ts)`. Immutable (no UPDATE).
+
+**Env (agentflow-agents):**
+
+- No new server-side env. Uses existing `x-api-key` auth and TLS termination at Caddy.
+- `DEVICE_HEARTBEAT_TIMEOUT_MS` (default 30000) — WS heartbeat-miss before marking offline. (env TBD verify post-deploy)
+- `DEVICE_TOOL_CALL_TIMEOUT_MS` (default 60000) — forward-over-WS await ceiling. (env TBD verify post-deploy)
+
+**Env / files (client Mac):**
+
+- `~/.agentflow/auth.json` — mode 0600, JSON `{ api_key, device_id, device_secret }`. Written by `install.sh` after handshake.
+- `~/.agentflow/computer-scope.toml` — user-editable scope file (mirror of server-side `scope_json`).
+- `~/Library/Logs/agentflow-computer-mcp.log` — launchd stdout/err.
+
+**Routes:**
+
+- `GET    /me/devices` → list with `status` (online if heartbeat in last 30s).
+- `POST   /me/devices` → body `{name}` → returns `{device_id, enrollment_token}` (one-time, 24h TTL).
+- `POST   /me/devices/:id/scope` → body `{scope: DeviceScope}` → updates `scope_json`.
+- `DELETE /me/devices/:id` → revokes (soft-delete + closes any active WS).
+- `GET    /me/devices/:id/sessions?limit=` → list sessions for device.
+- `GET    /me/devices/:id/sessions/:sid/log` → action log paginated.
+- `GET    /me/devices/:id/sessions/:sid/stream` → SSE stream of new action_log rows.
+- `WS     /_devices/connect` → reverse-tunnel upgrade.
+- `GET    /install/computer-mcp.sh` → installer script (static).
+
+**MCP tools registered per online device:**
+
+```
+computer.screen.capture(region?)
+computer.mouse.click(x, y, button="left")
+computer.mouse.move(x, y)
+computer.mouse.scroll(dx, dy)
+computer.keyboard.type(text)
+computer.keyboard.key(name)
+computer.keyboard.shortcut(combo)             # "cmd+space"
+computer.window.list()
+computer.window.focus(title)
+computer.fs.read(path)                        # scoped
+computer.fs.list(path)                        # scoped
+computer.fs.write(path, content)              # scoped + native confirm
+computer.shell.exec(cmd)                      # whitelist + native confirm
+computer.clipboard.read()
+computer.clipboard.write(text)
+```
+
+## Security model
+
+1. **Enrollment token one-time, expires 24h.** Exchanged after first handshake for long-lived `device_secret` (hashed in DB).
+2. **API key never in WS payload plaintext** — only in connect headers, TLS-only (`wss://`).
+3. **Two-layer scope enforcement.** Server (`mcp-bridge`) rejects out-of-scope args before forwarding; client (`scope.py`) rejects again on receive (defense in depth).
+4. **Hard-coded deny-paths fallback.** Even if `scope_json.deny_paths` is empty or removed, these are always blocked: `~/.ssh`, `~/.config`, `~/Library/Keychains`, `~/.aws`, `~/.gnupg`.
+5. **`shell_whitelist` empty by default.** No shell command runs unless the owner explicitly added it via the scope editor.
+6. **Native confirm dialog for `fs.write` and `shell.exec`** — always, even if scope allows. Cancelling returns `error: user_declined` to the agent.
+7. **Budget cap.** `device_sessions.tokens_used * model_price > budget_usd` → session aborted (status=aborted, agent gets `error: budget_exceeded`).
+8. **`max_actions_per_session` cap.** Default 50. Hard limit even if budget remains.
+9. **Action log immutable.** Audit trail — INSERT only.
+10. **Auth file mode 0600.** `install.sh` chmods.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Device shows offline despite launchd running | `[device] heartbeat timeout user= device=` | `routes/devices-ws.ts:(TBD)` — heartbeat loop; check ws_client reconnect in `ws_client.py:(TBD)` |
+| Tool call returns `scope_denied` | `[device] scope denied path=` / `[device] scope denied tool=` | Check `user_devices.scope_json.allow_paths` vs requested path; update scope at `/cabinet/devices/:id` |
+| Tool call returns `timeout` after 60s | `[device] tool_call timeout id= name=` | Mac MCP froze or network dropped — `launchctl kickstart -k gui/$(id -u)/com.agentflow.computer-mcp` |
+| Mac client crashes with permission error | `pyautogui FailSafeException` or `PIL.UnidentifiedImageError` in `~/Library/Logs/agentflow-computer-mcp.log` | macOS Accessibility / Screen Recording not granted; see [Device registration runbook](/runbooks/device-registration) |
+| All tool calls return `user_declined` | `[device] confirm dialog cancelled tool=` | Owner cancelled native dialog; either widen scope (remove tool from `confirm_before`) or have the agent ask before retrying |
+| WS connect rejected with 401 | `[device] invalid api-key` / `[device] enrollment_token expired` | Token TTL 24h passed before client first connected — re-issue from `/cabinet/devices` "Add device" |
+| Session aborted mid-run | `[device] session budget exceeded session=` / `[device] session max_actions reached session=` | Raise `budget_usd` or `max_actions_per_session` in scope editor |
+| Device row stuck `online` after launchd job stopped | `[device] heartbeat miss but ws not closed` | Stale WS reference in `mcp-bridge.ts:(TBD)`; restart `agentflow-agents` deploy |
+| `fs.write` succeeds but file empty | `[device] fs.write zero bytes path=` | Client received empty `content` arg — likely caller bug, check upstream agent output |
+| Enrollment token reused after first use | `[device] enrollment_token already consumed` | One-time semantics; issue a new token |
+| pyautogui import fails on Apple Silicon Sonoma+ | `ImportError: ... Quartz` in startup log | Reinstall with `--no-cache pyobjc-framework-Quartz>=10.0` |
+
+(All log strings above will become greppable substrings once Agent A/B push code — update this row set in the same PR that backfills line numbers.)
+
+## Related
+
+- [Desktop-agent kind (graph-executor)](/subsystems/desktop-agent-kind)
+- [Flow: Desktop-agent attach](/flows/desktop-agent-attach)
+- [Runbook: Device registration](/runbooks/device-registration)
+- [Runbook: Device offline debug](/runbooks/device-offline-debug)
+- [Subsystems: MCP bridge / Code Exec MCP](/subsystems/code-exec-mcp)
+- [Subsystems: Presets](/subsystems/presets)
+- [Subsystems: Marketplace](/subsystems/marketplace)
 Cabinet                 agentflow-agents (pod)                  agentflow-desktop (Mac)
    │                            │                                       │
    │ POST /dispatch_task        │                                       │

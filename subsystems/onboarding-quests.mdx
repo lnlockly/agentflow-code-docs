@@ -1,4 +1,28 @@
 ---
+title: "Onboarding quests"
+description: "/start gamification page — quest list, claimable earnings, referral link, raffles, leaderboard. Wired to /me/quests + /me/earnings + /me/referral-link."
+---
+
+# Onboarding quests
+
+## TL;DR
+
+`/start` is the "Путь новичка" gamified onboarding page. It used to be
+all mock data; 2026-05-15 wired the five sections through `useMockOrApi`
+which prefers real API responses and falls back to mocks only on fetch
+failure (kept for offline/dev). Quest completion awards FLOW via the
+existing `referral_earnings` ledger.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/gamification.ts:141` | `GET /me/quests` — defs join user completions |
+| `agentflow-agents/src/routes/gamification.ts:171` | `POST /me/quests/:questId/complete` — insert `user_quests` + credit reward |
+| `agentflow-landing/src/pages/OnboardingPage.tsx:251` | Page component (route `/start` in `main.tsx:483`) |
+| `agentflow-landing/src/pages/OnboardingPage.tsx:235` | `useMockOrApi` helper — real fetch with mock fallback |
+| `agentflow-landing/src/pages/OnboardingPage.tsx:260` | `useMockOrApi(['quests'], MOCK_QUESTS, '/me/quests')` |
+| `agentflow-landing/src/main.tsx:483` | `<Route path="/start" element={<OnboardingPage />} />` |
 title: "Onboarding Quests — /start"
 description: "Real-product quest catalog with server-side auto-completion hooks and USDF rewards"
 ---
@@ -54,6 +78,24 @@ Starter payout total (excluding referrals): 8.00 USDF.
 ## Data flow
 
 ```
+/start mount
+  ├─► useMockOrApi('/me/quests')         ─► quest list (defs ⊕ user completions)
+  ├─► useMockOrApi('/me/earnings')       ─► claimable FLOW total
+  ├─► useMockOrApi('/me/referral-link')  ─► personal ref URL
+  ├─► useMockOrApi('/raffles/active')    ─► active raffles
+  └─► useMockOrApi('/leaderboard')       ─► top users by FLOW
+
+User clicks "Complete quest"
+  └─► POST /me/quests/:id/complete  { proofUrl? }
+      ├─► INSERT user_quests (user_id, quest_id, proof_url)
+      ├─► if reward > 0: INSERT referral_earnings (type='quest', amount)
+      └─► refetch ['quests']
+
+useMockOrApi behavior:
+  • initialData = mockData      → page renders instantly
+  • queryFn tries apiGet(path)  → real data overwrites mock on success
+  • on apiGet throw → returns mockData → page silently keeps placeholder
+  • staleTime: 30s
                             user action
                                 │
                                 ▼
@@ -81,6 +123,15 @@ Starter payout total (excluding referrals): 8.00 USDF.
 
 ## DB / Env / API
 
+- Tables (existing, not added by this work):
+  - `quest_definitions(id, title, title_ru, reward, sort_order, repeatable)`
+  - `user_quests(user_id, quest_id, completed_at, proof_url)`
+  - `referral_earnings(user_id, source_user_id NULL, amount, type)` — `type='quest'` for quest rewards
+- Routes:
+  - `GET /me/quests` — returns `{ ok, quests: [{ id, title, title_ru, reward, repeatable, completed, completed_at }] }`
+  - `POST /me/quests/:questId/complete` — body `{ proofUrl? }`
+  - Errors: `404 quest_not_found`, `409 already_completed` (non-repeatable + already done)
+- Mock constants live in `OnboardingPage.tsx` and only render when the API throws
 - Tables: `quest_definitions`, `user_quests`, `referral_earnings`,
   `projects`, `project_collaborators`.
 - Env: none new — reuses `REFERRAL_BASE_URL` and DB.
@@ -99,6 +150,15 @@ Starter payout total (excluding referrals): 8.00 USDF.
 
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
+| Page shows mock quests even after login | `useMockOrApi` catch returned `mockData` | `/me/quests` is failing — check session cookie + that `requireSession` is mounted on the route |
+| Complete-quest 404 | `quest_not_found` | `questId` from URL does not match any `quest_definitions.id` |
+| Complete-quest 409 | `already_completed` | Non-repeatable quest, user already completed. By design |
+| Reward not in earnings page | n/a — only `reward > 0` writes to `referral_earnings` | Zero-reward quests track completion only; expected |
+
+## Related
+
+- [Funnel analytics](/subsystems/funnel-analytics) — fires `onboarding_completed` event on first quest claim flow
+- Spec: `agentflow-landing/docs/specs/2026-05-15-analytics-funnel-reminders-v2.md` (referenced for the event taxonomy)
 | Quest hook silently no-ops | `[quest-events] maybeCompleteQuest failed:` | `src/services/quest-events.ts:95` |
 | `connect_device` not granted on hosted-device create | `[hosted-devices] apply failed` | `src/routes/me-hosted-devices.ts:300` |
 | `open_preview` rejected with `preview_not_ready` | check `projects.preview_url` is non-empty | `src/routes/gamification.ts:222` |
