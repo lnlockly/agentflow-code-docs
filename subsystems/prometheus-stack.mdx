@@ -7,7 +7,11 @@ description: "In-cluster Prometheus pod that scrapes annotated first-party Deplo
 
 ## TL;DR
 
-Audit-4 + Audit-7 found Grafana dashboards + scrape annotations committed, but no Prometheus pod actually running. `k8s/prometheus.yaml` fixes that — a single-replica `prom/prometheus:v3.0.1` in the `monitoring` namespace, ClusterRole + ServiceAccount for service/pod discovery, two scrape jobs (`kubernetes-pods` and `kubernetes-services`). Phase 5 also wires three new metric families on the existing `/metrics` route so billing-loss incidents (`recordusage_failures_total`) and upstream LLM regressions (`llm_request_duration_seconds`, `llm_retry_attempts_total`) become alertable.
+Audit-4 + Audit-7 found Grafana dashboards + scrape annotations committed, but no Prometheus pod actually running. `k8s/prometheus.yaml` is the intended fix — a single-replica `prom/prometheus:v3.0.1` in the `monitoring` namespace, ClusterRole + ServiceAccount for service/pod discovery, two scrape jobs (`kubernetes-pods` and `kubernetes-services`). Phase 5 also wires three new metric families on the existing `/metrics` route so billing-loss incidents (`recordusage_failures_total`) and upstream LLM regressions (`llm_request_duration_seconds`, `llm_retry_attempts_total`) become alertable.
+
+:::caution[DEPLOYMENT STATUS — NOT LIVE (verified 2026-05-30)]
+The manifest is **committed but not deployed**. On ff-france there is **no `monitoring` namespace** and **no Prometheus/Grafana pod anywhere** (`kubectl get pods -A | grep -iE 'prometheus|grafana'` → none). Root cause: `agentflow-agents/.github/workflows/deploy.yml` never `kubectl apply`s `k8s/prometheus.yaml` or `k8s/monitoring.yaml` (it applies only the minio + remotion manifests). On top of that, `MATRIX_METRICS_AUTH_TOKEN` is unset on the agents Deployment, so even a scrape would get `404 metrics_disabled`. To go live (owner-gated — costs CPU/RAM on the capacity-constrained box): (1) wire both manifests into `deploy.yml` + create the `monitoring` ns, (2) set `MATRIX_METRICS_AUTH_TOKEN` (32-byte hex) on the agents Secret and match it in the scrape job's `bearer_token`. See `plans/autonomous/_observability-audit-2026-05-30.md`.
+:::
 
 ## Files (with line refs)
 
@@ -64,6 +68,7 @@ Scraped series:
 |---|---|---|
 | Prom target DOWN with 404 on `:4100/metrics` | `metrics_disabled` in agents pod logs | Set `MATRIX_METRICS_AUTH_TOKEN` env on `agentflow-agents` + matching `bearer_token` in Prom scrape config |
 | Prom pod CrashLoopBackOff | `parsing YAML file /etc/prometheus/prometheus.yml` | Validate `prometheus-config` ConfigMap, kubectl rollout restart |
+| No metrics at all / `monitoring` ns missing — Prometheus never deployed | `kubectl get ns` shows no `monitoring`; `kubectl get pods -A \| grep prometheus` → empty | `deploy.yml` does not apply `k8s/prometheus.yaml`/`k8s/monitoring.yaml`. Add the `kubectl apply -f` steps + create the `monitoring` ns (owner-gated: resource cost). Verified not-deployed 2026-05-30. |
 | RBAC denied on discovery | `forbidden: User "system:serviceaccount:monitoring:prometheus"` | Re-apply ClusterRole + ClusterRoleBinding from `k8s/prometheus.yaml` |
 | Cardinality blow-up on `recordusage_failures_total` | n/a (silent — visible in `/metrics` size) | `classifyRecordUsageError` collapses unknowns to `other`; reject any new `reason` value not enumerated in `services/matrix-bots/metrics.ts` |
 | Histogram missing the `error` bucket label | `llm_request_duration_seconds_count` series with only `2xx`/`5xx` | Catch path in `callUpstreamWithFallback` must call `.observe()` with `status: 'error'` before `continue` |

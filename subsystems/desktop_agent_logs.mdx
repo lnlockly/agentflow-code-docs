@@ -29,7 +29,7 @@ frames. The cabinet reads them via `GET /me/devices/:id/logs`.
 | `agentflow-agents/src/db/migrations/0071_device_logs.sql:1` | `device_logs` table + `idx_device_logs_device_time` |
 | `agentflow-agents/src/services/devices-ws.ts:1030` | `persistDeviceLog` — `device_log` frame → INSERT (binds `ts.toISOString()`) |
 | `agentflow-agents/src/services/devices-ws.ts:1000` | `normaliseDeviceLog` — level whitelist + 4 KB truncate + ±24h ts clamp |
-| `agentflow-agents/src/routes/me-devices.ts:1132` | `GET /me/devices/:id/logs` |
+| `agentflow-agents/src/routes/me-devices/logs.ts:95` | `GET /me/devices/:id/logs` |
 | `agentflow-agents/tests/me-devices-logs.test.ts:1` | Pure-helper tests (parse + normalise) |
 | `agentflow-computer-mcp/tests/test_logging_setup.py:1` | log_dir + rotation + mkdir-failure tests |
 | `agentflow-computer-mcp/tests/test_ws_log_uploader.py:1` | Drop-oldest + drain-on-attach + truncation tests |
