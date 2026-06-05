@@ -26,6 +26,10 @@ we don't burn the daily DM quota on guaranteed rejections.
 | `agentflow-agents/src/mcp-servers/kwork-inbox.ts` | `kwork-inbox` MCP: `list_wants`, `get_want` (surfaces `buyer_inbox_open`), `send_message`. |
 | `agentflow-agents/src/mcp-servers/kwork-inbox.ts:submitOfferViaCandidates` | Candidate-loop dispatcher for `respond_to_want`. Canonical: `POST /api/offer/createoffer` (multipart FormData, `offerType=kwork`, `kwork_id=<PID>`, `kwork_count=1`). Legacy fallbacks: `/new_offer/save`, `/new_offer`, `/offers/save`, `/projects/<id>/offer`. Tagged via `shape: 'createoffer_multipart' | 'legacy_urlencoded'`. |
 | `agentflow-agents/src/mcp-servers/kwork-inbox.ts:isAntiBotShieldHtml` | Pure detector for `<title>Технические работы</title>` maintenance HTML. Used by the dispatcher to continue past shielded candidates instead of returning `unexpected_response`. |
+| `agentflow-agents/src/mcp-servers/kwork-inbox.ts:withActionLog` | **Choke point.** Wraps every tool handler in `kworkInboxToolsRaw` so each invocation writes one `kwork_action_log` row. The exported `kworkInboxTools` IS the wrapped registry, so both the JSON-RPC dispatch (`handleKworkInboxMcp`) and the direct path (`callKworkInboxTool`) are audited — no trigger source (goose agent, cron, bridge, direct call) can bypass it. Best-effort: `logKworkAction` swallows all failures so a log error never breaks the Kwork action. |
+| `agentflow-agents/src/mcp-servers/kwork-inbox.ts:ACTION_KIND_BY_TOOL` | Tool→kind map (`scan`/`read`/`reply`/`bid`/`offer`/`deliver`). `classifyStatus` maps the `{ok}`/`{error}`/`{pre_skipped}`/`{awaiting_approval}` envelope → `ok`/`failed`/`skipped`/`awaiting_approval`. `extractTarget` pulls `dialog_id`/`want_id`/`kwork_id`. All three exported for unit coverage. |
+| `agentflow-agents/src/routes/me-integrations-kwork.ts:/me/integrations/kwork/actions` | Owner-scoped reader of `kwork_action_log` (`?limit=50`, max 200). Data source for the cabinet action-log UI. |
+| `agentflow-agents/src/routes/me-integrations-kwork.ts:/me/integrations/kwork/start` | **Cabinet launch entry.** Ensures a `kwork-account-replier` agent exists for the owner (slug `kwork-account-replier-<uid>`, idempotent) and arms its `agent_triggers` cron from the preset's `auto_triggers` — without the Activepieces/flow path. Requires a connected session (`400 kwork_not_connected` otherwise). Reuses `getPreset` + `seedAutoTriggersForAgent`. Gates stay OFF (`KWORK_AUTO_SEND`/`KWORK_AUTO_BID` not flipped; bid cron seeded `enabled:false`) → draft-then-approve. |
 
 ## Data flow
 ```
@@ -39,10 +43,23 @@ cron 30m
 
 ## DB / Env / API
 - Tables:
+  - `kwork_action_log` — **unified per-action audit of record** (migration
+    `2026-06-02a-kwork-action-log.sql`). One row per kwork-inbox tool call:
+    `owner_user_id`, `account_ref`, `kind`, `target`, `status`,
+    `detail_json`, `created_at`. Idx `(owner_user_id, created_at)` +
+    `(owner_user_id, kind, created_at)`. Written at the `withActionLog` choke
+    point regardless of trigger. `kwork_want_responses` is the conversion
+    view layered on top, not the audit. **CI does NOT run migrations — apply
+    `2026-06-02a` manually via the postgres pod after merge.**
   - `kwork_want_responses` — anti-double-send ledger. Unique on
     `(owner_user_id, want_id, buyer_user_id)`. Columns: `ok`, `error`,
     `pre_skipped`, `confidence` (forensics — migration
     `2026-05-23a-kwork-want-responses-forensics.sql`).
+- Routes:
+  - `GET /me/integrations/kwork/actions?limit=50` — read the action log
+    (owner-scoped, requireSession).
+  - `POST /me/integrations/kwork/start` — cabinet launch entry; ensure the
+    replier agent + arm cron (owner-scoped, flow-independent).
 - Env: none new. `KWORK_SESSION_JSON` continues to live in
   `project_secrets` keyed by `owner_user_id`.
 - MCP tools: `kwork-inbox.list_wants`, `kwork-inbox.get_want` (now returns

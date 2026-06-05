@@ -93,6 +93,7 @@ UnderTheHood ▾ → lazy Terminal (WS /terminal) · FileTree · CodeEditor
 | Drive click lands off-target | rendered-img scaling vs remote resolution | `AgentScreen.tsx` `handleMonitorClick` → `renderedImgRect` (letterbox math); clicks on bars are dropped |
 | Record button disabled | `recordSupported` false (no MediaRecorder / `canvas.captureStream`) | `AgentScreen.tsx` `pickRecordMime()` / `recordSupported` — button shows `live.feed.record_unsupported` |
 | Agent stays paused after Drive | `drivePausedRef` resume call failed | `CabinetDeviceLive.tsx` `handleDriveChange` — fallback is the detail-page Resume button |
+| Feed row shows the literal word «null» | daemon SSE `complete`/`error` event ships `detail: "null"` (a stringified absent field), mapped to `secondary: payload.detail` at `CabinetDeviceLive.tsx:412`, then rendered raw at `RunTimeline.tsx:267`/`:271` (and through `humanizeChatText` at `:244`/`:246`) | guard the secondary in `RunRow` with `cleanSecondary(row.secondary)` so the strings `"null"`/`"undefined"`/`""` collapse to empty before the render at `agentflow-landing/src/components/cabinet-live/RunTimeline.tsx:235` |
 
 ## Phase 2 (shipped — PR landing #576)
 

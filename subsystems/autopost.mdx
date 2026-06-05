@@ -1,0 +1,127 @@
+---
+title: "Autopost (scheduled autoposting)"
+description: "Cron-driven content generation that posts to a user's TG channel and VK wall via the cross-poster."
+---
+
+# Autopost
+
+## TL;DR
+
+A scheduled autoposting agent: every due `autopost_schedules` row generates a
+post from its brief via the LLM router (`useModel(TEXT_LARGE)`) and fans it out
+to the owner's TG channel + VK wall through the existing cross-poster. It reuses
+the send/auth/scheduler substrate wholesale; the new pieces are only the content
+generator, a runner, two tables, CRUD routes, and the cron pass. The `run-now`
+route is ungated; the cron pass is gated by `FF_AUTOPOST=1`.
+
+This is the platform's money/traffic loop. A schedule may carry a `ref_code`;
+the runner then appends ONE deterministic CTA line
+`https://agentflow.website/?ref=<code>` to the generated post (never invented by
+the LLM), so a viewer's signup attributes to `users.invited_by_ref_code`. TG
+delivery FAILS CLOSED through a safe-sender guard: it never sends via the owner's
+personal account and never reports `sent` when no Telethon session delivered the
+post.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/autopost/generate.ts:101` | `generatePost(brief, ownerUserId, deps, opts)` — LLM router → one post body. No model literals. Appends the CTA link when `opts.refCode` set. |
+| `agentflow-agents/src/services/autopost/generate.ts:31` | `buildCtaLink(refCode)` — `https://agentflow.website/?ref=<code>`, URL-encoded, null on blank. |
+| `agentflow-agents/src/services/autopost/generate.ts:43` | `appendCtaLink(body, refCode)` — one clean CTA line, idempotent, no-op on blank. Deterministic; LLM never invents it. |
+| `agentflow-agents/src/services/autopost/runner.ts:92` | `runAutopost(schedule, deps)` — generate (with `refCode`) → `dispatchPost` → insert `autopost_posts`. DI for tests. |
+| `agentflow-agents/src/services/autopost/runner.ts:58` | `rollupStatus(results)` — sent / partial / failed rollup. |
+| `agentflow-agents/src/routes/me-autopost.ts:60` | CRUD + `POST /:id/run-now`. `requireSession`. `ref_code` in the create DTO. |
+| `agentflow-agents/src/services/agent-trigger-worker.ts:753` | `processAutopostSchedules(now)` — cron pass, claims due rows, stamps `last_fired_at`, passes `refCode`. |
+| `agentflow-agents/src/services/cross-poster/dispatcher.ts:15` | `dispatchPost({...,channelOverride?})` — optional TG channel override. |
+| `agentflow-agents/src/services/cross-poster/tg.ts:250` | `resolveSafeSender(...)` — fail-closed account selection. Returns `autopost_no_safe_sender` / `autopost_no_session`. |
+| `agentflow-agents/src/services/cross-poster/safe-sender.ts:82` | `isPersonalOwnerAccount(account)` — generic predicate (config phone/username, not a hardcoded id). |
+| `agentflow-agents/src/services/cross-poster/safe-sender.ts:104` | `hasLiveSession(account)` — true only when `session_encrypted` is non-blank. |
+| `agentflow-agents/src/services/autopost/insights.ts:39` | `listAutopostPosts(scheduleId,owner)` + `scheduleTraffic(...)` — posts history + ref-code signup metrics (raw SQL on `users.invited_by_ref_code`). |
+| `agentflow-agents/src/services/autopost/audience.ts:158` | `findAudience({brief,owner})` — AI-Охотник: LLM-derived TG search queries → live `search_telegram` → ranked channels; degrades to `tg_not_connected`. |
+| `agentflow-agents/src/db/schema.ts` | `autopostSchedules` (incl. `refCode`), `autopostPosts` drizzle defs. |
+| `agentflow-agents/src/db/migrations/0081_autopost.sql` | Base schema migration (applied manually). |
+| `agentflow-agents/src/db/migrations/0082_autopost_ref_code.sql` | Adds `ref_code` (applied manually — CI does not run migrations). |
+| `agentflow-landing/src/pages/CabinetAutopost.tsx` | The «AI-Охотник» cabinet (`/cabinet/autopost`) — setup + monitoring UI. |
+| `agentflow-landing/src/lib/autopostApi.ts` | Typed client for all autopost + TG-picker routes. |
+
+## Data flow
+
+```
+cron tick (30s, FF_AUTOPOST=1)            POST /me/autopost/schedules/:id/run-now
+  processAutopostSchedules                  (requireSession, manual verify)
+        │  select enabled + computeCronDue        │
+        │  atomic claim (last_fired_at)           │
+        └────────────► runAutopost(schedule) ◄────┘
+                          │
+                generatePost(brief) ── useModel(TEXT_LARGE)
+                          │
+                generatePost(brief, owner, {}, {refCode})
+                          │  appendCtaLink → …/?ref=<code>
+                dispatchPost({ownerUserId,text,targets,channelOverride})
+                          │                       │
+                  postToTelegram (userbot)   postToVk (wall.post)
+                          │  resolveSafeSender:
+                          │   personal? → autopost_no_safe_sender (no send)
+                          │   no session? → autopost_no_session (no send)
+                insert autopost_posts {text, result, status}
+```
+
+## DB / Env / API
+
+- Tables:
+  - `autopost_schedules(id, owner_user_id, cron_expr, targets jsonb, brief, channel_override, ref_code, enabled, last_fired_at, created_at)`
+  - `autopost_posts(id, schedule_id, owner_user_id, text, result jsonb, status, posted_at)`
+  - `platform_tg_accounts(id, phone, label, tg_username, display_name, session_encrypted, status, added_by_user_id, …)` — read by `resolveSafeSender` to decide a safe sender.
+  - Attribution sink: `users.invited_by_ref_code` (set on first signup; the live metric).
+- Env:
+  - `FF_AUTOPOST=1` — cron pass (default off; also starts the trigger worker in `pool-worker/index.ts`).
+  - `OWNER_PERSONAL_TG_PHONES` — comma-separated phones flagged personal (default includes `+79036340462`).
+  - `OWNER_PERSONAL_TG_USERNAMES` — comma-separated handles flagged personal (default `avsee4`).
+- Routes:
+  - `POST /me/autopost/schedules` `{cron_expr, brief, targets?, channel_override?, ref_code?, enabled?}` — `ref_code` is `[A-Za-z0-9_-]{1,64}`.
+  - `GET /me/autopost/schedules`
+  - `DELETE /me/autopost/schedules/:id`
+  - `POST /me/autopost/schedules/:id/run-now` — fires immediately, returns `{status, post_id, text, results}`.
+  - `GET /me/autopost/schedules/:id/posts` — published/failed history (`autopost_posts`), most-recent-first.
+  - `GET /me/autopost/schedules/:id/traffic` — `{postsTotal, postsSent, lastSentAt, signups, refCode}`. `signups` is null when the schedule has no `ref_code` (attribution never faked).
+  - `POST /me/autopost/find-audience` `{brief}` — AI-Охотник. Always 200; `{ok:false, reason:'tg_not_connected'|'tg_search_failed'|'empty_brief'}` on degrade, else `{ok:true, queries, channels[]}`.
+- Cabinet: `/cabinet/autopost` (`CabinetAutopost.tsx`) — TG channel picker (live `/me/telegram/dialogs`), daily-time schedule, optional ref-link, per-agent monitoring + run-now + post history + audience search. Honest "подключи Telegram" banner when no live session.
+- Reused MCP: TG send via `mcpDirect.callTool('telegram','send_message',...)` (inside `cross-poster/tg.ts`); VK via `wall.post`.
+- Preconditions (existing flows, not rebuilt): a non-personal tg-mcp account
+  with a live Telethon session, channel via
+  `chat_tg_links.account_labels.default_channel` (or a `channel_override`), and/or
+  a VK `wall`-scope token in `chat_vk_links`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Generation produced nothing | `autopost_empty_generation` | `services/autopost/generate.ts` — model returned empty; recorded as failed post |
+| Blank brief on create | `autopost_empty_brief` | `services/autopost/generate.ts` — schedule brief empty |
+| TG post no-ops, account not linked | `TG: аккаунт не привязан` | `cross-poster/tg.ts:189` — no `chat_tg_links` row |
+| TG post no-ops, no default channel | `не настроен канал по умолчанию` | `cross-poster/tg.ts:197` — set `default_channel` or pass `channel_override` |
+| Refused to send — sender is the owner's personal account, no safe fallback | `autopost_no_safe_sender` | `cross-poster/tg.ts:250` (`resolveSafeSender`) — repoint `chat_tg_links.primary_login_id` to a non-personal `platform_tg_accounts` row, or add a platform account. Recorded as `failed`, never `sent`. |
+| Refused to send — chosen account has no Telethon session (the false-positive fix) | `autopost_no_session` | `cross-poster/tg.ts:272` (`resolveSafeSender`) — connect/restore the session for the platform account (`platform_tg_accounts.session_encrypted` is NULL). Recorded as `failed`, never `sent`. |
+| VK access denied | `error 15` / `scope \`wall\`` | `cross-poster/vk.ts` — token missing `wall` scope or expired |
+| Schedule never fires | (no `autopost schedule fired` log) | check `FF_AUTOPOST=1` and that the worker started (`pool-worker/index.ts`) |
+| Audience search empty / "подключи Telegram" | `tg_account_not_linked` / `tg_primary_login_missing` | no live TG session — `find-audience` returns `reason:'tg_not_connected'`; user must link an account (`tg-accounts.ts`) |
+| Traffic `signups` shows `—` | (schedule `ref_code` is null) | set a ref-link on the schedule; `scheduleTraffic` returns null signups without one (`services/autopost/insights.ts`) |
+
+## Value loop (measuring a post)
+
+A schedule's `ref_code` makes a post attributable. The body ends with
+`https://agentflow.website/?ref=<code>`; a viewer who clicks and signs up gets
+`users.invited_by_ref_code = <code>` on first signup (set in
+`routes/auth-tg-callback.ts` / `routes/auth-magic-link.ts`). Measure value by:
+
+1. TG post view counter (real external view) — read via the `af_telegram_messages` MCP.
+2. `SELECT count(*) FROM users WHERE invited_by_ref_code='<code>' AND created_at > <posted_at>` rising by ≥1 — a real click→signup.
+3. ($1) that user later appears paid in `cryptobot_payments` / `flow_payments`.
+
+The fire-the-first-post recipe (curl + go/no-go checklist) lives outside the RAG
+in the workspace at `.artifacts/value-loop-fire-runbook.md`.
+
+## Related
+- [Matrix Bots](/subsystems/matrix-bots) — cross-poster (`@af-poster`) engine.
+- [VK Bridge](/subsystems/vk-bridge) — VK wall.post + token storage.
