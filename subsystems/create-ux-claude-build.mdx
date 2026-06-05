@@ -1,0 +1,82 @@
+---
+title: "Create UX — describe-it → VS Code build view"
+description: "Front-end create flow: a single brief field, no kind picker, no approve; submit navigates straight to the project VS Code build view."
+---
+
+# Create UX — describe-it → VS Code build view
+
+## TL;DR
+
+Creating a project is just «describe it». The `/projects` dashboard shows one
+brief textarea + one primary «Создать» button. There is no kind/«что собрать?»
+chooser and no approve step on the default path. On submit the FE calls
+`createProject({ brief })` and navigates straight to the project VS Code build
+view (`/account/projects/:id/vscode`), where Claude builds from scratch
+(backend provisions a VS Code+Claude pod, status=`building`, no approve). The
+project list renders plain-Russian states — «Claude строит…» / «Готово» — with
+an «Открыть в VS Code» action and no raw kind labels.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/pages/ProjectsDashboard.tsx:201` | `create` mutation `onSuccess` — invalidate list, then navigate to vscode. |
+| `agentflow-landing/src/pages/ProjectsDashboard.tsx:203` | `navigate('/account/projects/:id/vscode')` — straight into the build view, no interstitial. |
+| `agentflow-landing/src/pages/ProjectsDashboard.tsx:89` | `getStatusVisual` — status → plain-Russian state via `pcb.status.*` (building / done). |
+| `agentflow-landing/src/pages/ProjectsDashboard.tsx:62` | `VSCODE_STATUSES` includes `building` (the new create-flow status). |
+| `agentflow-landing/src/pages/ProjectsDashboard.tsx:403` | `data-testid="create-project-submit"` — the single primary CTA. |
+| `agentflow-landing/src/pages/ProjectsDashboard.tsx:528` | `data-testid="open-in-vscode"` — card action. |
+| `agentflow-landing/src/lib/agentsApi/projects.ts:562` | `createProject(brief)` — brief-only call to `POST /me/projects`. |
+| `agentflow-landing/src/i18n/{ru,en,zh}.json` | `pcb.*` namespace — all create-UX + list-state copy. |
+| `agentflow-landing/tests/create-ux-claude-build.test.mjs:1` | Source-introspection test pinning the contract. |
+
+## Data flow
+
+```
+/projects (ProjectsDashboard)
+  │  brief textarea + «Создать» (data-testid=create-project-submit)
+  ▼
+createProject(brief)  → POST /me/projects { brief }
+  │  (backend provisions VS Code+Claude pod, status=building, NO approve)
+  ▼
+navigate(/account/projects/:id/vscode)   ← straight into the build view
+  │
+  └─ ProjectVsCode.tsx renders the live Claude terminal + «Войти и направить»
+
+list cards: status → getStatusVisual → pcb.status.{building,done}
+  building → «Claude строит…» (amber)   done/running → «Готово» (soft-green)
+  action: «Открыть в VS Code» → /account/projects/:id/vscode
+```
+
+## DB / Env / API
+
+- Routes: `POST /me/projects { brief }` (no `kind`, no approve), `GET /me/projects?limit=200`, `GET /me/projects/create-status`.
+- Target route: `/account/projects/:id/vscode` (FE, `main.tsx`).
+- i18n keys: `pcb.hero.*`, `pcb.field.*`, `pcb.cta.*`, `pcb.status.*`, `pcb.card.*`, `pcb.list.*`, `pcb.empty.*`, `pcb.example.*` in ru/en/zh.
+- No new env vars.
+
+## What was removed from the default path
+
+- `CreateProjectModal` (kind + builtin-template picker + BotFather token paste) — no longer rendered by the dashboard.
+- The inline `LiveBuildView` interstitial — the owner lands in VS Code instead.
+- `runPostCreateBackground` warm-daemon-claim + `approveProject` — the new
+  backend provisions the pod and builds with no approve.
+- Raw kind tag/emoji on cards (`KIND_LABEL` / `kindLabel`).
+
+`CreateProjectModal.tsx` and the `/projects/new` (`ProjectCreating`) route still
+exist on disk but are no longer wired into the default create surface.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Submit does nothing | brief shorter than `MIN_BRIEF` (5) — CTA stays disabled | `ProjectsDashboard.tsx` `canSubmit` |
+| Create CTA shows «Недоступно» | `create-status` returned `locked:true` | `pcb.locked.*` lock panel |
+| Card pill shows a raw status word | new backend status not mapped in `getStatusVisual` | add a `case` → `pcb.status.*` |
+| «Открыть в VS Code» missing on a card | status not in `VSCODE_STATUSES` | `ProjectsDashboard.tsx:62` |
+
+## Related
+
+- [Project VS Code IDE](/subsystems/project-vscode-ide)
+- [Projects dashboard](/subsystems/projects-dashboard)
+- [Projects create flow (instant-create)](/subsystems/projects-create-flow) — deprecated kind-classifier path this replaces on the FE.
