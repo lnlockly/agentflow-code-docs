@@ -30,6 +30,11 @@ sub-second. The same pod's Caddy sidecar serves
 | `agentflow-agents/src/mcp-servers/code-exec/helpers/kubectl.ts:586` | `kubectlExecInWorkspaceBinary` — binary-stdout variant for `read_file_b64` / `upload_to_storage`. No sudo (files are 0644). Path-validated via `validateProjectPath`. |
 | `agentflow-agents/src/mcp-servers/code-exec/helpers/kubectl.ts:638` | `writeFileInWorkspace` — resolves abs path (`/workspace/<slug>/<rel>` peruser, `/workspace/<rel>` legacy), runs `mkdir -p && tee && chmod` via sudo wrapper on peruser. |
 | `agentflow-agents/tests/unit/code-exec-peruser-helpers.test.ts` | 10 TDD unit tests covering the routing matrix above with `_runKubectl` / `_runKubectlBinary` / `_runLegacyExec` injected stubs. |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts` (PR-2) | `create_project` / `destroy_project` branching on flag. |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/kubectl.ts` (PR-3) | `exec` / `write_file` / `read_file` routing to `user-workspace-1` pod when project's `host_pod_name` matches. |
+| `agentflow-agents/src/services/peruser-pod-rbac.ts` | Auto-bootstraps `agentflow-agents-peruser-exec` RoleBinding in `af-tenant-<id>` on first peruser exec. Idempotent, in-process memoised. |
+| `agentflow-agents/k8s/agentflow-agents.yaml` (ClusterRole `agentflow-agents-peruser-rbac`) | Grants the agents ServiceAccount `rolebindings: get/create/update/patch` + `clusterroles.bind` on `agentflow-peruser-exec` so the bootstrap apply passes RBAC privilege-escalation checks. |
+| `agentflow-agents/src/services/pingers/peruser-web-supervisor.ts` | Server-side ticker (60s) that scans peruser landing/spa/mini_app projects for dead `web:` PIDs and restarts them via setsid+nohup. Also installs `/workspace/.tools/supervisor.sh` in-pod for 30s in-pod recovery. |
 
 ## Data flow
 
@@ -90,15 +95,89 @@ preview:
   `workspace_project_name`; the routing change in PR-2/PR-3 is invisible
   to callers.
 
+## Foundation port allocation
+
+Every Next.js / SPA / mini_app project in a shared peruser pod needs its
+own listening port — multiple projects co-located in `/workspace/<slug>/`
+would otherwise collide on the same TCP socket and Caddy's host-based
+routing would send every `p-<slug>.proj.agentflow.website` request to
+whichever process bound the port first.
+
+`computePortBase(projectId)` in `agentflow-agents/src/services/peruser-pod.ts:101`
+returns a deterministic port window per project:
+
+```ts
+// Knuth multiplicative hash → port in [3001, 9999].
+const h = (projectId * 2654435761) >>> 0;
+const port = 3001 + (h % 6999);
+return { port, botPort: port + 1, vitePort: port + 2, previewPort: port + 3 };
+```
+
+Pinned overrides live in `PERUSER_POD_PORT_PINS` (currently `{ 1292 → 3091 }`
+for Monar / Golden Connect, whose Procfile was hand-configured before the
+auto-port era). `isPortPinned(projectId)` is the predicate the reconciler
+uses to skip those projects entirely.
+
+The port lands on disk in two places:
+
+| File | Writer | Consumer |
+|---|---|---|
+| `/workspace/<slug>/.ports.env` (`PORT=<n>\nBOT_PORT=<n+1>\n...`) | `renderCreateProjectScript` at create_project time | Procfile `web:` line sources it on every restart |
+| `/workspace/<slug>/.runtime/foundation_port` (just `<n>`) | graph-executor `spa.ts` foundation bridge + `peruser-services-reconcile` | Caddy preview sidecar reads it to pick the upstream localhost port |
+
+Pre-2026-05-22 bug: the formula was `30000 + pid*100`. For any
+`pid ≥ 356` the result overflowed the 16-bit TCP range (project 1389
+emitted port 168900). The s6 supervisor silently fell back to its
+hardcoded `PORT=3001` default; the foundation bridge in `spa.ts` also
+defaulted to `3001` on missing/empty `.ports.env`. Result: 7 projects
+in `user-workspace-1-599c48bff8-grx7b` all had
+`.runtime/foundation_port=3001` and Caddy routed every preview host to
+whichever next-server bound 3001 first. Fix landed via
+agentflow-agents PR #739.
+
+### Stale .ports.env divergence (PR #752, 2026-05-23)
+
+PR #739 fixed the formula but only retrofitted `.runtime/foundation_port`
+on existing projects — `.ports.env` kept the original literal `PORT=` the
+old scaffold wrote. The Procfile `web:` line sources `.ports.env`, so
+`next dev` bound the stale port (often `3001`); Caddy reverse_proxy'd to
+the correct per-project hash; the two ports never matched and the
+preview returned 502. With multiple legacy projects in one peruser pod,
+the second-onwards `next dev` crashed with `EADDRINUSE` and stayed dead.
+
+The reconciler (`services/pingers/peruser-services-reconcile.ts`) now
+detects divergence:
+
+1. Source the existing `.ports.env`, read `CURRENT_PORT`.
+2. If `CURRENT_PORT != computePortBase(id).port`, back up to
+   `.ports.env.pre-reconcile-bak` and rewrite the `PORT=` line in place
+   (POSIX sed; sibling vars like `BOT_PORT`, `VITE_PORT` are preserved).
+3. `SIGTERM → 2s grace → SIGKILL` the existing `.services/web/pid`,
+   wipe the pid file. `runtime-supervisor` and the in-pod web
+   supervisor both treat a missing pid file as "needs spawn" and
+   relaunch on the new `$PORT`.
+
+A second reconciler pass (90s realign-cooldown, vs. the usual 10 min
+success cooldown) confirms the new port is bound before flipping the
+project's reconcile state to `succeeded`. The `RECONCILE:` summary line
+gained two fields: `ports_rw=<0|1>` and `stale_pid=<pid|none>`. Parser
+still accepts the legacy 3- and 4-field shapes for mid-deploy skew
+between agent pod and the workspace tools image.
+
 ## Failure modes
 
 | Symptom | Log signature for grep | Where to fix |
 |---|---|---|
 | `kubectl apply -f user-workspace.yaml` returns `Service "user-workspace-1" not found` from the Ingress | (none — apply order) | Apply PVC + Deployment + Service first, Ingress last. Or `kubectl apply` the whole file twice. |
+| Fresh userId added to `PERUSER_POD_ENABLED_USER_IDS` fails project create with opaque `peruser_pod_create_failed: exit=1` (pre-2026-05-23) | `Forbidden: deployments.apps "user-workspace-<id>" is forbidden` | RoleBinding `agentflow-agents-peruser-exec` missing in `af-tenant-<id>`. Auto-seeded by `ensurePeruserExecRoleBinding` on first peruser exec (`services/peruser-pod-rbac.ts`). If it still fails, check the agents SA holds `agentflow-agents-peruser-rbac` ClusterRole. |
 | Caddy preview returns 404 on `p-<slug>.proj.agentflow.website` | (Caddy stdout shows `no such file or directory: /workspace/<slug>`) | `code-exec.create_project` (PR-2) didn't mkdir the slug. Check `kubectl exec deploy/user-workspace-1 -c tools -- ls /workspace`. |
+| Every preview host in one peruser pod serves the same project (port collision) | All projects' `.runtime/foundation_port` read `3001` | `computePortBase` formula overflowed pre-2026-05-22 — fixed in `agentflow-agents/src/services/peruser-pod.ts:101`. Reconciler at `pingers/peruser-services-reconcile.ts` rewrites stale `foundation_port` on next tick (skips pinned ids). |
+| Project's port doesn't match `computePortBase(id).port` after reconciler tick | `peruser_services_reconcile: foundation_port_rewritten=true` | Expected after PR #739 deploy. One-shot per project per pod lifetime. |
+| Caddy preview returns 502 even though `foundation_port` is the correct per-project hash | `EADDRINUSE` in `.services/web/log`, or `wget http://localhost:<expected_port>/` from preview container = `connection refused` while `lsof` shows next-server bound to a DIFFERENT port | `.ports.env` carries a stale literal `PORT=` from the pre-hash scaffold era. `peruser-services-reconcile` (PR #752, 2026-05-23) detects divergence, rewrites the `PORT=` line in place, SIGTERM→SIGKILLs the misbound web PID, supervisor relaunches on the right port within ~90s (realign cooldown). Manifest is unchanged — no need to hand-patch `Service.targetPort`. Look for `peruser_services_reconcile: ports_rewritten=true stale_pid_killed=<pid>` in the project log. |
 | Caddy serves stale build after `pnpm build` | (none — `Cache-Control: no-cache` set, but client cache may still serve) | Force-refresh in browser. If persists: check `/workspace/<slug>/dist/index.html` mtime via `kubectl exec`. |
 | User 1 PVC fills (>90%) | `df -h` on the pod | Bump PVC to 50 Gi or wire an LRU eviction job for idle project subdirs. |
 | Pod restart loses in-flight project state | Pod restart event | Recreate strategy is intentional — projects re-clone from git remote on next coder turn. For long-running builds, snapshot state before any planned restart. |
+| `next dev` / `next start` not restarted after peruser pod restart (preview → 502) | `peruser-web-supervisor: tick done ... restarted=N` in agentflow-agents logs; per-project `peruser_web_restarted` event | Fixed by `pingers/peruser-web-supervisor.ts` (60s server-side tick) + in-pod `/workspace/.tools/supervisor.sh` (30s loop). Both are idempotent; cooldown 3min per project after restart attempt. Manual fallback: `kubectl -n af-tenant-<id> exec deployment/user-workspace-<id> -c tools -- bash /workspace/.tools/supervisor.sh &`. |
 | Ingress wildcard routing collides with existing per-project ingresses | nginx-ingress reload warning about duplicate host | Per-project Ingresses (`ensurePreviewIngressPlaceholder`) target the same wildcard host pattern. With ingress class `nginx` the most-specific Ingress wins; if a per-project Ingress for `p-<slug>.proj.agentflow.website` exists it'll mask the wildcard. PR-2 must skip `ensurePreviewIngressPlaceholder` for per-user-pod projects. |
 | Tool returns `unknown_project` for a fresh peruser-pod project | `[code-exec] assertWorkspaceExists` miss; `test -d` exit 1 | Check `kubectl -n af-tenant-1 exec deploy/user-workspace-1 -c tools -- ls /workspace`. If slug dir missing, rerun `create_project`. |
 | Tool returns `{ok:false, error:'path_outside_workspace'}` | (handler-side, never hits kubectl) | Coder passed a `cwd` / `path` outside `/workspace/<slug>/`. Fix the coder prompt — never widen the gate. Note: `exec` / `start_service` tool handlers no longer default `cwd` to `/workspace` on the peruser branch (PR #533) — they pass `undefined` so `buildSudoWrapper` resolves it to `/workspace/<slug>`. Graph handlers must also avoid hardcoded `cd /workspace` / `/workspace/src/...` paths; use cwd-relative paths. |
@@ -127,7 +206,55 @@ ssh ff-france "kubectl -n af-tenant-1 exec deploy/user-workspace-1 -c tools -- \
 # Rollback (the per-project STS pipeline is unchanged, so this is non-destructive
 # until PR-2 ships and starts routing user 1 traffic here)
 ssh ff-france "kubectl delete -f -" < agentflow-agents/k8s/user-workspace.yaml
+
+# Tail in-pod web supervisor log (auto-restart of dead next dev / next start)
+ssh ff-france "kubectl -n af-tenant-1 exec deploy/user-workspace-1 -c tools -- \
+    tail -n 50 /workspace/.tools/supervisor.log"
+
+# Manually kick the in-pod supervisor if /workspace/.tools/supervisor.lock is stale
+ssh ff-france "kubectl -n af-tenant-1 exec deploy/user-workspace-1 -c tools -- \
+    sh -c 'rm -f /workspace/.tools/supervisor.lock && \
+           setsid nohup bash /workspace/.tools/supervisor.sh \
+           > /workspace/.tools/supervisor.boot.log 2>&1 &'"
 ```
+
+## Web auto-restart (T2, 2026-05-23)
+
+Pod restarts (image roll, OOM, node drain) kill every detached
+`setsid bash` that scaffold-time `runtime-supervisor.deploy()` spawned.
+The PID files in `/workspace/<slug>/.services/web/pid` go stale,
+`next dev` / `next start` is gone, the preview returns 502 until a
+human steps in. PR #748 deploy on 2026-05-23 took down projects 1411,
+1445, 1446 this way.
+
+Two complementary layers handle this:
+
+1. **Server-side (`pingers/peruser-web-supervisor.ts`)** — 60s ticker
+   in agentflow-agents. For every peruser landing/spa/mini_app project,
+   exec a single probe script in the workspace pod:
+   - read `.services/web/pid`, `kill -0` to liveness-check
+   - check the deterministic per-project port (`computePortBase(id).port`)
+     via `ss` / `/proc/net/tcp`
+   - if pid dead AND port not bound → re-execute the recorded
+     `.services/web/cmd` (falls back to the Procfile `web:` line) via
+     `setsid nohup bash -c` so the spawn survives the kubectl-exec
+     teardown
+   - emit `peruser_web_restarted` / `peruser_web_restart_failed`
+     project_events.
+   3-min per-project cooldown to avoid pinning exec slots on a
+   chronically-broken project.
+
+2. **In-pod (`/workspace/.tools/supervisor.sh`)** — installed + booted
+   by the same server-side ticker. Loops every 30s, walks
+   `/workspace/*\/.services/web/pid`, restarts dead PIDs from
+   `.services/web/cmd`. Single-flight via `/workspace/.tools/supervisor.lock`
+   (stale-lock detection via `kill -0` on the recorded PID). Survives
+   the agents pod being unreachable.
+
+Both layers honour `/workspace/<slug>/.no_auto_start` as an operator
+escape hatch (same marker `runtime-supervisor.deploy()` checks). Pinned
+ports (`PERUSER_POD_PORT_PINS`, currently `{1292: 3091}` for Monar) are
+skipped server-side — manual ops owns those.
 
 ## Verification (real, not surface signals)
 

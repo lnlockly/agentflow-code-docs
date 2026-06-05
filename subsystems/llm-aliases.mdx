@@ -1,0 +1,130 @@
+---
+title: "LLM Model Aliases (FLOW pattern)"
+description: "Per-user model aliases on the public /llm/v1 facade — one stable client-facing name with a hot-swappable upstream behind it."
+---
+
+# LLM Model Aliases (FLOW pattern)
+
+## TL;DR
+
+Owner registers a friendly alias (`flow`) via `POST /me/llm/aliases` that
+resolves to any enabled upstream model (`gpt-5.3-codex`, `claude-opus-4-7`).
+Route clients (opencode, codex CLI, anything OpenAI/Anthropic-shaped) keep
+sending `model=<alias>`; `PUT /me/llm/aliases/:alias` swaps the upstream
+behind the alias without touching client config. Billing rides on the
+resolved upstream id, so the caller pays honest upstream prices.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/migrations/2026-05-25c-user-model-aliases.sql:14` | Canonical schema for `user_model_aliases` |
+| `agentflow-agents/src/services/bootstrap-schema.ts:441` | Idempotent boot-time `CREATE TABLE IF NOT EXISTS` |
+| `agentflow-agents/src/services/user-model-aliases.ts:43` | `normaliseAliasName` regex + helpers |
+| `agentflow-agents/src/services/user-model-aliases.ts:117` | `resolveUserAlias` (alias → upstream model id) |
+| `agentflow-agents/src/routes/me-llm-aliases.ts:67` | `GET /me/llm/aliases` |
+| `agentflow-agents/src/routes/me-llm-aliases.ts:84` | `POST /me/llm/aliases` |
+| `agentflow-agents/src/routes/me-llm-aliases.ts:144` | `PUT /me/llm/aliases/:alias` |
+| `agentflow-agents/src/routes/me-llm-aliases.ts:181` | `DELETE /me/llm/aliases/:alias` |
+| `agentflow-agents/src/routes/public-llm.ts:55` | `resolveAlias` helper at the proxy boundary |
+| `agentflow-agents/src/routes/public-llm.ts:97` | `/llm/v1/models` soft-auth alias rows |
+| `agentflow-agents/src/routes/public-llm.ts:139` | `/llm/v1/chat/completions` alias hop |
+| `agentflow-agents/src/routes/public-llm.ts:163` | `/llm/v1/responses` alias hop |
+| `agentflow-agents/src/routes/public-llm.ts:200` | `/llm/v1/messages` alias hop |
+| `agentflow-landing/src/sections/llm-cabinet/tabs/AliasesTab.tsx:31` | Cabinet UI for CRUD |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/opencode_installer.py:286` | `patch_opencode_config(alias=…, alias_mode=…)` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/tools/opencode_installer.py:430` | `set_opencode_default_alias` (targeted re-point) |
+
+## Data flow
+
+```
+opencode/codex CLI                AgentFlow public LLM facade               upstream
+  model="flow"  ──HTTP──▶  /llm/v1/chat/completions
+                                  │
+                                  ├─ pickUpstreamForModel("flow")  → null (no direct match)
+                                  │
+                                  ├─ resolveUserAlias(userId=1, "flow")
+                                  │     SELECT upstream_model_id
+                                  │       FROM user_model_aliases
+                                  │      WHERE user_id=1 AND alias_name='flow'
+                                  │     → "gpt-5.3-codex"
+                                  │
+                                  ├─ pickUpstreamForModel("gpt-5.3-codex")
+                                  │     → row from llm_provider_configs (codex.sale)
+                                  │
+                                  └─ proxyOpenAi(...)  ──fetch──▶  codex.sale /v1/chat/completions
+                                                                              │
+                                  recordUsage(model="gpt-5.3-codex") ◀─────────┘
+                                  (billing keyed on upstream id, not on alias)
+```
+
+Owner swap:
+
+```
+cabinet ─PUT /me/llm/aliases/flow {upstream:"claude-opus-4-7"}─▶  UPDATE user_model_aliases ...
+next request:  model="flow"  ──▶  resolveUserAlias → "claude-opus-4-7"
+                                  pickUpstreamForAnthropicRequest("claude-opus-4-7")
+                                  → east-api-3 (or hardcoded alias map fallback)
+```
+
+## DB / Env / API
+
+- Tables: `user_model_aliases(id, user_id, alias_name, upstream_model_id, created_at, updated_at)` with `UNIQUE (user_id, alias_name)` and `INDEX (user_id)`.
+- Env: none new. Reuses the existing public-llm + auth env from `agentflow-agents` (`AGENTS_MASTER_KEY`, provider api-key env vars referenced by `llm_provider_configs.api_key_env`).
+- Routes (owner-auth, `Authorization: Bearer af_live_*` or session cookie):
+  - `GET    /me/llm/aliases`              → `{ ok, aliases:[{alias,upstream,created_at,updated_at}] }`
+  - `POST   /me/llm/aliases`              body `{alias,upstream}` → 201
+  - `PUT    /me/llm/aliases/:alias`       body `{upstream}` → 200
+  - `DELETE /me/llm/aliases/:alias`       → 200 / 404
+- Routes (public facade, alias-aware):
+  - `GET    /llm/v1/models`               soft-auth; appends caller's aliases with `is_alias:true`, `upstream_model_id`
+  - `POST   /llm/v1/chat/completions`     swaps `model` through alias before upstream pick
+  - `POST   /llm/v1/responses`            same
+  - `POST   /llm/v1/messages`             same (alias may resolve to an OpenAI-shaped upstream; bridge handles the wire-format translation)
+- MCP / daemon tools:
+  - `computer.opencode.patch_config(api_key, alias?, alias_mode?)` — register the alias on the matching OpenCode provider block.
+  - `set_opencode_default_alias(alias, alias_mode?)` — targeted re-point of `opencode.json` `model` field after a cabinet swap.
+
+## Owner one-liners
+
+Register + use (single API call, no client restart):
+
+```
+curl -X POST https://agentflow.website/_agents/me/llm/aliases \
+  -H "x-api-key: $AF_KEY" -H "content-type: application/json" \
+  -d '{"alias":"flow","upstream":"gpt-5.3-codex"}'
+
+curl https://agentflow.website/llm/v1/chat/completions \
+  -H "Authorization: Bearer $AF_KEY" -H "content-type: application/json" \
+  -d '{"model":"flow","messages":[{"role":"user","content":"ping"}]}'
+```
+
+Swap upstream behind the alias (single API call, no client restart):
+
+```
+curl -X PUT https://agentflow.website/_agents/me/llm/aliases/flow \
+  -H "x-api-key: $AF_KEY" -H "content-type: application/json" \
+  -d '{"upstream":"claude-opus-4-7"}'
+```
+
+Next request with `model=flow` from opencode / codex CLI lands on Claude Opus 4.7.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `POST /me/llm/aliases` returns 400 `alias_collision` | `alias_collision` in `me-llm-aliases.ts` | Owner picked a name that matches an enabled upstream id. Pick a different name; the direct upstream match would shadow the alias. |
+| `POST /me/llm/aliases` returns 400 `upstream_unknown` | `upstream_unknown` in `me-llm-aliases.ts` | Upstream id is not in the live catalog (`GET /llm/v1/models`). Seed the upstream in `llm_provider_configs` or pick an enabled one. |
+| `POST /me/llm/aliases` returns 400 `invalid_alias` | `invalid_alias` in `me-llm-aliases.ts` | Name fails `/^[a-z0-9][a-z0-9_-]{1,63}$/`. Use lowercase letters, digits, `_`, `-`. |
+| `POST /me/llm/aliases` returns 409 `alias_exists` | `alias_exists` in `me-llm-aliases.ts` | Owner already has that alias. PUT instead of POST, or DELETE first. |
+| `chat/completions` with `model="flow"` returns 400 `invalid_request_error` | `Model "flow" is not available` in `public-llm.ts` | Caller is not authed as the alias owner, or alias was deleted, or upstream behind it was removed. Re-check `GET /me/llm/aliases`. |
+| `chat/completions` succeeds but billing row shows wrong model | `recordUsage` logs in `public-llm-billing.ts` | Expected — billing is keyed on resolved upstream id, not on alias label. See alias-cycle note below. |
+| Upstream removed from `llm_provider_configs` while alias still references it | upstream pick returns null → `Model "<alias>" is not available` | Alias becomes a dead pointer. Either PUT the alias to a live upstream or DELETE it. The backend never auto-deletes orphan aliases. |
+| Alias chain (alias pointing to another alias name) | n/a — guard catches it | `POST /me/llm/aliases` rejects with `upstream_unknown` because alias names are not in the upstream catalog. No cycle possible by construction. |
+| OpenCode says model unknown after cabinet swap | n/a (client-side) | Run `set_opencode_default_alias(alias)` so the local `opencode.json` adds the alias to the provider's `models` map. |
+
+## Related
+
+- [foundation-bridge](/subsystems/foundation-bridge)
+- [desktop-agent-llm-reasoning-effort](/subsystems/desktop-agent-llm-reasoning-effort)
+- [opencode-integration](/subsystems/opencode-integration)

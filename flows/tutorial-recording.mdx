@@ -1,0 +1,62 @@
+---
+title: "Tutorial Recording Flow"
+description: "End-to-end path from cabinet click to public .webm URL, without macOS Screen Recording permission."
+---
+
+# Tutorial Recording Flow
+
+## TL;DR
+
+User clicks "Записать тестовый ролик" on `/cabinet/recordings`. The cabinet POSTs a default Playwright script to `/me/recording-jobs`. The backend renders a Kubernetes Job manifest, applies it in the user's `af-tenant-<userId>` vcluster, and a reconciler harvests the resulting `.webm` to a public URL. The user gets a playable `<video>` tag inside the same page within ~60–120 seconds.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/pages/CabinetRecordings.tsx:1` | UI page (single button + list). |
+| `agentflow-landing/src/main.tsx` | Route mount for `/cabinet/recordings`. |
+| `agentflow-agents/src/routes/me-recording-jobs.ts:228` | `POST /me/recording-jobs` handler. |
+| `agentflow-agents/src/routes/me-recording-jobs.ts:159` | `renderRecordingJob()` Job manifest. |
+| `agentflow-agents/src/routes/me-recording-jobs.ts:347` | `reconcileTick()` poll loop. |
+
+## Data flow
+
+```
+[cabinet] CabinetRecordings.tsx → POST /me/recording-jobs { script, name, duration_s }
+                                  ↓
+[agentflow-agents] sanitize → INSERT recording_jobs row (queued)
+                  ↓
+                  kubectl apply Job into af-tenant-<userId> (status=running)
+                  ↓
+[user's vcluster] Job pulls Playwright image → headless Chromium → recordVideo
+                  ↓
+                  Job container sleeps 5 min so cp has a window
+                  ↓
+[agentflow-agents reconciler, every 10 s]
+                  kubectl get job .status.conditions.Complete
+                  ↓
+                  kubectl cp pod:/data/out/<name>.webm /var/lib/recordings/<id>.webm
+                  ↓
+                  UPDATE recording_jobs SET status=done, artefact_url, artefact_bytes
+
+[cabinet] poll GET /me/recording-jobs every 6 s → row shows artefact_url → render <video>
+```
+
+## DB / Env / API
+
+- Table: `recording_jobs`
+- Env: `RECORDING_DIR`, `UPLOADS_PUBLIC_BASE`
+- Public host: `https://agents.agentflow.website/recordings/<uuid>.webm`
+
+## Failure modes
+
+| Symptom | Where to look |
+|---|---|
+| Cabinet shows "ошибка" with `tenant_not_ready` | `users.tenant_status` row in Postgres; needs `tenant-bootstrap` rerun. |
+| Job never moves off `queued` | `kubectl get job -A` in `af-tenant-<userId>`; usually image-pull rate-limit on mcr.microsoft.com. |
+| `done` row but `<video>` won't load | `curl -I https://agents.agentflow.website/recordings/<id>.webm` — check ingress + `RECORDING_DIR` mount. |
+
+## Related
+
+- [Recording Jobs](/subsystems/recording-jobs)
+- [Hosted Devices](/subsystems/hosted-devices)

@@ -1,0 +1,79 @@
+---
+title: "Marketplace grid curation (front-door + dead-end guard)"
+description: "How /marketplace drops unreachable cards and hides filters that lead to empty results, so every visible card and chip goes somewhere real."
+---
+
+# Marketplace grid curation
+
+## TL;DR
+
+`/marketplace` (`MarketplaceV2`) renders a single grid of agents + templates
+from `GET /marketplace`. Two generic, data-driven guards keep the front door
+clean: (1) a **dead-end guard** drops any card that can't navigate (no slug,
+no display name, or a template with an unknown `listing_type`) before render;
+(2) **empty-filter hiding** removes the type tabs and category chips that have
+zero stock, so a new user never clicks a filter that opens an empty grid. No
+slug allow-lists — curation keys off item shape and live counts only.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/lib/marketplaceUnified.ts:44` | `isReachableItem(it)` — card may render only if it leads somewhere real |
+| `agentflow-landing/src/lib/marketplaceUnified.ts:57` | `reachableOnly(items)` — filter helper applied before any render/count |
+| `agentflow-landing/src/pages/MarketplaceV2.tsx:556` | `unified = reachableOnly(mergeUnified(items, templates))` — single curated source |
+| `agentflow-landing/src/pages/MarketplaceV2.tsx:566` | `showTypeRow = hasAgents && hasTemplates` — type row only when both kinds exist |
+| `agentflow-landing/src/pages/MarketplaceV2.tsx:570` | `presentBuckets` — set of category buckets actually in stock (query-independent) |
+| `agentflow-landing/src/pages/MarketplaceV2.tsx:580` | reset effect — drops a now-empty `activeType`/`activeCategory` back to «Все» |
+| `agentflow-landing/src/pages/MarketplaceV2.tsx:684` | category chip row renders only when `presentBuckets.size > 1`, filtered to present buckets |
+| `agentflow-landing/src/main.tsx:617` | `/marketplace` → `MarketplaceV2` (RequireAuth) |
+| `agentflow-landing/tests/marketplace-unified.test.mjs` | unit coverage for `isReachableItem` / `reachableOnly` + curation source-asserts |
+
+## Reachability contract (`isReachableItem`)
+
+| Item | Reachable when |
+|---|---|
+| agent | non-empty `slug` AND (`title` or `name`) — opens the slide-over panel |
+| template | non-empty `slug` AND `listing_type ∈ {studio_graph_template, workspace_project_template}` AND `name` — navigates to `/marketplace/<slug>` |
+
+Anything else is a card that opens an empty/404 detail → dropped before render.
+
+## Data flow
+
+```
+GET /marketplace ── listMarketplace()
+        │ items (agents) + templates
+        ▼
+mergeUnified ──► reachableOnly  ◄── drops no-slug / no-name / unknown-listing-type
+        │ unified (curated)
+        ├─ agentCount / templateCount ──► stats row
+        ├─ hasAgents && hasTemplates ──► showTypeRow (else type row hidden)
+        ├─ presentBuckets ──► category chips (only in-stock buckets; hidden if ≤1)
+        └─ filterUnified(query, type, bucket) ──► visible grid
+```
+
+## Why
+
+Owner directive «причесать маркетплейс, убрать лишнее» — a brand-new user must
+never hit a card or filter that goes nowhere. Before curation, the catalog
+exposed 6 category chips + an Агенты tab even when only a couple of templates
+existed (Sales/Ops only), so Support/Marketing/Dev/Content/Агенты all opened
+empty grids. The static dead-end source (`TEMPLATES` array in
+`src/data/templates.ts`) was already emptied 2026-05-27; the grid is now 100%
+backend-sourced, and these guards keep it clean regardless of what the backend
+returns.
+
+## Failure modes
+
+| Symptom | Log / grep signature | Where to fix |
+|---|---|---|
+| A card opens an empty/404 detail | card slug missing or template `listing_type` unknown | `marketplaceUnified.ts:44` — `isReachableItem` |
+| Category chip opens an empty grid | bucket not derived from live items | `MarketplaceV2.tsx:570` — `presentBuckets` |
+| «Агенты»/«Шаблоны» tab opens empty | type row shown with one kind in stock | `MarketplaceV2.tsx:566` — `showTypeRow` |
+| Selected filter sticks after catalog shrinks | no reset when filter goes empty | `MarketplaceV2.tsx:580` — reset effect |
+
+## Related
+
+- [Marketplace hire flow](/flows/marketplace-hire)
+- [Templates marketplace](/flows/templates-marketplace)
+- [Landing app shell + design tokens](/subsystems/landing-shell)

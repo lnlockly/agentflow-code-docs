@@ -1,0 +1,97 @@
+---
+title: "coder-tg-farm preset"
+description: "MTProto-specialised coder preset for tg_farm projects (tg-cold-mailer + tg-ai-shiller). Reaches DB via preset auto-seeder on boot."
+---
+
+# coder-tg-farm preset
+
+## TL;DR
+
+Specialised coder preset that scaffolds MTProto workers (Telethon/Python +
+GramJS/TypeScript) for `tg_farm` projects. Lives at
+`agentflow-agents/presets/coder-tg-farm.json` and is auto-seeded into the
+`agent_presets` table on every server boot via
+`bootstrapMarketplaceTemplates()`. Without this file, every `tg_farm` graph
+fails the first node with `coder_preset_not_found:coder-tg-farm` because
+the handler in `tg-marketing.ts` hard-codes the slug.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/presets/coder-tg-farm.json` | Preset JSON — `system` prompt + `mcp_allow` (code-exec + self) + fallback slugs (coder-tg-bot, coder-backend). |
+| `agentflow-agents/src/services/graph-executor/handlers/tg-marketing.ts:84-161` | Hard-codes `coder-tg-farm` as the slug for every node in tg-cold-mailer + tg-ai-shiller graphs. |
+| `agentflow-agents/src/services/graph-executor/exec-ctx.ts:128` | Throws `coder_preset_not_found:<slug>` when no `agent_presets` row exists AND `MARKETPLACE_TEMPLATES[slug]` is absent. |
+| `agentflow-agents/src/services/preset-store.ts:203` | `seedPresetsFromDiskIfMissing()` reads every `presets/*.json` and upserts `agent_presets` rows (`source='platform'`). |
+| `agentflow-agents/src/services/marketplace-templates.ts:353` | `bootstrapMarketplaceTemplates()` runs the seeder on boot. Idempotent. |
+| `agentflow-agents/src/scripts/re-instantiate-presets-from-json.ts:52` | Slug → preset mapping. Matches `^coder-tg-farm(-|$)` so already-provisioned agents pick up new system prompt on re-instantiate. |
+
+## Data flow
+
+```
+boot (server.ts)
+  → bootstrapMarketplaceTemplates()
+      → seedPresetsFromDiskIfMissing()
+          → readAllPresetsFromDisk() — globs presets/*.json
+          → INSERT INTO agent_presets (slug='coder-tg-farm', character=<JSON>, source='platform')
+              ON CONFLICT(slug) DO UPDATE SET character = EXCLUDED.character
+      → refreshFromDb() — primes in-memory MARKETPLACE_TEMPLATES
+
+approve project (kind=tg_farm)
+  → graph-executor runs tg-cold-mailer / tg-ai-shiller node graph
+  → each node handler calls ctx.coderInvoke({ slug: 'coder-tg-farm', brief, expects })
+  → resolveCoderSlug('coder-tg-farm')
+      → check agents table for existing agent with slug='coder-tg-farm' or 'coder-tg-farm-<owner>-…'
+      → if none AND MARKETPLACE_TEMPLATES['coder-tg-farm'] exists → provisionAgent({ character: tpl })
+      → else throw 'coder_preset_not_found:coder-tg-farm'
+  → invoke provisioned agent with brief
+```
+
+## DB / Env / API
+
+- **Tables**: `agent_presets` (slug PK, character JSONB, source, status), `agents` (per-owner instance row created by `provisionAgent`).
+- **Env**: none added by this preset. Reads project secrets at runtime: `TG_API_ID`, `TG_API_HASH`, `TG_PHONE`, `TG_SESSION_STRING`, optional `DAILY_DM_CAP`, `KEYWORDS`, `SHILL_PROMPT`.
+- **MCP servers allowed**: `code-exec`, `self`. No multimodal — tg_farm is text/message only.
+- **No bot tokens.** This preset MUST never use `Bot(token=...)` (aiogram/grammy) — it runs only on MTProto StringSession.
+
+## Workflow nodes that hit this preset
+
+| Graph | Node ids | Coder output expected |
+|---|---|---|
+| tg-cold-mailer | `link_account`, `import_leads`, `personalize_template`, `throttled_send`, `log_replies` | `workers/*.py`, `db/schema.sql` |
+| tg-ai-shiller | `link_account`, `set_keywords`, `poll_chats`, `ai_compose_reply`, `send_reply` | `src/*.ts` (TypeScript / GramJS) |
+
+`link_account` is shared between both farms; the handler is the same but
+the coder picks Python vs TypeScript based on the `OUTPUT_EXPECTED` block
+in the brief (Telethon if `.py`, GramJS if `.ts`).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Any tg_farm project fails at first node | `node_failed error="coder_preset_not_found:coder-tg-farm"` | `presets/coder-tg-farm.json` missing → restore file + restart server (auto-seeder runs on boot) |
+| Coder uses Bot API instead of MTProto | coder REPLY contains `aiogram` / `Bot(token=` / `grammy` / `webhookCallback` | tighten the `RUNTIME ВЫБОР` section in the preset `system` prompt; check `OUTPUT_EXPECTED` is being passed through `tg-marketing.ts:60` |
+| Session string lost between runs | new phone-code prompt on every restart, `TG_SESSION_STRING_LEN=...` printed but secret has_value=false | coder skipped `code-exec.set_project_secret({key:'TG_SESSION_STRING',…})` — reinforce in preset Persistence StringSession section |
+| Secrets leak into logs | Sentry payload contains api_hash / session_string | coder ignored `🚫 НЕ принты` rules — extend `_shared/critical-rules.md` |
+
+## Bootstrap recipe (manual re-seed without restart)
+
+If you ship a new presets file and don't want to bounce the server:
+
+```bash
+# Local dev:
+cd agentflow-agents && npx tsx src/scripts/dump-presets-to-json.ts --reverse
+# OR call the seeder explicitly:
+node -e "import('./dist/services/preset-store.js').then(m => m.seedPresetsFromDiskIfMissing()).then(console.log)"
+
+# Prod (k8s):
+kubectl -n franchise-factory exec deploy/agentflow-agents -- \
+  node -e "import('./dist/services/preset-store.js').then(m => m.seedPresetsFromDiskIfMissing()).then(console.log)"
+```
+
+## Related
+
+- [Graph handlers](/subsystems/graph-handlers)
+- [TG MCP (Telethon pool)](/subsystems/tg-mcp)
+- [Contact Farm](/subsystems/farm)
+- [Presets](/subsystems/presets)

@@ -1,0 +1,85 @@
+---
+title: "Project IDE pod-tools — the in-editor agent's hands"
+description: "Per-user flow key + AgentFlow MCP toolbox + project secrets injected into the per-project VS Code pod so the in-IDE agent has the same hands as the platform agent."
+---
+
+# Project IDE pod-tools
+
+## TL;DR
+
+When a user opens their project's browser VS Code, the in-editor coding
+extension and an in-terminal `claude` both need the SAME hands as the platform
+agent: the flow LLM, the AgentFlow MCP toolbox, and the project secrets.
+`provisionProjectIdePodTools` mints THAT user's `af_live_*` flow key, renders an
+owner-scoped MCP config, exports the project secrets as env, and writes the
+bundle into the pod's `<workspaceDir>/.agentflow/` via one access-gated pod
+`exec`. Per-user isolation is structural: the key, secrets, and MCP `?owner=`
+all key off the pod owner, so one tenant never reaches another's data.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/project-ide-pod-tools.ts:349` | `provisionProjectIdePodTools` — orchestrates mint + secrets + MCP + pod write |
+| `agentflow-agents/src/services/project-ide-pod-tools.ts:128` | `POD_MCP_SERVERS` — AgentFlow MCP catalogue exposed to the pod |
+| `agentflow-agents/src/services/project-ide-pod-tools.ts:150` | `buildPodMcpConfig` — renders owner-scoped `{mcpServers}` map |
+| `agentflow-agents/src/services/project-ide-pod-tools.ts:207` | `composePodAgentEnv` — flow facade env + secrets (reserved keys win) |
+| `agentflow-agents/src/services/project-ide-pod-tools.ts:253` | `buildAgentSettings` — claude/agent settings (flow + MCP, no model id) |
+| `agentflow-agents/src/services/project-ide-pod-tools.ts:277` | `buildPodToolsWriteCommand` — heredoc writer for the three config files |
+| `agentflow-agents/src/services/cloud-ide-flow-key.ts:48` | `ensureCloudIdeFlowKey` — mints the per-user `af_live_*` flow key (reused) |
+| `agentflow-agents/src/mcp-servers/code-exec/helpers/workspace-resolve.ts:75` | `loadProjectSecretValues` — per-owner+project secret dict (reused) |
+| `agentflow-agents/src/services/project-ide.ts:83` | `ideOpenAiBaseUrl` — `${agentsPublicBaseUrl}/llm/v1` (flow facade) |
+| `agentflow-agents/src/services/project-ide.ts:89` | `ideFlowModel` — logical `flow` alias (`env.anthropicLargeModel`) |
+| `agentflow-agents/src/services/mcp-direct.ts:115` | `OWNER_PINNED_SERVERS` — the `?owner=<uid>` scoping this module mirrors |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts:1693` | `exec` code-exec tool — access-gated pod shell the write rides on |
+| `agentflow-agents/src/routes/projects.ts:1981` | `GET /me/projects/:id/ide` calls provision after the editor is up |
+| `agentflow-agents/tests/project-ide-pod-tools.test.ts:1` | Tests: per-user key, scoped MCP, secrets, no cross-tenant leak |
+
+## Data flow
+
+```
+GET /me/projects/:id/ide
+  → ensureProjectIde() brings up code-server (project-ide.ts, untouched)
+  → result.ready
+      → provisionProjectIdePodTools({ ownerUserId, workspaceProjectName, workspaceDir })
+          → ensureCloudIdeFlowKey(ownerUserId)        # per-USER af_live_ key
+          → loadProjectSecretValues({owner,ws})       # per-USER+project secrets
+          → buildPodMcpConfig(ownerUserId)            # MCP URLs ?owner=<uid>
+          → composePodAgentEnv({flowKey,secrets})     # flow env wins over secrets
+          → callTool('exec', {project, command}, {ownerUserId})
+                # resolveProjectByWorkspace gates the pod by owner
+                → heredoc-writes .agentflow/{mcp.json,settings.json,flow.env}
+                → appends `source .agentflow/flow.env` to ~/.bashrc, ~/.profile
+```
+
+The editor extension reads `OPENAI_BASE_URL`/`OPENAI_API_KEY` and `mcp.json`;
+an in-terminal `claude` inherits `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`
+from the sourced `flow.env` and reads the same `mcpServers` from
+`settings.json`. Both hit the flow facade, never `api.openai.com`.
+
+## DB / Env / API
+
+- Tables: `api_keys` (flow key row `cloud-ide:flow`), `project_secrets`
+- Env: `AGENTS_PUBLIC_BASE_URL` (flow facade base), `ANTHROPIC_LARGE_MODEL`
+  (flow alias), `AGENTFLOW_AGENTS_URL` (internal MCP base), `INTERNAL_API_SECRET`
+  (MCP `x-mcp-auth`), `TG_MCP_URL` / `TG_MCP_TOKEN` (Telethon MCP)
+- Routes: `GET /me/projects/:id/ide`
+- MCP servers exposed to the pod: `telegram`, `tasks`, `tg-bot`, `architect`,
+  `kwork-inbox`, `vk-inbox`, `instagram-inbox` (owner-scoped via `?owner=`)
+- Pod files: `<workspaceDir>/.agentflow/mcp.json`, `…/settings.json`,
+  `…/flow.env` (chmod 600)
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Pod toolbox missing after open | `pod_tools_write_failed` | `services/project-ide-pod-tools.ts:349` |
+| Flow key absent in pod | `flow_key_mint_failed` | `services/project-ide-pod-tools.ts:349` |
+| Editor reaches openai.com | check `OPENAI_BASE_URL` ends `/llm/v1` | `services/project-ide-pod-tools.ts:207` |
+| MCP server unreachable from pod | server skipped when `INTERNAL_API_SECRET` unset | `services/project-ide-pod-tools.ts:150` |
+
+## Related
+
+- [Cloud IDE extensions](/subsystems/cloud-ide-extensions)
+- [Cloud IDE](/subsystems/cloud-ide)
+- [Project VS Code IDE](/subsystems/project-vscode-ide)

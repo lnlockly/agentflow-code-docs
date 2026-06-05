@@ -1,0 +1,162 @@
+---
+title: "@af-todo"
+description: "Eleventh Matrix bot — personal reminders via `/remind <time> <text>`, deterministic time parser, 30s dispatcher loop."
+---
+
+# @af-todo
+
+## TL;DR
+
+Eleventh platform Matrix bot. `/remind <time> <text>` schedules a personal reminder; a 30s dispatcher loop inside the runner polls `chat_todo_reminders` and posts due rows back into the originating room as `🔔 @owner: <text>`. Time parsing is deterministic (no LLM) and supports RU + EN forms: `15:00`, `через 5 минут` / `in 5 minutes`, `завтра 09:00` / `tomorrow 9am`, ISO `2026-05-23 09:00`. Idempotency via `UPDATE ... RETURNING FOR UPDATE SKIP LOCKED` atomic swap, boot-recovery sweep for rows that crashed between UPDATE and post.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/matrix-bots/lib.ts:18` | `BOT_SLUGS` — new `'af-todo'` entry (11th bot) |
+| `agentflow-agents/src/services/matrix-bots/lib.ts:579` | `parseTodoCommand` — `/remind`, `/list`, `/cancel`, `/remind tz`, `/remind every` (rejected), `/help` |
+| `agentflow-agents/src/services/matrix-bots/handlers/todo-time-parser.ts:1` | Deterministic time-string parser; `parseTimeString`, `tzOffsetMinutes`, `wallClockToUtc`, `localParts` |
+| `agentflow-agents/src/services/matrix-bots/handlers/todo.ts:1` | Handler: welcome, slash commands, dispatcher, boot-recovery |
+| `agentflow-agents/src/services/matrix-bots/handlers/todo.ts:170` | `claimDueReminders` — atomic UPDATE...RETURNING swap |
+| `agentflow-agents/src/services/matrix-bots/handlers/todo.ts:193` | `recoverOrphanedFired` — boot-recovery sweep |
+| `agentflow-agents/src/services/matrix-bots/handlers/todo.ts:230` | `parseRemindArguments` — pure helper that returns `{dueAt, text}` or `{err}` |
+| `agentflow-agents/src/services/matrix-bots/handlers/todo.ts:418` | `startTodoDispatcher` — boot recovery + setInterval polling |
+| `agentflow-agents/src/services/matrix-bots/register.ts:53` | `DISPLAY_NAMES['af-todo']` — `⏰ AF Todo` |
+| `agentflow-agents/src/services/matrix-bots/runner.ts:55` | Handler + invite-hook + dispatcher wiring |
+| `agentflow-agents/src/services/matrix-onboarding.ts:189` | `BOT_DM_NAMES` + `BOT_DM_INTROS` — first-bounce DM intro copy |
+| `agentflow-agents/migrations/2026-05-22g-chat-todo.sql:1` | `chat_todo_reminders`, `chat_todo_user_prefs` |
+| `agentflow-agents/src/db/schema.ts:3699` | Drizzle table definitions |
+| `agentflow-agents/tests/matrix-bots/af-todo-time-parser.test.ts:1` | 22 unit tests for the time parser |
+| `agentflow-agents/tests/matrix-bots/af-todo.test.ts:1` | 22 unit tests for command parser, remind arguments, formatters |
+
+## Data flow
+
+```
+incoming message in a room where @af-todo is a member
+    │
+    ├─ runner.ts dispatch: DM or @-mention only (no auto-mode)
+    │
+    └─ handlers/todo.ts: handleTodoMessage
+          │
+          ├─ parseTodoCommand(body):
+          │    /help, /start                    → sendText(HELP_BODY)
+          │    /list                            → SELECT pending in room+owner → render
+          │    /cancel <id>                     → fetch row, verify owner, UPDATE status='cancelled'
+          │    /remind tz <IANA>                → UPSERT chat_todo_user_prefs
+          │    /remind every …                  → reject with «не реализовано»
+          │    /remind <time> <text>            → parseTimeString + insertReminder
+          │                                      → reply «📌 Принято. Напомню в HH:MM. id: N.»
+          │
+          └─ unknown / plain text               → sendText(HELP_BODY)
+
+scheduler (detached, every 30s)
+    │
+    └─ claimDueReminders(50):
+          UPDATE chat_todo_reminders
+          SET status='fired', fired_at=NOW()
+          WHERE id IN (
+            SELECT id FROM chat_todo_reminders
+            WHERE status='pending' AND due_at <= NOW()
+            ORDER BY due_at ASC LIMIT 50
+            FOR UPDATE SKIP LOCKED
+          )
+          RETURNING …
+       for each row → sendText(room, "🔔 @owner: <text>")
+
+boot recovery (once on startup)
+    │
+    ├─ recoverOrphanedFired:
+    │    rows with status='fired' AND fired_at IS NULL AND due_at >= NOW()-1h
+    │    → stamp fired_at=NOW(), post message
+    │
+    └─ sealStaleFired:
+         rows with status='fired' AND fired_at IS NULL AND due_at < NOW()-1h
+         → stamp fired_at=NOW() (drop, too late to ping)
+```
+
+## DB / Env / API
+
+### Postgres tables
+
+```sql
+CREATE TABLE chat_todo_reminders (
+  id          BIGSERIAL PRIMARY KEY,
+  room_id     TEXT NOT NULL,
+  owner_mxid  TEXT NOT NULL,
+  text        TEXT NOT NULL,
+  due_at      TIMESTAMPTZ NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'pending'
+              CHECK (status IN ('pending', 'fired', 'cancelled')),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  fired_at    TIMESTAMPTZ NULL
+);
+
+CREATE INDEX idx_chat_todo_reminders_due
+  ON chat_todo_reminders (status, due_at);
+
+CREATE INDEX idx_chat_todo_reminders_owner
+  ON chat_todo_reminders (owner_mxid, room_id, status);
+
+CREATE TABLE chat_todo_user_prefs (
+  mxid        TEXT PRIMARY KEY,
+  tz          TEXT NOT NULL DEFAULT 'Europe/Moscow',
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+The atomic `UPDATE … RETURNING` against `(status, due_at)` is the idempotency gate. Two racing pods race on `FOR UPDATE SKIP LOCKED` — one wins, the loser's `RETURNING` clause comes back empty, no double-post.
+
+### Env (agentflow-agents)
+
+| Var | Default | Effect |
+|---|---|---|
+| `MATRIX_TODO_DISABLED` | unset | When `=1` the bot row stays registered but the dispatcher loop refuses to start. Mirror of `MATRIX_NEWS_DISABLED`. |
+| `MATRIX_TODO_DEFAULT_TZ` | `Europe/Moscow` | Default tz for time parsing when the user hasn't set `/remind tz`. |
+| `MATRIX_TODO_MAX_PER_USER` | `200` | Refuse new reminders once a user has this many open. |
+| `MATRIX_TODO_DISPATCH_INTERVAL_SEC` | `30` | Polling cadence for the dispatcher. Lower = tighter pings, more load. |
+| `MATRIX_BOT_KEY` | (shared) | Cluster-wide HMAC for per-bot password derivation. |
+
+### Commands
+
+| Shape | Effect |
+|---|---|
+| `/remind <time> <text>` | Schedule. `time` is the longest matching prefix (see Time formats below); `text` is what's left. Reply: `📌 Принято. Напомню в YYYY-MM-DD HH:MM (<tz>). id: <n>.` |
+| `/list` | Show this user's open reminders in this room (id, due time in their tz, first 40 chars). |
+| `/cancel <id>` | Cancel a `pending` reminder. Owner-only — anyone else gets «это не твоё». A `fired` row replies «уже отправлено», `cancelled` replies «уже отменено». |
+| `/remind tz <IANA>` | Set caller's tz (validated via `Intl.DateTimeFormat`). |
+| `/remind tz` | Show caller's current tz. |
+| `/remind every <…>` | Rejected with «повторяющиеся напоминания пока не реализованы». Out of scope for v1. |
+| `/help`, `/start` | Help blurb. |
+
+### Time formats
+
+| Form | Example | Notes |
+|---|---|---|
+| Absolute today | `15:00`, `9:05`, `09:30` | Next occurrence of that wall-clock in caller's tz. If already passed today → tomorrow. |
+| Relative RU | `через 5 минут`, `через 2 часа`, `через 30 сек`, `через 1 день` | Units: `сек/секунд[у/ы]`, `мин/минут[у/ы]`, `час/часа/часов`, `день/дня/дней`. |
+| Relative EN | `in 5 minutes`, `in 2h`, `in 30s`, `in 1 day` | Same units with English aliases. |
+| Tomorrow | `завтра 09:00`, `tomorrow 9am`, `tomorrow 21:00` | `am/pm/утра/вечера` accepted. |
+| ISO date+time | `2026-05-23 09:00`, `2026-05-23T09:00` | Wall-clock in caller's tz. Past times rejected. |
+
+Anything else returns the canonical examples line: «Не понял время. Примеры: `15:00`, `через 2 часа`, `завтра 09:00`, `2026-05-23 09:00`.»
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Reminder never fires | `[af-todo] dispatch tick` count never includes the id | Row may be `status='cancelled'` — check `psql -c "SELECT id, status, due_at, fired_at FROM chat_todo_reminders WHERE id = <N>"`. If still `pending` after `due_at` passed, dispatcher loop is stalled — check pod logs for `[af-todo] tick error`. |
+| Dispatcher silent on boot | `[af-todo] dispatcher disabled` | `MATRIX_TODO_DISABLED=1` is set. Flip the env to unset and restart. |
+| Two pings for the same reminder | (would only happen if `claimDueReminders` lost atomicity) | `psql -c "SELECT id, status, fired_at FROM chat_todo_reminders WHERE id = <N>"`. If the row is `fired` once but two messages went out, the `UPDATE ... RETURNING` swap raced — verify migration 2026-05-22g applied (indexes + check constraint), then look for two pods both running with `MATRIX_TODO_DISABLED` unset. |
+| Time parser rejects valid input | reply «Не понял время. Примеры: …» | `parseTimeString` is intentionally narrow. Either rephrase to one of the canonical shapes or add a row to `todo-time-parser.ts` — keep it deterministic (no LLM). |
+| Boot recovery floods rooms after long outage | `[af-todo] boot recovery posted` with count > N | Rows older than 1h are sealed without a message (`sealStaleFired`). If you still see floods, lower `RECOVERY_MAX_AGE_MS` in `handlers/todo.ts`. |
+| `/cancel` rejects owner | reply «это не твоё» | `chat_todo_reminders.owner_mxid` does not match `msg.sender`. In TG-bridged rooms the bridge uses puppet mxids — owner must run `/cancel` from the account that ran `/remind`. |
+| Welcome blurb never lands on invite | `[af-todo] welcome failed` | `sendText` failed; check inner `err`. Slash commands still work — there's no row to lazy-create (unlike `@af-news`). |
+| `/remind tz Mars/Olympus` rejected | reply «Не знаю такой часовой пояс» | Use IANA names (`Europe/Moscow`, `Asia/Singapore`, `America/Los_Angeles`). `Intl.DateTimeFormat` validates by throwing `RangeError` on unknown zones. |
+| Bot row never registers | `[matrix-bots] ensure complete` lists `af-todo` in `failed` | Same root cause as other bots — `MATRIX_BOT_KEY` empty or registration shared secret drifted. Re-run `scripts/register-matrix-bots.mjs`. |
+| Reminder text >500 chars rejected | reply «Текст напоминания длиннее 500 символов» | Hard cap to keep `m.text` events small. Split the text or store the long text elsewhere and remind to «check note X». |
+
+## Related
+
+- [Matrix Bots](/subsystems/matrix-bots) — overall bot runner architecture, `ensureBot`/`/sync` loop, dispatch gating
+- [@af-news](/subsystems/matrix-bots#af-news--daily-0900-digest) — closest analog (scheduler-driven bot polling DB for due rows)
+- [@af-translator](/subsystems/matrix-bots/af-translator) — closest analog for command-style per-user persistence
