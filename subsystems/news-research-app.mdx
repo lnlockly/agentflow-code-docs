@@ -1,0 +1,92 @@
+---
+title: "News research app"
+description: "The runtime behind research-desk.json: fetch news via Tavily MCP, analyze into a structured signal via useModel, cache it per owner+topic so a betting agent can read it."
+---
+
+# News research app
+
+## TL;DR
+`research-desk.json` declares the Ресёрчер app; `services/news-research-app.ts`
+gives it a runtime. Three owner-scoped routes fetch recent news (Tavily MCP `news`
+tool), analyze it into a structured trading-style signal (`useModel(TEXT_LARGE)`),
+and serve the cached latest signal so another agent (e.g. the Polymarket betting
+app) can read the contract. Pure helpers (`normalizeNewsResult`, `parseSignalReply`,
+`buildSignal`) take the fetcher + LLM as injected deps, so the unit test never
+touches a DB, the network, or a Tavily key.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/news-research-app.ts:1` | Service module: routes + pure helpers + signal cache |
+| `agentflow-agents/src/services/news-research-app.ts:35` | `NewsItem` — normalized item shape `{title,url,source,publishedAt,snippet}` |
+| `agentflow-agents/src/services/news-research-app.ts:47` | `ResearchSignal` — the contract the betting agent reads |
+| `agentflow-agents/src/services/news-research-app.ts:80` | `normalizeNewsResult()` — Tavily payload → items, http-only |
+| `agentflow-agents/src/services/news-research-app.ts:119` | `makeLiveNewsFetcher()` — `callTavilyTool(owner,'news',…)` |
+| `agentflow-agents/src/services/news-research-app.ts:134` | `makeLiveLlmCaller()` — `useModel(TEXT_LARGE)` |
+| `agentflow-agents/src/services/news-research-app.ts:224` | `buildSignal()` — items + LLM → `ResearchSignal`, never throws |
+| `agentflow-agents/src/services/news-research-app.ts:316` | `cacheSignal()` / `readCachedSignal()` — per owner+topic, bounded |
+| `agentflow-agents/src/services/news-research-app.ts:351` | `POST /me/apps/research/news` (requireSession) |
+| `agentflow-agents/src/services/news-research-app.ts:386` | `POST /me/apps/research/analyze` (requireSession) |
+| `agentflow-agents/src/services/news-research-app.ts:426` | `GET /me/apps/research/signal` (requireSession) |
+| `agentflow-agents/src/server.ts:753` | Mount `app.route('/', newsResearchApp)` |
+| `agentflow-agents/app-manifests/research-desk.json` | Manifest: modes `research`/`analyze` carry `action.path` to the routes |
+| `agentflow-agents/src/mcp-servers/tavily.ts:307` | `callTavilyTool()` — direct handler the fetcher calls |
+| `agentflow-agents/src/mcp-servers/tavily.ts:249` | Tavily `news` tool — `{results:[{title,url,content,published_date,score}]}` |
+
+## Data flow
+```
+composer "BTC ETF" → mode research|analyze (research-desk.json action.path)
+   │
+   ▼
+POST /me/apps/research/news    { topic, sinceHours? }
+   │  makeLiveNewsFetcher → callTavilyTool(owner,'news',{query,days,max_results})
+   ▼
+normalizeNewsResult(raw)  → NewsItem[]  (http-only, host→source, snippet≤600)
+   │
+POST /me/apps/research/analyze { topic, items? }   (items omitted → fetch first)
+   │  buildSignal(topic, items, useModel(TEXT_LARGE))
+   ▼
+ResearchSignal  → cacheSignal(owner, signal)   (in-process, owner-keyed)
+   │
+GET /me/apps/research/signal?topic=  → readCachedSignal(owner, topic)
+   │
+   ▼
+betting agent reads { stance, confidence, drivers, sources, asOf }
+```
+
+## DB / Env / API
+- Tables: none — the signal cache is in-process (bounded at 500 entries, MRU eviction).
+- Env: `TAVILY_API_KEY` (platform fallback; per-user key in `user_provider_keys` provider=`tavily` takes precedence). No new env var added.
+- Routes (all `requireSession`, owner-scoped):
+  - `POST /me/apps/research/news` `{ topic, sinceHours? }` → `{ ok, topic, items[] }`
+  - `POST /me/apps/research/analyze` `{ topic, items? }` → `{ ok, signal }`
+  - `GET /me/apps/research/signal?topic=` → `{ ok, signal }` or 404 `signal_not_found`
+- MCP tools: `tavily.news` (web search). Model: `useModel(ModelType.TEXT_LARGE)` — no hardcoded model name.
+
+### Signal shape (the betting-agent contract)
+```json
+{
+  "topic": "BTC ETF",
+  "stance": "bullish | bearish | neutral",
+  "confidence": 0.71,
+  "rationale": "2-3 sentences citing the news",
+  "drivers": ["Q3 revenue beat", "regulatory probe opened"],
+  "sources": ["https://reuters.com/…", "https://bloomberg.com/…"],
+  "asOf": "2026-06-05T08:00:00.000Z"
+}
+```
+`stance` defaults to `neutral` with `confidence` 0 when news is empty, the analyst
+reply is unparseable, or the model is unreachable — the reader always gets a valid
+contract.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Empty items despite a real topic | tool envelope `{ ok:false, error:'tavily_key_not_configured' }` | add a Tavily key (account → Provider Keys) or `TAVILY_API_KEY` |
+| News fetch 502 | `[news-research] news_fetch_failed` | `services/news-research-app.ts` (Tavily/network down) |
+| Signal always neutral confidence 0 | `[news-research] parse_failed` or `[news-research] llm_call_failed` | model/router health; analyst returned non-JSON |
+| `GET /signal` 404 | response `{ ok:false, error:'signal_not_found' }` | run `POST /analyze` for that topic first (cache is populated on analyze) |
+
+## Related
+- [JSON App Manifests](/subsystems/json-app-manifests) — the manifest layer this app's `research-desk.json` lives in
+- [Research citation pills](/subsystems/research-citations) — how Tavily/knowledge URLs harvest into chat sources

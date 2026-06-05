@@ -67,6 +67,12 @@ export default defineConfig({
             // it silently broke the static build once MDX parsing succeeded.
             // Projects are covered by 'Projects Frontend' + 'Projects Dashboard' below.
             { label: 'Code Exec MCP', slug: 'subsystems/code-exec-mcp' },
+            { label: 'JSON App Manifests', slug: 'subsystems/json-app-manifests' },
+            { label: 'Generic App Renderer (FE)', slug: 'subsystems/generic-app-renderer' },
+            { label: 'Plane Task Manager', slug: 'subsystems/plane-task-manager' },
+            { label: 'Tasks MCP', slug: 'subsystems/tasks-mcp' },
+            { label: 'Cloud IDE', slug: 'subsystems/cloud-ide' },
+            { label: 'Cloud Engines (Goose adapter)', slug: 'subsystems/cloud-engines' },
             { label: 'Pod Pre-Warm Pool', slug: 'subsystems/pod-prewarm-pool' },
             { label: 'Caddy Preview', slug: 'subsystems/caddy-preview' },
             { label: 'Runtime Supervisor', slug: 'subsystems/runtime-supervisor' },
@@ -86,6 +92,7 @@ export default defineConfig({
             { label: 'Products Hub', slug: 'subsystems/products-hub' },
             { label: 'Onboarding Quests', slug: 'subsystems/onboarding-quests' },
             { label: 'Proxy Pool', slug: 'subsystems/proxy-pool' },
+            { label: 'Social Session Posting (cross-poster)', slug: 'subsystems/social-session-posting' },
             { label: 'VK Bridge', slug: 'subsystems/vk-bridge' },
             { label: 'Social Network', slug: 'subsystems/social-network' },
             { label: 'Autonomous Goals', slug: 'subsystems/autonomous-goals' },
