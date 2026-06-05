@@ -6,7 +6,7 @@ description: "Connection hygiene, hot-path indexes, and the weekly cleanup CronJ
 # Postgres tuning
 
 ## TL;DR
-agentflow-postgres is a single 1-replica Deployment in `franchise-factory` ns
+agentflow-postgres is a 1-replica StatefulSet in `franchise-factory` ns
 serving every AgentFlow database (the main `agentflow` DB + per-tenant
 `eliza_user_<id>` DBs + `dendrite`, `lobechat`, `glitchtip` etc). P0 symptoms
 on 2026-05-23 were 85 active connections (75 idle) and stuck advisory locks
@@ -14,11 +14,17 @@ blocking 10 waiters in `eliza_user_1`. Fix: server-side
 `idle_session_timeout`, LRU cap on the Eliza per-tenant pool cache, hot-path
 composite index on `project_events`, weekly cleanup CronJob.
 
+Phase 4 / Audit-4 (2026-05-27) migrated the workload from `Deployment` to
+`StatefulSet` and added a weekly offsite backup to in-cluster MinIO. See
+"StatefulSet migration" below for the dump+restore runbook.
+
 ## Files (with line refs)
 | Path | Role |
 |---|---|
+| `agentflow-agents/k8s/agentflow-postgres-sts.yaml` | StatefulSet + headless Service. 2Gi mem limit, 1Gi mem request, terminationGracePeriod 60s, mounts tuning ConfigMap, postStart hook adds `include_dir` |
+| `agentflow-agents/k8s/postgres-backup-cron.yaml` | Weekly CronJob `agentflow-postgres-backup-minio` at Sunday 03:17 UTC — pg_dump to s3://agentflow-backups/postgres/ via in-cluster MinIO, 90-day retention sweep |
 | `agentflow-agents/k8s/postgres-tuning-config.yaml` | ConfigMap with `tuning.conf` overrides (shared_buffers, idle timeouts, lock_timeout) |
-| `agentflow-agents/k8s/postgres-tuning-patch.yaml` | Strategic-merge patch — raises pod memory to 2Gi, mounts the ConfigMap, postStart hook adds `include_dir` to `postgresql.conf` |
+| `agentflow-agents/k8s/postgres-tuning-patch.yaml` | Legacy strategic-merge patch (Deployment era). Superseded by `agentflow-postgres-sts.yaml` which inlines the same memory + ConfigMap + postStart bits. Kept for reference / rollback. |
 | `agentflow-agents/k8s/postgres-cleanup-cron.yaml` | Weekly `CronJob` at Sunday 03:00 UTC, runs `cleanup-postgres-bloat.sh` |
 | `agentflow-agents/scripts/cleanup-postgres-bloat.sh` | DELETE old `kind='log'` events, VACUUM ANALYZE top tables, reap idle advisory-lock holders |
 | `agentflow-agents/migrations/2026-05-23e-postgres-hot-indexes.sql` | Adds `idx_project_events_project_kind_id`, sets per-table autovacuum to 5%/2% |
@@ -32,9 +38,14 @@ app pod (agentflow-agents, 1 replica)
   ├── postgres-js pool max:10           ──┐
   └── pg.Pool per tenant (max:2, LRU 16)  │
                                           ▼
-               agentflow-postgres Deployment (Pod, 2Gi mem, 2 CPU)
+               agentflow-postgres StatefulSet (pod -0, 2Gi mem, 2 CPU)
                ├── tuning.conf via /etc/postgresql/conf.d/  (include_dir)
-               └── PVC agentflow-postgres-data (4Gi used)
+               ├── headless svc agentflow-postgres:5432 (port name `pg`)
+               └── PVC data-agentflow-postgres-0 (10Gi local-path, 2.3Gi used)
+                       │
+                       ▼  (Sunday 03:17 UTC, weekly)
+               agentflow-postgres-backup-minio CronJob
+               └── pg_dump | gzip → s3://agentflow-backups/postgres/dump-<TS>.sql.gz (MinIO, 90d retention)
 ```
 
 No PgBouncer in front: the `k8s/pgbouncer.yaml` manifest exists in the repo
@@ -50,7 +61,7 @@ post-tuning. Revisit if `count(*) FROM pg_stat_activity` regresses above 120.
 - ConfigMap: `agentflow-postgres-tuning` (ns `franchise-factory`)
 - ConfigMap: `agentflow-postgres-cleanup-script` (script body — re-create from `scripts/cleanup-postgres-bloat.sh` whenever it changes)
 - CronJob: `agentflow-postgres-cleanup` — `0 3 * * 0` UTC
-- Existing daily backups: `agentflow-postgres-backup` (hourly), `agentflow-postgres-backup-full` (04:00 UTC)
+- Existing daily backups: `agentflow-postgres-backup` (hourly → Telegram), `agentflow-postgres-backup-full` (04:00 UTC → Telegram), `agentflow-postgres-backup-minio` (Sun 03:17 UTC → MinIO `agentflow-backups/postgres/`, 90-day retention)
 - Postgres role: `agentflow / PJSwYHDhdKDdG3zEAfBFlOzWLJJhPY2k` (in `agentflow-postgres-creds` secret)
 - Image: `pgvector/pgvector:pg17` (extensions installed: plpgsql, fuzzystrmatch, pgcrypto, vector)
 
@@ -85,6 +96,83 @@ post-tuning. Revisit if `count(*) FROM pg_stat_activity` regresses above 120.
 - **`project_events` partitioning** — table is 35 MB / 31K rows. Partitioning helps at the 10M-row mark.
 - **`pg_stat_statements`** — needs a `shared_preload_libraries` change and a Postgres restart. Tracked in a follow-up. For now `log_min_duration_statement=500` gives us slow-query visibility.
 - **Disk cleanup at the host level** — node `/` is 82% full but only 1.5 GB of that is Postgres data. The rest is k3s state, container images, and tenant pod volumes. Separate runbook.
+
+## StatefulSet migration (Audit-4, 2026-05-27)
+
+The live Deployment + standalone PVC was replaced by a StatefulSet with
+`volumeClaimTemplates`. Because STS auto-names PVCs as
+`<volumeClaimTemplate>-<sts-name>-<ordinal>` (here `data-agentflow-postgres-0`),
+the existing PVC `agentflow-postgres-data` cannot be reused in place. The safe
+migration is dump + restore. Owner schedules a 10–20 min downtime window.
+
+```bash
+# 0. Pre-flight: confirm pod, size, and pin a recent backup.
+ssh ff-france
+POD=$(kubectl -n franchise-factory get pod -l app=agentflow-postgres -o jsonpath='{.items[0].metadata.name}')
+kubectl -n franchise-factory exec "$POD" -- du -sh /var/lib/postgresql/data
+TS=$(date -u +%Y%m%d-%H%M%SZ)
+
+# 1. Take a fresh dump out of band (in addition to the hourly TG backup).
+kubectl -n franchise-factory exec "$POD" -- bash -c \
+  'PGPASSWORD=$POSTGRES_PASSWORD pg_dump -U $POSTGRES_USER -d $POSTGRES_DB --format=plain --clean --if-exists | gzip -9' \
+  > /tmp/agentflow-pre-sts-$TS.sql.gz
+ls -lh /tmp/agentflow-pre-sts-$TS.sql.gz   # sanity-check size
+
+# 2. Quiesce all writers. Scale every consumer to 0 first so nothing
+#    reconnects mid-cutover. agentflow-agents and pgbouncer are the
+#    primary writers; the rest pick up via DNS once the new STS is up.
+kubectl -n franchise-factory scale deploy agentflow-agents --replicas=0
+kubectl -n franchise-factory scale deploy pgbouncer --replicas=0 2>/dev/null || true
+kubectl -n franchise-factory scale deploy agentflow-postgres --replicas=0
+sleep 15
+
+# 3. Delete the legacy Deployment + Service + PVC.
+#    The Service must go first because STS recreates a same-named headless svc.
+kubectl -n franchise-factory delete svc agentflow-postgres --ignore-not-found
+kubectl -n franchise-factory delete deploy agentflow-postgres --ignore-not-found
+kubectl -n franchise-factory delete pvc agentflow-postgres-data --ignore-not-found
+
+# 4. Apply the new STS + headless service.
+kubectl apply -f k8s/agentflow-postgres-sts.yaml
+kubectl -n franchise-factory rollout status sts/agentflow-postgres --timeout=180s
+
+# 5. Restore the dump into the fresh STS pod.
+NEWPOD=agentflow-postgres-0
+gunzip -c /tmp/agentflow-pre-sts-$TS.sql.gz \
+  | kubectl -n franchise-factory exec -i "$NEWPOD" -- bash -c \
+     'PGPASSWORD=$POSTGRES_PASSWORD psql -U $POSTGRES_USER -d $POSTGRES_DB -v ON_ERROR_STOP=1'
+
+# 6. Verify row counts match pre-cutover. Compare with the values from step 1.
+kubectl -n franchise-factory exec "$NEWPOD" -- bash -c \
+  'PGPASSWORD=$POSTGRES_PASSWORD psql -U $POSTGRES_USER -d $POSTGRES_DB -c \
+   "SELECT (SELECT count(*) FROM projects) AS projects, (SELECT count(*) FROM project_events) AS events, (SELECT count(*) FROM agent_memories) AS mems;"'
+
+# 7. Spin writers back up.
+kubectl -n franchise-factory scale deploy agentflow-agents --replicas=1
+kubectl -n franchise-factory scale deploy pgbouncer --replicas=1 2>/dev/null || true
+kubectl -n franchise-factory rollout status deploy/agentflow-agents
+```
+
+Backup CronJob bucket bootstrap (one-time, before first Sunday run):
+
+```bash
+kubectl -n franchise-factory exec deploy/minio -- sh -c \
+  'mc alias set local http://localhost:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD && mc mb -p local/agentflow-backups'
+kubectl apply -f k8s/postgres-backup-cron.yaml
+# Trigger once to validate:
+kubectl -n franchise-factory create job --from=cronjob/agentflow-postgres-backup-minio bkup-test-$(date +%s)
+kubectl -n franchise-factory logs -l job-name=bkup-test-... --tail=80
+```
+
+Rollback (if STS pod fails to start):
+
+```bash
+kubectl -n franchise-factory scale sts agentflow-postgres --replicas=0
+kubectl -n franchise-factory delete sts agentflow-postgres
+kubectl -n franchise-factory delete pvc data-agentflow-postgres-0
+# Reapply the original Deployment manifest (kept in git history),
+# then restore from /tmp/agentflow-pre-sts-$TS.sql.gz the same way.
+```
 
 ## Related
 - [Projects create flow](/subsystems/projects-create-flow) — uses `project_events` heavily
