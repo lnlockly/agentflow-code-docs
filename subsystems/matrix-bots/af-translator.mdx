@@ -1,0 +1,138 @@
+---
+title: "@af-translator"
+description: "Tenth Matrix bot — /translate <text> with per-room auto-mode and per-user preferred target language."
+---
+
+# @af-translator
+
+## TL;DR
+
+Tenth platform Matrix bot. Direct mode: a user types `/translate <text>` (or `/translate ja: hello`, or `/translate en→fr Hello`) and the bot posts a translation as a reply. Auto mode: when a room owner has set `/translate auto on`, the bot detects the language of every non-bot, non-command message and posts a translation for each participant whose preferred language differs. One `useModel(ModelType.TEXT_SMALL)` call covers detect + translate; cost is capped by per-room rolling rate limit and per-event idempotency log.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/matrix-bots/lib.ts:18` | `BOT_SLUGS` — new `'af-translator'` entry |
+| `agentflow-agents/src/services/matrix-bots/lib.ts:421` | `TRANSLATOR_LANGUAGES` ISO-639-1 → name table |
+| `agentflow-agents/src/services/matrix-bots/lib.ts:454` | `parseTranslateCommand(body)` — `/translate xx:`, `<src>→<dst>`, `auto`, `prefer`, `help` |
+| `agentflow-agents/src/services/matrix-bots/handlers/translator.ts:1` | Handler: welcome, slash commands, auto-mode dispatch, throttle, idempotent log |
+| `agentflow-agents/src/services/matrix-bots/handlers/translator.ts:200` | `translateOnce` — `useModel(TEXT_SMALL)` call with JSON envelope contract |
+| `agentflow-agents/src/services/matrix-bots/handlers/translator.ts:233` | `parseTranslateLlmResponse` — fence-stripping JSON parser |
+| `agentflow-agents/src/services/matrix-bots/handlers/translator.ts:259` | `pickAutoTargets` — de-dup target langs, drop source lang, skip bot |
+| `agentflow-agents/src/services/matrix-bots/handlers/translator.ts:115` | `isAutoModeRoomCached` / `ensureAutoModeHydrated` — in-process cache the runner reads on dispatch |
+| `agentflow-agents/src/services/matrix-bots/register.ts:51` | `DISPLAY_NAMES['af-translator']` — `🌐 AF Translator` |
+| `agentflow-agents/src/services/matrix-bots/runner.ts:50` | Handler + invite-hook wiring + auto-mode dispatch gate |
+| `agentflow-agents/src/services/matrix-onboarding.ts:187` | `BOT_DM_NAMES` + `BOT_DM_INTROS` — first-bounce DM intro copy |
+| `agentflow-agents/migrations/2026-05-22f-chat-translator.sql:1` | `chat_translator_room_settings`, `chat_translator_user_prefs`, `chat_translator_log` |
+| `agentflow-agents/src/db/schema.ts:3650` | Drizzle table definitions for the three tables |
+| `agentflow-agents/tests/matrix-bots/af-translator.test.ts:1` | 25 unit tests — command parser, LLM JSON parser, target-resolver, fan-out planner, throttle, slug sanity |
+
+## Data flow
+
+```
+incoming message in a room where @af-translator is a member
+    │
+    ├─ runner.ts dispatch decision
+    │     ├─ DM or @-mention                  → translator handler (slash path)
+    │     ├─ auto-mode cache says room is on  → translator handler (auto path)
+    │     └─ neither                          → drop event (no cost)
+    │
+    └─ handlers/translator.ts: handleTranslatorMessage
+          │
+          ├─ parseTranslateCommand(body):
+          │    /help, /start                  → sendText(buildHelpBody)
+          │    /translate auto on|off         → setRoomAutoMode → cache write
+          │    /translate prefer <code>       → chat_translator_user_prefs UPSERT
+          │    /translate [<src>→]<dst> text  → translateOnce(text, dst, src?)
+          │                                      → sendText(reply, markdown)
+          │    /translate <text>              → pref-lookup → translateOnce
+          │                                      → pref-flip if src===pref
+          │                                      → sendText(reply)
+          │
+          └─ no slash + auto_mode=true:
+                throttle: shouldAllowAutoRun(room, now, 5s) — drop if hot
+                primary lang = first participant's pref
+                translateOnce(text, primary)               (one LLM call)
+                pickAutoTargets(prefs, detectedSrc, botMx)  (de-dup, drop src)
+                for each target lang:
+                  reserveTranslation(room, event, lang)     (PK insert)
+                    skip when already done
+                  if lang === primary: reuse translation
+                  else translateOnce(text, lang, detectedSrc)
+                  sendText(reply)
+```
+
+## DB / Env / API
+
+### Postgres tables
+
+```sql
+CREATE TABLE chat_translator_room_settings (
+  room_id    TEXT PRIMARY KEY,
+  auto_mode  BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE chat_translator_user_prefs (
+  mxid           TEXT PRIMARY KEY,
+  preferred_lang TEXT NOT NULL DEFAULT 'ru',
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE chat_translator_log (
+  room_id       TEXT NOT NULL,
+  event_id      TEXT NOT NULL,
+  target_lang   TEXT NOT NULL,
+  translated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (room_id, event_id, target_lang)
+);
+```
+
+`chat_translator_log` is the idempotency gate. A retried `/sync` batch (or a runner restart that replays the same event) inserts the same primary key, the unique constraint kicks in, and the second translation never runs.
+
+### Env (agentflow-agents)
+
+| Var | Default | Effect |
+|---|---|---|
+| `MATRIX_TRANSLATOR_DISABLED` | unset | When `=1` the bot row stays registered but the runner skips dispatch. Mirror of `MATRIX_NEWS_DISABLED`; lets the operator kill a misbehaving bot without a code change. |
+| `MATRIX_TRANSLATOR_AUTO_RATE_LIMIT_SEC` | `5` | Rolling per-room window. Two messages arriving inside the window translate only the first; second is dropped. Set to `0` to disable. |
+| `MATRIX_TRANSLATOR_MAX_INPUT_CHARS` | `4000` | Maximum input length. Longer messages get a friendly refusal in slash mode, are silently skipped in auto mode. |
+| `MATRIX_BOT_KEY` | (shared) | Cluster-wide HMAC for per-bot password derivation. Same key every bot uses. |
+
+### Commands
+
+| Shape | Effect |
+|---|---|
+| `/translate <text>` | Auto-detect source. Target = caller's `prefer` (default `ru`). When detected source equals the pref, flip to the obvious counterpart (`en` ↔ `ru`) so we don't translate to the same language. |
+| `/translate <code>: <text>` | Explicit ISO-639-1 target. |
+| `/translate <src>→<dst> <text>` | Explicit source and target. Hint passes through to the model so detect step is skipped. |
+| `/translate auto on` / `/translate auto off` | Per-room toggle. Default OFF. |
+| `/translate auto` | Reports the current state. |
+| `/translate prefer <code>` | Per-user preferred target lang. Stored in `chat_translator_user_prefs.mxid` (Matrix mxid is the key — works across rooms). |
+| `/translate prefer` | Reports the current preference. |
+| `/help`, `/start` | Help blurb. |
+
+### Supported languages
+
+`en, ru, es, fr, de, it, pt, pl, nl, tr, uk, zh, ja, ko, ar, hi, he, vi, th, id` — 20 codes. Adding a new language is a one-line patch to `TRANSLATOR_LANGUAGES` in `lib.ts`; `parseTranslateCommand` then accepts it everywhere and the help body picks it up on next deploy.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Bot ignores `/translate` slash command silently | `[af-translator] translate failed` followed by `useModel` error | Upstream LLM provider is down — the bot replies «Не получилось перевести — попробуй ещё раз через минуту». The detect+translate call is a single round-trip; no DB writes on failure. |
+| Welcome blurb never lands on invite | `[af-translator] welcome failed` | `sendText` or `setRoomAutoMode` failed; inspect inner `err`. Subsequent slash commands still work — the row gets created lazily by `handleTranslatorMessage`. |
+| Same message gets translated twice into the same lang | (would only happen if PRIMARY KEY constraint missing) | `psql -c "SELECT room_id, event_id, target_lang, count(*) FROM chat_translator_log GROUP BY 1,2,3 HAVING count(*)>1"`. If rows exist, the migration was applied incorrectly — re-run `2026-05-22f-chat-translator.sql`. |
+| Auto mode never fires | `[af-translator] auto rate-limited` repeats forever | Throttle is healthy but the source lang matches every participant's pref. Confirm with `psql -c "SELECT mxid, preferred_lang FROM chat_translator_user_prefs WHERE mxid IN (…)"` — at least one participant needs a different pref. |
+| `parseTranslateLlmResponse` throws | inner error `translator_llm_not_json` | LLM returned prose instead of JSON. Retry is safe — the next user message gets a fresh call. If recurring, the upstream model is drifting from the system prompt — re-check `translateOnce` prompt. |
+| Bot row never registers | `[matrix-bots] ensure complete` lists `af-translator` in `failed` | Same root cause as other bots — `MATRIX_BOT_KEY` empty or registration shared secret drifted. Re-run `scripts/register-matrix-bots.mjs`. |
+| `/translate prefer xx` rejected | reply contains «Не знаю язык» | Code outside `TRANSLATOR_LANGUAGES`. Either pick a supported ISO-639-1 from the help list, or add a row to the table. |
+| Auto-mode dispatches even after `/translate auto off` | (would only happen if cache write missed) | `setRoomAutoMode` writes both DB and cache. After process restart the cache hydrates from DB on first event in the room — there's a 1-event window where stale state could leak through. The handler still gates on the fresh DB row (`getRoomSettings`) so the worst case is one wasted LLM call. |
+
+## Related
+
+- [Matrix Bots](/subsystems/matrix-bots) — overall bot runner architecture, `ensureBot`/`/sync` loop, dispatch gating
+- [@af-news](/subsystems/matrix-bots#af-news--daily-0900-digest) — closest analog (invite welcome, per-room subs, idempotent log)
+- [@af-image](/subsystems/matrix-bots#af-image--multi-model-slash-commands) — closest analog for the direct slash-command path

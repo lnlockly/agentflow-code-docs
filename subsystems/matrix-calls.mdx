@@ -1,0 +1,91 @@
+---
+title: "Matrix Calls (hosted Element Call)"
+description: "Voice and video calls in chat.agentflow.website via hosted call.element.io. No self-hosted LiveKit yet — Phase-2 backlog."
+---
+
+# Matrix Calls (hosted Element Call)
+
+> **Status: shipped 2026-05-23** — three Element Web feature flags flipped, `element_call.url` points at hosted SaaS. No self-hosted SFU.
+
+## TL;DR
+
+Element Web at `chat.agentflow.website` ships with three call flags enabled (`feature_video_rooms`, `feature_element_call_video_rooms`, `feature_group_calls`). The Element Call widget connects directly to `call.element.io`'s LiveKit. Room state lives in our Dendrite — federation off does not block this because state events are local to the room and Element Call treats unknown event types as opaque payload. Media plane (audio/video) routes through Element's SaaS. The self-host LiveKit path was rejected for first ship: cluster has nginx-ingress (not Caddy), no UDP proxy configured, OVH UDP firewall on `144.217.65.94` unverified.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/k8s/element-web-config.yaml:39-41` | Three feature flags = `true` |
+| `agentflow-agents/k8s/element-web-config.yaml:240-243` | `element_call.url = https://call.element.io`, `use_exclusively = false` |
+| `agentflow-agents/tests/smoke/element-call-flags.test.ts` | Smoke test pins all five values, fails on regression |
+| `agentflow-agents/docs/specs/2026-05-23-livekit-deploy.md` | Brainstorm doc: why hosted, why not self-host yet |
+
+## Data flow
+
+```
+User clicks call button in Element Web
+            │
+            ▼
+Element Web loads <iframe src=https://call.element.io/...>  (hosted EC widget)
+            │
+            ├── signalling room state → POST to Dendrite (matrix.agentflow.website)
+            │   event type: org.matrix.msc3401.call (opaque to Dendrite)
+            │
+            └── WebRTC media → call.element.io LiveKit SFU
+                              (audio/video do not touch our cluster)
+```
+
+## DB / Env / API
+
+- Tables: none. Call state lives as Matrix events in Dendrite's own DB.
+- Env: none added.
+- Routes: none added. Element Web reads `/config.json` from the `element-web-config` ConfigMap.
+- ConfigMap: `element-web-config` in namespace `franchise-factory`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Call button missing in room header | `feature_group_calls":false` in `kubectl get cm element-web-config -o jsonpath` | Re-flip flags in `k8s/element-web-config.yaml:39-41` |
+| Call button clicks but widget does not load | browser console: `Refused to frame 'https://call.element.io'` | Element Web CSP — verify `element-web-config.yaml` does not pin a stricter `frame-src` |
+| Widget loads, never connects | browser console: `WebRTC peer connection failed` / `ICE failed` | Hosted EC's job; users on aggressive corporate NAT may need to retry. If systematic, Phase-2 self-host with coturn becomes necessary |
+| Audio works, video missing for one peer | browser console: `MediaStreamTrack ended unexpectedly` | Hosted EC issue, not ours. Check `https://status.element.io` |
+| Flags silently flipped back by a refactor | smoke test fails: `not ok 1 - feature_video_rooms is enabled` | `tests/smoke/element-call-flags.test.ts` catches it pre-merge |
+
+## Privacy caveat
+
+Audio and video flow through Element's SaaS LiveKit. We do not see media, but neither does the user have an on-prem option today. **Document this on the user-facing chat page if it becomes a concern.** Phase-2 self-host plan in `agentflow-agents/docs/specs/2026-05-23-livekit-deploy.md` (rejected for now: UDP routing, OVH firewall, single-pod HA all unresolved).
+
+## Rejected for first ship
+
+- **Self-host LiveKit (Option A / B in the brainstorm spec):** cluster ingress is nginx (not Caddy as the original brief assumed), no UDP proxy path validated, OVH firewall on `144.217.65.94` for UDP 7882-7892 unverified. Brainstorm doc preserves the work for a follow-up ticket.
+- **Use `feature_video_rooms` without Element Call flags:** ships only legacy 1:1 calls, not group/video calls. Goal was group calls.
+- **Set `element_call.use_exclusively: true`:** removes the Jitsi-widget fallback that some power users rely on. Kept `false` for graceful degradation.
+
+## Verification recipe
+
+```bash
+ssh ff-france 'kubectl -n franchise-factory get cm element-web-config \
+  -o jsonpath="{.data.config\.json}"' \
+  | jq '.features.feature_group_calls,
+        .features.feature_element_call_video_rooms,
+        .features.feature_video_rooms,
+        .element_call'
+```
+
+Expect:
+
+```
+true
+true
+true
+{ "url": "https://call.element.io", "use_exclusively": false }
+```
+
+Then open `https://chat.agentflow.website`, sign in, open or create a room with ≥2 members, look for the phone/video icon in the room header (top right). Click it. Widget loads → done.
+
+## Related
+
+- [Matrix Instagram bridge](/subsystems/matrix-ig-bridge) — sibling Matrix subsystem
+- `agentflow-agents/docs/specs/2026-05-21-matrix-chat-integration.md` — parent Matrix integration spec (calls were deferred there, this is that follow-up)
+- `agentflow-agents/docs/specs/2026-05-23-livekit-deploy.md` — Phase-2 self-host brainstorm (backlog)

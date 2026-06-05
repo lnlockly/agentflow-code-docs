@@ -1,0 +1,181 @@
+---
+title: "Daemon image reconciler"
+description: "Cron-driven rollout-restart of daemon STSs whose pod imageID drifts from the ghcr `:latest` digest. Keeps /workspace intact via PVC."
+---
+
+# Daemon image reconciler
+
+## TL;DR
+
+Every `DAEMON_IMAGE_RECONCILE_TICK_MS` (default 5 min) the worker pod
+walks `hosted_devices` rows with status `provisioning` or `running`,
+HEAD-checks `ghcr.io/lnlockly/agentflow-daemon-{coder,universal,assistant}:latest`
+for the current OCI digest, compares against the digest baked into the
+running pod's `containerStatuses[0].imageID`, and fires
+`kubectl rollout restart sts/<name>` when they differ. The STS template
+already mounts `/workspace` from a `local-path` PVC + sets
+`imagePullPolicy: Always`, so the restarted pod re-pulls the new image
+and keeps the user's project tree intact.
+
+Opt-in via `DAEMON_IMAGE_RECONCILE_ENABLED=1` on the agentflow-agents
+deployment. Off by default so the first deploy is safe to roll back
+without behaviour change.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/daemon-image-reconciler.ts:51` | `DAEMON_IMAGE_RECONCILE_ENABLED` env flag |
+| `agentflow-agents/src/services/daemon-image-reconciler.ts:60` | `DAEMON_IMAGE_RECONCILE_COOLDOWN_MS` per-STS cooldown |
+| `agentflow-agents/src/services/daemon-image-reconciler.ts:108` | `fetchRegistryDigest` — cached ghcr HEAD |
+| `agentflow-agents/src/services/daemon-image-reconciler.ts:172` | `listDaemonRows` — DB read of candidates |
+| `agentflow-agents/src/services/daemon-image-reconciler.ts:230` | `extractSha256` — parses kubelet imageID |
+| `agentflow-agents/src/services/daemon-image-reconciler.ts:256` | `reconcileOne` — per-row decision tree |
+| `agentflow-agents/src/services/daemon-image-reconciler.ts:357` | `startDaemonImageReconciler` — wires into `setInterval` |
+| `agentflow-agents/src/server.ts:367` | Boot wire inside `RUN_WORKERS` block |
+| `agentflow-agents/src/routes/internal-dev.ts:130` | `POST /internal/dev/daemon-image-reconcile` on-demand tick |
+| `agentflow-agents/src/routes/internal-dev.ts:152` | `GET /internal/dev/daemon-image-digest?image=` for diffing |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:511` | `renderDaemonManifest` — PVC + imagePullPolicy: Always |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:774` | `volumeClaimTemplates` keeps `/workspace` across rollouts |
+
+## Data flow
+
+```
+       ┌────────────────────────────────────┐
+       │ setInterval (5 min) on worker pod  │
+       └─────────────────┬──────────────────┘
+                         │
+                         ▼
+   ┌──────────────────────────────────────────────┐
+   │ SELECT * FROM hosted_devices                 │
+   │ WHERE deleted_at IS NULL                     │
+   │   AND sts_name IS NOT NULL                   │
+   │   AND status IN ('provisioning', 'running')  │
+   └──────────────────┬───────────────────────────┘
+                      │  (per row)
+                      ▼
+   ┌──────────────────────────────────────────────────────┐
+   │ resolveDaemonImage(template)                         │
+   │   → ghcr.io/.../agentflow-daemon-<variant>:latest    │
+   └──────────────────┬───────────────────────────────────┘
+                      │
+       ┌──────────────┴──────────────┐
+       │                             │
+       ▼                             ▼
+  ghcr HEAD                  kubectl get pod -o
+  Authorization: Bearer       jsonpath imageID
+  <ghp_ from                  via tenant kubeconfig
+  GHCR_DOCKER…B64>            (or in-cluster auth for warm)
+       │                             │
+       ▼                             ▼
+   sha256:<registry>        sha256:<pod>
+                      │
+                      ▼
+              equal? ── yes ──▶ in_sync, no-op
+                      │
+                      no
+                      ▼
+            check skip rules:
+            - active session window (2 min)
+            - per-STS cooldown (15 min)
+                      │
+                      ▼
+            kubectl -n <ns> rollout restart sts/<name>
+                      │
+                      ▼
+            emitPoolEvent(image_rollout_restart)
+                      │
+                      ▼
+            kubelet recreates pod, re-pulls :latest,
+            PVC stays bound → /workspace intact
+```
+
+## DB / Env / API
+
+- Tables read: `hosted_devices` (status, sts_name, vcluster, template, user_id),
+  `users` (tenant_kubeconfig_sealed for user-bound rows).
+- Tables written: `hosted_pool_events` (kind = `image_rollout_restart`,
+  `image_rollout_restart_failed`).
+- Env:
+  - `DAEMON_IMAGE_RECONCILE_ENABLED` — `1` to opt in (default off).
+  - `DAEMON_IMAGE_RECONCILE_TICK_MS` — loop interval, min 60_000, default 300_000.
+  - `DAEMON_IMAGE_RECONCILE_COOLDOWN_MS` — per-STS cooldown, min 60_000,
+    default 900_000.
+  - `DAEMON_IMAGE_RECONCILE_MAX_PER_TICK` — max rollout-restarts per tick,
+    default 3.
+  - `GHCR_DOCKERCONFIGJSON_B64` — already present, used to extract the
+    `ghp_*` PAT for private-package HEAD requests.
+- Routes (internal-only, `x-agentflow-secret` required):
+  - `POST /internal/dev/daemon-image-reconcile` — fire one tick on demand
+  - `GET  /internal/dev/daemon-image-digest?image=ghcr.io/...` — return
+    the cached registry digest, useful for diffing against
+    `kubectl get pod`.
+
+## Skip rules
+
+| Condition | Action |
+|---|---|
+| `pod imageID == registry digest` | `in_sync` — no-op |
+| `status='running' AND last_status_at < 2 min` | `skip_active` — retry next tick |
+| restart fired for this STS within cooldown | `skip_cooldown` |
+| tenant_kubeconfig_sealed unsealable | `no_kubeconfig` — counted as error |
+| pod `containerStatuses[0]` missing | `no_pod` — counted as error |
+| ghcr HEAD returns no `docker-content-digest` | `no_registry_digest` |
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Reconciler never restarts pods on `:latest` push | `daemon-image-reconciler: disabled` | Set `DAEMON_IMAGE_RECONCILE_ENABLED=1` on agentflow-agents-env |
+| ghcr HEAD returns 401 | `daemon-image-reconciler: registry HEAD failed` | Rotate `GHCR_DOCKERCONFIGJSON_B64` PAT (needs `read:packages`) |
+| Tenant rollout fails | `daemon-image-reconciler: rollout-restart fired` then exit non-zero | Check tenant_status='ready' in `users` row; reseal kubeconfig |
+| Restart loop on same STS | repeated `image_rollout_restart` events in `hosted_pool_events` | Cooldown active — wait 15 min or raise `DAEMON_IMAGE_RECONCILE_COOLDOWN_MS` |
+| Owner sees old code after merge | no `image_rollout_restart` event in `hosted_pool_events` for the device | Hit `POST /internal/dev/daemon-image-reconcile` to force a tick |
+
+## /workspace survival contract
+
+The reconciler relies on three contracts in `renderDaemonManifest`:
+
+1. **`volumeClaimTemplates`** declares a `local-path` PVC named `workspace`
+   bound to `/workspace`. Pod delete → kubelet recreates the pod attached
+   to the SAME PVC → file tree intact.
+2. **`imagePullPolicy: Always`** forces a digest re-resolve on every pod
+   start so a `:latest` change reaches the new pod even when ghcr keeps
+   the tag pointer stable for a few minutes (registry-side caching).
+3. **`updateStrategy: RollingUpdate`** + **`terminationGracePeriodSeconds: 60`**
+   + 5s `preStop` sleep let the old pod flush in-flight WS frames before
+   SIGTERM, so the cabinet's live stream sees ≤3s of perceived outage.
+
+Daemon rows from PR #918 onwards inherit all three. Rows created before
+that PR (e.g. `hd-e3290bf9` on user-1) still run on `emptyDir`-backed
+STSs and need a one-shot migration before the reconciler can be enabled
+for them without data loss:
+
+```bash
+# 1. Snapshot the old pod's /workspace to host.
+ssh ff-france "kubectl --kubeconfig=/tmp/vc-admin.yaml exec -n default \
+  hd-e3290bf9-0 -- tar czf - -C / workspace" > /tmp/workspace-e3290bf9.tgz
+
+# 2. Apply the new manifest (PVC + RollingUpdate). The `kubectl apply -f`
+#    flow inside agentflow-agents creates a STS with `volumeClaimTemplates`
+#    when the row is re-saved through `renderDaemonManifest`.
+#    Trigger by bumping the row's last_status_at (PVC is generated on the
+#    next render, no DB schema change needed). Or run:
+ssh ff-france "kubectl --kubeconfig=/tmp/vc-admin.yaml delete sts -n default \
+  hd-e3290bf9 --cascade=orphan"
+# (re-apply via the route now lays down the PVC-backed manifest)
+
+# 3. Restore /workspace into the new pod once it's Running.
+cat /tmp/workspace-e3290bf9.tgz | ssh ff-france \
+  "kubectl --kubeconfig=/tmp/vc-admin.yaml exec -i -n default hd-e3290bf9-0 \
+   -- tar xzf - -C /"
+```
+
+After the migration the reconciler treats the row like any other: digest
+diff → `kubectl rollout restart` → pod re-pulls → PVC stays bound.
+
+## Related
+
+- [Hosted Daemon (kind=daemon)](/subsystems/hosted-daemon)
+- [Hosted-device warm pool](/subsystems/hosted-device-warm-pool)
+- [Workspace janitor](/runbooks/) — orthogonal sweep of orphan STSs

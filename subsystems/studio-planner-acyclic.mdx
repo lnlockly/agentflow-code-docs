@@ -1,0 +1,113 @@
+---
+title: "Studio planner — back-edge strip on save"
+description: "Server-side invariant that guarantees flows persisted from Studio are DAGs, preventing flow-executor cycle_detected failures."
+---
+
+# Studio planner — back-edge strip on save
+
+## TL;DR
+
+The Studio `mode=automate` planner LLM occasionally emits graphs that
+contain cycles (retry loops, "wait for reply → poll" patterns). The
+flow-executor uses a strict topological sort that returns `null` for any
+cyclic graph and aborts the run with `flow_runs.error='cycle_detected'`
+in ~10ms. To keep the executor strict but make Studio usable, the
+`POST /me/flows/create-from-graph` and `POST /me/flows/refine` routes
+unconditionally run the graph through a DFS-based **back-edge stripper**
+before persisting / returning. Cycles become DAGs by dropping exactly
+the edges that close them; the trade-off is that planner-emitted retry
+loops degrade to a single pass.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/graph-acyclic.ts:1` | `stripBackEdges(graph)` — DFS 3-color (WHITE/GRAY/BLACK) back-edge stripper. Pure function on `FlowGraph`. |
+| `agentflow-agents/src/routes/flows.ts:705` | Wire-in for `POST /me/flows/create-from-graph` — strip after node/edge normalization, before `db.insert(flows)`. |
+| `agentflow-agents/src/routes/flows.ts:668` | Wire-in for `POST /me/flows/refine` — strip on the LLM's `updated_schema` before returning to the client. |
+| `agentflow-agents/src/services/flow-executor.ts:4614` | `topoSort(graph)` — strict; returns null on cycle → `cycle_detected`. Unchanged. |
+| `agentflow-agents/tests/graph-acyclic.test.ts:1` | 10 unit tests covering DAG/2-loop/3-loop/self-loop/diamond/disconnected/determinism. |
+
+## Data flow
+
+```
+Studio (frontend)
+  │
+  │ POST /me/flows/refine  (planner LLM round-trip)
+  ▼
+flow-refine.ts → updated_schema (may contain cycles)
+  │
+  │ ← stripBackEdges() ← also applied here for display safety
+  ▼
+returned to frontend, edits, then:
+  │
+  │ POST /me/flows/create-from-graph
+  ▼
+routes/flows.ts:
+  normalize nodes (drop un-derivable kinds)
+  normalize edges (drop endpoints to missing nodes)
+  stripBackEdges(graph)   ← invariant enforced here
+  db.insert(flows)
+  │
+  │ later, on run:
+  ▼
+flow-executor.topoSort(graph)   ← always succeeds (DAG guaranteed)
+  → run proceeds, no cycle_detected
+```
+
+## DB / Env / API
+
+- Tables: `flows.graph` (jsonb, `FlowGraph` shape) — written post-strip.
+- Env: none (strip is unconditional, no feature flag).
+- Routes:
+  - `POST /me/flows/create-from-graph` — persists Studio graph.
+  - `POST /me/flows/refine` — returns refined graph.
+- Log signature on strip: `pino.warn` with
+  `{ flow_slug, removed_edge_count, removed_edges }` and message
+  `studio planner emitted cyclic graph — back-edges stripped`. Grep
+  prod logs to count how often the planner ships cycles.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Studio run aborts in ~10ms with `cycle_detected` | `error: 'cycle_detected'` from `flow_runs` row | should be impossible after strip lands; if seen, suspect a flow row inserted before this fix (back-fill: `UPDATE flows SET graph = ... WHERE id = ?`) or a non-Studio code path inserting a cyclic graph |
+| Planner-intended retry loop never retries | `studio planner emitted cyclic graph — back-edges stripped` | by design — the strip drops the closing edge. If retries are required, the planner must encode them via a different primitive (e.g. a future `loop.*` node kind with bounded iterations) instead of raw back-edges |
+| Disconnected cyclic component silently loses an edge | same warn log | review the log: the `removed_edges` array names every dropped edge so the user can see what the planner sent |
+
+## Algorithm
+
+3-state DFS coloring:
+
+1. All nodes start `WHITE`.
+2. Iterate roots in **sorted-id order** (determinism).
+3. On entering a node, mark `GRAY` (= on DFS stack).
+4. For each outgoing edge `(u → v)`:
+   - `v` is `GRAY` → **back-edge** → drop, record.
+   - `v` is `WHITE` → recurse.
+   - `v` is `BLACK` → cross/forward edge → keep.
+5. After exploring a node, mark `BLACK`.
+
+Iterative implementation (loop blow-up safe). Edge order in the kept
+list matches input order. Self-loops `(u → u)` are dropped because `u`
+is `GRAY` when the edge is inspected.
+
+## Trade-offs
+
+- **Why save-time, not run-time?** Keeping the executor strict means
+  flows that bypass Studio (manually-authored, API-imported) get the
+  same invariant check the executor was already doing — we just shift
+  the *response* from "fail the run" to "save a cleaned graph". If we
+  relaxed the executor, every consumer of `flows.graph` would have to
+  cope with cycles.
+- **Why drop the edge instead of bounding the loop?** Bounded loops
+  would need a new node kind and runtime budget tracking. That's
+  separate work — file under "controlled loops" once the planner
+  actually needs them.
+- **Why no feature flag?** Cycles are always a planner bug. There's no
+  scenario where preserving a cycle yields a working flow today.
+
+## Related
+
+- [Graph executor — node handlers](/subsystems/graph-handlers)
+- qa-issues: `qa-issues/RESOLVED/2026-05-16-studio-cycle-detected-fail.md`

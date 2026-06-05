@@ -1,0 +1,135 @@
+---
+title: "Landing app shell + design tokens"
+description: "AppShellV2 sidebar/topbar, admin section split, design tokens used across /studio, /projects, /marketplace, /account/*."
+---
+
+# Landing app shell + design tokens
+
+## TL;DR
+
+All v2 pages (`/studio`, `/projects`, `/marketplace`, `/my/agents`, `/inbox`, `/triggers`, `/account/usage`, `/account/billing`, `/account/settings`, `/admin/hub`, `/status`) wrap their bodies in `AppShellV2`. The shell renders a 240px sidebar + 70px topbar with a single set of design tokens defined in `dark-tokens.css`. Two sidebar variants exist: the regular nav for everyday browsing and an ADMIN nav that activates only when the user is on `/admin/*` AND `user.is_admin === true`. Admin entries never bleed into the regular workspace shell.
+
+**Apps-cleanup 2026-05-29 (UX overhaul §3):** the regular nav is now grouped by outcome, not one flat list. `WORKSPACE_SECTIONS` renders «Создать» (`CREATE_NAV`: Кабинет/Проекты/Устройства/Навыки) then «Работа» (`WORK_NAV`: Мои агенты/Маркетплейс/Приложения); `INSIGHTS_NAV` is the «Кабинет» group (Биллинг/Партнёрка/Настройки). Removed from the sidebar: **Singularity** (`/singularity` — static duplicate hub, no own backend) and **Квесты** (`/start` — gamification stub). The `/apps` launcher dropped its **Души** (`/workspace/souls`) tile — graph-executor was unwired (PR #917), souls is tombstoned. All three routes still resolve by direct URL (archive-not-break; souls `/me/souls` still answers 200 pre-Phase-3). Audit + per-item evidence: `plans/autonomous/_apps-cleanup-audit.md`. i18n keys `app.shell.section.{create,work,cabinet}` in ru/en/zh.
+
+**«Маркетплейс» = the flows app (IA 2026-05-30).** Owner correction: "the
+marketplace" is the rebranded templates/automation app at
+`flows.agentflow.website` (seam-2 SSO via `/flows` → `FlowsLaunch` →
+`POST /me/flows/sso`), **not** the in-app agent catalog. So the prominent
+`CORE_NAV` «Маркетплейс» now points at `/flows` (`AppShellV2.tsx` CORE_NAV +
+mobile BOTTOM_NAV). The in-app hire-an-agent catalog (`MarketplaceV2` at
+`/marketplace`) is a separate `MORE_NAV` item **«Нанять агента»** (i18n
+`app.shell.nav.hire_agents`, `UserPlus` icon) — distinct from «Мои агенты»
+(`/account/agents`, owned agents). The duplicate «Автоматизации»
+(`flows_app → /flows`) MORE entry was dropped. Legacy `/account/marketplace`
+(old `AccountMarketplace` → `Marketplace.tsx`, an embedded duplicate of the
+unified grid) is retired: route redirects to `/marketplace`, both components
+deleted, `FloatingGuide` refs repointed. Seam-2 SSO verified live:
+`POST /me/flows/sso` → 200 + activepieces JWT + `publicUrl
+flows.agentflow.website` (`FF_ACTIVEPIECES_ENABLED` on). Nav map summary:
+«Маркетплейс»→`/flows` · «Нанять агента»→`/marketplace` · «Мои агенты»→`/account/agents`.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:103` | `CREATE_NAV` — «Создать» group: Кабинет, Проекты, Устройства, Навыки |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:112` | `WORK_NAV` — «Работа» group: Мои агенты, Маркетплейс, Приложения |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:118` | `WORKSPACE_SECTIONS` — ordered `{titleKey, items}` groups the sidebar maps over |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:126` | `INSIGHTS_NAV` — «Кабинет» group: Биллинг, Партнёрка, Настройки |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:139` | `ADMIN_NAV` — Hub, All projects, Campaigns, Ads, FLOW emission, Billing config, Platform workspace |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:151` | `isAdminPath(pathname)` — matches `/admin/*`, `/account/admin/*`, `/workspace/admin/*` |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx:345` | `onAdminRoute && isAdmin` swap that picks WORKSPACE_SECTIONS+INSIGHTS vs ADMIN |
+| `agentflow-landing/src/pages/AppsLauncher.tsx:83` | `/apps` `SECTIONS` — iOS-style tile grid for secondary surfaces |
+| `agentflow-landing/src/components/layout/Sidebar.tsx:73` | Legacy team-shell `DISCOVER_NAV` (used by old `AppShell`: TeamHub/TeamsList/MyTasks/invites) |
+| `agentflow-landing/src/components/account/AccountHeader.tsx:32` | Legacy header for `/account`, `/hub` — no longer carries an admin pill |
+| `agentflow-landing/src/styles/dark-tokens.css:17` | All design tokens — surfaces, borders, text, accent, fonts |
+
+## Design tokens
+
+| Token | Value | Use |
+|---|---|---|
+| `--af-bg` | `#0A0A0C` | Page background, shell base |
+| `--af-elev1` | `#0F0F12` | Sidebar fill |
+| `--af-elev2` | `#141417` | Card surface, raised panels, topbar widgets |
+| `--af-input` | `#1C1C20` | Input field background, inline pills |
+| `--af-hover` | `#1A1A1E` | Nav-item hover + active state |
+| `--af-border-subtle` | `#1F1F23` | Section dividers, shell edges |
+| `--af-border-medium` | `#27272B` | Card border, button border |
+| `--af-text-primary` | `#FAFAFA` | Body text, h1/h2 |
+| `--af-text-secondary` | `#9A9A9F` | Sub-labels, inactive nav |
+| `--af-text-tertiary` | `#5F5F65` | Meta, kbd hints, empty-state hints |
+| `--af-accent` | `#A6F25C` | Acid green — active nav, primary CTA, USDF labels |
+| `--af-accent-dark` | `#0A0A0C` | Text on accent surface |
+| `--af-danger` | `#EF4444` | Errors, revoke, delete |
+| `--af-font-sans` | Inter | Body, nav labels |
+| `--af-font-geist` | Geist | H1/H2 |
+| `--af-font-mono` | Geist Mono / JetBrains Mono | Meta, numbers, kbd hints |
+
+Spacing increments: 8 / 12 / 16 / 20 / 24 / 32px. Border-radius scale: 4 / 6 / 8 / 10 / 12 / 14 / 16 / 18px.
+
+## Admin section split (2026-05-15)
+
+Owner complaint: admin links surfaced inside the regular workspace shell. Fix:
+
+1. `AppShellV2` swaps `WORKSPACE_NAV + INSIGHTS_NAV` → `ADMIN_NAV` when `isAdminPath(location.pathname) && user.is_admin` is true. A "Back to workspace" row sits above the admin section.
+2. Admin avatar dropdown gets an "Admin" entry only when `user.is_admin === true` — one click to `/admin/hub`.
+3. `AccountHeader.tsx` dropped its inline `🛡 Admin` pill — admin entry no longer bleeds into Hub/Account chrome.
+4. `Hub.tsx` extraNav dropped its admin link for the same reason.
+
+## Routes wired in the shell
+
+`agentflow-landing/src/main.tsx` mounts:
+
+- `/admin` → redirect to `/admin/hub`
+- `/admin/hub` → `AdminHubV2` (gated by `AccessGate`)
+- `/account/admin/projects`, `/admin/campaigns`, `/admin/ads`, `/admin/flow`, `/admin/billing`, `/admin/workspace` — admin-only pages, all wrapped in `AppShellV2` so the ADMIN_NAV sidebar shows automatically.
+
+## Plain-language copy rule (h-polish 2026-05-30)
+
+User-facing strings stay plain human Russian. **Banned jargon** in any user-visible
+string: `казна`, `саплай`, `treasury`, `supply`, `operator`, `protocol`, plus any
+crypto/DAO/insider lingo. Also banned: `бесплатно` / `free` (AgentFlow is paid). The
+token-launchpad crypto product (`pages/LaunchToken.tsx`, `components/launch-token/*`,
+`components/token-pages/*`, `pages/Whitepaper.tsx`, `prod.economy.*` / `app.launch_token.*`
+i18n keys) is the one allowed exception — `treasury` / `supply` there are correct domain
+terms for that audience, not core-cabinet copy. The **public front door**
+(https://agentflow.website — `App.tsx` + `sections/landing-v3/*`) is verified clean via
+browser-MCP snapshot.
+
+Empty-states must read "no X yet, do Y" in Russian, never raw English `Loading…` / `Error:`
+or a dev string. Good references already in tree: `pages/ProjectsDashboard.tsx:549`
+(`EmptyProjects`), `pages/MarketplaceV2.tsx:698` (error + no-results), `app.agents.empty`
+i18n key. h-polish PR 1 Russified `Profile.tsx` modal, `LiveProject.tsx` + `LiveProjectNewsPost.tsx`
+loading/empty, and reworded the `Desktop.tsx` demo card off `бесплатно`.
+
+**Static `index.html` meta.** The pre-hydration `<title>` / `description` / OG / Twitter
+fallback (what crawlers + first-paint see before `useHead` runs) lives in `index.html`.
+Keep it plain RU, no `operator` / `decentralized marketplace` jargon — h-polish follow-up
+aligned it to the runtime `seo.home.title/desc` (`AgentFlow — AI собирает твой проект`) and
+flipped `<html lang>` + `og:locale` to `ru`. `useHead` (`src/lib/useHead.ts:122`) overrides
+`document.documentElement.lang` per active language at runtime.
+
+**Follow-up tranche — DONE (h-polish PR 2):** `pages/ApiKeyDetail.tsx` fully Russified
+(labels, period/window pickers via `PERIOD_LABEL`/`WINDOW_LABEL` maps, tables, empty-states);
+admin `Loading…` / `Error:` in `AdminAds` / `AdminLlmProviders` / `FlowEmissionDashboard` → RU.
+Token-launchpad mobile: verified 0 horizontal overflow at 375px on `/pricing` + `/launchpad`
+(browser-MCP) — already responsive, no fix needed.
+
+**Still deferred (owner product call):** the `Free` pricing/B2B tier label
+(`pages/ApiKeys.tsx`, `pages/PricingPageV2.tsx`, `ApiKeyDetail.tsx` `TIER_LABEL.free`) —
+brand tier name kept as-is pending an owner naming decision (a $0 tier literally named
+"Free" vs the no-`бесплатно` rule).
+
+## Failure modes
+
+| Symptom | Log / grep signature | Where to fix |
+|---|---|---|
+| Admin sees admin links inside `/studio` or `/projects` | `ADMIN_NAV` rendering when `isAdminPath` returns false | `AppShellV2.tsx:87` — extend `isAdminPath` |
+| Non-admin lands on `/admin/hub` and bounces to `/account` | `AdminHubV2` `Navigate to="/account"` | `AdminHubV2.tsx:62` — gate uses `user.is_admin` |
+| Hardcoded hex in a new page diverges from the palette | `grep -nE "'#[0-9A-Fa-f]{3,8}'" src/pages/<page>.tsx` | Replace with `var(--af-*)` from the table above |
+| Banned jargon / English copy reaches a user page | `grep -rniE "казна\|саплай\|treasury\|\bfree\b\|бесплатн\|Loading…\|Failed:" src/pages` (exclude launch-token) | Swap to plain RU per the copy rule above |
+
+## Related
+
+- [Projects frontend](/subsystems/projects-frontend)
+- [Auth and access](/subsystems/auth-and-access)

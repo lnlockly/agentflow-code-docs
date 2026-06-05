@@ -1,0 +1,138 @@
+---
+title: "TG Pool Billing + user rentals"
+description: "Admin uploads MTProto accounts to a pool; any authenticated user can rent one without SMS auth. Per-action USDF billing (send_message=0.1, send_voice=0.3, ...). Billing wrapper debits before send, refunds on failure."
+---
+
+# TG Pool Billing + user rentals
+
+## TL;DR
+
+Платформа держит пул admin-owned MTProto-аккаунтов (`platform_tg_accounts`), и каждая billable операция (`send_message`, `send_voice`, ...) списывает USDF с баланса вызывающего юзера. Все вызовы `mcpDirect.callTool('telegram', ...)` для billable-тулов идут через `chargeAndCallTg`: дебет → MCP call → log + bump stats. Failed send → refund mirror. Прайс настраивается через `/admin/tg-pricing/:action`.
+
+С 2026-05-15 любой авторизованный юзер может арендовать аккаунт из пула через `POST /me/tg-pool/:id/rent` (без SMS, без своего номера). Аренда бесплатна, оплата идёт по факту отправленного сообщения.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/db/schema.ts:2738` | `platformTgAccounts` table — pool admin MTProto-сессий со status state machine. |
+| `agentflow-agents/src/db/schema.ts:2788` | `tgActionPricing` table — USDF цена per MCP-tool (PK = action). |
+| `agentflow-agents/src/db/schema.ts:2797` | `tgUsageLog` table — append-only audit, status: `charged \| refunded \| send_failed \| insufficient_balance`. |
+| `agentflow-agents/src/db/schema.ts:2820` | `tgAccountRentals` table — user-facing 1-час soft-leases, без чарджа. |
+| `agentflow-agents/src/db/migrations/0067_platform_tg_pool.sql` | Создаёт три таблицы + сидит default pricing (send_message=0.1, send_voice=0.3, send_photo=0.2, send_file=0.25, send_video=0.5, forward=0.05, react=0.02). |
+| `agentflow-agents/src/db/migrations/0068_tg_account_rentals.sql` | Создаёт `tg_account_rentals` для user-rental flow. |
+| `agentflow-agents/src/services/tg-billing.ts:27` | `BILLABLE_TG_TOOLS` — Set из 7 тулов (send_message, send_voice, send_photo, send_file, send_video, forward, react). |
+| `agentflow-agents/src/services/tg-billing.ts:85` | `chargeAndCallTg(callerUserId, toolName, args, options, deps?)` — основной wrapper. Pass-through для non-billable. Возвращает `{ ok:false, error:'insufficient_balance' }` если баланса не хватает. |
+| `agentflow-agents/src/services/tg-billing.ts:187` | `getPriceUsdf(action)` — читает `tg_action_pricing WHERE active=true`. |
+| `agentflow-agents/src/services/tg-billing.ts:202` | `logUsage(row)` — INSERT в `tg_usage_log`; never blocks billing path. |
+| `agentflow-agents/src/services/tg-billing.ts:223` | `bumpAccountStats(accountId, cost)` — `send_count += 1`, `revenue_usdf += cost`. |
+| `agentflow-agents/src/services/flow-executor.ts:1706` | `runTgMcpStep` — если `BILLABLE_TG_TOOLS.has(toolName)` → routes через `chargeAndCallTg(ctx.ownerUserId, ...)`. На `insufficient_balance` бросает `tg_billing:insufficient_balance` — flow step падает в `step_logs.error`. |
+| `agentflow-agents/src/routes/admin-tg-accounts.ts` | Admin REST: `GET /admin/tg-accounts`, `POST /admin/tg-accounts/add-phone`, `POST /admin/tg-accounts/confirm-code`, `PATCH /admin/tg-accounts/:id`, `DELETE /admin/tg-accounts/:id`, `GET /admin/tg-pricing`, `PUT /admin/tg-pricing/:action`. |
+| `agentflow-agents/src/routes/me-tg-pool.ts` | User REST (auth-only, NOT admin): `GET /me/tg-pool/available`, `POST /me/tg-pool/:account_id/rent`. |
+| `agentflow-landing/src/lib/agentsApi.ts:4180` | `getTgPoolAvailable`, `rentTgPoolAccount`, `pickSendMessagePriceUsdf` — клиент для user-rental endpoints. |
+| `agentflow-landing/src/components/marketplace/TgRentalPanel.tsx` | "Использовать наш аккаунт (акция)" sidebar block; рендерится в `MarketplaceDetail` когда листинг trogает Telegram. |
+| `agentflow-landing/src/pages/MarketplaceDetail.tsx:234` | Mount: `<TgRentalPanel />` первой картой в `<aside class="mk-side">` если `listingNeedsTg(...)`. |
+| `agentflow-agents/tests/tg-billing.test.ts` | 8 unit-tests (dep-injection — no DB). |
+
+## Data flow
+
+### Per-message billing (admin + user paths оба идут сюда):
+
+```
+flow-executor.runTgMcpStep(toolName='send_message', args, ctx)
+  ↓ BILLABLE_TG_TOOLS.has('send_message') === true
+chargeAndCallTg(ctx.ownerUserId=42, 'send_message', argsWithOwner, opts)
+  ↓ getPriceUsdf('send_message') → '0.1' (или null/0 → pass-through)
+  ↓ chargeFlat({ userId:42, amountFlow:'0.1', kind:'debit_other', meta:{tg_action:'send_message'} })
+      • insufficient → logUsage(status='insufficient_balance') → return { ok:false }
+      • applied → balance -= 0.1
+  ↓ mcpDirect.callTool('telegram', 'send_message', args)
+      • throws → creditUser({ amountFlow:'0.1', kind:'refund_tg' })
+                   + logUsage(status='send_failed') → re-throw
+      • ok    → logUsage(status='charged') + bumpAccountStats(accountId, '0.1')
+                + return { ok:true, result, cost:'0.1' }
+```
+
+### Admin upload-phone:
+
+```
+POST /admin/tg-accounts/add-phone { phone:'+79...', label:'pool-1' }
+  ↓ requireSession + requireAdmin
+  ↓ UPSERT platform_tg_accounts (status='pending')
+  ↓ mcpDirect.callTool('telegram', 'add_phone', { owner_user_id:ADMIN_PLATFORM_OWNER, phone })
+  ↓ result.status='code_sent' → UPDATE status='awaiting_code'
+
+POST /admin/tg-accounts/confirm-code { account_id, code }
+  ↓ mcpDirect.callTool('telegram','confirm_code',{owner_user_id:ADMIN_PLATFORM_OWNER,phone,code})
+  ↓ result.status='active' → UPDATE status='active', tg_user_id, tg_username, display_name
+```
+
+### User rental (промо):
+
+```
+landing/MarketplaceDetail
+  ↓ listingNeedsTg({slug,required_secret_keys}) === true
+  ↓ <TgRentalPanel/> mount → GET /me/tg-pool/available
+       → { accounts: [{account_id, handle, display_name, label}], pricing: [{action, price_usdf}] }
+  ↓ user selects account, clicks "Подключить наш аккаунт"
+  ↓ POST /me/tg-pool/:account_id/rent
+       → INSERT tg_account_rentals (user_id=session.sub, account_id, expires_at=NOW()+1h)
+       → returns { node_value: "rental:42", handle, lease_expires_at }
+  ↓ panel stashes node_value в sessionStorage[af.tg_rental.<slug>]
+       чтобы граф-node-renderer мог его прочитать
+```
+
+## DB / Env / API
+
+**Tables:**
+- `platform_tg_accounts` — pool ownership + status; revenue rolling totals (`send_count`, `revenue_usdf`).
+- `tg_action_pricing` — `(action PK, price_usdf NUMERIC(18,6), active BOOL, updated_at)`.
+- `tg_usage_log` — `(user_id, account_id, action, cost_usdf, mcp_args JSONB, mcp_result TEXT, status, error_message)`.
+- `tg_account_rentals` — `(user_id, account_id, created_at, expires_at, meta JSONB)`. Soft lease, никаких unique constraints — юзер может арендовать несколько аккаунтов или повторить.
+
+**Env:**
+- `ADMIN_PLATFORM_OWNER` — user-id passed to tg-mcp как `owner_user_id` для всех платформенных аккаунтов (default `1` = Артем).
+- `TG_POOL_LEASE_SECONDS` — TTL аренды (default `3600` = 1 час).
+- `TG_MCP_URL`, `TG_MCP_TOKEN` — uses (same as existing tg-mcp client).
+
+**Routes (admin-gated):**
+- `GET /admin/tg-accounts` — pool list + totals (accounts/revenue/sends).
+- `POST /admin/tg-accounts/add-phone` `{phone, label?}` → `{status:'code_sent', account_id}`.
+- `POST /admin/tg-accounts/confirm-code` `{account_id, code, password?}` → `{ok:true, telegram_id, display_name}`.
+- `PATCH /admin/tg-accounts/:id` `{status?, label?}`.
+- `DELETE /admin/tg-accounts/:id` — soft-delete (`status='retired'`).
+- `GET /admin/tg-pricing` — list pricing rows.
+- `PUT /admin/tg-pricing/:action` `{price_usdf, active?}`.
+
+**Routes (user-facing, auth-gated):**
+- `GET /me/tg-pool/available` → `{ accounts:[{account_id, handle, display_name, label}], pricing:[{action, price_usdf}] }`. Возвращает только `status='active'`.
+- `POST /me/tg-pool/:account_id/rent` → `{ rental_id, account_id, handle, node_value:"rental:<id>", lease_expires_at, pricing }`. Чарджа нет.
+
+**MCP tools billed:** `send_message`, `send_voice`, `send_photo`, `send_file`, `send_video`, `forward`, `react`. All others (list_accounts, get_user, get_dialogs, scrape_chat, ...) pass through without charge.
+
+**Graph node field:**
+- `tg_account` принимает либо `"user_account"` (existing), либо `"rental:<account_id>"` (новый). Runtime читает префикс и подставляет нужные credentials в `mcpDirect.callTool('telegram', ...)`.
+
+**Ledger entries:**
+- debit: `kind='debit_other'`, `meta.source='tg-billing'`, `meta.tg_action=<toolName>`.
+- refund: `kind='refund_tg'`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Step fails with `tg_billing:insufficient_balance:...` | `tg_billing:insufficient_balance` | Top-up user USDF via `/admin/flow/credit` или check `tg_action_pricing` (price too high). |
+| Action billed but message not sent | `tg-billing` + `creditUser` + `kind=refund_tg` in flow_ledger | Expected — refund logic kicked in. Investigate the original throw in `tg_usage_log.error_message`. |
+| Admin adds phone, tg-mcp unreachable | route returns 503 `{error:'tg_unreachable'}` | Check `${TG_MCP_URL}` env + tg-mcp pod logs. Row stays `status='pending'`. |
+| Pricing edit ignored | row has `active=false` | `PUT /admin/tg-pricing/:action {price_usdf, active:true}`. |
+| All sends free unexpectedly | no row in `tg_action_pricing` for action OR `active=false` | seed/restore via migration `0067_platform_tg_pool.sql`. |
+| Revenue stats not updating | `bumpAccountStats` called with `accountId=null` | Pass `options.accountId` to `chargeAndCallTg` when caller has resolved the row. (TODO: derive from `args.phone` when missing.) |
+| User-rental panel shows "Сейчас в пуле нет свободных аккаунтов" | `GET /me/tg-pool/available` returns `accounts:[]` | Admin не загрузил ни одного номера со `status='active'`. Залить через `/admin/tg-pool`. |
+| Rental endpoint returns 409 `account_unavailable` | route source `me-tg-pool.ts` | Аккаунт в статусе `paused/banned/flood/retired`. Юзер должен выбрать другой. |
+| Rental endpoint returns 404 `not_found` | route source `me-tg-pool.ts` | account_id не существует / был удалён. UI должен перечитать `/me/tg-pool/available`. |
+
+## Related
+
+- [TG MCP (Telethon pool)](/subsystems/tg-mcp) — Python service that owns the actual sessions.
+- [Cryptobot billing](/subsystems/cryptobot-billing) — USDF top-up provider.
+- [Graph handlers](/subsystems/graph-handlers) — flow-executor + `runTgMcpStep` integration.

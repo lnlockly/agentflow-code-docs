@@ -1,0 +1,72 @@
+---
+title: "Proxied cloud-browser connect (FE)"
+description: "«Войти через защищённый браузер» — the connect-drawer flow that drives a residential-proxied pod chromium via screenshot-poll."
+---
+
+# Proxied cloud-browser connect (FE)
+
+## TL;DR
+For platforms whose connector needs an IP-bound residential-proxy login (kwork
+first), the Пульт connect drawer offers «Войти через защищённый браузер». It
+opens a remote view of a chromium running in the pod behind the account's
+sticky residential proxy; the user logs into the real platform there, and on
+success the backend captures cookies into the vault. The FE renders frames by
+polling `screenshot_url` and forwards clicks/keystrokes to `input_url`. The
+platform password is typed straight into the real login page — never stored by
+AgentFlow.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/components/accounts/connect/ProxiedBrowserFlow.tsx:50` | The flow component — boots the session, runs the poll loop, maps input |
+| `agentflow-landing/src/components/accounts/connect/ProxiedBrowserFlow.tsx:94` | `poll()` — fetches screenshot + status in parallel on `poll_interval_ms` |
+| `agentflow-landing/src/components/accounts/connect/ProxiedBrowserFlow.tsx:105` | Connected gate — `status.connected` → stop + cancel + `onConnected()` (refetch accounts) |
+| `agentflow-landing/src/components/accounts/connect/ProxiedBrowserFlow.tsx:172` | `handleViewportClick` — maps render-space click → remote viewport coords via `naturalWidth/clientWidth` |
+| `agentflow-landing/src/components/accounts/connect/ProxiedBrowserFlow.tsx:203` | `submitTypeBuffer` — the text-input affordance forwards `type` to the focused remote field |
+| `agentflow-landing/src/components/accounts/connect/types.ts:55` | `needsProxiedBrowserLogin(platform)` — capability gate (registry, NOT `if(platform===)`) |
+| `agentflow-landing/src/components/accounts/connect/types.ts:133` | `connectMethodsFor` — prepends the proxied-browser method as primary for capable platforms |
+| `agentflow-landing/src/components/accounts/connect/ConnectDrawer.tsx:146` | Renders `ProxiedBrowserFlow` for `method.kind === 'proxied_browser'` |
+| `agentflow-landing/src/lib/agentsApi/integrations.ts:273` | `startBrowserLogin` → `{ session_id, login_url, proxied, stream }` |
+| `agentflow-landing/src/lib/agentsApi/integrations.ts:283` | `fetchBrowserLoginScreenshot` → `{ image_base64 }` |
+| `agentflow-landing/src/lib/agentsApi/integrations.ts:292` | `sendBrowserLoginInput` — `click` / `type` / `press` / `navigate` |
+| `agentflow-landing/src/lib/agentsApi/integrations.ts:303` | `fetchBrowserLoginStatus` → `{ status, connected, hint?, cookie_count? }` |
+| `agentflow-landing/src/lib/agentsApi/integrations.ts:312` | `cancelBrowserLogin` — releases the pod browser |
+| `agentflow-landing/src/styles/accounts-connect.css` (`.capc-rb-*`) | Remote-view styling — soft-green accent only, no inline styles |
+
+## Data flow
+```
+ConnectDrawer (platform with needsProxiedBrowserLogin)
+  └─ ProxiedBrowserFlow mount
+       startBrowserLogin(platform) ── POST /me/integrations/:platform/browser-login/start
+         → { session_id, stream:{ screenshot_url, input_url, status_url, poll_interval_ms } }
+       loop every poll_interval_ms:
+         GET  screenshot_url  → image_base64  → <img src=data:png;base64,…>
+         GET  status_url      → { connected, hint? }
+       user click on <img> → map (clientX-rect)/rect.width * naturalWidth → remote (x,y)
+         POST input_url { action:'click', x, y }
+       user types (canvas focus OR text-input affordance)
+         POST input_url { action:'type', text } | { action:'press', key }
+       status.connected:true → stop loop → cancelBrowserLogin → onConnected() (invalidate accounts)
+  └─ unmount / «Отмена» → cancelBrowserLogin (best-effort)
+```
+
+## DB / Env / API
+- Routes (agents service): `POST /me/integrations/:platform/browser-login/start`,
+  `GET …/:session_id/screenshot`, `POST …/:session_id/input`,
+  `GET …/:session_id/status`, `POST …/:session_id/cancel`. (#1114/#1115)
+- Capability: `needsProxiedBrowserLogin` — FE registry today
+  (`PROXIED_BROWSER_PLATFORMS = {kwork}`); swap to a live
+  `GET /me/accounts/platforms` flag when the BE ships it.
+- No new env / tables on the FE.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Frames never appear, drawer shows shimmer | `Не удалось запустить браузер` | `ProxiedBrowserFlow.tsx` boot catch |
+| Session torn down mid-login | `Сессия браузера завершилась` | poll-loop 4xx handler (`status >= 400 && status !== 429`) |
+| Clicks land in the wrong spot | (no log) check `naturalWidth`/`naturalHeight` vs rendered `getBoundingClientRect` | `handleViewportClick` |
+
+## Related
+- [Cabinet «Пульт аккаунтов»](/subsystems/cabinet-accounts-pult)
+- [Kwork connector](/subsystems/kwork-connector)
+- Design: `agentflow/PLANS/build/40-proxied-cloud-browser-connect.md`

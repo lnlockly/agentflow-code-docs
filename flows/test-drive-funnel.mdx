@@ -1,0 +1,120 @@
+---
+title: "Test Drive funnel"
+description: "Anonymous landing visitor receives one personalized cold-DM from soul-agentflow_team_sales in <60s, then sees a subscribe CTA."
+---
+
+# Test Drive funnel
+
+## TL;DR
+
+A single-step conversion funnel that lets a landing-page visitor (no auth)
+experience the AgentFlow sales agent before paying. POST `/public/test-drive`
+on agentflow-agents accepts a TG handle, rewrites the `soul-agentflow_team_sales`
+flow graph to target that handle (in-memory only — the persisted flow row
+is untouched), runs the flow synchronously via `executeFlow`, polls up to
+60s for completion, and returns the sent `message_id`. The frontend page
+at `/try` polls until the response lands, then flips to a "Подключить —
+49$/мес" CTA. Daily-cap 5/IP, 10-min cooldown per handle.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/test-drive.ts:1` | POST `/public/test-drive` route — validate, rate-limit, clone graph, run flow, persist outcome |
+| `agentflow-agents/src/routes/test-drive.ts:96` | `rewritePeerInGraph` — string-replace `"@avsee4"` peer with visitor handle in-memory |
+| `agentflow-agents/src/routes/test-drive.ts:118` | `extractMessageId` — pulls TG message_id from the `send` step output |
+| `agentflow-agents/migrations/2026-05-15g-test-drive-requests.sql:1` | new table `test_drive_requests` (ip_hash, tg_handle, status, message_id, flow_run_id) |
+| `agentflow-agents/src/db/schema.ts` | drizzle table `testDriveRequests` |
+| `agentflow-agents/src/server.ts` | mounts the route under `/` |
+| `agentflow-landing/src/pages/TryDrive.tsx:1` | `/try` page — handle input, spinner, success state with subscribe CTA |
+| `agentflow-landing/src/components/HeroArea.tsx` | above-the-fold CTA chip → `/try` |
+| `agentflow-landing/src/styles/try-drive.css` | `.td-*` namespaced styles |
+| `agentflow-agents/presets/souls/agentflow-team-sales.json` | source soul flow (NOT modified — runtime graph is rewritten in-memory per request) |
+
+## Data flow
+
+```
+Visitor on /try
+    │
+    │ POST /public/test-drive { tg_handle: "@artem" }
+    ▼
+ipRateLimit (per-IP, in-memory, 120 req/min)
+    │
+    ▼
+normalizeHandle  ──► invalid_handle → 400
+    │
+    ▼
+isPeerDenied (FF_TG_PEER_DENYLIST) ──► peer_denylist → 403
+    │
+    ▼
+SELECT count(*) FROM test_drive_requests WHERE ip_hash=$ AND requested_at > now() - 24h
+    │                                          ──► >=5 → rate_limited → 429
+    ▼
+SELECT count(*) FROM test_drive_requests WHERE tg_handle=$ AND requested_at > now() - 10m
+    │                                          ──► >=1 → rate_limited → 429
+    ▼
+SELECT * FROM flows WHERE slug='soul-agentflow_team_sales'
+    │                                          ──► null → flow_not_found → 503
+    ▼
+UPSERT tg_lead_states (state='test_drive_pending', tags=['test_drive', 'ip:<prefix>'])
+    │
+    ▼
+INSERT test_drive_requests (status='pending')
+    │
+    ▼
+rewritePeerInGraph(graph, '@avsee4', '@artem')   ← in-memory only, never persisted
+    │
+    ▼
+executeFlow({ graph, input: { peer: '@artem' } }) — runs synchronously through
+    trigger → soul → get_profile/get_history → classify → kb_* → compose →
+    dedup → typing → send → write_state
+    │
+    ▼
+Poll flow_runs every 500ms until status terminal or MAX_WAIT_MS (60s)
+    │
+    ▼
+extractMessageId(stepLogs)  ──► null → no_message_sent → 502
+    │
+    ▼
+UPDATE test_drive_requests SET status='sent', message_id=$, flow_run_id=$
+    │
+    ▼
+Response: { ok: true, message_id, preview, elapsed_ms, run_id }
+```
+
+## DB / Env / API
+
+- **Tables:** `test_drive_requests` (new), `tg_lead_states` (upserted), `flow_runs` (written by executeFlow), `flows` (read-only)
+- **Env:**
+  - `FF_FLOWS=1` — feature gate (already set in prod)
+  - `FF_TG_PEER_DENYLIST` — optional comma-list; rejects with 403 if handle hit
+  - `TEST_DRIVE_IP_DAILY_CAP=5` — per-IP rolling 24h cap
+  - `TEST_DRIVE_HANDLE_COOLDOWN_MIN=10` — per-handle cooldown matching tg.send_text throttle
+  - `TEST_DRIVE_MAX_WAIT_MS=60000` — bound on polling loop
+  - `TEST_DRIVE_POLL_MS=500` — poll interval
+  - `TEST_DRIVE_IP_SALT` — sha256 salt for ip_hash; rotate to invalidate cap counters
+- **Routes:**
+  - `POST /public/test-drive` — body `{ tg_handle: string }`, no auth
+- **Frontend:**
+  - `GET /try` — the form page
+  - Hero CTA chip on `/` → `/try`
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| 400 invalid_handle | (no log — body validation reject) | client retry with valid input |
+| 403 peer_denylist | `tg.send_text blocked: peer in FF_TG_PEER_DENYLIST` | remove handle from denylist env |
+| 429 rate_limited (per-IP) | (no log — DB count query) | wait 24h or rotate `TEST_DRIVE_IP_SALT` |
+| 429 rate_limited (per-handle) | (no log — DB count query) | wait 10m or change `TEST_DRIVE_HANDLE_COOLDOWN_MIN` |
+| 502 flow_run_failed | `executeFlow threw` | inspect `flow_runs.error` for the run_id returned |
+| 502 no_message_sent | `flow completed without sending` | private TG profile / dedup-guard skipped / cot_leak match — check `flow_runs.step_logs` |
+| 504 flow_run_timeout | (no log — deadline elapsed) | tg-mcp slow / LLM provider slow — bump `TEST_DRIVE_MAX_WAIT_MS` |
+| 503 feature_disabled | (no log — env check) | set `FF_FLOWS=1` |
+| 503 flow_not_found | (no log — DB miss) | seed `soul-agentflow_team_sales` from preset |
+
+## Related
+
+- [Ферма (sales-funnel-tg-farm)](/architecture/ferma-sales-funnel) — the parent funnel preset this soul is descended from
+- [Graph executor](/architecture/graph-executor) — `executeFlow` is the engine that runs the rewritten graph
+- [Soul presets in JSON](/architecture/overview) — see `presets/souls/agentflow-team-sales.json` for the source graph

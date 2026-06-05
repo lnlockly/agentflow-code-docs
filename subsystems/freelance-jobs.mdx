@@ -1,0 +1,103 @@
+---
+title: "Freelance Jobs (фриланс-биржа v0.1)"
+description: "Простая доска заказов: пост → возьми → Matrix-комната между заказчиком и исполнителем."
+---
+
+# Freelance Jobs
+
+## TL;DR
+`/jobs` — простая доска заказов. Юзер постит (`title + brief + budget_coins`),
+другой юзер жмёт «Взять», статус атомарно `open → in_progress`,
+`@af-helper` создаёт Matrix-комнату между ними. Кнопка «✨ Помоги дописать»
+прогоняет черновик через `useModel(ModelType.TEXT_LARGE)` и возвращает
+структурированный бриф (Задача / Результат / Сроки / Бюджет / Требования).
+Эскроу, торги, рейтинги — v0.2+.
+
+## Файлы (с line refs)
+
+| Путь | Роль |
+|---|---|
+| `agentflow-agents/migrations/2026-05-25a-freelance-jobs.sql` | Таблица `fl_orders` + три индекса. |
+| `agentflow-agents/src/db/schema.ts` (внизу файла) | Drizzle `flOrders` table. |
+| `agentflow-agents/src/routes/me-freelance.ts:73` | `GET /me/freelance/orders?status=&q=&limit=` — фильтрованный список. |
+| `agentflow-agents/src/routes/me-freelance.ts:94` | `GET /me/freelance/orders/:id` — один заказ. |
+| `agentflow-agents/src/routes/me-freelance.ts:114` | `POST /me/freelance/orders {title, brief, budget_coins}` — создать. |
+| `agentflow-agents/src/routes/me-freelance.ts:131` | `POST /me/freelance/orders/:id/take` — атомарный переход `open → in_progress`, создание Matrix-комнаты best-effort. |
+| `agentflow-agents/src/routes/me-freelance.ts:185` | `POST /me/freelance/brief-helper {rough}` — AI-дополнение черновика. |
+| `agentflow-agents/src/services/freelance/brief-helper.ts` | `refineBrief(rough, ownerUserId)` — single-shot `TEXT_LARGE` с 5-секционным system prompt'ом на русском. |
+| `agentflow-agents/src/services/freelance/order-room.ts` | `createOrderRoom({orderId, title, ownerUserId, takerUserId})` — `@af-helper` POST'ит `createRoom` + intro-сообщение. Best-effort: на ошибку возвращает null, route отдаёт 200 без room_id. |
+| `agentflow-agents/src/server.ts` (импорт + `app.route('/', meFreelanceApp)`) | Монтировка. |
+| `agentflow-landing/src/pages/Jobs.tsx` | Страница `/jobs` — форма сверху, список снизу. |
+| `agentflow-landing/src/styles/jobs.css` | Стили `jobs-*`. AgentFlow Dark palette. |
+| `agentflow-landing/src/lib/agentsApi.ts` (внизу) | `listFreelanceOrders / getFreelanceOrder / createFreelanceOrder / takeFreelanceOrder / freelanceBriefHelper`. |
+| `agentflow-landing/src/main.tsx` | `<Route path="/jobs" element={<JobsPage />} />` в обоих наборах роутов. |
+| `agentflow-landing/src/sections/v2expanded/FreelanceTeaser.tsx` | Был waitlist-form → стал CTA `Link to="/jobs"`. |
+
+## Data flow
+
+```
+User → /jobs
+       ↓
+       Jobs.tsx mount → listFreelanceOrders({status:'open'}) → GET /_agents/me/freelance/orders
+       ↓
+       Render cards
+       ↓
+Юзер заполняет форму
+       ↓ optional: "✨ Помоги дописать"
+       POST /_agents/me/freelance/brief-helper → refineBrief() → TEXT_LARGE
+       ↓
+Юзер жмёт "Опубликовать" → POST /_agents/me/freelance/orders → INSERT fl_orders → 201
+       ↓
+Другой юзер видит карточку → "Взять"
+       ↓
+       POST /_agents/me/freelance/orders/:id/take
+       UPDATE fl_orders SET status='in_progress', taken_by, taken_at WHERE id=:id AND status='open' AND owner_id<>:taker
+       (атомарно — race-condition безопасно: только один UPDATE вернёт строку)
+       ↓
+       createOrderRoom(...) → @af-helper POST /_matrix/client/v3/createRoom (invite=[owner, taker])
+       ↓
+       UPDATE fl_orders SET room_id=...
+       ↓
+       Response { ok:true, order, room_id }
+       ↓
+       Фронт: navigate('/chat#/room/' + room_id)
+```
+
+## DB / Env / API
+
+- **Tables**: `fl_orders` — см. миграцию `2026-05-25a-freelance-jobs.sql`.
+- **Env**: `FF_FREELANCE=1` — feature gate (без него все маршруты 404).
+- **Routes** (все под `/_agents/me/freelance/*`):
+  - `GET  /orders?status=&q=&limit=`
+  - `GET  /orders/:id`
+  - `POST /orders` (auth, body `{title,brief,budget_coins}`)
+  - `POST /orders/:id/take` (auth)
+  - `POST /brief-helper` (auth, body `{rough}`)
+- **Front routes**: `/jobs` (anon-readable список, авторизация требуется только на «Опубликовать» и «Взять»).
+- **LLM**: `useModel(ModelType.TEXT_LARGE)` через ai-router. Никаких hard-coded моделей.
+- **Matrix**: `@af-helper` access token из `matrix_bots`. Бот должен быть запущен (`MATRIX_BOTS_ENABLED=1`), иначе room creation тихо фейлится и заказ всё равно переходит в `in_progress`.
+
+## Failure modes
+
+| Симптом | Log signature for grep | Где чинить |
+|---|---|---|
+| `/jobs` отдаёт 404 на API | `feature_disabled` в response body | `FF_FREELANCE` не выставлен — `kubectl -n franchise-factory set env deploy/agentflow-agents FF_FREELANCE=1`. |
+| Заказ создаётся, но room_id всегда null | `[freelance-room] no af-helper bot identity — skip` или `create failed` | В `matrix_bots` нет строки `af-helper` ИЛИ `accessToken` пустой ИЛИ `MATRIX_HOMESERVER_INTERNAL` не задан. Поднять `matrix-bots` runner. |
+| «Взять» сразу даёт 409 `already_taken` | `409` на `POST /me/freelance/orders/:id/take` | Race — кто-то опередил. UI делает `load()` в `finally`, список обновляется. |
+| «Взять» даёт 409 `cannot_take_own` | `cannot_take_own` в response | Заказчик нажал на свой же заказ. UI должен скрывать кнопку для своих, но пока не скрывает — TODO в v0.2. |
+| AI brief-helper возвращает исходный rough без изменений | `[me-freelance] brief-helper failed` в логах | LLM-вызов выкинул. Проверить ai-router health (`useModel TEXT_LARGE no_provider_registered`). На фронт уходит 502 → UI оставляет исходный текст. |
+| `INSERT fl_orders` падает на CHECK title | 400 `bad_input` с `detail.fieldErrors.title` | Frontend zod ограничивает 3-200, бэк zod дублирует. Длиннее обрезается, короче — отказ. |
+
+## Что НЕ в v0.1 (backlog v0.2)
+
+- **Эскроу монет**: использовать `chat_game_balances` + паттерн `stake / awardPot` из `bot-platform/src/routes/games.ts`. Кнопка «Подтвердить выполнение» переводит coins owner → taker.
+- **Торги/заявки** (`fl_bids`): сейчас «первый нажал — взял». Добавить таблицу заявок + выбор исполнителя.
+- **Рейтинги** (`fl_reviews`): после `status=done` обе стороны ставят оценку.
+- **Скрывать «Взять» для своих заказов** на фронте.
+- **Push-уведомление** заказчику когда кто-то взял (через `@af-helper` DM).
+
+## Related
+- [Marketplace](/subsystems/marketplace) — соседняя поверхность (агенты + темплейты), общий визуальный язык.
+- [Matrix bots](/subsystems/matrix-bots) — `@af-helper` создаёт комнаты заказа.
+- [LLM router](/subsystems/llm-router) — `useModel(TEXT_LARGE)` для brief-helper.
+- Spec: `docs/specs/2026-05-25-freelance-jobs.md`.

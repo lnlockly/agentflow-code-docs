@@ -1,0 +1,366 @@
+---
+title: "GitHub template search (scorer)"
+description: "Brief → similar real GitHub repo. Extended multi-query search + capability-aware fallback + file-tree-verified ranking that the project-create flow uses to pick a foundation."
+---
+
+# GitHub template search (scorer)
+
+## TL;DR
+
+`pickBestTemplateForBrief(brief, kind)` finds a real GitHub repo that already
+looks like the user's brief, so the coder adapts a feature-complete app instead
+of filling one page of an empty starter. It runs an **extended multi-query
+GitHub Search**, AI-ranks the merged candidates, then **verifies capability
+against each finalist's file tree** (package.json + root layout). When search is
+unauthenticated or empty, a **capability-aware fallback** routes a DB+auth+
+dashboard brief to a real boilerplate — never the bare no-DB starter.
+
+This replaced the legacy per-kind graph walkers + the [Foundation Scout](/subsystems/foundation-scout/)
+in the Phase-A2 create-project flow (see [projects](/subsystems/projects/)).
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/github-template-search.ts:960` | `searchTemplatesForBrief` — main entry. Cache → keywords → multi-query search → AI rank → file-tree refine → fallback. |
+| `agentflow-agents/src/services/github-template-search.ts:1009` | `pickBestTemplateForBrief` — top-1 wrapper called by the create-project route. |
+| `agentflow-agents/src/services/github-template-search.ts:162` | `analyzeBriefCapabilities` — pure regex read of DB/auth/dashboard/commerce + vertical + `complex` flag (RU+EN). |
+| `agentflow-agents/src/services/github-template-search.ts:558` | `buildSearchQueries` — extended fan-out: base + capability + vertical queries. |
+| `agentflow-agents/src/services/github-template-search.ts:617` | `searchGithub` — runs the queries (Promise.allSettled), merges + dedupes by stars; logs `github_search_unauthenticated` with no token. |
+| `agentflow-agents/src/services/github-template-search.ts:899` | `refineByFileTree` — fetch package.json + root tree, hard-reject monorepo/framework/desktop, boost real capability deps. |
+| `agentflow-agents/src/services/github-template-search.ts:282` | `pickFallbackForBrief` — capability-aware fallback tiers (kind → complex-curated → app → static). |
+| `agentflow-agents/src/services/github-template-search.ts:385` | `KIND_RECIPES` — per-kind search filters (language gate, stars, `size:<…`). |
+| `agentflow-agents/src/services/github-template-search.ts:543` | `extendedEnabled` — `FF_TEMPLATE_EXTENDED_SEARCH` gate (default ON). |
+| `agentflow-agents/src/services/github-template-search.ts:330` | `FRAMEWORK_SOURCE_BLOCKLIST` — only true framework source; structural hard-reject covers the rest. |
+| `agentflow-agents/src/services/github-template-search.ts:350` | `INSTALL_HOSTILE_REPOS` + `isInstallHostile` + `pickCleanCuratedLead` — yarn-only / external-backend repos that brick in-pod install; skipped as fallback lead AND filtered from search hits. |
+| `agentflow-agents/src/services/github-template-search.ts:375` | `EXTERNAL_AUTH_SAAS_REPOS` + `isExternalAuthSaas` — curated repos that hard-need Clerk/Supabase (500 on boot without keys we don't provision); `pickCleanCuratedLead` skips them so a complex brief lands on a self-contained starter. |
+| `agentflow-agents/src/services/github-template-search.ts:1025` | `BOOT_BLOCKING_AUTH_DEP_RX` / `SOFT_EXTERNAL_SAAS_DEP_RX` + `externalAuthSaasPenalty` — deprioritize a GitHub-Search finalist whose package.json hard-depends on external auth/data SaaS (applied in `refineByFileTree`). |
+| `agentflow-agents/src/services/github-template-search.ts` `shouldRejectAuthGated` | **HARD-REJECT (not just −6) a boot-blocking auth-SaaS finalist (Clerk/Auth0/Kinde/WorkOS/…) when the brief has NO auth requirement (PR #1038).** The −6 soft penalty was overcome by a high dashboard/admin relevance → a no-auth booking brief landed on `next-shadcn-dashboard-starter` (Clerk) → `next start` crashed `Missing publishableKey` → never served (proj 1650). `refineByFileTree` now drops such a candidate (`hard_reject reason=auth_gated_no_auth_brief`) so a no-auth brief is steered to a clean, bootable foundation. A brief that DOES need auth keeps the soft-penalty path. |
+| `agentflow-agents/src/services/github-template-search.ts:773` | `parseRankerArray` (tolerant fence/prose JSON extraction) + `heuristicRankFallback` — capability-aware fallback when the AI ranker errors; drops vertical-conflicting + external-auth-SaaS candidates, and **leads with the self-contained curated repo for a complex brief** (optional `brief` arg). |
+| `agentflow-agents/src/services/github-template-search.ts` `textFromModelResult` | reads `content[].text` from a `TextGenerationResult` — replaces `String(raw)` (which produced `"[object Object]"` → 100% AI-ranker + keyword-extractor failure). |
+| `agentflow-agents/src/services/foundation-structural-filter.ts:445` | `detectVertical` — operator detection via `VERTICAL_RX.dashboard_saas` ∪ `ADMIN_OPERATOR_RX` ∪ record-CRUD, gated by `STOREFRONT_CORE_RX` (dashboard-over-ecom). + `pickCuratedBypassList` / `deriveStructuralSignals` / `decideHardReject` / `structuralBias`. |
+| `agentflow-agents/src/services/github-template-search.ts:141` | `DB_RX` — persistence signal. Also catches booking / reservation / CRUD intent (`запис`/`бронь`/`заявк`/`booking`/`reservation`) so a booking brief signals `needs_db` → drives the clean-foundation preference + heavy-ORM down-rank. |
+| `agentflow-agents/src/services/github-template-search.ts:1108` | `HEAVY_ORM_DEP_RX` — Prisma/Drizzle/TypeORM/Sequelize/Mongoose/knex fingerprint. A baked ORM is a LIABILITY for a from-scratch persistence brief (platform serves DB via PGlite + raw `pg`). |
+| `agentflow-agents/src/services/github-template-search.ts:1229` | `dbFromScratchPenalty(caps, pkg)` — `−5` `heavy_orm_vs_pglite` when a `needs_db` OR `complex` brief's finalist ships a heavy ORM; applied in `refineByFileTree` (defense-in-depth for complex briefs that enter github-search). `capabilityFileTreeBonus` no longer rewards a baked DB layer. |
+| `agentflow-agents/src/services/github-template-search.ts` `applyCleanFoundationGuard` + `templateShipsHeavyOrm` + `isCleanFoundationKind` | DECISIVE clean-foundation guard in `searchTemplatesForBrief`: for a `needs_db` persistence brief on a web kind, if the TOP pick ships a heavy ORM (by repo+desc+topics), LEAD with the clean curated foundation (`pickFallbackForBrief` → cruip-class). The `−5` penalty alone wasn't decisive — proj 1645 still picked ARKA (Drizzle+Next-Auth) despite it. Greppable `clean_foundation_guard persistence_brief`. |
+| `agentflow-agents/src/services/foundation-structural-filter.ts:144` | `KIND_SPA_SET` — now includes **`nextjs`** (the real prod kind), so the monorepo/desktop/framework/`component_library` hard-rejects + app-template bias finally gate every web brief. |
+| `agentflow-agents/src/services/foundation-structural-filter.ts:266` | `is_publishable_library` signal + `component_library` hard-reject (`:326`) — a charting/gantt/util LIB (publishes `main`/`module`/`types`, not `private`, no app dir) is rejected for web kinds. |
+| `agentflow-agents/src/routes/projects.ts:912` | the only prod caller — honours an explicit `selected_foundation` (mode=`github_repo`) over the scorer; otherwise `pickBestTemplateForBrief(brief, resolvedKindForPicker)`. |
+
+## Data flow
+
+```
+POST /me/projects { brief }
+  → resolvedKind = tg_bot | nextjs   (projects.ts)
+  → pickBestTemplateForBrief(brief, kind)
+      → cache hit? return
+      → analyzeBriefCapabilities(brief)         # db/auth/dashboard/commerce + vertical + complex
+      → extractKeywords (1 LLM call)
+      → searchGithub:
+           buildSearchQueries → [ base, capability(if complex), vertical ]
+           Promise.allSettled(runGithubQuery × N) → merge+dedupe by stars
+           (no GITHUB_TOKEN → log github_search_unauthenticated, 1 query only)
+      → rankByBrief (1 LLM call, 0-10)
+           parseRankerArray (tolerant) — on ANY ranker error (parse/timeout/
+           empty) → heuristicRankFallback: capability-aware, drops vertical-
+           conflicting candidates (no ecom storefront for a non-commerce brief).
+           Old code took a blind top-3-by-stars slice here → handed a dashboard
+           brief the highest-star ecom storefront.
+      → refineByFileTree (token + extended only):
+           fetch package.json + root tree → decideHardReject (drop monorepo/
+           framework/desktop) → +structuralBias +capabilityFileTreeBonus
+           −externalAuthSaasPenalty (Clerk/Auth0/Supabase) → re-sort
+      → if empty → pickFallbackForBrief (capability-aware curated boilerplate)
+```
+
+## DB / Env / API
+
+- Tables: none (Redis-cached only via `template-search-cache`).
+- Env:
+  - `GITHUB_TOKEN` — **required for the feature**. Read-only PAT in
+    `agentflow-agents-env`. Unauthenticated GitHub Search = 10 req/min + 403s →
+    degraded single-query mode + capability fallback. Owner-provided.
+  - `FF_TEMPLATE_EXTENDED_SEARCH` — set `0` to force the legacy single-query
+    path. Default: extended ON.
+- Routes: consumed by `POST /me/projects` (create-project flow).
+- MCP tools: none.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Every complex brief picks the bare `agentflow-nextjs-starter` (score 0) | `github_search_unauthenticated` | Set `GITHUB_TOKEN` in `agentflow-agents-env`; code at `github-template-search.ts:630`. |
+| All search queries fail (rate-limit / 403) | `github_search_failed status=` | `github-template-search.ts` `runGithubQuery`; caller falls to capability fallback. |
+| A monorepo / framework-source finalist gets dropped | `[github-template-search] hard_reject reason=monorepo` | Intended — `refineByFileTree` + `decideHardReject`. Loosen the structural filter only if a real app template is mis-rejected. |
+| Template pick returns 400 with no fallback | `project_missing_template_repo` | `projects.ts` — brief had no `templateRepoFull` and no scorer match. |
+| Project dies at `install` before coder/DB/route-gate run (yarn-only / external-backend repo) | picked repo in `INSTALL_HOSTILE_REPOS` (e.g. `medusajs/nextjs-starter-medusa`, `packageManager: yarn@4`) | Add the repo to `INSTALL_HOSTILE_REPOS` (`github-template-search.ts:350`); it's then skipped as fallback lead and filtered from search hits. |
+| Dashboard/admin/CRUD brief lands on the ecom medusa storefront (`reasoning=capability_fallback_ecom_marketplace`) | `capability_fallback_ecom_marketplace` for an operator brief | `detectVertical` dashboard-over-ecom guard (`foundation-structural-filter.ts`): dashboard wins when no `STOREFRONT_CORE_RX` match. |
+| Caller's explicit `selected_foundation` ignored, scorer pick stored instead | stored `templateRepoFull` ≠ posted `selected_foundation.repo_full_name` | `projects.ts:912` — explicit `mode=github_repo` foundation now wins; `mode=scratch`/absent falls through to the scorer. |
+| AI ranker errors → a dashboard/non-commerce brief picked a high-star ecom storefront | `[github-template-search] ai_ranker_failed err=` (then `stars-based fallback (AI ranking failed)` in old reasoning) | `rankByBrief` now logs the real error + calls `heuristicRankFallback` (capability-aware, drops vertical-conflicting candidates). `github-template-search.ts:773`. |
+| **AI ranker fails on EVERY call** → heuristic fallback always runs (`reasoning: capability-aware heuristic fallback (AI ranking failed; vertical=…)` on 100% of picks); keyword extraction also returns junk | `ai_ranker_failed err=ranker_output_not_a_json_array` every time — root cause: `useModel(TEXT_SMALL)` returns a `TextGenerationResult` **object**, old code did `String(raw)` → literal `"[object Object]"` | `textFromModelResult(raw)` reads `content[].text` instead of `String(raw)`. Fixed in `rankByBrief` + `extractKeywords` (`github-template-search.ts`). |
+| Operator/admin/CRM brief WITHOUT the literal "dashboard/админка" word lands on ecom | `caps.vertical=ecom_marketplace` for a back-office brief (e.g. "список клиентов / добавить-удалить") | `detectVertical` operator detection widened via `ADMIN_OPERATOR_RX` + record-CRUD (add+remove+record-noun) in `foundation-structural-filter.ts`. |
+| Generated dashboard app 500s on every route: `@clerk/nextjs: Missing publishableKey` | picked repo in `EXTERNAL_AUTH_SAAS_REPOS` (e.g. `kiranism/next-shadcn-dashboard-starter`) or finalist logs `external_auth_saas reason=external_auth_saas_boot_blocking` | Curated dashboard lead is the self-contained `arhamkhnz/next-shadcn-admin-dashboard`; Clerk/Supabase repos skipped by `pickCleanCuratedLead` + penalized in `refineByFileTree`. We don't provision external-SaaS keys (own-infra). **For a brief with NO auth requirement the GitHub-Search refine path now HARD-REJECTS such a finalist (PR #1038, `shouldRejectAuthGated` → `hard_reject reason=auth_gated_no_auth_brief`), not just −6 — the soft penalty was overcome by dashboard relevance and a no-auth booking brief still landed on the Clerk starter → never served (proj 1650).** |
+| Booking/persistence brief picks a Prisma foundation → `prisma db push` fails on PGlite + strict ESLint blocks `next build` (proj 1642 → `kaje94/menufic`) | `[github-template-search] db_from_scratch reason=heavy_orm_vs_pglite penalty=5 candidate=…` | Intended — `dbFromScratchPenalty` down-ranks a baked ORM on a `needs_db` brief so a clean goose-fillable foundation wins. The clean pick lets the proven pg→PGlite build-heal path run (`coder-shim` 4a-db). |
+| Booking brief lands on a charting/gantt LIBRARY (proj 1643 → `neuronetio/gantt-schedule-timeline-calendar`) — nothing to serve | `[…] hard_reject reason=component_library candidate=…` | Intended — `is_publishable_library` + `component_library` reject in `decideHardReject` for web kinds (now incl. `nextjs`). A web brief needs an APP foundation, not an npm lib. |
+| Booking/persistence brief STILL picks a heavy-ORM booking system (proj 1645 → `pjborowiecki/ARKA-…-Appointment-Booking-System`, Drizzle+Next-Auth) even though the `−5` down-rank fired | reasoning shows `[-5 heavy_orm_vs_pglite]` yet the repo is the pick; no `clean_foundation_guard` line | The penalty wasn't decisive against a strong on-vertical ORM repo → `applyCleanFoundationGuard` now LEADS with the clean curated foundation (cruip) for a `needs_db` web brief whose top pick ships an ORM. Look for `clean_foundation_guard persistence_brief`. |
+| A web (`kind=nextjs`) brief's monorepo/desktop/lib candidate was NOT structurally rejected | (no `hard_reject` line for an obviously-bad pick) | `nextjs` was missing from `KIND_SPA_SET` — now added, so the gate fires for the real prod kind. |
+
+## Capability-aware fallback tiers
+
+`pickFallbackForBrief(brief, kind)` order:
+
+1. **Kind fallback** — `tg_bot`/`api`/`spa`/`mini_app` → in-house kind starter.
+2. **Complex (DB/auth/dashboard/commerce)** → **first install-clean AND
+   self-contained** curated repo for the brief's vertical via
+   `pickCleanCuratedLead` (`arhamkhnz/next-shadcn-admin-dashboard` for dashboard
+   — built-in mock auth, no Clerk/Supabase; `vercel/commerce` for ecom).
+   `medusajs/nextjs-starter-medusa` is skipped as yarn-only/external-backend;
+   `kiranism/next-shadcn-dashboard-starter` (Clerk) and
+   `horizon-ui/shadcn-nextjs-boilerplate` (Supabase) are skipped as external-
+   auth-SaaS. `reasoning: capability_fallback_<vertical>`.
+3. **App keyword** → install-clean vertical lead (`reasoning: vertical_fallback_<vertical>`).
+4. **Static-keyword brief** → `agentflow-static-starter`.
+5. **Ambiguous** → static, unless kind is web (then install-clean vertical lead).
+
+### Install-safety + vertical discriminator (route-gate 2026-05-30)
+
+- `INSTALL_HOSTILE_REPOS` lists repos that brick a plain `npm/pnpm install` in
+  the project pod (yarn@4-pinned monorepos, starters that require an external
+  backend to boot). `medusajs/nextjs-starter-medusa` is the seed entry — it
+  ships `.yarnrc.yml` + `packageManager: yarn@4.12.0`, so the project died at
+  install before any code ran. Such repos can never win: skipped as a curated
+  fallback lead (`pickCleanCuratedLead`) and filtered from GitHub Search hits
+  (`runGithubQuery`).
+- `detectVertical` dashboard-over-ecom guard: an operator brief
+  (dashboard / admin / CRM / **CRUD** / back-office / data-table) with no
+  customer-facing storefront core (`STOREFRONT_CORE_RX`: магазин/marketplace/
+  корзина/cart/checkout/…) resolves to `dashboard_saas`, not `ecom_marketplace`.
+  A real online store that merely mentions «админка» still resolves to ecom.
+
+### AI-ranker-error capability fallback + external-auth-SaaS avoidance (route-gate 2026-05-30)
+
+Two last-mile robustness fixes, found by route-gate's dashboard E2E on the live
+image:
+
+- **AI-ranker error → capability-aware, not stars-based.** `rankByBrief` used to
+  take a blind top-3-by-stars slice when the LLM reply failed to parse, so an
+  un-pinned dashboard-CRUD brief picked `saleor/storefront` (a high-star ecom
+  repo) with `reasoning: stars-based fallback (AI ranking failed)`. Now the
+  ranker reply is parsed by `parseRankerArray` (strips fences, extracts the
+  `[ … ]` block from prose) and ANY error logs `ai_ranker_failed err=…` then
+  routes to `heuristicRankFallback`. The heuristic keys off the brief's vertical
+  + capabilities, **drops vertical-conflicting candidates** (an ecom storefront
+  for a non-commerce brief), and returns `[]` (→ capability-aware curated
+  fallback) when nothing compatible survives. Ecom briefs still keep ecom.
+- **Self-contained over external-auth-SaaS.** A generated app that hard-needs an
+  external auth/data SaaS (Clerk, Supabase) is dead-on-arrival — every route
+  500s on a missing key, and we don't provision those (own-infra: PGlite not
+  Neon). The curated dashboard lead is now `arhamkhnz/next-shadcn-admin-dashboard`
+  (built-in mock auth, no `.env`, runs on `next dev`/`next start`).
+  `pickCleanCuratedLead` skips `EXTERNAL_AUTH_SAAS_REPOS`
+  (`kiranism/next-shadcn-dashboard-starter` Clerk,
+  `horizon-ui/shadcn-nextjs-boilerplate` Supabase, `satnaing/shadcn-admin`
+  Clerk), and `refineByFileTree` applies `externalAuthSaasPenalty` to any
+  GitHub-Search finalist whose package.json carries `@clerk/*` / `@auth0/*`
+  (boot-blocking, −6) or `next-auth` / `@supabase/*` / `firebase` (soft, −3),
+  logging `external_auth_saas reason=…`.
+
+### AI-ranker 100% failure + classifier + heuristic-floor fix (route-gate 2026-05-30, live #994)
+
+Found live on the fully-deployed #994 image: a clients-admin dashboard brief
+auto-picked an ECOM template, and EVERY run logged `capability-aware heuristic
+fallback (AI ranking failed; vertical=…)` — the AI ranker never succeeded.
+
+- **Root cause — AI ranker failed on every call.** `useModel(ModelType.TEXT_SMALL)`
+  resolves to a `TextGenerationResult` **object** (`{ content: [{type:'text',
+  text}], … }`), not a string. `rankByBrief` + `extractKeywords` did
+  `String(raw ?? '').trim()` → the literal `"[object Object]"`, so
+  `parseRankerArray` threw `ranker_output_not_a_json_array` 100% of the time and
+  keyword extraction emitted the junk token `objectobject`. Fix:
+  `textFromModelResult(raw)` reads `content[].text` (defensive: a bare string is
+  returned verbatim). The ranker (and GitHub keyword search) now actually works;
+  the heuristic is a true fallback, not the default path.
+- **Classifier — operator intent widened.** The dashboard-over-ecom guard keyed
+  only off `VERTICAL_RX.dashboard_saas`, so a back-office brief whose operative
+  words were management verbs ("управление клиентами", "список клиентов /
+  добавить-удалить") and no literal "dashboard/админка" fell to ecom on an
+  incidental commerce word. `detectVertical` now treats a brief as operator when
+  it matches `VERTICAL_RX.dashboard_saas` **OR** `ADMIN_OPERATOR_RX`
+  (admin\*/back-office/internal-tool/CRM/ERP/CRUD/«панель управления»/«управление|
+  список|реестр|база ‹records›»/«клиентская база|админка|кабинет») **OR** a
+  record-CRUD pair (add-verb + remove-verb + record-noun). Operator + no
+  `STOREFRONT_CORE_RX` → `dashboard_saas`. **Ecom is reserved for real
+  storefronts** (cart/checkout/shop/корзина); an admin panel FOR a real store
+  still resolves to ecom because the storefront core gates it.
+- **Heuristic floor — self-contained curated lead.** Because the AI ranker may
+  stay flaky, `heuristicRankFallback` (when given the `brief`) now LEADS a
+  complex brief with the capability-aware self-contained curated repo
+  (`pickFallbackForBrief` → `arhamkhnz/next-shadcn-admin-dashboard` for
+  dashboard, `vercel/commerce` for ecom) and lists the keyword-ranked GitHub
+  repos as alternatives. It also drops `EXTERNAL_AUTH_SAAS_REPOS` candidates
+  (Clerk/Supabase 500-on-boot). The legacy 3-arg signature (no `brief`) keeps
+  the pure-candidate behavior, so an empty conflict-filtered set still returns
+  `[]` for the caller's `pickFallbackForBrief`.
+
+Verified (API-only, real regexes; AI-ranker-down path simulated with an
+ecom-skewed candidate set):
+
+- `клиентская админка / список клиентов / добавить-удалить / дашборд метрик`
+  → `vertical=dashboard_saas`; heuristic(AI-down) lead =
+  `arhamkhnz/next-shadcn-admin-dashboard`; Clerk + ecom candidates dropped.
+- `Внутренний инструмент: список клиентов, добавить/удалить клиента, статистика`
+  (no literal "dashboard" word) → `dashboard_saas` → arhamkhnz.
+- `client-admin dashboard, clients list, add and remove clients, back-office`
+  → `dashboard_saas` → arhamkhnz.
+- `Интернет-магазин обуви: каталог товаров, корзина, оформление заказа`
+  → `ecom_marketplace`; heuristic lead = `vercel/commerce` (medusa skipped);
+  ecom alternatives kept.
+
+### DB / persistence foundation-fit — prefer a CLEAN foundation, down-rank baked ORM (#17, 2026-05-30)
+
+The complex-app END-TO-END gate. The DB-provision fix is proven
+(`coder-shim` 4a-db `pnpm add pg` + generic build-heal, #1023/#1024 live): goose
+writes `import 'pg'` → `Module not found: pg` → the platform installs `pg` →
+`next build` passes → the route persists in an embedded **PGlite**. But that
+proven path only fires on a **clean foundation**. The scorer kept mis-picking
+HEAVY/WRONG foundations for a persistence brief, so a real build rarely hit the
+clean missing-`pg` case:
+
+- **proj 1642 → `kaje94/menufic`** — ships Prisma, so there's no clean missing-`pg`
+  path; instead `prisma db push` runs against the PGlite socket (fails — shadow-DB
+  features PGlite lacks) and the foundation's strict `sort-keys-fix`/`import/order`
+  ESLint blocks `next build` on goose's edits.
+- **proj 1643 → `neuronetio/gantt-schedule-timeline-calendar`** — a charting/gantt
+  LIBRARY, the wrong vertical for a booking brief, with no app shell to serve.
+
+The fix is generic + signal-driven (no per-slug):
+
+1. **Persistence signal widened.** `DB_RX` now also matches booking / reservation
+   / CRUD intent (`запис`/`бронь`/`заявк`/`booking`/`reservation`), so a booking
+   brief reports `needs_db` and routes through the clean-foundation logic.
+2. **`needs_db` no longer makes a brief `complex`.** The platform provisions DB for
+   ANY project, so a persistence-on-a-landing brief stays on the clean curated lead
+   instead of being pulled toward heavy GitHub foundations. `complex` keys only on
+   genuine structural needs (auth / dashboard / commerce) + the heavy verticals.
+   `capabilityBias` no longer pushes `prisma` into the search (it over-surfaced
+   baked-ORM repos we then have to down-rank).
+3. **Heavy-ORM down-rank.** `dbFromScratchPenalty` subtracts `5`
+   (`heavy_orm_vs_pglite`) in `refineByFileTree` when a `needs_db` brief's finalist
+   ships Prisma/Drizzle/TypeORM/Sequelize/Mongoose/knex. `capabilityFileTreeBonus`
+   no longer rewards a baked DB layer for a persistence brief. A clean Next.js +
+   Tailwind foundation (cruip-class) — which the coder fills with a thin `pg` layer
+   — therefore wins.
+4. **Vertical gate / library reject.** `is_publishable_library`
+   (`main`/`module`/`exports`/`types` or a `files` allowlist, not `private`, not an
+   app template) → `component_library` hard-reject for web kinds. And `nextjs` (the
+   real prod kind) joined `KIND_SPA_SET`, so the monorepo/desktop/framework/library
+   rejects + the app-template bias finally gate every web brief — previously they
+   silently skipped `kind=nextjs`.
+5. **Ranker guidance flipped.** The `nextjs` `rankByBrief` prompt now tells the
+   model the platform provisions DB and to prefer a clean foundation WITHOUT a baked
+   ORM for a persistence brief (and never a component lib), instead of the old
+   "prefer a repo that already ships Prisma/Drizzle".
+6. **Decisive clean-foundation guard.** Live verify on the rebuilt image showed the
+   `−5` down-rank was NOT decisive: proj 1645 (a coffee-shop booking brief) still
+   picked `pjborowiecki/ARKA-…-Appointment-Booking-System` (Drizzle + Next-Auth +
+   MySQL) — a strong on-vertical ORM repo out-scored the penalty. Root cause: the
+   main create flow (`pickBestTemplateForBrief`) never consults the curated clean
+   bypass (that lives in `recommendProjectFoundations` and excludes `kind=nextjs`).
+   `applyCleanFoundationGuard` in `searchTemplatesForBrief` makes it deterministic:
+   for a `needs_db` web brief whose TOP pick ships a heavy ORM (detected from
+   repo+desc+topics), it LEADS with the clean curated foundation (cruip-class) and
+   keeps the GitHub hits as alternatives. The `−5` penalty still orders those
+   alternatives; the guard guarantees the lead.
+
+NOT in scope (separate follow-up, task #23): Prisma `db push` vs PGlite migrations
+and strict-foundation ESLint as a `next build` blocker — both are sidestepped by
+the clean-foundation pick, not fixed here.
+
+**Unit proof (CI):** `tests/unit/foundation-vertical-routing.test.ts` asserts a
+booking/persistence brief → `cruip/open-react-template` (clean), NOT
+menufic/gantt; an operator-CRUD brief → self-contained `arhamkhnz/next-shadcn-
+admin-dashboard`; a gantt-shaped repo → `component_library` reject; a menufic-shaped
+Prisma repo → `dbFromScratchPenalty > 0`; and the no-regression coffee-landing row
+keeps its clean static foundation (`needs_db=false`, ORM penalty 0).
+**Full integrated reality-verify** (fresh booking brief → clean foundation →
+`[coder-shim] db-provision: pnpm add pg → exit=0` → `next build` passes → submit a
+served form → SELECT the persisted PGlite row) runs POST-merge on the rebuilt
+agents image — the scorer change only takes effect after merge + image rebuild.
+
+### Explicit `selected_foundation` wins over the scorer
+
+`POST /me/projects` with `selected_foundation: { mode: 'github_repo',
+repo_full_name, repo_url?, ref? }` skips the scorer entirely and persists the
+caller's repo as `templateRepoFull` / `foundationRepoFullName` (`ref` honoured,
+default `main`). `mode: 'scratch'` and an absent foundation fall through to
+`pickBestTemplateForBrief`. (`projects.ts:912`.)
+
+## Verification (2026-05-30)
+
+Local `gh` token, real GitHub Search, AI-ranker-error path simulated (token
+never committed):
+
+- **Dashboard-CRUD (the bug):** real candidates included `Kiranism/next-shadcn-dashboard-starter`
+  (Clerk), `satnaing/shadcn-admin` (Clerk) and `saleor/storefront` (ecom).
+  Ranker-error fallback picked `ant-design/ant-design-pro` (self-contained admin,
+  auth deps NONE-CLEAN) — **not** the ecom storefront. Capability curated
+  fallback = `arhamkhnz/next-shadcn-admin-dashboard` (self-contained, not Clerk).
+- **Blog:** ranker-error fallback + curated fallback both → `timlrx/tailwind-nextjs-starter-blog`
+  (NONE-CLEAN).
+- **Ecom (control):** ranker-error fallback kept ecom (`vuestorefront/storefront-ui`);
+  curated fallback = `vercel/commerce`. Vertical respected — ecom stays ecom.
+
+Earlier run (2026-05-29): `saas-admin-with-billing` → `satnaing/shadcn-admin`
+(+5 capability-verified, beat `ant-design-pro` ★38k) — note that pick is now
+deprioritized by `externalAuthSaasPenalty` (Clerk).
+
+## Extended-mode comparison (ranked shortlist + justification)
+
+Owner direction (`plans/complex-app-extended-mode.md`): a complex brief must NOT
+get a silent top-1. Two product modes:
+
+- **default** (simple landing / bot) → fast single-pick; callers take
+  `pickBestTemplateForBrief` / `comparison.lead_repo_full`.
+- **extended** (dashboards / SaaS / multi-feature) → the cabinet shows a RANKED
+  SHORTLIST with per-candidate justification so the user chooses;
+  `selected_foundation` (#992) is the channel for that choice.
+
+`compareTemplatesForBrief(brief, kind, opts)` reuses `searchTemplatesForBrief`
+(so reliability + self-contained + capability-aware ranking apply underneath),
+then enriches the top `COMPARE_LIMIT` (5) via a package.json probe:
+
+```
+TemplateComparison {
+  brief_vertical, complex, mode,            # mode = resolveScorerMode (opts.mode || complex→extended)
+  lead_repo_full,                            # == candidates[0].repo_full (default-mode fast pick)
+  candidates: TemplateComparisonCandidate[]  # each:
+    summary                 # "TypeScript · dashboard_saas · MUI · несёт: дашборд/таблицы/графики"
+    ships {db,auth,dashboard,commerce,ui_kit}  # real deps (CAP_DEP_SIGNALS) or topics fallback
+    install_clean           # !isInstallHostile
+    self_contained          # !isExternalAuthSaas && no boot-blocking @clerk/@auth0 dep
+    pros[] / cons[]         # FOR THIS BRIEF (covers caps? install-clean? self-contained?)
+    recommended             # index 0 = reasoned default
+    recommendation_reason   # the WHY, not just a score
+}
+```
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/github-template-search.ts` `compareTemplatesForBrief` | extended-mode entry — ranked shortlist + per-candidate justification. |
+| `…` `describeCandidate` (pure) | builds one justified entry: ships + install_clean/self_contained + pros/cons + reason. |
+| `…` `detectShips` / `detectUiKit` | capability + UI-kit fingerprint from package.json deps (topics fallback). |
+| `…` `resolveScorerMode` + `SearchOpts.mode` | default vs extended (explicit toggle wins; else `complex`). |
+
+Verified (local `gh` token, real GitHub Search + package.json probes) — dashboard
+brief shortlist: `devias-io/material-kit-react` (★ recommended; MUI; ships
+dashboard; install-clean + self-contained), `vercel/nextjs-postgres-nextauth-
+tailwindcss-template` (ships db+auth, shadcn), `ant-design/ant-design-pro` (Ant
+Design) — all install-clean + self-contained, none Clerk; each with pros/cons +
+reason. (The PLANNER step + cabinet plan/compare UI are separate work per the
+spec — this PR ships only the scorer's comparison output.)
+
+## Related
+
+- [projects](/subsystems/projects/) — Phase-A2 create-project flow that calls the scorer.
+- [Foundation Scout](/subsystems/foundation-scout/) — legacy vertical-routing path (deprecated); its vertical buckets are reused here.
+- [Builtin templates registry](/subsystems/builtin-templates/) — curated starters surfaced above scorer candidates in the modal.

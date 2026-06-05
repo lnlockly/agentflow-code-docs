@@ -1,0 +1,63 @@
+---
+title: "Cloud IDE"
+description: "Browser VS Code (code-server) in a cluster pod with Claude Code pre-installed, surfaced as the cloud-ide JSON app at ide.agentflow.website."
+---
+
+# Cloud IDE
+
+## TL;DR
+A browser VS Code (`code-server`) runs in a cluster pod at
+`ide.agentflow.website`, with Claude Code pre-installed and a persistent
+`/home/coder/workspace` volume — so development moves off the weak owner Mac into
+the cloud. It is surfaced as a [JSON app](/subsystems/json-app-manifests)
+(`app-manifests/cloud-ide.json`) with an `embed` panel pointing at the editor.
+The k8s manifests live under `k8s/cloud-ide/`. The editor password is an
+out-of-band Secret (`cloud-ide-auth`) — the Deployment maps the Secret key into
+the `PASSWORD` env, and a missing Secret/key is the classic boot failure.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/app-manifests/cloud-ide.json` | JSON app manifest (modes `editor`/`task`, `embed` panel → `https://ide.agentflow.website`) |
+| `agentflow-landing/src/lib/appManifest.ts` (`CLOUD_IDE_EMBED_URL`, `CLOUD_IDE_MANIFEST`, `FALLBACK_MANIFESTS['cloud-ide']`) | FE fallback manifest — one embed panel at the IDE host, added the same generic way as `tasks` |
+| `agentflow-landing/src/pages/CloudIdePage.tsx` | `/cloud-ide` page — builds the embed panel inline, renders via generic `AppPanelView` (reuses `EmbedPanel` loading/error + open-in-new-tab) |
+| `agentflow-landing/src/main.tsx` (`/cloud-ide` route) | auth-gated route → `CloudIdePage` |
+| `agentflow-landing/src/components/layout/AppShellV2.tsx` (`MORE_NAV`) | «Облако / IDE» sidebar row (`key: 'cloud_ide'`, `Code2` icon) |
+| `agentflow-agents/k8s/cloud-ide/kustomization.yaml` | kustomize entry (excludes the example secret on purpose, :6) |
+| `agentflow-agents/k8s/cloud-ide/00-pvc.yaml` | persistent `/home/coder/workspace` |
+| `agentflow-agents/k8s/cloud-ide/10-deployment.yaml:91` | `PASSWORD` env via `secretKeyRef` → `cloud-ide-auth.password` (:93) |
+| `agentflow-agents/k8s/cloud-ide/01-secret.example.yaml` | template (NOT applied — real secret created out of band) |
+| `agentflow-agents/k8s/cloud-ide/20-ingress.yaml:27` | ingress host `ide.agentflow.website`, TLS `cloud-ide-tls` (:40) |
+| `agentflow-agents/k8s/cloud-ide/SETUP.md:25` | Step 1: create the `cloud-ide-auth` Secret FIRST |
+
+## Data flow
+```
+app-manifests/cloud-ide.json  → /apps/cloud-ide (embed panel)
+                                   → iframe https://ide.agentflow.website
+agentflow-landing /cloud-ide  → CloudIdePage → AppPanelView(embed) → same iframe
+ingress ide.agentflow.website (TLS cloud-ide-tls)
+   → code-server Deployment (codercom/code-server)
+       env PASSWORD ← secretKeyRef cloud-ide-auth.password
+       PATH/NPM_CONFIG_PREFIX → npm-global Claude Code on terminal PATH
+       /home/coder/workspace ← PVC (persistent)
+```
+
+## DB / Env / API
+- Tables: none.
+- Env (pod): `PASSWORD` (from Secret `cloud-ide-auth` key `password`), `PATH` + `NPM_CONFIG_PREFIX` (npm-global Claude Code on PATH).
+- Secret: `cloud-ide-auth` — created out of band (`kubectl … create secret generic cloud-ide-auth --from-literal=password=…`), NOT in git.
+- Host: `ide.agentflow.website` (TLS via cert-manager, secret `cloud-ide-tls`).
+- Manifest `uses.mcp_tools`: `["agentflow"]`.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Pod stuck, container won't start | pod status `CreateContainerConfigError` | Secret `cloud-ide-auth` (or key `password`) missing — create it first, `agentflow-agents/k8s/cloud-ide/SETUP.md:25` |
+| Editor prompts but rejects password | wrong key in `cloud-ide-auth` | `secretKeyRef … key: password`, `agentflow-agents/k8s/cloud-ide/10-deployment.yaml:93` |
+| `kubectl apply -k` re-creates a placeholder secret | example secret leaks in | it is intentionally excluded from kustomization (`agentflow-agents/k8s/cloud-ide/kustomization.yaml:6`) |
+| TLS not issued | host/cert mismatch | `agentflow-agents/k8s/cloud-ide/20-ingress.yaml:27` |
+
+## Related
+- [JSON App Manifests](/subsystems/json-app-manifests) — `cloud-ide.json` is one manifest
+- [Generic App Renderer](/subsystems/generic-app-renderer) — renders the `embed` panel
+- FE surface lives in `agentflow-landing` (`/cloud-ide` page + `cloud-ide` fallback manifest), reusing the #672 embed panel; landing PR #673.

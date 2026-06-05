@@ -18,7 +18,7 @@ Single `feature_flags` table (`key` text PK, `value` jsonb, `updated_at`, `updat
 | `agentflow-agents/src/services/feature-flags.ts:80` | `getFlagBool(key, fallback)` — boolean with TTL cache + boolean coercion. |
 | `agentflow-agents/src/services/feature-flags.ts:93` | `getFlagJSON<T>(key, fallback)` — typed JSON with TTL cache. |
 | `agentflow-agents/src/services/feature-flags.ts:103` | `setFlag(key, value, updatedByUserId)` — upsert + local cache invalidation. |
-| `agentflow-agents/src/services/projects-pipeline.ts` (`isGraphExecutorEnabledFor`, `isGraphExecutorMasterEnabled`) | First consumer — graph-executor master switch + kind allowlist. |
+| `agentflow-agents/src/services/graph-executor-routing.ts` (`resolveGraphExecutorRouting`, `isGraphExecutorEnabledFor`, `isGraphExecutorMasterEnabled`, `FORCE_GRAPH_KINDS`) | First consumer — graph-executor master switch + kind allowlist + force-set for tg_profile_bundle/tg_farm. Re-exported from `projects-pipeline.ts` for back-compat. |
 | `agentflow-agents/src/routes/admin.ts` (`/admin/feature-flags*` block) | List / read / upsert REST surface. |
 
 ## Schema
