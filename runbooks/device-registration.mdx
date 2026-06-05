@@ -1,0 +1,187 @@
+---
+title: "Device registration (Mac onboarding)"
+description: "Step-by-step: install agentflow-computer-mcp on a Mac, grant macOS permissions, verify online status."
+---
+
+# Device registration (Mac onboarding)
+
+## TL;DR
+
+Юзер регистрирует Mac в один заход: открывает `/cabinet/devices` → **Add device** → копирует `curl ... | bash` команду → запускает в терминале. Скрипт ставит pip-пакет, кладёт `~/.agentflow/auth.json` (0600), регистрирует launchd-юнит и стартует его. После этого нужно вручную выдать macOS-permissions: **Accessibility** (для мыши/клавиатуры) и **Screen Recording** (для скриншотов). Через 5-10 секунд устройство показывает зелёную точку online в кабинете.
+
+## Prerequisites
+
+- macOS 13+ (Ventura или новее).
+- Python 3.11+ установлен (`python3 --version`). `brew install python@3.11` если нет.
+- Активная AgentFlow подписка (api-key выдаётся в `/cabinet`).
+
+## Step-by-step
+
+### 1. Open the cabinet page
+
+```
+https://agentflow.website/cabinet/devices
+```
+
+Click **Add device**. В модалке:
+
+- введи имя (например `MacBook Artem` — для опознавания в списке).
+- нажми **Generate install command**.
+
+Backend выполняет `POST /me/devices` с этим именем и возвращает:
+
+- `device_id` — UUID.
+- `enrollment_token` — одноразовый, TTL 24 часа.
+
+Модалка собирает curl-команду:
+
+```bash
+curl -sSL https://agentflow.website/install/computer-mcp.sh | \
+  AF_KEY=af_live_xxxxx \
+  AF_DEVICE_ID=<device_id> \
+  AF_ENROLLMENT_TOKEN=<enrollment_token> \
+  bash
+```
+
+Скопируй кнопкой **Copy**.
+
+### 2. Run the installer
+
+В терминале на Mac:
+
+```bash
+# Paste the command, hit enter
+curl -sSL https://agentflow.website/install/computer-mcp.sh | \
+  AF_KEY=af_live_xxxxx \
+  AF_DEVICE_ID=... \
+  AF_ENROLLMENT_TOKEN=... \
+  bash
+```
+
+Что произойдёт (`install.sh:(line TBD)`):
+
+1. Проверит Python 3.11+, упадёт если нет.
+2. `pip install --user agentflow-computer-mcp`.
+3. `mkdir -p ~/.agentflow`.
+4. Запишет `~/.agentflow/auth.json` mode 0600 с `{api_key, device_id, enrollment_token}`.
+5. Создаст `~/.agentflow/computer-scope.toml` с дефолтным безопасным скопом.
+6. Положит `~/Library/LaunchAgents/com.agentflow.computer-mcp.plist`.
+7. `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agentflow.computer-mcp.plist`.
+8. Напечатает: `agentflow-computer-mcp installed. Now grant macOS permissions — see https://docs.agentflow.website/desktop-permissions`.
+
+### 3. Grant macOS permissions
+
+macOS блокирует автоматизацию по умолчанию. Открой:
+
+**System Settings → Privacy & Security → Accessibility**
+
+- Найди в списке Python (полный путь должен быть `~/Library/Python/3.11/bin/python3` или аналогичный — launchd запускает его).
+- Если его нет — нажми **+**, добавь `/usr/local/bin/python3` (или путь который покажет `which python3`).
+- Включи тумблер.
+
+**System Settings → Privacy & Security → Screen Recording**
+
+- То же самое: добавь Python и включи.
+
+После каждого включения macOS попросит **Quit & Reopen** — это нормально, launchd сам перезапустит.
+
+### 4. Verify online status
+
+Вернись в `/cabinet/devices`. Через 5-10 секунд:
+
+- зелёная точка слева от имени устройства;
+- `last_seen` обновляется каждые 15 секунд (heartbeat).
+
+Если точка остаётся серой больше минуты — переходи к [Troubleshooting](#troubleshooting).
+
+### 5. Set up scope (optional but recommended)
+
+Кликни на устройство → откроется `/cabinet/devices/:id`. По умолчанию:
+
+- `allow_paths`: пусто (нельзя читать ничего вне `~/Desktop` и `~/Downloads`).
+- `deny_paths`: `~/.ssh`, `~/.config`, `~/Library/Keychains`, `~/.aws`, `~/.gnupg` (hard-coded, не убрать).
+- `shell_whitelist`: пусто (никакие shell-команды не разрешены).
+- `confirm_before`: `["fs.write", "shell.exec"]` (native dialog).
+- `max_actions_per_session`: 50.
+- `budget_usd`: 2.
+
+Расширь по мере доверия. Сохрани — `POST /me/devices/:id/scope` обновит `user_devices.scope_json`.
+
+## Troubleshooting
+
+### "Device stays offline more than 60s"
+
+1. Проверь launchd:
+   ```bash
+   launchctl list | grep agentflow
+   # ожидается:  -  0  com.agentflow.computer-mcp
+   #            (PID нет = job упал — exit код 0 значит штатный stop;
+   #             ненулевой код = ошибка)
+   ```
+2. Логи:
+   ```bash
+   tail -100 ~/Library/Logs/agentflow-computer-mcp.log
+   ```
+   Что искать:
+   - `ImportError: pyobjc-framework-Quartz` → переустанови: `pip install --user --force-reinstall pyobjc-framework-Quartz`.
+   - `ConnectionRefusedError` / `wss handshake failed` → проверь что прод доступен: `curl -I https://agentflow.website/install/computer-mcp.sh` (ожидается 200).
+   - `enrollment_token expired` → токен жил 24 часа, выпиши новый через UI.
+   - `invalid api-key` → `~/.agentflow/auth.json` повреждён, переставь.
+
+### "Permission denied" в логах
+
+`pyautogui FailSafeException` или `Cannot capture screen — permission required`. macOS не выдал permissions. Повтори шаг 3. Если permissions выданы а ошибка осталась:
+
+```bash
+# Force-reset (на свой страх — придётся подтверждать заново всем приложениям)
+tccutil reset Accessibility
+tccutil reset ScreenCapture
+# затем перезапусти launchd:
+launchctl kickstart -k gui/$(id -u)/com.agentflow.computer-mcp
+```
+
+### "Connection refused" или "wss handshake 401"
+
+Корпоративный proxy / firewall блокирует WSS. Проверь:
+
+```bash
+curl -I https://agentflow.website/_devices/connect
+# ожидается 400 (нужны WS-headers) или 426 Upgrade Required — это OK,
+# означает endpoint доступен. 5xx или таймаут — сеть блокирует.
+```
+
+Если ты за корпоративным proxy — variables `HTTPS_PROXY` в launchd plist:
+
+```xml
+<key>EnvironmentVariables</key>
+<dict>
+  <key>HTTPS_PROXY</key>
+  <string>http://proxy.example.com:8080</string>
+</dict>
+```
+
+После правки plist: `launchctl unload ~/Library/LaunchAgents/com.agentflow.computer-mcp.plist && launchctl load ...`.
+
+### "I want to uninstall"
+
+```bash
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.agentflow.computer-mcp.plist
+rm ~/Library/LaunchAgents/com.agentflow.computer-mcp.plist
+rm -rf ~/.agentflow
+pip uninstall agentflow-computer-mcp
+```
+
+В кабинете: открой устройство → **Revoke device** → `DELETE /me/devices/:id` пометит row как `deleted_at=now()`.
+
+## Verification checklist
+
+- [ ] `launchctl list | grep agentflow` показывает active job.
+- [ ] `tail -5 ~/Library/Logs/agentflow-computer-mcp.log` содержит `connected to /_devices/connect`.
+- [ ] `/cabinet/devices` показывает зелёную точку.
+- [ ] Тест: открой `/cabinet/devices/:id` → нажми **Test screen capture** → должна показаться превьюшка скрина.
+
+## Related
+
+- [Computer MCP subsystem](/subsystems/computer-mcp)
+- [Device offline debug](/runbooks/device-offline-debug)
+- [Desktop-agent attach flow](/flows/desktop-agent-attach)

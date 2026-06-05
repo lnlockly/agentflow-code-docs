@@ -73,6 +73,7 @@ handleKnowledgeMcp (knowledge.ts)
 - `INTERNAL_API_SECRET` — shared secret the mount validates via constant-time compare.
 
 **Routes:**
+- `POST /internal/mcp/knowledge/?agent=<slug>&token=<secret>` — JSON-RPC MCP transport. `agent` is required, missing → 400 `missing_agent_query`. Token mismatch → 401 `unauthorized`.
 - `POST /internal/mcp/knowledge/?agent=<slug>` with `x-mcp-auth: <INTERNAL_API_SECRET>` header — JSON-RPC MCP transport. `agent` is required, missing → 400 `missing_agent_query`. Wrong/absent header → 401 `unauthorized`. The secret is HEADER-ONLY: the legacy `?token=<secret>` query param is no longer accepted (it leaked the secret into nginx access logs, SECURITY.md M-3). A stale request still carrying `?token=` is rejected and logs a one-shot `rejected_query_token` — see `routes/internal-mcp.ts:readToken()`.
 
 **MCP tools:**
@@ -162,6 +163,7 @@ Source: `agentflow-agents/scripts/backfill-researcher-knowledge-uuid.ts`.
 |---|---|---|
 | Agent replies "Я не вижу прикреплённого документа" despite ingest | (no log — model hallucinated) | The agent's `character.settings.mcp.servers` lacks `knowledge`. Run the backfill UPDATE above. Source: `agent-provision.ts:55-104`. |
 | Mount returns `missing_agent_query` | `"missing_agent_query"` | URL lacks `?agent=<slug>`. Resolver should mint that — check `internal-mcp-resolver.ts:73-82` and `AGENT_SCOPED_KEYS`. |
+| Mount returns `unauthorized` | `unauthorized` | `?token=` doesn't match `INTERNAL_API_SECRET`. Token rotated since the URL was baked into `character.settings.mcp.servers`. The resolver rebuilds stale-token URLs on the next provision (`internal-mcp-resolver.ts:115`). Force a redeploy of the agent. |
 | Mount returns `unauthorized` | `unauthorized` | The `x-mcp-auth` header is missing or doesn't match `INTERNAL_API_SECRET`. A stale baked URL still using `?token=` is rejected (header-only since SECURITY.md M-3) and logs `rejected_query_token`. The resolver migrates `?token=` URLs to header form on the next provision (`internal-mcp-resolver.ts`, `urlMatchesCtx`). Force a redeploy of the agent. |
 | Search returns `agent_not_found` | `"error":"agent_not_found"` | Slug in URL has no row in `agents`. Agent was deleted but its baked URL is being hit by a stale chat session. |
 | Search returns `agent_tombstoned` | `"error":"agent_tombstoned"` | Agent was soft-deleted (`state='tombstoned'`); no further retrieval. |

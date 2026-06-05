@@ -9,6 +9,8 @@ description: "Single DAG demonstrating AgentFlow's full power — TG outreach + 
 > Walker + handlers shipped in [PR #209](https://github.com/lnlockly/agentflow-agents/pull/209);
 > MCP unwrap regression caught and fixed in [PR #210](https://github.com/lnlockly/agentflow-agents/pull/210).
 > **v2 (preemptive parallel)** lands in the same boilerplate row (id=31) via
+> `migrations/2026-05-14d-diploma-preemptive.sql` — see § "v2 Parallel preemptive"
+> below. v1 sections retained for historical context.
 > `migrations/2026-05-14d-diploma-preemptive.sql`, patched by
 > `migrations/2026-05-14e-wait-reply-self-loop.sql` (accept_outbound),
 > `migrations/2026-05-14i-wait-reply-since-from-ack.sql` (since_message_id +
@@ -522,6 +524,38 @@ After PR merges + handlers ship + boilerplate INSERT applied:
 **Target end-to-end:** 5–8 min from "Hire" click to delivered preview
 URL. Screenshot the canvas mid-run for the diploma deck.
 
+### Actual verification on #581 (2026-05-13, v1 self-loop schema)
+
+The v1 DAG was end-to-end-verified on project #581 (slug `diploma-test-833551be`,
+kind `tg_farm`, peer=`me`, account_id=4 — a self-loop variant where @avsee4 DMs
+herself in Saved Messages). Four messages landed in @avsee4 Saved Messages:
+
+| # | msg_id | UTC | Node | Text (truncated) |
+|---|---|---|---|---|
+| 1 | **390028** | 2026-05-13 22:49:29 | `tg.send_text` (pitch) | "Привет! Это AgentFlow diploma-flow. Сделать тебе визитку или бота?" |
+| 2 | **390029** | 2026-05-13 22:49:29 | `tg.send_text:reply` | "Хочу визитку!" |
+| 3 | **390030** | 2026-05-13 22:49:29 | `tg.send_text:ack` | "Понял, делаю визитку! Через 5-10 минут пришлю ссылку." |
+| 4 | **390068** | 2026-05-13 23:29:44 | `manual_deliver` (workaround) | "Готово! Твоя визитка @avsee4: https://p-6j3a196b.proj.agentflow.website" |
+
+Sub-project **#582** (slug `6j3a196b`, kind `tg_profile_bundle`) was created at
+22:52:49 by `project.create_sub` (event #70978 on #581). The 4th message was
+posted manually via `mcpDirect.callTool('telegram','send_message',...)` because:
+
+1. `project.wait_done` zod-failed on the parent walker (ev #70983) — handler
+   required `project_id` in static config; sub_project_id is only known at
+   runtime. See Failure modes row.
+2. Sub-project #582's own walker stalled on `approved` across 3 agentflow-agents
+   pod restarts (preemptive-build PR series shipping). `agent-revive` did not
+   resurrect it; auto-pinger broken by SQL bug (task #5).
+
+Total elapsed (admin-approve → final deliver): **23 min 16s** (23:06:28 →
+23:29:44 UTC). v1 narrative is closed; v2 (preemptive parallel) lands the
+fix-forward.
+
+Recovery event recorded on #581 as `project_events.kind='manual_deliver'`
+(ev #71242, 2026-05-13 23:32:13) with payload
+`{sub_project_id:582, msg_id:390068, reason:'wait_done_handler_bug_workaround + pod_restart_killed_walker'}`.
+
 ## Failure modes
 
 | Symptom | Log signature for grep | Fix |
@@ -537,6 +571,8 @@ URL. Screenshot the canvas mid-run for the diploma deck.
 | Edge-condition resolver matches multiple branches | `[graph-executor] ambiguous_edge_match node=llm.classify_intent intent=visitka` | Walker enforces single-match; investigate boilerplate edge labels |
 | Loop in graph (mis-edited boilerplate) | `[graph-executor] cycle_detected nodes=[…]` | The clarify retry must NOT be an edge — it lives inside `llm.classify_intent`. Re-check seeded `workflow_schema` |
 | Delivery DM blocked by @MLM808's privacy | `tg.send_text: USER_PRIVACY_RESTRICTED` (or tg-mcp passthrough) | Per-kind policy = continue on `tg.send_text:deliver` — sub-project still exists, owner sees it at `/projects` |
+| `project.wait_done` zod fails with `project_id: required` after `project.create_sub` succeeds | `node_failed node_id=project.wait_done error.path=['project_id'] error.message='Required'` (observed on #581 ev #70983, 2026-05-13 22:52:49) | Handler reads `project_id` from static node config only — sub_project_id is only known at runtime as upstream output. Fix: walker wires `ctx.steps['project.create_sub'].output.sub_project_id` into `project.wait_done` input, OR handler falls back to last `sub_project_created` event on parent. Tracked alongside [preemptive-build PR](task #7) which lands the new schema. File: [`project.wait_done.ts:20-26`](https://github.com/lnlockly/agentflow-agents/blob/main/src/services/graph-executor/handlers/project.wait_done.ts#L20) |
+| Sub-project stalls on `approved` indefinitely after agentflow-agents pod restart | `agent-revive sweep complete checked:N alive:N revived:0` reported every minute, no `tool_call`/`thought` events for >5min on the affected project (observed on #582 across 3 pod restarts, 2026-05-13 23:01-23:21) | Walker has no resume-from-checkpoint after k8s pod restart, and `agent-revive` treats "alive in DB" as "running" even when no work is happening. The auto-pinger that should heal idle approved projects is broken with `column pt.project_id does not exist` (see [task #5](#)). Workaround: re-POST `/internal/projects/<id>/admin-approve` with `reset_workspace=true` once platform is stable. Permanent fix: fix the auto-pinger SQL join column |
 
 ## Open questions / impl gates
 

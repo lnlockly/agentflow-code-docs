@@ -1,0 +1,114 @@
+---
+title: "Desktop-agent kind (graph-executor)"
+description: "Project kind=desktop_agent — attaches an Eliza marketplace agent to a user's Mac via Computer MCP. No coder, no repo, no preview."
+---
+
+# Desktop-agent kind (graph-executor)
+
+## TL;DR
+
+`kind=desktop_agent` — это новый тип проекта в graph-executor, который не делает coder, не пишет файлы в `/workspace`, не поднимает preview. Вместо этого он берёт уже опубликованного агента из marketplace (preset, например `desktop-assistant`), резолвит выбранное юзером устройство (`user_devices.id`), создаёт `device_sessions` row и инжектит scope + session_id в runtime-контекст Eliza-агента. Дальше агент работает в обычном цикле — но единственные доступные ему тулы это `computer.*` через [Computer MCP](/subsystems/computer-mcp).
+
+Этим он отличается от `landing` / `tg_bot` / `spa` — там graph многоэтапный (scaffold → coder → smoke → deploy), здесь один node `attach_computer_tools` и сразу runtime.
+
+## Files
+
+| Repo / path | Role |
+|---|---|
+| `agentflow-agents/src/services/graph-executor/kinds/desktop-agent.ts:(line TBD — Agent B PR not yet merged)` | Kind handler. One node: `attach_computer_tools`. |
+| `agentflow-agents/src/services/graph-executor/registry.ts:(line TBD)` | Registers `attach_computer_tools` in `defaultRegistry`. See [Graph handlers](/subsystems/graph-handlers). |
+| `agentflow-agents/src/services/kind-classifier.ts:(line TBD)` | `ProjectKind` union extended with `'desktop_agent'`. |
+| `agentflow-agents/src/services/projects.ts:(line TBD)` | `runProjectApprovalBackground` — branch for `kind=desktop_agent` skips workspace pod provision, auto-bot, auto-scrape (none apply). |
+| `agentflow-agents/src/presets/desktop-assistant.json:(line TBD)` | Default Eliza preset bundled with the platform; marketplace seed. |
+| `agentflow-agents/db/schema/devices.ts:(line TBD)` | `device_sessions` row created by `attach_computer_tools` node. |
+| `agentflow-agents/src/mcp/bridge.ts:(line TBD)` | `ComputerDeviceProvider` consumes the injected `device_id` + `session_id` from agent context. |
+| `agentflow-landing/src/pages/WorkspaceV2.tsx:(line TBD)` | Workspace UI swaps preview iframe for `<DeviceLiveSession />` when project kind is `desktop_agent`. |
+
+## Data flow
+
+```
+POST /me/projects { brief, kind: 'desktop_agent', agent_id, device_id }
+   │
+   ▼
+runProjectApprovalBackground (projects.ts:(TBD))
+   │
+   ├─ skip provisionWorkspaceWithRetry (no pod for desktop_agent)
+   ├─ skip auto-bot, auto-scrape (none apply)
+   ▼
+graph-executor → kinds/desktop-agent.ts
+   │
+   └─ attach_computer_tools node
+        │
+        ├─ SELECT * FROM user_devices WHERE id=:device_id AND user_id=session.sub
+        ├─ if device.status != 'online' → fail: device_offline
+        ├─ INSERT device_sessions (device_id, agent_id, project_id, status='active')
+        ├─ build runtime context:
+        │     { scope: device.scope_json,
+        │       session_id: new_session.id,
+        │       tool_filter: ComputerDeviceProvider.toolsFor(scope) }
+        └─ hand off to Eliza runtime → agent starts loop
+   │
+   ▼
+Eliza agent loop (in agentflow-agents process, no pod)
+   │ reads brief.goal
+   │ agent.callTool('computer.screen.capture') → mcp-bridge → WS → Mac
+   │ reasons about screenshot
+   │ agent.callTool('computer.mouse.click', {x,y}) → forward → execute
+   │ repeat until: goal achieved (task.complete) | max_actions | budget_exceeded | user revoke
+   │
+   ▼
+session end → UPDATE device_sessions SET ended_at=now(), status=<complete|aborted>
+```
+
+## DB / Env / API
+
+**Tables:**
+
+- `projects.kind = 'desktop_agent'` — new value in the `ProjectKind` union.
+- `projects.detail_meta` — stores `{ agent_id, device_id }` so workspace UI can resolve them.
+- `device_sessions` — see [Computer MCP](/subsystems/computer-mcp).
+
+**Env:**
+
+- None new. Re-uses `mcp-bridge` infra.
+
+**API:**
+
+- `POST /me/projects` with `{ kind: 'desktop_agent', agent_id, device_id, brief }` — create.
+- `POST /me/projects/:id/approve` — kicks `runProjectApprovalBackground` which dispatches to `attach_computer_tools`.
+- `DELETE /me/projects/:id` — aborts active session (UPDATE `device_sessions.status='aborted'`, fires WS unregister of agent's tool subscriptions).
+
+## How it differs from other kinds
+
+| Kind | Provisions pod? | Coder runs? | Preview deployed? | Terminal node |
+|---|---|---|---|---|
+| `landing` | yes (per-user warm pod) | yes (boilerplate + fill) | yes (Caddy) | `deploy_caddy` |
+| `tg_bot` | yes | yes | n/a | `deploy` |
+| `spa` | yes | yes | yes (Caddy + Procfile) | `deploy` |
+| `mini_app` | yes | yes | yes | `deploy` |
+| `tg_profile_bundle` | yes | yes (template applier) | yes | `deploy_bot` |
+| **`desktop_agent`** | **no** | **no** | **no — live session UI instead** | **`attach_computer_tools`** |
+
+Comparison source: [Project kinds map](/architecture/kinds).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Project approve fails immediately | `[desktop_agent] device_offline device_id=` | User must start launchd job on their Mac; check `/cabinet/devices` |
+| Project approve fails with `device_not_owned` | `[desktop_agent] device_not_owned device_id= user=` | `device_id` belongs to another user — UI bug, frontend sent wrong id |
+| Session starts but agent never calls a tool | `[device] no tool calls in 5 min session=` | Agent preset has empty `allowed_tools` or LLM returned plain text — check preset config |
+| Session starts, all tool calls return `scope_denied` | `[device] scope denied tool=` repeated | Preset `allowed_tools` doesn't match `device.scope_json.allowed_tools` intersection; widen scope |
+| Workspace UI shows blank (no live session) | `desktop_agent project has no active session` | `device_sessions` row not created — `attach_computer_tools` failed mid-flight; check `project_events` |
+| Project stuck `running` forever | `[desktop_agent] session active over 60min` | Agent in infinite loop. Hit `max_actions` (default 50) or revoke device |
+
+(Log substrings to be backfilled by Agent B PR.)
+
+## Related
+
+- [Computer MCP (desktop agent)](/subsystems/computer-mcp)
+- [Flow: Desktop-agent attach](/flows/desktop-agent-attach)
+- [Project kinds map](/architecture/kinds)
+- [Graph handlers](/subsystems/graph-handlers)
+- [Presets](/subsystems/presets)
+- [Runbook: Add a new project kind](/runbooks/add-new-kind)

@@ -1,0 +1,182 @@
+---
+title: "Landing multi-framework pipeline (React / Vue / Solid)"
+description: "One graph schema, one config contract, three boilerplate repos. Brief keywords route the project to the matching framework; coder edits a single file."
+---
+
+# Landing multi-framework pipeline (React / Vue / Solid)
+
+## TL;DR
+
+`kind=landing` resolves to one of three boilerplates depending on owner-brief keywords. All three repos expose the **same** `src/config/landing.config.ts` schema, so AgentFlow's content prefill (`landing-config-prefill.ts`) runs unchanged for every variant. The picker prefers the most specific cue (DaisyUI → Solid, shadcn-vue / "на Vue" → Vue, otherwise React). Each variant has its own graph node (`render_landing`, `render_landing_vue`, `render_landing_solid`), its own coder preset, and its own clone target — but every other step (Caddy deploy, sentinel gate, expects gate, SHA1 probe) is shared.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/graph-executor/pick-workflow-schema.ts:179` | `LANDING_SOLID_BOILERPLATE_NAME = 'landing-solid-boilerplate'` |
+| `agentflow-agents/src/services/graph-executor/pick-workflow-schema.ts:185` | `landingBriefPrefersVue(brief)` — Vue keyword detector |
+| `agentflow-agents/src/services/graph-executor/pick-workflow-schema.ts:204` | `landingBriefPrefersSolid(brief)` — Solid/DaisyUI keyword detector |
+| `agentflow-agents/src/services/graph-executor/pick-workflow-schema.ts:444` | `pickLandingSchema(brief, db)` — 3-way dispatch (Solid > Vue > React) |
+| `agentflow-agents/src/services/graph-executor/handlers/landing.ts` | React handler — `render_landing` |
+| `agentflow-agents/src/services/graph-executor/handlers/landing-vue.ts` | Vue handler — `render_landing_vue` |
+| `agentflow-agents/src/services/graph-executor/handlers/landing-solid.ts:152` | Solid handler — `render_landing_solid` |
+| `agentflow-agents/src/services/graph-executor/handlers/landing-config-prefill.ts` | Shared prefill — overwrites `src/config/landing.config.ts` (all three variants) |
+| `agentflow-agents/src/services/graph-executor/handlers/index.ts:15-17` | Side-effect imports for `landing.js`, `landing-solid.js`, `landing-vue.js` |
+| `agentflow-agents/presets/coder-landing.json` | React coder preset (slug `coder-landing`) |
+| `agentflow-agents/presets/coder-landing-vue.json` | Vue coder preset (slug `coder-landing-vue`) |
+| `agentflow-agents/presets/coder-landing-solid.json` | Solid coder preset (slug `coder-landing-solid`) |
+| `agentflow-agents/src/scripts/seed-boilerplate-workflows.ts:60` | Seeds React row `landing-boilerplate` |
+| `agentflow-agents/src/scripts/seed-boilerplate-workflows.ts:88` | Seeds Vue row `landing-vue-boilerplate` |
+| `agentflow-agents/src/scripts/seed-boilerplate-workflows.ts:123` | Seeds Solid row `landing-solid-boilerplate` |
+| `agentflow-agents/tests/services/pick-workflow-schema.test.ts` | 49 tests covering the 3-way picker |
+
+## Data flow
+
+```
+brief
+  │
+  ▼
+POST /me/projects → kind classifier → kind='landing'
+  │
+  ▼
+pickWorkflowSchema({kind:'landing', brief}) → pickLandingSchema(brief, db)
+  ├─ landingBriefPrefersSolid(brief) ∧ landing-solid-boilerplate row in DB
+  │     → reason='landing_solid_route', schema=[render_landing_solid, deploy_caddy]
+  ├─ landingBriefPrefersVue(brief)   ∧ landing-vue-boilerplate   row in DB
+  │     → reason='landing_vue_route',   schema=[render_landing_vue,   deploy_caddy]
+  └─ otherwise (any landing-boilerplate row)
+        → reason='landing_react_default', schema=[render_landing, deploy_caddy]
+  │
+  ▼
+approve → graph-executor walks schema
+  │
+  ▼ (variant-specific render_landing_{vue,solid,} handler)
+  1. git clone lnlockly/landing-boilerplate{,-vue,-solid} → /workspace
+  2. landing-config-prefill: deriveLandingContent(brief) → applyLandingContent
+  3. coderInvoke({slug: 'coder-landing{,-vue,-solid}'}) — edits src/config/landing.config.ts only
+  4. SHA1 probe (config file changed?) + sentinel grep gate (BrandX/Acme → fail)
+  5. expects=['src/config/landing.config.ts'] file-exists gate
+  │
+  ▼
+deploy_caddy (single handler, framework-agnostic) → Caddy serves /workspace/dist/
+```
+
+## Routing — keyword precedence
+
+The picker tries detectors **in order of specificity**, returning the first match. Solid runs first because the DaisyUI cue is unique to it; Vue runs second because "vue" can appear in unrelated contexts; React is the always-on default.
+
+### Solid triggers — `landingBriefPrefersSolid`
+
+`pick-workflow-schema.ts:204`
+
+- `solid` + `js` / `.js` / `js`  (`solidjs`, `solid.js`, `solid-js`, `solid start`)
+- `на solid` (Russian preposition)
+- `daisyui` / `daisy ui` / `daisy-ui`  — most specific cue; DaisyUI is Solid-bundled
+- Bare `solid` + reactivity-related vocabulary (`fine-grained`, `signal`, `сигнал`, `реактивность`, `framework`, `stack`)
+
+Discards (anti-false-positive):
+
+- `solid foundation`, `solid plan` — bare `solid` without framework context never routes Solid.
+
+### Vue triggers — `landingBriefPrefersVue`
+
+`pick-workflow-schema.ts:185`
+
+- `на vue`, `vue 3`, `vue.js`, `shadcn-vue`, `composition api`
+- Bare `vue` as a standalone word
+
+Discards: `value`, `revue`, `value proposition`, `press revue`.
+
+### React — default
+
+When neither detector fires (or the matched row is missing from the DB seed), the picker returns the React row. This preserves backward compat for every brief written before the multi-framework split.
+
+## Boilerplate contract — what every variant ships
+
+Every repo ships the same file paths so the prefill, gates, and Caddy deploy can stay framework-agnostic:
+
+| Path | Role |
+|---|---|
+| `src/config/landing.config.ts` | The ONLY file the coder edits |
+| `src/config/schema.ts` | Zod schema enforced at runtime (`landingConfigSchema`) |
+| `src/i18n/{ru,en}.json` | Translation dictionaries |
+| `src/build/seo-inject-plugin.ts` | Vite plugin — rewrites `<title>`, `og:*` at build time |
+| `Procfile` | `web: npx vite preview --host 0.0.0.0 --port 8080 --strictPort` |
+| `index.html` | Static head + mount node (`#app` for Vue/Solid, `#root` for React) |
+| `package.json` | `npm run build` writes `dist/` |
+| `vite.config.ts` | Plugins: framework + tailwindcss + seoInjectPlugin |
+
+What differs per variant (and which coder never touches):
+
+| Layer | React | Vue | Solid |
+|---|---|---|---|
+| Repo | `lnlockly/landing-boilerplate` | `lnlockly/landing-boilerplate-vue` | `lnlockly/landing-boilerplate-solid` |
+| Framework | React 19 | Vue 3.5 Composition API | SolidJS 1.9 signals |
+| Entry | `src/main.tsx` | `src/main.ts` + `App.vue` | `src/index.tsx` + `App.tsx` |
+| UI primitives | shadcn-react over Radix | shadcn-vue over Reka UI | Kobalte (`Accordion`) |
+| Theme system | CSS vars in `style.css` | CSS vars in `style.css` | DaisyUI `data-theme` (mapped in `lib/theme.ts`) |
+| Sections dir | `src/components/sections/*.tsx` | `src/components/sections/*.vue` | `src/components/sections/*.tsx` |
+| Icons | `lucide-react` | `lucide-vue-next` | `lucide-solid` |
+| i18n helper | `lib/i18n.tsx` (React context) | `composables/useI18n.ts` (provide/inject) | `lib/i18n.tsx` (createContext + signal) |
+
+### Theme preset mapping
+
+The schema preset (`'cyberpunk' \| 'corporate' \| 'minimal'`) is framework-agnostic. Each variant maps it locally:
+
+| Preset | React / Vue (CSS vars) | Solid (DaisyUI `data-theme`) |
+|---|---|---|
+| `cyberpunk` | dark neon palette via `:root` | `synthwave` |
+| `corporate` | light blue palette | `corporate` |
+| `minimal` | light neutral palette | `light` |
+
+## DB / Env / API
+
+- DB table: `agent_boilerplates`. Three rows for `kind='landing'`:
+  - `name='landing-boilerplate'`        (React, seed row 60)
+  - `name='landing-vue-boilerplate'`    (Vue, seed row 88)
+  - `name='landing-solid-boilerplate'`  (Solid, seed row 123)
+- Constants for grep: `LANDING_REACT_BOILERPLATE_NAME`, `LANDING_VUE_BOILERPLATE_NAME`, `LANDING_SOLID_BOILERPLATE_NAME` in `pick-workflow-schema.ts`.
+- Env: same as React — `AGENTFLOW_INTERNAL` for the coder MCP gateway, `OPENROUTER_API_KEY` (via `useModel(ModelType.TEXT_LARGE)`) for `deriveLandingContent`.
+- Routes: no new routes — every variant rides on `POST /me/projects` + `POST /me/projects/:id/approve`.
+- Graph nodes (registered via `defaultRegistry.register()` side-effect from `handlers/index.ts`):
+  - `render_landing`        (React)
+  - `render_landing_vue`    (Vue)
+  - `render_landing_solid`  (Solid)
+  - `deploy_caddy`          (shared by all three)
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Solid boilerplate clone fails | `landing_solid_boilerplate_clone_failed:render_landing_solid` | `handlers/landing-solid.ts:193` — repo or network |
+| Solid `landing.config.ts` missing after clone | `landing_solid_boilerplate_clone_incomplete:render_landing_solid` | `handlers/landing-solid.ts:206` — boilerplate dirty |
+| Solid coder skipped, prefill skipped | `coder_landing_solid_did_nothing:render_landing_solid` | `handlers/landing-solid.ts:283` — `coder-landing-solid` preset not registered |
+| Solid file listed in `expects[]` not on disk | `coder_landing_solid_missing_expected_files:render_landing_solid` | `handlers/landing-solid.ts:294` — coder wrote wrong path |
+| Solid upstream BrandX/Acme survived | `coder_landing_solid_left_boilerplate:render_landing_solid` | `handlers/landing-solid.ts:304` — prefill missed |
+| Vue brief routed to React | grep `landing_react_default` in `project_events` when brief mentions Vue | `pick-workflow-schema.ts:185` — extend Vue regex |
+| Solid brief routed to Vue/React | grep `landing_react_default` / `landing_vue_route` when brief mentions `daisyui` | `pick-workflow-schema.ts:204` — extend Solid regex |
+| Vue boilerplate clone fails | `landing_vue_boilerplate_clone_failed:render_landing_vue` | `handlers/landing-vue.ts` — see `landing-vue-pipeline.mdx` |
+| React boilerplate clone fails | `landing_boilerplate_clone_failed:render_landing` | `handlers/landing.ts` — see `landing-shell.mdx` |
+
+## Test coverage
+
+`tests/services/pick-workflow-schema.test.ts` — 49 tests total, including:
+
+- React-default fallthrough on neutral briefs.
+- Vue routing on `vue 3`, `на vue`, `shadcn-vue`, bare `vue`.
+- Solid routing on `solidjs`, `на solid`, `solid + signals`, `daisyui`.
+- Vue+Solid combos: explicit `solidjs + daisyui` wins over Vue.
+- DB-row-missing fallthrough: Solid brief without Solid row → Vue if vue cues, else React.
+- Negative tests: `value proposition`, `solid plan`, `revue` — never route Vue/Solid.
+
+## Related
+
+- [`landing-shell`](/subsystems/landing-shell) — React variant deep-dive + Caddy deploy
+- [`landing-vue-pipeline`](/subsystems/landing-vue-pipeline) — Vue variant deep-dive (predecessor doc)
+- [`graph-handlers`](/subsystems/graph-handlers) — registry contract and walker
+- [`presets`](/subsystems/presets) — coder preset loading
+- [`caddy-preview`](/subsystems/caddy-preview) — `dist/` serving (single handler for all three)
+- Sister repos on GitHub:
+  - `lnlockly/landing-boilerplate`        (React 19)
+  - `lnlockly/landing-boilerplate-vue`    (Vue 3.5)
+  - `lnlockly/landing-boilerplate-solid`  (SolidJS 1.9 + DaisyUI 5)
