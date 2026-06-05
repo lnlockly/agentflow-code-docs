@@ -86,6 +86,10 @@ Dendrite pod mounts the registration Secret via `projected` volume — adding fu
 | `CREATE DATABASE` fails during bootstrap | `ERROR: CREATE DATABASE cannot run inside a transaction block` | Run the `CREATE USER` and `CREATE DATABASE` statements as separate `psql -c` calls (psql wraps a multi-statement `-c` in one txn). |
 | Bridge can't log a user in | `M_FORBIDDEN: appservice not registered` from Dendrite | Restart Dendrite after applying the appservice — registration files are loaded only at startup. |
 
+## Operator actions remaining
+
+1. **None** for the bridge to be up — it is `1/1 Running` and Dendrite has provisioned `@telegrambot:agentflow.website`.
+2. **For users to log in (Phase 4.C work):** ship the `/me/chat/telegram/login` flow in `agentflow-agents` that proxies to the bridge's `POST /_matrix/provision/v3/login` with each AF user's Matrix access_token.
 ## Multi-account management (shipped 2026-05-21)
 
 bridgev2 supports several Telegram logins per Matrix user. AgentFlow surfaces this through `/account/integrations/telegram` — a card-based panel where the user adds, removes, primes, and **labels** accounts without touching `!tg`-prefixed bot commands. Owners with two or more linked accounts see them grouped into per-login Matrix spaces inside Element (`bridge.personal_filtering_spaces: true`), and per-account labels (e.g. "Work", "Личный") render on the cabinet card so two contacts with the same name are distinguishable at a glance.
