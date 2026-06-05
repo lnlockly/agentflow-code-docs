@@ -48,7 +48,7 @@ For diagnosis-heavy tasks, spawn `intel-<topic>` agents that **do not write code
 At sprint end, spawn `red-final-demo` (or similar) — waits for everyone else to finish, validates artifacts on prod, sends honest delivery to the user (e.g. TG Saved Messages).
 
 ### 8. No false-PASS — dismiss immediately
-If an agent marks PASS on a product that diverges from the brief, fire it in chat: "FIRED. <reason>". Example: smoke-bot marked PASS on a bot replying with "Записал вопрос" when the brief was "AI Battle Royale". One false-PASS poisons the entire sprint.
+If an agent marks PASS on a product that diverges from the brief, fire it in chat: "FIRED. `<reason>`". Example: smoke-bot marked PASS on a bot replying with "Записал вопрос" when the brief was "AI Battle Royale". One false-PASS poisons the entire sprint.
 
 ### 9. Validation = curl + content + behaviour + LLM judge
 Not `status=done`. Required:

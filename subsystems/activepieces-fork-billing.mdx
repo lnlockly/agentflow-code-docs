@@ -1,0 +1,150 @@
+---
+title: "activepieces fork — engine-level billing/quota hook"
+description: "The lnlockly/agentflow-flows fork gates a flow run on the owner's AgentFlow balance before dispatch (hard block at zero) and debits the owner per production run. Flag-gated, idempotent, fail-closed gate + fail-soft debit."
+---
+
+# activepieces fork — engine-level billing/quota hook
+
+## TL;DR
+
+This is the reason AgentFlow forked activepieces (a webhook-meter wrapper can't
+hard-block spend at zero). Two minimal seams in the flow-run pipeline, both gated
+behind `AP_AGENTFLOW_BILLING_ENABLED` (default off → upstream-identical): a
+**pre-run balance gate** that blocks dispatch with HTTP 402 when the owner's
+AgentFlow balance is ≤ 0, and a **per-run debit** on terminal production runs.
+The fork is a CLIENT of agentflow-agents' internal billing API. The agents side
+exposes two `/internal/*` routes for it: the pre-existing balance read and the
+companion debit `POST /internal/flow-run-charge` (a thin idempotent `chargeFlat`
+wrapper). Owner identity comes from the AP project `externalId = 'af-<agentflowUserId>'`
+minted by the auth patch. All AgentFlow logic lives in one new file; the two hook
+insertions are one guarded call each → trivial rebase.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-flows/packages/server/api/src/app/flows/flow-run/agentflow-billing.ts:1` | NEW self-contained module: `assertOwnerHasBalance` (pre-run gate), `debitOwnerForRun` (post-run idempotent debit), `ownerUserIdFromExternalId`. Injectable HTTP client for unit tests. |
+| `agentflow-flows/packages/server/api/src/app/flows/flow-run/flow-run-service.ts:302` | Pre-run gate call `agentflowBilling.assertOwnerHasBalance({ projectId, log })` at the top of `start()`, before `queueOrCreateInstantly` / `addToQueue` |
+| `agentflow-flows/packages/server/api/src/app/flows/flow-run/flow-run-hooks.ts:25` | Per-run debit call `agentflowBilling.debitOwnerForRun(...)` in `onFinish()` for terminal PRODUCTION runs |
+| `agentflow-flows/packages/server/api/src/app/helper/system/system-props.ts:22` | New enum members: `AGENTFLOW_BILLING_ENABLED`, `AGENTFLOW_AGENTS_URL`, `AGENTFLOW_INTERNAL_SECRET`, `AGENTFLOW_RUN_PRICE_FLOW` |
+| `agentflow-flows/packages/server/api/src/app/helper/system/system.ts:24` | Fail-closed defaults `AGENTFLOW_BILLING_ENABLED='false'`, `AGENTFLOW_RUN_PRICE_FLOW='0.01'` |
+| `agentflow-flows/packages/server/api/src/app/helper/system-validator.ts:51` | Env validators for the new props (also adds the missing `AGENTFLOW_AUTH_ENABLED` validator the auth patch omitted — the validator map is a `Record<SystemProp,…>` so every enum member needs an entry or `tsc` fails) |
+| `agentflow-flows/packages/server/api/test/unit/app/flows/flow-run/agentflow-billing.test.ts:1` | 15 unit tests (mock balance/charge HTTP): zero→blocked, positive→runs+debits, retry→same idempotency key, flag off→no call, fail-closed gate, fail-soft debit |
+| `agentflow-agents/src/routes/internal.ts:388` | Reused balance-read endpoint `GET /internal/flow-balance/:userId` (unmodified) |
+| `agentflow-agents/src/routes/internal.ts:437` | **Companion debit endpoint `POST /internal/flow-run-charge`** — thin idempotent wrapper over `chargeFlat`, internal-secret guarded. This is the target the fork's per-run debit POSTs to. |
+| `agentflow-agents/src/services/flow-meter.ts:623` | `chargeFlat` — the positive-only, FOR-UPDATE-locked debit primitive the companion route reuses (no bespoke debit SQL in the route) |
+| `agentflow-agents/tests/internal-flow-run-charge.test.ts:1` | 9 tests: static contract guard (always runs in CI, no DB) + live-DB behavioural (401, bad body/user, first-charge, idempotent retry, insufficient→402, alias body, concurrent-race charged-once) |
+
+## Data flow
+
+```
+flow run dispatched
+   │  flowRunService.start({ projectId, ... })
+   ▼
+[AGENTFLOW_BILLING_ENABLED?] ──off──► (no call, upstream-identical)
+   │ on
+   ▼ resolve owner: projectService.getOne(projectId).externalId → "af-42" → 42
+   │  (not af-<int> → no-op; non-AgentFlow project)
+   ▼ GET {AGENTFLOW_AGENTS_URL}/internal/flow-balance/42   (x-agentflow-secret)
+   │       balance "Infinity" → allow (flow schema not migrated)
+   │       balance <= 0 / non-ok / transport error → throw QUOTA_EXCEEDED (402)  ◄── HARD BLOCK, surfaced
+   │       balance > 0 → allow
+   ▼ queueOrCreateInstantly + addToQueue   (run proceeds)
+   ▼ ... run executes ...
+   ▼ flowRunHooks.onFinish(flowRun)   [terminal state]
+[AGENTFLOW_BILLING_ENABLED? && environment===PRODUCTION]
+   │ on
+   ▼ POST {AGENTFLOW_AGENTS_URL}/internal/flow-run-charge   (x-agentflow-secret)
+        { user_id:42, amount_flow:"0.01", idempotency_key:"ap_run_<flowRun.id>",
+          project_external_id:"af-42", flow_run_id:<id> }
+        transport error → log + swallow (fail-SOFT; run already completed)
+```
+
+The pre-run gate is **fail-closed** (block if balance can't be confirmed); the
+post-run debit is **fail-soft** (never corrupt a completed run if the meter
+hiccups). The asymmetry is deliberate: block before spend, don't break after.
+
+## DB / Env / API
+
+- **Tables:** none new. Reuses agentflow-agents `flow_balances.usdf_balance` (read
+  via `getBalance`) + `flow_ledger` (write via `chargeFlat`). No AP entity / migration.
+- **Env (on the fork pod):**
+  - `AP_AGENTFLOW_BILLING_ENABLED` (`true`/unset; default off)
+  - `AP_AGENTFLOW_AGENTS_URL` (e.g. `http://agentflow-agents.franchise-factory:8080`)
+  - `AP_AGENTFLOW_INTERNAL_SECRET` (the shared `x-agentflow-secret` value)
+  - `AP_AGENTFLOW_RUN_PRICE_FLOW` (decimal string; default `0.01`)
+  - `AP_SSRF_ALLOW_LIST` must include the agents host (the URL resolves to a
+    private cluster IP; `safeHttp` rejects private IPs otherwise)
+- **Routes consumed (agentflow-agents, internal, `x-agentflow-secret`):**
+  - `GET /internal/flow-balance/:userId` → `{ ok, user_id, balance }` (EXISTS today)
+  - `POST /internal/flow-run-charge` → `{ ok, applied, charged, balance, balanceAfter }`
+    (**agents-side companion, BUILT** — `internal.ts:437`). Body
+    `{ user_id, amount_flow, idempotency_key, project_external_id?, flow_run_id? }`
+    (snake_case is canonical; `{ userId, amount, refExternal }` aliases accepted).
+    Reuses `chargeFlat` (kind `debit_other`, `refExternal = idempotency_key`,
+    `meta.source = 'ap_flow_run'`); `amount_flow` defaults to
+    `AP_AGENTFLOW_RUN_PRICE_FLOW` (env, default `0.01`) when omitted. **Idempotent**:
+    a per-key session advisory lock (`pg_advisory_lock(hashtext(idempotency_key))`
+    on a reserved connection) serialises concurrent retries, then a
+    `flow_ledger.meta->>'refExternal'` lookup short-circuits a duplicate →
+    `{ applied:false, idempotent:true }`, never a second debit. Insufficient
+    balance → HTTP 402 `insufficient_balance`, balance untouched.
+- **MCP tools:** none (server-to-server REST).
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Run blocked unexpectedly | `[agentflow-billing] insufficient balance — run blocked` | owner balance ≤ 0 in `flow_balances.usdf_balance` — top up |
+| Every run blocked with flag on | `[agentflow-billing] enabled but AGENTFLOW_AGENTS_URL / AGENTFLOW_INTERNAL_SECRET unset — blocking (fail-closed)` | set `AP_AGENTFLOW_AGENTS_URL` + `AP_AGENTFLOW_INTERNAL_SECRET` on the fork pod |
+| Run blocked on agents outage | `[agentflow-billing] balance check failed — blocking (fail-closed)` | agents pod down / network — fail-closed by design; restore agents |
+| Run blocked, balance call non-ok | `[agentflow-billing] balance check returned non-ok — blocking (fail-closed)` | check `x-agentflow-secret` matches; agents-side auth |
+| Run completes but no debit | `[agentflow-billing] debit failed (fail-soft, run already completed)` | the companion route returned 5xx — check the agents-side log below; replay from `flow_run` rows |
+| Companion charge 500s (agents side) | `[internal/flow-run-charge] charge failed` (`agentflow-agents/src/routes/internal.ts`) | DB/lock error — generic error returned, detail logged server-side; the run stays SUCCEEDED (fork swallows fail-soft) |
+
+(Fork log strings are greppable substrings of `agentflow-billing.ts`; the agents-side
+string is in `agentflow-agents/src/routes/internal.ts`.)
+
+## Security notes
+
+- **Flag-off = upstream-identical:** default `'false'`; both hooks early-return
+  before any HTTP call or owner resolution. No new public AP route.
+- **No bypass:** trust is the shared `x-agentflow-secret` over the internal
+  cluster network (same guard every other `/internal/*` consumer uses,
+  `agentflow-agents/src/middleware/auth.ts:398`). Secret read from env, never logged.
+- **Idempotent debit:** stable `ap_run_<flowRun.id>` key; the agents-side companion
+  (`internal.ts:437`) takes a per-key advisory lock then dedupes on
+  `flow_ledger.meta->>'refExternal'` → retries/resumes/concurrent re-fires can't
+  double-charge (proven by the concurrent-race test).
+- **Fail-closed gate / fail-soft debit:** block before spend if funds can't be
+  confirmed; don't corrupt a SUCCEEDED run if the post-charge call fails (bounded,
+  logged, reconcilable). The gate is the hard money guard.
+- **Tenant scoping:** the hook reads/charges only the run's own owner (resolved
+  from the run's project `externalId`), never another tenant.
+- **LLM = `flow` only:** this patch touches no AI piece config; LLM spend is metered
+  AgentFlow-side via the `flow` gateway into the SAME `flow_balances` pool the gate
+  reads, so the per-run flat fee does not double-count LLM tokens.
+
+## Verification status
+
+- **Fork unit tests:** 15/15 pass (vitest, mocked HTTP) — zero→blocked, positive→runs+debits,
+  retry→same key, flag off→no call, fail-closed gate, fail-soft debit.
+- **Fork build:** `turbo run build --filter=api` → 10/10 successful (CI-equivalent `tsc`).
+- **Companion route (agentflow-agents):** `POST /internal/flow-run-charge` BUILT +
+  tested. `npm run typecheck` + `npm run build` green (0 errors).
+  `tests/internal-flow-run-charge.test.ts` → 9/9 pass against real Postgres
+  (static contract guard always runs in CI even without a DB): first charge debits,
+  same key → no double-charge (exactly one ledger row, balance unchanged),
+  insufficient → 402 untouched, alias body charges, two concurrent same-key requests
+  → charged exactly once.
+- **LIVE e2e** (a real flow blocked + debited on a deployed fork pod, billing flag
+  ON) is **CAPACITY-GATED** (needs the fork image on a 2nd node — see MASTER §8
+  capacity block) and the owner must enable billing (`AP_AGENTFLOW_BILLING_ENABLED`)
+  after rotating `AP_BRIDGE_SECRET`. Deferred, not blocking. The companion endpoint
+  now EXISTS so the debit is no longer free-runs-on-fail-soft once the owner flips it on.
+
+## Related
+
+- [activepieces fork — native AgentFlow auth](/subsystems/activepieces-fork-auth)
+- Rebase map + full security review: `plans/autonomous/_ap-fork-billing.md`
+- MARKETPLACE-INTEGRATION.md seam 4 (billing meter)

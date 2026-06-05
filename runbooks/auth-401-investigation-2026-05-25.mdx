@@ -1,0 +1,109 @@
+---
+title: "Investigating 401s + re-auth loops"
+description: "Расследование 401-ответов на /auth/me и других защищённых маршрутах. Классификация причин, фильтр в ingress, серверный лог auth_reject."
+---
+
+# Investigating 401s + re-auth loops
+
+## TL;DR
+
+`requireSession` отдаёт 401 в шести разных ситуациях, но до 25 мая 2026 все они логировались одной строкой ответа (`{"ok":false,"error":"bad_session"}`) и не писались в серверный лог. Юзер видит «опять разлогинило», а оператору нечего грепать. Этот runbook фиксирует, как читать ingress + серверные логи, классифицировать причину и подтверждать, реальный это баг или фоновый шум от анонимных тыков в `/auth/me`.
+
+## Reason matrix
+
+| Body bytes | `reason` (после PR) | Что это значит | Действие |
+|---|---|---|---|
+| 38 | `unauthenticated` | Cookie не прислан вообще | Фоновой шум, фронт зовёт `/auth/me` на каждой загрузке. Норма. |
+| 34 | `bad_session` + `reason=jwt_expired` | JWT истёк (`exp` < `now`) | TTL 7 дней. Норма раз в неделю на юзера. Всплеск = ротация cookie / clock skew. |
+| 34 | `bad_session` + `reason=jwt_invalid_signature` | Подпись чужая | Smoking gun ротации `AUTH_JWT_SECRET` или утечки старого cookie. Сверить hash секрета между `agentflow-agents` и `agentflow-api`. |
+| 34 | `bad_session` + `reason=jwt_malformed` | Cookie битый (не три сегмента / не base64) | Юзер прислал мусор. Если массово — проверить proxy/CDN/Cloudflare worker, который мог покромсать cookie. |
+| 34 | `bad_session` + `reason=jwt_not_before` | `nbf` в будущем | Никто не выставляет `nbf` — если появится, баг при подписи. |
+| 34 | `session_revoked` | `claims.rev < auth_settings.jwt_revision` | Owner дёрнул emergency revoke. Юзеры идут на повторный логин. |
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/middleware/auth.ts:244` | `requireSession` catch блок: `classifyJwtError` → `reason` + `auth_reject` лог. |
+| `agentflow-agents/src/middleware/auth.ts:286` | `classifyJwtError` — мапит `TokenExpiredError`/`JsonWebTokenError`/`NotBeforeError` в `reason`. |
+| `agentflow-agents/src/middleware/auth.ts:304` | `decodeSubUnsafe` — best-effort base64 декод payload'а, чтобы достать `sub` в лог без verify. |
+| `agentflow-agents/src/middleware/auth.ts:316` | `logAuthReject` — единственная строка `auth_reject reason=… source=… sub=… ip=… route=…`. |
+
+## Data flow
+
+```
+Browser → Cloudflare → ingress-nginx → agentflow-agents (port 4100) → requireSession
+                                                            │
+                                                            ├─ jwt.verify ok → next()
+                                                            ├─ no token → 401 unauthenticated
+                                                            ├─ bad shape → 401 bad_session (reason=bad_session_shape)
+                                                            ├─ rev mismatch → 401 session_revoked
+                                                            └─ jwt.verify throw → classifyJwtError(err)
+                                                                                  └─ 401 bad_session + reason=<жил-был>
+                                                                                  → console.warn auth_reject …
+```
+
+## Расследование (рецепт)
+
+1. **Сколько 401 за окно** (ingress):
+   ```bash
+   ssh -T -o ExitOnForwardFailure=no ff-france \
+     'kubectl -n ingress-nginx logs ingress-nginx-controller-dbfb7cdc7-9qcc2 --since=4h --tail=200000 \
+        | awk "\$9==401" | wc -l'
+   ```
+2. **Распределение по path** (ingress):
+   ```bash
+   ssh -T -o ExitOnForwardFailure=no ff-france \
+     'kubectl -n ingress-nginx logs ingress-nginx-controller-dbfb7cdc7-9qcc2 --since=4h --tail=200000 \
+        | awk "\$9==401" | awk -F\" "{print \$2}" | awk "{print \$2}" | sort | uniq -c | sort -rn'
+   ```
+   Если 100% — `/auth/me`, это бутстрап-проба `AuthProvider`, а не баг.
+3. **Различить `unauthenticated` vs `bad_session`** через размер тела:
+   - 38 байт — нет cookie (норма).
+   - 34 байта — cookie есть, но не проходит verify (реальный re-auth signal).
+4. **Серверный лог** (после PR):
+   ```bash
+   ssh -T -o ExitOnForwardFailure=no ff-france \
+     'kubectl -n franchise-factory logs deploy/agentflow-agents --since=4h --tail=200000 \
+        | grep auth_reject | awk "{print \$2}" | sort | uniq -c | sort -rn'
+   ```
+   `reason=jwt_expired` сам по себе ничего не значит. `reason=jwt_invalid_signature` → инцидент.
+5. **Топ пострадавших юзеров**:
+   ```bash
+   ssh -T -o ExitOnForwardFailure=no ff-france \
+     'kubectl -n franchise-factory logs deploy/agentflow-agents --since=4h --tail=200000 \
+        | grep auth_reject | grep -oE "sub=[0-9]+" | sort | uniq -c | sort -rn | head -20'
+   ```
+6. **Если один и тот же `sub`** ловит `jwt_expired` чаще, чем раз в `SESSION_TTL_SECONDS` (7 дней) — проверить, не мусорит ли клиент cookie через `document.cookie = …` после `Set-Cookie`. Браузер может держать два значения одной cookie на двух доменах (`agentflow.website` host-only vs `.agentflow.website` parent), и читать stale первым.
+
+## Известные источники 401-шума
+
+- `/auth/me` от анонимного посетителя — это **ожидаемое** поведение `AuthProvider` при первом mount.
+- `Referer: /auth/telegram?next=…` в ingress-логе — юзер пошёл логиниться, фронт ещё не дождался `Set-Cookie`. Норма.
+- Cloudflare кеширует `/auth/me` на edge **никогда** (через `cache-control: private`) — если кто-то увидит cached 200, это баг в политике.
+
+## Что было найдено 25 мая 2026
+
+За 24 часа в ingress: **62 375 запросов, 28 401**, все до одного — `GET /_agents/auth/me`. Из них 25 имели тело 34 байта (`bad_session`), 3 имели тело 0 (вырезано CRLF при grep).
+
+- Все 28 в одном часе (16:00 UTC).
+- 5 уникальных IP (Cloudflare edge), 4 разных user-agent.
+- Без серверного `console.warn` нельзя различить `jwt_expired` от `jwt_invalid_signature`.
+- Hash секрета `AUTH_JWT_SECRET` совпадает между `agentflow-agents` и `agentflow-api` (`067b4a4eb164e17b2c5f2402e9cd343374729ee4a90f359b314a8eb3a7d72ba4`) — ротации не было.
+- `SESSION_COOKIE_DOMAIN=.agentflow.website` совпадает.
+
+Вывод: реального бага нет, но диагностический blind spot был. PR `lnlockly/agentflow-agents#XXX` (auth-reject classification) закрывает его — после деплоя следующий жалующийся юзер даст конкретную причину в логах.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Юзеров массово выкидывает после деплоя | `auth_reject reason=jwt_invalid_signature` (десятки в минуту) | Сверить hash `AUTH_JWT_SECRET` между `agentflow-agents` и `agentflow-api`. Откатить ротацию. |
+| Юзер залогинился, но `/auth/me` сразу 401 | `auth_reject reason=jwt_malformed source=cookie` | Проверить, не пишет ли клиент свою cookie через `document.cookie =` (видно в DevTools → Application → Cookies два значения `af_session`). |
+| Тишина после revoke | `auth_reject reason=session_revoked` | Это ожидаемое поведение. Не чинить — юзеры повторно логинятся. |
+| `/auth/me` 401 при наличии cookie в браузере | сравнить `bytes=34` (есть cookie, fail verify) vs `bytes=38` (cookie не отправлен) | Если 38 — cookie host-only / cross-site. Проверить `SameSite`, `Domain`, `Secure`. |
+
+## Related
+
+- [Auth + access](/subsystems/auth-and-access)
+- [`agentflow-agents/src/middleware/auth.ts`](https://github.com/lnlockly/agentflow-agents/blob/main/src/middleware/auth.ts)

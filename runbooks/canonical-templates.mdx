@@ -63,6 +63,10 @@ Two slot syntaxes — coder MUST replace both before audit passes:
 `brief.title`, `brief.nav_home`, `brief.nav_about`, `brief.home_title`/`_body`, `brief.about_title`/`_body`. Procfile uses `npx serve -s dist` so subpaths 200 instead of 404 (python3 `http.server` breaks SPA history-mode routing).
 
 **Layout contract** (fix `fix/spa-monorepo-layout-2026-05-18`): single-package `/workspace/frontend/` (Vite SPA) + `/workspace/backend/.gitkeep` placeholder. NO Turborepo, NO `pnpm-workspace.yaml`, NO `apps/*`. The 6-node `webapp-full` graph writes into `backend/src/*` (Nest server) and `frontend/src/pages/admin/*` (admin React pages inside the same Vite project). `handlers/spa.ts` injects a LAYOUT_DIRECTIVE into every coder brief and throws `<kind>_apps_dir_forbidden` if the coder writes `apps/*`. See [spa-scaffold](/subsystems/spa-scaffold).
+Layout (PR fix/spa-monorepo-layout-2026-05-18 / spec `docs/specs/2026-05-18-spa-layout-fix.md`):
+- `/workspace/frontend/` — Vite SPA (canonical, react-router, 2 pages + Layout outlet).
+- `/workspace/backend/.gitkeep` — empty placeholder so `coder-backend` has a target dir for `scaffold_nest` / `scaffold_prisma` / `jwt_auth` / `billing_stripe` / `multi_tenant`. Without this the coder drifts into `/workspace/apps/backend/` (preset's old `webapp-boilerplate` trail) and the frontend-only Procfile build ships an empty bundle.
+- `apps/*` is forbidden — `handlers/spa.ts` throws `<kind>_apps_dir_forbidden` if the coder writes there.
 
 ### tg_bot
 `brief.start_greeting`, `brief.help_reply`, `brief.about_reply`, `brief.system_prompt`, `brief.fallback_reply`. Commands beyond `/help` and `/about` are added by appending to `backend/commands.py::COMMAND_REGISTRY` — `bot.py` auto-registers them at startup.
@@ -88,6 +92,7 @@ See `architecture/visitka-tg-profile.mdx`. Existing scaffold (PR #222), unchange
 | Coder shipped unresolved slots | `<!-- SLOT:brief.` in `/workspace/frontend` | audit must call `listUnresolvedSlots` per file before marking `done` |
 | SPA subpath returns 404 | `python3 -m http.server` in `Procfile` of spa kind | spa Procfile must use `npx serve -s dist -l 8080` |
 | SPA preview shows empty 420-byte bundle (`<div id="root"></div>` only) | `spa_bundle_too_small` in `landing_gate_fail`; coder reply lists `apps/frontend/src/*` paths | Layout drift — scaffold lays single-package `frontend/` but coder wrote `apps/*` (Turborepo). Fix `fix/spa-monorepo-layout-2026-05-18` adds `backend/.gitkeep`, LAYOUT_DIRECTIVE in `handlers/spa.ts`, and `<kind>_apps_dir_forbidden` gate. See [spa-scaffold](/subsystems/spa-scaffold). |
+| SPA preview ships empty `<div id="root"></div>` (project 1001 `5f3i5l4e`) | `spa_bundle_too_small` in `landing_gate_fail`; coder reply lists `apps/frontend/src/pages/*.tsx` | Coder wrote into `/workspace/apps/*` (preset trained on a never-applied `webapp-boilerplate`). Fixed by `handlers/spa.ts` rewriting briefs to explicit `backend/...` + `frontend/...` paths + `<kind>_apps_dir_forbidden` gate; `presets/coder-spa.json` purged of `apps/*` references; `spa-scaffold.ts` ships `backend/.gitkeep`. See `docs/specs/2026-05-18-spa-layout-fix.md`. |
 | Mini App white-screen | `window.Telegram.WebApp is undefined` in browser console | `index.html` must load `telegram-web-app.js` synchronously |
 
 ## Related
