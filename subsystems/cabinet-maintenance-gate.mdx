@@ -1,0 +1,63 @@
+---
+title: "Cabinet maintenance gate"
+description: "Frontend-only gate that hides the authenticated cabinet behind an admin allowlist (default user ids [1, 2]); every other logged-in user sees a full-page «Идут технические работы» screen. Public pages (landing, login, register, auth) stay open."
+---
+
+# Cabinet maintenance gate
+
+## TL;DR
+
+While the cabinet is closed for «технические работы», only the admin allowlist (`ADMIN_USER_IDS`, default `[1, 2]`) reaches the real authenticated surface. `RequireAuth` adds one check after its existing `isAuthenticated` branch: if the logged-in `user.id` is not in the allowlist, it renders the full-page `MaintenanceGate` instead of `children`. The gate is purely frontend — the login flow itself is never blocked, so non-admins can still sign in and then land on the maintenance screen. Public routes (`/`, `/login`, `/register`, `/auth/*`) are not wrapped in `RequireAuth`, so they stay open for everyone.
+
+The allowlist is editable in one const and overridable at build time via `VITE_ADMIN_USER_IDS` (comma list). To reopen the cabinet, widen the allowlist or remove the `isAdminUser` branch in `RequireAuth`.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/lib/adminAllowlist.ts:15` | `DEFAULT_ADMIN_USER_IDS = [1, 2]` — the single editable allowlist. |
+| `agentflow-landing/src/lib/adminAllowlist.ts:22` | `parseAdminIds` — parses a comma-separated id list; drops non-positive / non-integer tokens; returns `null` when nothing usable parses. |
+| `agentflow-landing/src/lib/adminAllowlist.ts:35` | `ADMIN_USER_IDS` — active list; build-time override via `VITE_ADMIN_USER_IDS` wins when it parses, else the default. |
+| `agentflow-landing/src/lib/adminAllowlist.ts:46` | `isAdminUser(id, allowlist?)` — nullish / non-integer id is never admin. |
+| `agentflow-landing/src/components/auth/RequireAuth.tsx:188` | `if (!isAdminUser(user?.id)) return <MaintenanceGate />;` — the gate, placed AFTER the loading + `!isAuthenticated` branches and BEFORE `return <>{children}</>`. |
+| `agentflow-landing/src/components/auth/MaintenanceGate.tsx:19` | `MaintenanceGate` — centered full-height screen; soft-green `#4cb782` accent; `useAuth().logout` action; i18n title/body/logout. |
+| `agentflow-landing/src/i18n/ru.json` | `app.maintenance.title` / `.body` / `.logout` (also en.json, zh.json). ru body: «Идут технические работы. Личный кабинет скоро снова откроется.» |
+| `agentflow-landing/tests/cabinet-maintenance-gate.test.mjs` | Source-introspection test: non-admin id → gate, admin id (1/2) → pass, public routes ungated, soft-green-only, i18n in all three locales. |
+
+## Data flow
+
+```
+Authenticated request to a private route (/cabinet*, /projects*, /my/*, …)
+   ↓
+<RequireAuth> (src/main.tsx wraps every private route)
+   ↓
+isLoading          → spinner
+!isAuthenticated   → inline «Войти» panel (login flow stays open)
+   ↓
+isAdminUser(user.id)?
+   ├─ false → <MaintenanceGate />  («Идут технические работы» + logout)
+   └─ true  → <>{children}</>      (real cabinet surface, unchanged)
+
+Public routes ( / , /login , /register , /auth/* ) are NOT wrapped in
+RequireAuth → never reach this gate.
+```
+
+## DB / Env / API
+
+- **Tables:** none — gate is frontend-only. The user id comes from `useAuth().user.id`, sourced from `agentflow-agents GET /auth/me`.
+- **Env:** `VITE_ADMIN_USER_IDS` (optional, build-time; comma list e.g. `1,2,7`). Empty / malformed → falls back to `[1, 2]`.
+- **Routes:** none added. The gate keys off the existing `RequireAuth` wrapper in `agentflow-landing/src/main.tsx`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Admin (id 1/2) sees the maintenance page | (no log — render check; reproduce with `isAdminUser(1)` returning false) | `agentflow-landing/src/lib/adminAllowlist.ts:30` — confirm `DEFAULT_ADMIN_USER_IDS` and that no bad `VITE_ADMIN_USER_IDS` override is set. |
+| Non-admin reaches the cabinet | `isAdminUser(user?.id)` | `agentflow-landing/src/components/auth/RequireAuth.tsx:188` — branch must run before `return <>{children}</>`. |
+| Login / register page blocked | `RequireAuth` wrapping a public route | `agentflow-landing/src/main.tsx` — `/`, `/login`, `/register`, `/auth/*` must NOT be wrapped in `<RequireAuth>`. |
+| Raw i18n key shown (`app.maintenance.title`) | `app.maintenance.` | add the three keys to `agentflow-landing/src/i18n/{ru,en,zh}.json`. |
+
+## Related
+
+- [Auth + access](/subsystems/auth-and-access) — `useAuth` / `GET /auth/me` that supplies `user.id`.
+- [TG beta gate](/subsystems/beta-gate) — the backend closed-beta gate; the maintenance gate is its frontend cabinet analogue.
