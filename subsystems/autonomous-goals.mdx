@@ -1,0 +1,153 @@
+---
+title: "Autonomous Goals (Phase 0)"
+description: "Goal → milestones → daily plan → reflection loop. Desktop SQLite + server Postgres mirror + cabinet panel."
+---
+
+# Autonomous Goals (Phase 0)
+
+## TL;DR
+A two-store goal engine. The desktop daemon keeps an authoritative local SQLite (`~/.agentflow/autonomous.db`) wired to a CLI, while `agentflow-agents` mirrors the same shape in Postgres and runs a UTC-scheduled wake/reflect worker that drops one task per goal into `device_tasks` for the user's primary device. The cabinet UI reads the Postgres copy through `/me/autonomous/*` and renders inside the device detail page (`DeviceAutonomousPanel`), not as a standalone route.
+
+## Files (with line refs)
+
+### Desktop daemon (Python — `agentflow-computer-mcp`)
+| Path | Role |
+|---|---|
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/schema.py:19` | `SCHEMA_SQL` — 7 SQLite tables (goals, milestones, daily_plans, lessons, skills, budget_ledger, sub_agents) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/schema.py:140` | `init_db(path)` — idempotent migration, default `~/.agentflow/autonomous.db` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/planner.py:30` | `DEFAULT_LLM_URL` → `https://agentflow.website/_agents/llm/v1/messages` (Anthropic shape, `x-api-key` from `~/.agentflow/auth.json`) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/planner.py:175` | `decompose_goal` — LLM splits a goal into 5-12 milestones, persists, returns rows |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/planner.py:253` | `plan_today` — milestone → up to 8 tasks `{tool, objective, acceptance}` JSON |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/planner.py:323` | `reflect_on_day` — scores 1-10, extracts lessons + skills, updates `daily_plans.reflection` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/memory.py:64` | `recall(topic, limit)` — token-overlap ranked lessons (no embeddings in v1) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/memory.py:99` | `record_skill` — upsert by name, success counter starts at 1 |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/memory.py:142` | `top_skills` — skills with `fail_count > 2*success_count` are filtered out (auto-decay) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/wake_cycle.py:108` | `wake(now, ...)` — per-active-goal: find current milestone → `plan_today` → dispatch each task via `POST /me/devices/<id>/dispatch_task` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/wake_cycle.py:178` | `sleep_reflect` — for each plan with score ≥7 mark its milestone `completed` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/wake_cycle.py:218` | `run_forever` — 60s tick loop, fires once per day at `wake_hour:wake_minute` (default 07:30) and `sleep_hour:sleep_minute` (default 23:00) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/budget.py:27` | `_PRICE_TABLE` — USD per 1M tokens per model (Opus 4.7, Sonnet 4.6, Haiku 4.5, gpt-5.5) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/budget.py:56` | `record_llm_cost` — every planner call funnels through here |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/budget.py:99` | `today_spent` — sums `budget_ledger` by `kind` for UTC-current-day |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/budget.py:119` | `alert_if_over` — over cap → enqueue `system_alert` task on device |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/cli.py:145` | `build_parser` — `init / goal add\|list / plan --decompose / today / reflect / status` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/cli.py:34` | `_load_api_key_and_device` — reads `api_key` + `device_id` from `~/.agentflow/auth.json` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/sub_agents.py:1` | Phase-0 stub — records `sub_agents` rows, executor lands in Phase 2 |
+
+### Server mirror (`agentflow-agents`, Postgres)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-autonomous.ts:349` | `GET /me/autonomous/goals` — list owned goals + milestone counts |
+| `agentflow-agents/src/routes/me-autonomous.ts:378` | `POST /me/autonomous/goals` — Zod-validated create, returns `{ok, goal}` 201 |
+| `agentflow-agents/src/routes/me-autonomous.ts:417` | `GET /me/autonomous/goals/:id` — goal + milestones + last 30 daily plans + last 20 lessons |
+| `agentflow-agents/src/routes/me-autonomous.ts:463` | `PATCH /me/autonomous/goals/:id` — `COALESCE`-style partial update |
+| `agentflow-agents/src/routes/me-autonomous.ts:512` | `DELETE /me/autonomous/goals/:id` — cascades via FK |
+| `agentflow-agents/src/routes/me-autonomous.ts:527` | `POST /me/autonomous/goals/:id/decompose` — LLM milestones, 502 `llm_call_failed` or `no_milestones` |
+| `agentflow-agents/src/routes/me-autonomous.ts:633` | `POST /me/autonomous/goals/:id/plan_today` — LLM tasks → `device_tasks` row for `device_id` (or primary) |
+| `agentflow-agents/src/routes/me-autonomous.ts:735` | `POST /me/autonomous/goals/:id/pause` → status `paused` |
+| `agentflow-agents/src/routes/me-autonomous.ts:751` | `POST /me/autonomous/goals/:id/resume` — 404 `not_found_or_not_paused` if status was not `paused` |
+| `agentflow-agents/src/routes/me-autonomous.ts:767` | `GET /me/autonomous/budget` — today + last-7d roll-ups |
+| `agentflow-agents/src/services/autonomous-worker.ts:41` | `wakeHourUtc()` — reads `AUTONOMOUS_WAKE_HOUR_UTC`, defaults `4` (≈07:00 MSK) |
+| `agentflow-agents/src/services/autonomous-worker.ts:39` | `REFLECT_HOUR_UTC = 23` — end-of-day reflection pass |
+| `agentflow-agents/src/services/autonomous-worker.ts:105` | `fetchActiveGoalsWithoutTodaysPlan` — joins `autonomous_daily_plans` to skip already-planned goals |
+| `agentflow-agents/src/services/autonomous-worker.ts:175` | `runWakePass` — per goal: plan → insert plan row → enqueue first task into `device_tasks` |
+| `agentflow-agents/src/services/autonomous-worker.ts:295` | `runReflectionPass` — `ModelType.TEXT_LARGE`, strict JSON `{reflection, score 0-10}` |
+| `agentflow-agents/src/services/autonomous-worker.ts:368` | `tick()` — 60s loop, idempotent via `dayKey:wake\|reflect` tag |
+| `agentflow-agents/src/services/autonomous-worker.ts:390` | `startAutonomousWorker()` — wired from `src/server.ts` |
+| `agentflow-agents/src/services/autonomous-auto-pause.ts:38` | `shouldAutoPause(scores)` — pure decision: ≥3 non-null scores all ≤3 → pause |
+| `agentflow-agents/src/services/autonomous-auto-pause.ts:130` | `maybeAutoPauseGoal(goalId, sql)` — idempotent `UPDATE … WHERE status='active' RETURNING` + owner TG notify |
+| `agentflow-agents/src/services/autonomous-auto-pause.ts:91` | `notifyOwnerAutoPause(title)` — POST to owner-notify bot (`8706270502:…`), `text` field, chat `1361064246` |
+| `agentflow-agents/migrations/2026-05-24b-autonomous-goals-auto-pause.sql` | ALTER autonomous_goals ADD paused_at, pause_reason + partial index |
+| `agentflow-agents/src/db/schema.ts:3842` | `autonomous_goals` table |
+| `agentflow-agents/src/db/schema.ts:3870` | `autonomous_milestones` table |
+| `agentflow-agents/src/db/schema.ts:3896` | `autonomous_daily_plans` table |
+| `agentflow-agents/src/db/schema.ts:3917` | `autonomous_lessons` table |
+| `agentflow-agents/src/db/schema.ts:3943` | `autonomous_skills` table |
+| `agentflow-agents/src/db/schema.ts:3960` | `autonomous_budget_ledger` table |
+
+### Cabinet UI (read-side)
+See [Cabinet Device Autonomous Tab](/subsystems/cabinet-device-autonomous-tab).
+
+## Data flow
+
+```
+~/.agentflow/auth.json     desktop daemon                 agentflow-agents (pod)            Postgres
+  (api_key, device_id)            │                              │                              │
+                                  │ CLI: cli.py plan --decompose │                              │
+                                  ├── planner._default_llm_fn ──►│ /llm/v1/messages             │
+                                  │ ◄── milestones JSON ─────────│                              │
+                                  │ INSERT goals + milestones  ──┼─────────────────────────────►│ sqlite (local)
+                                  │                              │                              │
+       UTC wake_hour ─────────────┼──── runWakePass() ──────────►│ fetchActiveGoalsWithoutTodaysPlan
+                                  │                              │ llmPlanToday → useModel(TEXT_LARGE)
+                                  │                              │ INSERT autonomous_daily_plans
+                                  │                              │ INSERT device_tasks (queued)
+                                  │                              │                              │
+       desktop daemon polls ──────┼── GET /me/devices/:id/queued_tasks ─────────────────────────►│
+                                  │ ◄── task payload ────────────│                              │
+                                  │ runs task in driver loop     │                              │
+                                  │                              │                              │
+       UTC 23:00 ─────────────────┼──── runReflectionPass() ────►│ for each unreflected today's │
+                                  │                              │ plan: useModel(TEXT_LARGE)   │
+                                  │                              │ UPDATE reflection, score     │
+                                  │                              │ ─► maybeAutoPauseGoal:       │
+                                  │                              │     last 3 scores all ≤ 3?   │
+                                  │                              │     UPDATE goals SET         │
+                                  │                              │       status='paused'        │
+                                  │                              │       pause_reason='low_…'   │
+                                  │                              │     POST api.telegram.org    │
+                                  │                              │       /bot…/sendMessage      │
+                                  │                              │       {chat_id, text}        │
+                                  │                              │                              │
+       cabinet (CabinetDeviceDetail#tab=autonomous)              │                              │
+                                  ◄────── GET /me/autonomous/goals ──────────────────────────────│
+                                  ◄────── GET /me/autonomous/goals/:id, /budget ─────────────────│
+```
+
+## DB / Env / API
+
+- **SQLite (desktop)** — `~/.agentflow/autonomous.db`, 7 tables (see `schema.py:19`).
+- **Postgres (server)** — 6 mirror tables under `autonomous_*` (no `sub_agents` mirror in Phase 0).
+- **Env**:
+  - `AUTONOMOUS_WAKE_HOUR_UTC` (server, optional, integer 0-23, default `4`)
+  - `AF_UPDATE_INTERVAL_MIN` — orthogonal, used by the desktop self-updater
+  - desktop reads `api_key` + `device_id` from `~/.agentflow/auth.json`
+- **Routes** (auth: `requireSession` — cookie / API key / bearer):
+  - `GET    /me/autonomous/goals`
+  - `POST   /me/autonomous/goals` → 201 / 400 `invalid_body`
+  - `GET    /me/autonomous/goals/:id` → 200 / 404 `not_found`
+  - `PATCH  /me/autonomous/goals/:id`
+  - `DELETE /me/autonomous/goals/:id`
+  - `POST   /me/autonomous/goals/:id/decompose` → 202 / 502 `llm_call_failed` / 502 `no_milestones`
+  - `POST   /me/autonomous/goals/:id/plan_today` (body `{device_id?}`) → 202 `{plan, dispatched_task_id}` / 502 `llm_call_failed`
+  - `POST   /me/autonomous/goals/:id/pause`
+  - `POST   /me/autonomous/goals/:id/resume` → 404 `not_found_or_not_paused`
+  - `GET    /me/autonomous/budget`
+- **CLI entry**: `python -m agentflow_computer_mcp.autonomous.cli {init|goal|plan|today|reflect|status}`
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Wake worker plans for a user with no active milestone | `wake_skipped_no_milestone` | `agentflow-agents/src/services/autonomous-worker.ts:187` — expected; surface as empty state in cabinet |
+| Wake worker can't dispatch because user has no device | `wake_dispatched_skipped_no_device` | `agentflow-agents/src/services/autonomous-worker.ts:218` — user must link a device via cabinet |
+| Single goal blows up the wake pass | `wake_goal_failed` | `agentflow-agents/src/services/autonomous-worker.ts:242` — inspect `err` field; loop continues for remaining goals |
+| End-of-day reflection silently fails | `reflection_failed` | `agentflow-agents/src/services/autonomous-worker.ts:349` — LLM call or `JSON.parse` exception; row stays `reflection IS NULL` for re-attempt next tick |
+| Whole tick crashed (cron-style) | `autonomous_tick_failed` | `agentflow-agents/src/services/autonomous-worker.ts:397` — the loop survives; check error text |
+| `/me/autonomous/goals/:id/decompose` returns 502 | none (synchronous response) | response `{error: 'llm_call_failed'\|'no_milestones'}` — LLM call rejected JSON; check `ai-router` health |
+| Desktop CLI `plan --decompose` exits 2 with no LLM call | `[autonomous] no api_key in ~/.agentflow/auth.json` | `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/cli.py:49` — re-run install flow to write `auth.json` |
+| Daemon `wake_cycle.run_forever` keeps logging tick failures | `wake_cycle tick failed:` | `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/wake_cycle.py:272` — exception in `wake()` or `sleep_reflect()`; loop continues so the daemon never dies |
+| Daemon failed to dispatch a planned task | error field `http <code>` returned from `dispatch_task_to_device` | `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/wake_cycle.py:97` — 4xx means API key or device ownership; 5xx means agentflow-agents pod issue |
+| Reflection LLM emitted prose, not JSON | `reflection_failed` AND row has non-null `reflection` text but `score IS NULL` | server-side fallback at `autonomous-worker.ts:336` stores raw text; the next reflection pass re-runs because score gate is independent |
+| Budget alert never fires though spend > cap | none — `alert_if_over` returns `{triggered:true, dispatched:false, error:"no device_id/api_key wired"}` | `agentflow-computer-mcp/src/agentflow_computer_mcp/autonomous/budget.py:139` — daemon was started without `auth.json`; rerun installer |
+| Goals show 0 milestones in cabinet though decompose succeeded | none | check `autonomous_milestones.user_id` matches caller — `persistMilestones` writes per-user, cross-user reads are blocked by the `WHERE user_id =` clause |
+| Goal card renders `NaN / NaN ступенек` or bare `target_value` without unit | none — pure UI; reproduces on any fresh goal where `milestone_count`/`completed_count` are null and `target_metric` is empty | `agentflow-landing/src/components/devices/DeviceAutonomousPanel.tsx` uses `deriveMilestoneProgress` + `formatTargetValue` from `agentflow-landing/src/lib/autonomousGoalFormat.ts` — null counts collapse to 0 with «Декомпозиция готовится…»; USD/RUB/EUR/% get unit suffixes; empty metric hides the «метрика:» row |
+| Goal auto-paused after 3 low-score days | `autonomous_goal_auto_paused` | expected — `agentflow-agents/src/services/autonomous-worker.ts` reflection-pass tail. Owner gets a TG ping. Resume from cabinet or `POST /me/autonomous/goals/:id/resume`. |
+| Auto-pause flipped status but owner never got the TG | `auto_pause_notify_failed` | `agentflow-agents/src/services/autonomous-auto-pause.ts:91` — TG outage or wrong bot token. Goal is already paused; manually verify and resend via the bot CLI. |
+| Auto-pause SELECT/UPDATE blew up | `auto_pause_check_failed` | `agentflow-agents/src/services/autonomous-worker.ts` — sweep is wrapped per-goal; reflection pass survives. Inspect `err`. |
+
+## Related
+- [Desktop / Computer-Agent bridge](/subsystems/computer-mcp) — same daemon, transport layer
+- [Cabinet Device Autonomous Tab](/subsystems/cabinet-device-autonomous-tab) — UI consumer
+- [Desktop Auto-Updater](/subsystems/desktop-auto-updater) — same Mac daemon, no-API tag detection
+- [LLM Router](/subsystems/llm-router) — `useModel(ModelType.TEXT_LARGE)` used by the worker
+- [Auth and Access](/subsystems/auth-and-access) — `requireSession` middleware

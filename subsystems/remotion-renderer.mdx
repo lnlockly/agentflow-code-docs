@@ -32,7 +32,7 @@ preset that uses the tool.
 | `agentflow-agents/.github/workflows/build-remotion-runner.yml` | Builds + pushes `ghcr.io/lnlockly/agentflow-remotion-runner` on `remotion-runner/**` changes. |
 | `agentflow-agents/src/mcp-servers/video/index.ts` | `@agentflow-video` MCP server. Exposes `remotion.render` — POSTs to `${REMOTION_RUNNER_URL}/render`, 5-min timeout, passes runner envelope through. |
 | `agentflow-agents/src/mcp-servers/video/index.test.ts` | Unit tests — registry shape, missing-url branch, happy path, runner 4xx, empty `composition_id`, non-json reply. |
-| `agentflow-agents/src/routes/internal-mcp.ts:VIDEO_PATHS` | Owner-pinned mount at `/internal/mcp/video/?token=…&owner=<uid>`. |
+| `agentflow-agents/src/routes/internal-mcp.ts:VIDEO_PATHS` | Owner-pinned mount at `/internal/mcp/video/?owner=<uid>` with the `x-mcp-auth` header (secret is header-only, SECURITY.md M-3). |
 | `agentflow-agents/src/services/internal-mcp-resolver.ts:INTERNAL_MCPS` | `'video'` whitelisted for `${AGENTFLOW_INTERNAL}` placeholder substitution. |
 | `agentflow-agents/src/services/env.ts:remotionRunnerUrl` | Reads `REMOTION_RUNNER_URL`; defaults to empty so the tool refuses with `remotion_runner_not_configured` instead of hung fetch. |
 | `agentflow-agents/k8s/agentflow-agents.yaml:REMOTION_RUNNER_URL` | `http://agentflow-remotion-runner:4200` on the api Deployment. Workers don't call the MCP. |
@@ -74,7 +74,7 @@ agentflow-agents pod  ──POST /render──►  agentflow-remotion-runner pod
   - `GET  /health` → `{ok:true, service:'remotion-runner'}`
   - `POST /render` → `{ok, mp4_url, composition_id, duration_sec, size_bytes, render_ms}` or `{ok:false, error, details?}`
 - **Routes (agents pod):**
-  - `POST /internal/mcp/video/?token=<INTERNAL_API_SECRET>&owner=<uid>` — JSON-RPC streamable-http MCP. `initialize`, `tools/list`, `tools/call`. Owner-pinned.
+  - `POST /internal/mcp/video/?owner=<uid>` with the `x-mcp-auth: <INTERNAL_API_SECRET>` header — JSON-RPC streamable-http MCP. `initialize`, `tools/list`, `tools/call`. Owner-pinned. The secret is HEADER-ONLY (legacy `?token=` query no longer accepted, SECURITY.md M-3).
 - **MCP tools (PR-2 shipped):**
   - `remotion.render({ composition_id, props?, fps?, duration_frames? })` — agentflow-agents proxies the POST to the runner Service and returns the runner envelope unchanged.
 
@@ -138,12 +138,13 @@ Response (`result.content[0].text` is the JSON-encoded runner envelope):
 | `template_url` rejected | response `{ok:false, error:"template_url_not_supported"}` | Use built-in `composition_id` until PR-2/3 wires arbitrary bundles. |
 | Bundle stuck after tmpfs full | `[remotion-runner] listening` but `/render` hangs on bundle step | Pod restart clears it; bump `ephemeral-storage` limit in manifest. |
 | Agents pod env missing runner URL | MCP tool returns `{ok:false, error:"remotion_runner_not_configured"}` (no HTTP attempted) | Set `REMOTION_RUNNER_URL` on `deploy/agentflow-agents` (k8s/agentflow-agents.yaml). |
-| Runner pod down / Service unreachable | MCP tool returns `{ok:false, error:"remotion_runner_unreachable", details:"..."}` | `kubectl -n franchise-factory get pods -l app=agentflow-remotion-runner`; check restart count / OOMKilled. |
+| Runner pod down / Service unreachable | MCP tool returns `{ok:false, error:"remotion_runner_unreachable", details:"..."}` (text surfaced to user: `Рендер не удался — сервис remotion-runner недоступен (fetch failed)`) | `kubectl -n franchise-factory get pods -l app=agentflow-remotion-runner`; check restart count / OOMKilled. Verified 2026-05-17 16:57Z on prod run #163 — remains failure mode post PR #425. |
 | Render >5 min | MCP tool returns `{ok:false, error:"remotion_runner_timeout"}` (AbortSignal.timeout fires) | Either shorten composition `duration_frames` or split into smaller renders. |
 | Runner replies non-json | MCP tool returns `{ok:false, error:"remotion_runner_bad_response", details:"..."}` | Renderer regression — check pod logs for stack trace. |
 | Webpack can't resolve `./Root.js` / `./compositions/simple-card.js` | response `{ok:false, error:"render_failed", details:"Module not found: Error: Can't resolve './Root.js' in '/app/src'"}` | Source imports MUST omit `.js`. Remotion `bundle()` reads `.tsx` off disk directly; adding `.js` makes webpack look for compiled siblings that don't exist in source. See `remotion-runner/src/index.ts` and `src/Root.tsx`. Fixed in agentflow-agents PR #415. |
 | `imagePullSecrets` missing on Deployment | `kubectl get pods -l app=agentflow-remotion-runner` shows `ImagePullBackOff` + `Failed to pull image ... 401 Unauthorized` | Patch deployment: `kubectl patch deploy agentflow-remotion-runner -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"ghcr-pull"}]}}}}'`. The manifest in `k8s/remotion-runner.yaml` is missing it — needs a follow-up fix. |
 | Secret key names mismatch | pod stuck in `CreateContainerConfigError`, event: `couldn't find key accessKey in Secret franchise-factory/minio-creds` | The shared `minio-creds` Secret uses `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` keys (not `accessKey` / `secretKey`). Manifest in `k8s/remotion-runner.yaml` needs the same key names as `k8s/agentflow-agents.yaml` MINIO env. |
+| Preset not in marketplace catalog | `/marketplace/<slug>` resolves but `/marketplace` listing hides the card | Add slug to `PUBLIC_SEED_SLUGS` + `PLATFORM_AUTO_SEED_SLUGS` in `agentflow-agents/src/scripts/bootstrap-marketplace.ts`. Fixed for the 3 video presets 2026-05-17. |
 
 ## Available presets
 
@@ -161,5 +162,6 @@ The `@agentflow-video` plugin namespace is advertisement only — actual tool re
 
 ## Related
 
+- [AI-Видео (brief → reel)](/subsystems/ai-video-remotion) — `POST /me/functions/video` orchestrates brief → script → `brief-reel` render on this runner.
 - [code-exec MCP](/subsystems/code-exec-mcp) — sibling MCP-driven pod pattern.
 - [graph handlers](/subsystems/graph-handlers) — `video.record_graph_demo` does playwright-based screen capture; this renderer is the React-first alternative.

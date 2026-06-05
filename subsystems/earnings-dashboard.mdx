@@ -1,0 +1,66 @@
+---
+title: "Earnings Dashboard — /earnings"
+description: "Realtime auto-earn dashboard: SSE-driven snapshot of kwork/avito/tg DM ledgers"
+---
+
+# Earnings Dashboard
+
+## TL;DR
+
+`/earnings` is the live view of the auto-earn loop. Backend exposes
+`GET /me/earnings/realtime` (JSON snapshot) and `GET /me/earnings/stream`
+(SSE, 5s tick). Frontend page renders a spring-animated hero counter, three
+funnel cards per channel, and a recent-offers feed with raw-canvas confetti
+on every fresh `ok:true` send.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-earnings.ts:1` | Realtime + SSE Hono router |
+| `agentflow-agents/src/server.ts` (`meEarningsApp`) | Mount point |
+| `agentflow-agents/tests/unit/me-earnings.test.ts` | Source-contract tests (11 cases) |
+| `agentflow-landing/src/pages/Earnings.tsx` | Page component, spring + canvas + EventSource |
+| `agentflow-landing/src/main.tsx` (`/earnings` route) | Router wiring, `RequireAuth` |
+| `agentflow-landing/src/pages/CabinetDashboard.tsx` | "Заработок live" QuickAction card |
+
+## Data flow
+
+```
+kwork_want_responses          ─┐
+avito_want_responses          ─┤
+kwork_lead_state (status=replied)─┤
+flow_runs (slug='kwork-bid-monitor-basic--a912fd').step_logs ─┤
+                                 │
+                                 ▼
+   GET /me/earnings/realtime   (one-shot JSON)
+   GET /me/earnings/stream     (SSE, emits 'earnings' event every 5s)
+                                 │
+                                 ▼
+       Earnings.tsx
+   ├─ useSpring → hero counter
+   ├─ canvas confetti → on new ok:true offer
+   └─ EventSource → keeps payload fresh; falls back to 5s fetch poll on error
+```
+
+## DB / Env / API
+
+- Tables: `kwork_want_responses`, `avito_want_responses`, `kwork_lead_state`, `flows`, `flow_runs`
+- Routes: `GET /me/earnings/realtime`, `GET /me/earnings/stream`
+- Auth: `requireSession` (cookie / JWT / `x-api-key: af_live_*`)
+- Today-bucket: SQL-side `sent_at::date = current_date` so client clock drift can't shift the hero counter
+- Tick interval: 1800s (Kwork bid-monitor cron) — `next_tick_in_sec` derived from `last_tick_at + 1800s`
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Empty page on fresh tenant | `42P01` (table missing) | `me-earnings.ts:loadKworkSnapshot` returns `null` |
+| Counter never increments | EventSource open but no `earnings` events | check `meEarningsApp` mount in `server.ts` |
+| Confetti loops forever | `requestAnimationFrame` keeps scheduling | `useConfettiCanvas` only schedules when `particles.length > 0` |
+| Hero counter shows yesterday's total | client tz drift | check `sent_at::date = current_date` SQL stays in code |
+
+## Related
+
+- [Kwork auto-earn loop](/subsystems/kwork-auto-earn) — produces the rows we count
+- [Flow runs / studio](/subsystems/flow-runs) — `flow_runs.step_logs` carries last-tick summary

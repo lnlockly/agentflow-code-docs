@@ -1,0 +1,136 @@
+---
+title: "VK Bridge"
+description: "VK DM bridge — legacy access-token + new cookie-paste auth — keeps owner-side state in chat_vk_links."
+---
+
+# VK Bridge
+
+> **Status: v1 token-auth shipped earlier; cookie-paste auth shipped 2026-05-22.** Cookie path stores sealed `{remixsid,remixnsid?,remixflash?,p?}` in `chat_vk_links.cookies_encrypted` and pins a sticky proxy via `proxy_id`. Worker-side cookie poller is still TODO — the legacy long-poll loop only handles `access_token` rows and skips cookie rows on read.
+
+## TL;DR
+
+VK ships two link flows that share `chat_vk_links`:
+
+| `auth_kind` | Stored credential | Worker | Status |
+|---|---|---|---|
+| `token` (legacy) | `access_token` plaintext (TODO encrypt) | `vk-bridge-loop.ts` long-poll | Live |
+| `cookies` (new 2026-05-22) | Sealed JSON in `cookies_encrypted` + `proxy_id` FK | Cookie-mode poller (TODO) | Backend wired, worker pending |
+
+The cookie path was added because the public `access_token` flow is rate-limited and easy for VK to revoke; cookies + sticky residential proxy match the human-browser footprint.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-chat-vk.ts:1` | Wizard + account manager, both auth paths |
+| `agentflow-agents/src/routes/me-chat-vk.ts:283` | `parseCookiesBody` — pure validator for the new path |
+| `agentflow-agents/src/routes/me-chat-vk.ts:322` | `POST /me/chat/vk/start-from-cookies` handler |
+| `agentflow-agents/src/services/vk-bridge.ts` (verify line) | VK API client + `getMe`, `VkApiError` |
+| `agentflow-agents/src/services/vk-bridge-loop.ts:85` | Worker long-poll loop — token rows only |
+| `agentflow-agents/src/services/vk-bridge-loop.ts:95` | Comment + filter that drops `access_token IS NULL` (cookie) rows |
+| `agentflow-agents/src/services/proxy-pool.ts:73` | `pickProxy` — used to bind a sticky IP per VK account |
+| `agentflow-agents/src/services/seal.ts` (verify line) | `sealString` / `unsealString` for the cookies blob |
+| `agentflow-agents/migrations/2026-05-23a-proxies-pool.sql:45` | `ALTER TABLE chat_vk_links` adds `cookies_encrypted`, `proxy_id`, `auth_kind` |
+
+## Data flow
+
+### Cookie-paste link
+
+```
+Owner opens vk.com, runs bookmarklet → captures remixsid (+remixnsid/remixflash/p)
+   │
+   ▼
+POST /me/chat/vk/start-from-cookies
+   body { vk_user_id, cookies:{remixsid, …}, proxy_id?, country:'RU' }
+   │
+   ▼
+parseCookiesBody → validate (remixsid >= 20 chars, ids positive)
+   │
+   ├─ proxy_id == null → pickProxy(ownerUserId, `vk:link:<af>:<vk>`, {country:'RU'})
+   │                       (returns null if pool empty; response sets proxy_required:true)
+   │
+   ▼
+sealString(JSON.stringify(cookies)) → cookies_encrypted
+   │
+   ▼
+INSERT chat_vk_links (af_user_id, vk_user_id, auth_kind='cookies',
+                      cookies_encrypted, proxy_id, access_token=NULL,
+                      status='linked')
+   ON CONFLICT (af_user_id, vk_user_id) DO UPDATE …
+   │
+   ▼
+Worker (TODO) reads rows where auth_kind='cookies':
+   getProxy(proxy_id) → ProxyHandle
+   unsealString(cookies_encrypted) → {remixsid, …}
+   fetch vk.com via undici ProxyAgent + Cookie header
+```
+
+### Legacy token link (still works)
+
+```
+Owner generates access_token via VK OAuth Implicit
+   │
+   ▼
+POST /me/chat/vk/link  body {access_token}
+   │
+   ▼
+parseLinkBody → trim, length cap 2048
+   │
+   ▼
+getMe(access_token) → vk_user_id (also validates the token)
+   │
+   ▼
+UPSERT chat_vk_links (auth_kind='token', access_token=<plaintext TODO encrypt>)
+   │
+   ▼
+vk-bridge-loop.ts pulls all rows where status='linked' AND access_token IS NOT NULL,
+long-polls messages.getLongPollServer → forwards to Matrix room.
+```
+
+## DB / Env / API
+
+### Table `chat_vk_links` (relevant columns)
+
+| Column | Type | Notes |
+|---|---|---|
+| `af_user_id` | INT | FK users.id |
+| `vk_user_id` | BIGINT | from VK `users.get` |
+| `mx_user_id` | TEXT | derived `@user-<af>:<server>` |
+| `access_token` | TEXT NULL | NULL when `auth_kind='cookies'` |
+| `auth_kind` | TEXT DEFAULT `'token'` | `'token'` \| `'cookies'` |
+| `cookies_encrypted` | TEXT NULL | `sealString(JSON.stringify({remixsid, remixnsid?, remixflash?, p?}))` |
+| `proxy_id` | BIGINT REFERENCES proxies(id) ON DELETE SET NULL | sticky IP — see [Proxy Pool](/subsystems/proxy-pool) |
+| `last_message_id` | BIGINT | long-poll cursor |
+| `status` | TEXT | `'linked'` \| `'unlinked'` \| … |
+| `account_labels` | JSONB | e.g. `{default_channel:"-1234567"}` for cross-poster |
+
+Composite key: `(af_user_id, vk_user_id)` — one row per owner-VK pair.
+
+### Routes
+- `POST   /me/chat/vk/link` — body `{access_token}` (token path)
+- `POST   /me/chat/vk/start-from-cookies` — body `{vk_user_id, cookies, proxy_id?, country?}` (cookie path)
+- `GET    /me/chat/vk/accounts` — list owner's linked VK accounts
+- `POST   /me/chat/vk/unlink` — body `{vk_user_id}`
+- `POST   /me/chat/vk/label` — body `{vk_user_id, label}` (≤32 chars)
+
+### Env
+- `SEAL_KEY` / `SEAL_MASTER_KEY` (verify with: `kubectl -n franchise-factory exec deploy/agentflow-agents -- env | grep -i seal`) — required for `sealString` / `unsealString`.
+- `MATRIX_SERVER_NAME` — used by `matrixUserIdForAfUser` to mint `@user-N:agentflow.website`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `start-from-cookies` returns `remixsid_required` | response `{"error":"remixsid_required"}` | Bookmarklet didn't extract a non-empty `remixsid` ≥20 chars — re-run on vk.com while logged in |
+| `start-from-cookies` returns `vk_user_id_invalid` | response `{"error":"vk_user_id_invalid"}` | Owner-supplied id must be a positive integer (their numeric VK id, not a vanity slug) |
+| `start-from-cookies` returns `proxy_required:true` | response `{"ok":true,"proxy_required":true}` | Pool has no healthy RU row. Add one via `POST /me/proxies` and call `start-from-cookies` again (idempotent upsert) |
+| Cookie row never delivers messages | (no log — worker filter drops it) | `vk-bridge-loop.ts:99` filters out `accessToken !== null`. Cookie-mode poller is TODO; expect silence until shipped |
+| `unsealString` throws on read | `[vk-bridge] cookies_decrypt_failed` (when worker lands) | `SEAL_KEY` rotated since the row was written. Re-run the cookie-paste flow to reseal |
+| Token row gets `VkApiError code 5` | `[vk-bridge-loop] api_error code:5` | Token expired — owner re-links via `/me/chat/vk/link` |
+| `getMe` rejects token | `POST /me/chat/vk/link` returns 400 `access_token_invalid` (verify exact string) | Token missing scopes (`messages`, `offline`) — regenerate via VK OAuth Implicit |
+
+## Related
+
+- [Proxy Pool](/subsystems/proxy-pool) — sticky IP per VK account, `bound_resource = 'vk:link:<af>:<vk>'`
+- [Matrix Bots](/subsystems/matrix-bots) — `@af-poster` reads `chat_vk_links` rows for wall-post cross-posting
+- [Element Web](/subsystems/element-web) — VK DMs ultimately land in Matrix rooms a user joins via Element

@@ -1,0 +1,89 @@
+---
+title: "Chat-stack smoke (Playwright)"
+description: "Post-deploy E2E that verifies Element Web login, bot DM reply, SSO bounce, and TG manager render."
+---
+
+# Chat-stack smoke (Playwright)
+
+## TL;DR
+
+`tests/e2e/chat-smoke.spec.ts` in `agentflow-agents` runs four Playwright
+scenarios against production after every `Build & Deploy Agents` workflow:
+Element Web password login as `smoketest`, DM to `@af-helper` gets a reply
+within 30s, `/sso/element-sso` returns seeded HTML, and
+`/account/integrations/telegram` renders an `h1`. Triggered via GitHub
+Actions `chat-smoke.yml` on `workflow_run` and on demand via
+`workflow_dispatch`.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/tests/e2e/chat-smoke.spec.ts:1` | Four-scenario Playwright spec — login, DM, SSO, TG render |
+| `agentflow-agents/playwright.config.ts:1` | Playwright config: 60s test timeout, retain-on-failure traces, chromium project only |
+| `agentflow-agents/.github/workflows/chat-smoke.yml:1` | CI workflow: `workflow_run` after deploy + `workflow_dispatch` |
+| `agentflow-agents/package.json` | `test:e2e:chat` script + `@playwright/test` devDep |
+| `agentflow-agents/src/routes/element-sso.ts:114` | The `/me/chat/element-sso` handler that backs the public `/sso/element-sso` path |
+| `agentflow-agents/k8s/element-web.yaml:132` | Ingress that rewrites `/sso/element-sso` to `/me/chat/element-sso` |
+| `agentflow-agents/src/services/matrix-bots/handlers/helper.ts:1` | `@af-helper` static menu — what test 2 asserts against |
+
+## Data flow
+
+```
+GitHub Actions chat-smoke.yml
+   │
+   ├─ workflow_dispatch  (manual)
+   └─ workflow_run after "Build & Deploy Agents" success
+            │
+            ├─ npm ci
+            ├─ npx playwright install chromium
+            └─ npx playwright test tests/e2e/chat-smoke.spec.ts
+                  ├─ 1. https://chat.agentflow.website → password login as smoketest
+                  ├─ 2. + Start chat → @af-helper:agentflow.website → /help → wait ≤30s for menu text
+                  ├─ 3. GET https://agentflow.website/sso/element-sso (cookie) → 200 HTML with mx_* seeds
+                  └─ 4. GET https://agentflow.website/account/integrations/telegram → h1 "Telegram"
+```
+
+## DB / Env / API
+
+### CI secrets
+- `SMOKE_MATRIX_USER` — defaults to `smoketest` if unset.
+- `SMOKE_MATRIX_PASSWORD` — defaults to `testtest123` if unset.
+- `AF_SESSION_COOKIE` — optional, format `name=value; name2=value2`. Scenarios 3 and 4 self-skip if absent rather than failing the job.
+
+### Local env knobs (read by the spec)
+- `CHAT_BASE_URL` (default `https://chat.agentflow.website`)
+- `APP_BASE_URL` (default `https://agentflow.website`)
+
+### Local run
+```bash
+cd agentflow-agents
+npm ci
+npx playwright install chromium
+npx playwright test tests/e2e/chat-smoke.spec.ts
+# Single scenario:
+npx playwright test tests/e2e/chat-smoke.spec.ts -g "Element loads"
+```
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Login form never appears | `waiting for selector 'input[name="username"]'` | Element Web ingress / chart broken — check `k8s/element-web.yaml` rollout |
+| Login submit hangs on first sync | `waitForURL(/#\/(home\|room\|welcome)/) timed out` | Dendrite `/sync` 500 / Postgres slow — check `dendrite` deployment logs |
+| Bot never replies to `/help` | `Locator … "af-claude\|af-research…" timed out (30s)` | Matrix-bots runner off — verify `MATRIX_BOTS_ENABLED=1` and `[matrix-bots] starting` in agents pod |
+| SSO probe returns 401 | `unexpected status 401` | `AF_SESSION_COOKIE` expired — re-issue from a browser session |
+| SSO probe returns 200 but body missing seeds | `expect(body).toMatch(/mx_user_id/)` fails | `buildElementSeedHtml` regressed — see `src/routes/element-sso.ts` |
+| TG manager renders blank | `getByRole('heading', { name: /telegram/i, level: 1 })` timed out | Frontend route gone — check `agentflow-landing/src/account/integrations/Telegram*` |
+
+## Non-goals
+
+- No mautrix-telegram bridge coverage (Phase 5 — separate test once provisioning wizard ships).
+- No E2EE — bots stay out of encrypted rooms, so the spec doesn't probe encrypted DMs.
+- No load testing — single browser, sequential scenarios.
+
+## Related
+
+- [Matrix Bots](/subsystems/matrix-bots)
+- [Matrix Chat](/subsystems/matrix-chat)
+- [Matrix TG Bridge](/subsystems/matrix-tg-bridge)

@@ -67,6 +67,10 @@ rather than failing the entire endpoint.
 - Funnel stages (in response order): `registered`, `onboarding_started`,
   `onboarding_completed`, `tg_connect_clicked`, `tg_connected`,
   `farm_activated`, `academy_paid`
+- Bot-funnel kinds (2026-05-24): `funnel_step` (one row per question
+  answered in `@agentflowbot`) and `funnel_pitch` (one row per scenario
+  shown). Written via `POST /funnel-events` from agentflow-bot. See
+  [funnel-bot](/subsystems/funnel-bot).
 
 ## Failure modes
 

@@ -38,8 +38,10 @@ Fix (PRs `lnlockly/agentflow-agents#352` + `lnlockly/agentflow-api#2`): both `/a
 | `agentflow-agents/src/routes/internal.ts:382` | internal-secret balance endpoint, calls `getBalance(userId)` |
 | `agentflow-api/src/routes/me.ts:52` | `GET /me` — sums `flow_ledger.amount` (was: read `flow_balances.balance` directly) |
 | `agentflow-agents/src/services/flow-meter.ts:618` | `creditUser(args)` — INSERT `flow_ledger` + UPSERT `flow_balances` in one TX |
-| `agentflow-agents/src/services/flow-meter.ts:399` | `settle()` insufficient-funds gate (`SELECT … FOR UPDATE` + `have >= need`) before the debit upsert |
-| `agentflow-agents/src/services/flow-meter.ts:436` | settle-debit upsert on `flow_balances` (hot path, guarded by gate above) |
+| `agentflow-agents/src/services/flow-meter.ts:447` | `settle()` insufficient-funds gate (`SELECT … FOR UPDATE` reads `usdf_balance` before the debit) |
+| `agentflow-agents/src/services/flow-meter.ts:484` | settle-debit UPDATE on `flow_balances.usdf_balance` (dual-pool fix, migration 0021 follow-up) |
+| `agentflow-agents/src/services/flow-meter.ts:653` | `chargeFlat()` USDF debit — DesignAPI image/video, reflector, lessons |
+| `agentflow-agents/src/services/flow-meter.ts:1093` | `chargeLlmUsage()` USDF debit — Anthropic / OpenAI / GPT fallback per-turn |
 | `agentflow-agents/scripts/reconcile-negative-balances.ts` | one-shot ops script: zero out negative balances + write `credit_reconcile` ledger rows |
 | `agentflow-agents/src/services/promo-codes.ts:236` | promo `balance_topup` redeem — UPSERT `flow_balances` (writes ledger row separately, see file) |
 
@@ -93,6 +95,7 @@ read path
 | 3 balance APIs disagree (`/auth/me=0`, `/_api/me=X`, `/_agents/me/balance=Y`) | `balance_micro: 0` hard-coded in `routes/auth-password.ts` + `SELECT balance FROM flow_balances` in `agentflow-api/src/routes/me.ts` | Reconcile legacy users via `reconcile_legacy_balance` ledger row, then point both endpoints at `SUM(flow_ledger.amount)` (see "3-API balance parity" section above). |
 | Phantom $900+ "LLM burn" TG alert with no matching debit rows | `llm-burn-alert: hourly warn threshold exceeded` followed by `lastWarnHourBucket` skipping subsequent ticks; ledger shows large `credit_reconcile` rows with negative `amount` | `services/pingers/llm-burn-alert.ts` must filter `kind = ANY(LLM_DEBIT_KINDS)` (PR #358). `credit_reconcile` writes are accounting clawbacks (see `scripts/reconcile-tier-overcredit.mjs:202`) — not LLM spend. |
 | Hot-loop burn outpaces the daily cap before `agent_runs.cost_cents` updates | `BudgetExceededError period=daily` or `period=monthly` from `services/llm-circuit-breaker.ts` | Short-window kill switch reads `flow_ledger` for the last hour. Env: `LLM_USER_HOURLY_CAP_USD` (default $5), `LLM_PLATFORM_HOURLY_CAP_USD` (default $20). `0` disables. |
+| LLM spend drains USDT top-up pool while USDF credits stay static | every `debit_anthropic` / `debit_other` / `debit_llm` ledger row has `meta` without `column: 'usdf_balance'` AND `flow_balances.balance` decremented while `usdf_balance` unchanged | **RESOLVED 2026-05-17 [PR #444](https://github.com/lnlockly/agentflow-agents/pull/444)**: `settle()`, `chargeFlat()`, `chargeLlmUsage()` in `services/flow-meter.ts` now debit `usdf_balance` (credits pool) instead of `balance` (USDT top-up pool). Migration 0021 follow-up landed. New ledger rows carry `meta.column='usdf_balance'` for audit. Regression pinned by `tests/unit/settle-debits-usdf-pool.test.ts`. |
 
 ## Buy subscription from balance (May 2026)
 

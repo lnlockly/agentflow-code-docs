@@ -1,0 +1,68 @@
+---
+title: "agentflow CLI"
+description: "Typer-based CLI bundled with agentflow-computer-mcp for local agent ops + cloud goals"
+---
+
+# agentflow CLI
+
+## TL;DR
+`agentflow` is a Typer CLI shipped inside the `agentflow-computer-mcp` Python package. It speaks the local UNIX socket from `agents/socket.py` for per-machine agent ops (list, create, pause, logs) and `https://agentflow.website/_agents` REST for cross-machine goals, budget, and memory. One install, three platforms (Windows: REST commands work; local socket subcommands gated until #94).
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/cli/main.py:1` | Typer root app, command wiring |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/cli/auth_cli.py:1` | `login` / `whoami` impls |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/cli/daemon.py:1` | `daemon status/start/stop` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/cli/agent.py:1` | `agent list/create/pause/resume/kill/logs` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/cli/goal.py:1` | `goal list/create/show/pause/resume` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/cli/budget.py:1` | `budget` (daily spend / cap) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/cli/memory.py:1` | `memory recall/record-skill` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/cli/socket_client.py:1` | sync wrapper over async UNIX socket |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/cli/rest_client.py:1` | httpx wrapper with `x-api-key` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/cli/format.py:1` | mask_key, table, fmt_budget |
+| `agentflow-computer-mcp/pyproject.toml` | entry point `agentflow = "agentflow_computer_mcp.cli.main:main"` |
+
+## Data flow
+```
+agentflow <cmd>
+   |
+   +-- daemon/agent/* ---> UNIX /tmp/agentflow.sock ---> agents/socket.py (router.AgentSocket)
+   |
+   +-- login            ---> ~/.agentflow/auth.json (0600)
+   |
+   +-- whoami/goal/budget/memory --->
+         httpx GET/POST https://agentflow.website/_agents/me/...
+         headers: x-api-key=$AGENTFLOW_API_KEY | auth.json
+```
+
+## DB / Env / API
+- Env: `AGENTFLOW_API_KEY` (or legacy `AF_API_KEY`) overrides `~/.agentflow/auth.json`.
+- File: `~/.agentflow/auth.json` mode 0600 (created via existing `auth.save_auth()`).
+- File: `~/.agentflow/daemon.pid` (written by `agentflow daemon start`).
+- Socket: `/tmp/agentflow.sock` (line-JSON, methods: `list`, `pause`, `resume`, `logs`, `create`).
+- REST base: `https://agentflow.website/_agents` (the cabinet endpoint, NOT `api.agentflow.website`).
+- Endpoints called: `GET /me`, `GET /me/devices`, `GET /me/autonomous/goals`, `POST /me/autonomous/goals`, `GET /me/autonomous/goals/{id}`, `POST /me/autonomous/goals/{id}/pause|resume`, `GET /me/autonomous/budget`, `GET /me/memory/search`, `POST /me/memory/skills`.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `демон не запущен; запусти agentflow daemon start` | `демон не запущен` | `cli/agent.py:_handle_daemon` |
+| `не авторизован; запусти agentflow login` | `не авторизован` | `cli/rest_client.py:resolve_api_key` |
+| `server returned 4xx/5xx` | `server returned` | `cli/rest_client.py:_check` |
+| Windows agent commands rejected | `требует macOS/Linux пока #94` | `cli/agent.py:_windows_guard`, `cli/daemon.py:status` |
+| `/me` 404 falls back to local auth print | `endpoint /me unavailable` | `cli/auth_cli.py:do_whoami` |
+
+## Exit codes
+- 0 = success
+- 1 = generic daemon/local error
+- 2 = bad input (missing api_key, unsupported flag, Windows-gated command)
+- 3 = daemon socket unavailable
+- 4 = not authenticated
+- 5 = network error
+- 6 = server returned 4xx/5xx
+
+## Related
+- [agents/](/subsystems/agents) — multi-agent runtime, source of the UNIX socket protocol
+- [auth-and-access](/subsystems/auth-and-access) — `x-api-key` header, `~/.agentflow/auth.json`
+- [autonomous-goals](/subsystems/autonomous-goals) — REST endpoints under `/me/autonomous/...`

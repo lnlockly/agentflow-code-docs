@@ -1,0 +1,112 @@
+---
+title: "Matrix Instagram Bridge"
+description: "mautrix-meta appservice bridges Instagram DMs (and optionally Facebook Messenger) into our Dendrite homeserver."
+---
+
+# Matrix Instagram Bridge
+
+> **Status: shipped 2026-05-21** — bridge pod running, registered with Dendrite, `@metabot:agentflow.website` provisioned. Cookie-paste login UI wired in `/me/chat/ig/*`.
+
+## TL;DR
+
+`mautrix-meta` runs as a Matrix appservice in `franchise-factory` and bridges Instagram DMs into our Dendrite homeserver. Same upstream bridgev2 surface as `mautrix-telegram` — only differences are the cookie-flow login (vs phone+SMS) and the `fi.mau.meta.login.*` step ids. The bridge can also handle Facebook Messenger by flipping `network.mode` to `messenger` or `instagram_and_messenger`; we ship in `instagram` mode and will enable Messenger later in-place.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/k8s/mautrix-meta.yaml` | Deployment + Service + PVC, sed-template startup |
+| `agentflow-agents/k8s/mautrix-meta-config.yaml` | ConfigMap with the bridgev2 `config.template.yaml` |
+| `agentflow-agents/src/services/mautrix-meta-bridge.ts` | HTTP client for `/v3/login/*`, `/v3/whoami`, `/v3/logout` |
+| `agentflow-agents/src/routes/me-chat-ig.ts` | Login wizard + account manager (`/me/chat/ig/*`) |
+| `agentflow-agents/src/routes/widget-ig.ts` | Standalone Element widget at `/me/chat/widget/ig-accounts` |
+| `agentflow-agents/src/db/schema.ts` | `chatIgLinks` table + `idx_chat_ig_links_status` |
+| `agentflow-agents/src/db/migrations/0071_chat_ig_links.sql` | Drizzle migration |
+| `agentflow-agents/migrations/2026-05-21g-chat-ig-links.sql` | Mirror migration for the manual psql workflow |
+| `agentflow-agents/src/services/bootstrap-schema.ts` | Idempotent `CREATE TABLE IF NOT EXISTS chat_ig_links` at boot |
+| `agentflow-agents/src/services/matrix-bots/lib.ts` | `BRIDGE_PUPPET_PREFIXES`, `isBridgePuppet`, IG bot added to `isBridgeBotSender` |
+| `agentflow-agents/src/services/matrix-bots/handlers/claude.ts` | Mode C trigger uses `hasBridgePuppet` so IG-bridged rooms fire suggestion+👍 too |
+
+## Data flow
+
+```
+Instagram private GraphQL + Realtime
+       │  (cookie-auth session per AF user)
+       ▼
+mautrix-meta pod  (29320)
+       │  ▲   ▲
+       │  │   │ POST /_matrix/app/v1/transactions   (Dendrite → bridge)
+       │  │   │ as_token in registration.yaml
+       │  ▼   │
+       │  uses hs_token to call back into:
+       │  POST /_matrix/client/v3/createRoom, /sendEvent, /register
+       │       │
+       ▼       ▼
+dendrite (8008)
+       │
+       ▼
+agentflow-postgres (DBs: `dendrite` + `mautrix_meta` + `mautrix_telegram` + `agentflow`)
+```
+
+## DB / Env / API
+
+### Postgres
+- DB: `mautrix_meta` (separate from `mautrix_telegram`, `dendrite` and `agentflow`).
+- User: `mautrix_meta`, password in Secret `mautrix-meta-secrets` key `db_password`.
+- AF-side table: `chat_ig_links` — same shape as `chat_tg_links` with `instagram_user_id` instead of `telegram_user_id`.
+
+### Env / Secrets
+- `mautrix-meta-secrets` (keys read via `envFrom` then `sed`-substituted into `config.template.yaml`):
+  - `MAUTRIX_META_DB_PASSWORD`
+  - `MAUTRIX_META_AS_TOKEN` — appservice token, matches `as_token` in `mautrix-meta-registration`
+  - `MAUTRIX_META_HS_TOKEN` — homeserver token, matches `hs_token` in registration
+  - `MAUTRIX_META_PROVISIONING_SECRET` — guards the bridge's `/_matrix/provision/*` API
+- `agentflow-agents-env` (additive):
+  - `MAUTRIX_META_PROVISIONING_SECRET` — same value, mounted into agentflow-agents
+- Optional overrides:
+  - `MAUTRIX_META_INTERNAL_URL` (default `http://mautrix-meta.franchise-factory.svc.cluster.local:29320`)
+  - `MAUTRIX_META_BOT_MXID` (default `@metabot:agentflow.website`)
+- `mautrix-meta-registration` Secret: key `meta.yaml` containing the appservice manifest Dendrite mounts.
+
+### Dendrite config delta
+Append to `dendrite-config.yaml`:
+```yaml
+app_service_api:
+  config_files:
+    - /etc/dendrite/appservices/telegram.yaml
+    - /etc/dendrite/appservices/meta.yaml
+```
+Dendrite pod mounts the registration Secret via `projected` volume — add one more `secret:` source for `mautrix-meta-registration`, then `kubectl rollout restart deploy/dendrite`.
+
+### Routes (AF-side)
+- `GET  /me/chat/ig/status`
+- `POST /me/chat/ig/start`            — flow `cookies` (default)
+- `POST /me/chat/ig/step`             — submit `{ sessionid, ds_user_id, csrftoken }`
+- `POST /me/chat/ig/logout`           — `{ login_id }` drops one; `{}` wipes all
+- `GET  /me/chat/ig/accounts`         — proxy of bridge `/v3/whoami`
+- `POST /me/chat/ig/set-primary`      — AF-owned `primary_login_id` flag
+- `POST /me/chat/ig/label`            — AF-owned `account_labels` JSONB
+- `GET  /me/chat/widget/ig-accounts`  — standalone Element widget HTML
+
+### Routes (bridge-side)
+- `http://mautrix-meta.franchise-factory.svc.cluster.local:29320/_matrix/app/v1/*`
+- `http://mautrix-meta:29320/_matrix/provision/*`
+- `@metabot:agentflow.website` — bridge bot user
+- User regex: `@meta_<igid>:agentflow.website` (exclusive)
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Wizard returns 503 immediately | `mautrix_meta_not_configured` | `MAUTRIX_META_PROVISIONING_SECRET` empty in `agentflow-agents-env` |
+| Wizard returns 502 | `mautrix_meta_unreachable` | bridge pod not Ready: `kubectl -n franchise-factory get pod -l app=mautrix-meta` |
+| `/step` succeeds but bridge never finishes login | `[chat-ig] step failed` with bridge_error / `Bad session` | Cookies expired in source browser — re-paste a fresh `sessionid` |
+| `@af-claude` stays normal inside an IG-bridged room (no 💡 prefix) | grep `mode-c` log silent, members include `@meta_…` | `BRIDGE_PUPPET_PREFIXES` missing the puppet prefix (see `services/matrix-bots/lib.ts`) |
+| Mode C reaction-forward gets stuck | `[mode-c] sender_not_authorized` from a non-owner mxid | Expected — Mode C is owner-only. Verify reactor is `@user-<digits>:agentflow.website` |
+
+## Related
+
+- [matrix-tg-bridge](/subsystems/matrix-tg-bridge) — sibling for Telegram, same provisioning shape
+- [matrix-chat](/subsystems/matrix-chat) — Dendrite homeserver
+- [matrix-bots](/subsystems/matrix-bots) — `@af-claude` Mode C handler
+- [element-web](/subsystems/element-web) — Element Web client + widget hosting

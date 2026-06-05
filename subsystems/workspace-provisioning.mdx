@@ -1,0 +1,130 @@
+---
+title: "Workspace provisioning"
+description: "Approve-time vcluster pod provision with auto-retry + structured events"
+---
+
+# Workspace provisioning
+
+## TL;DR
+
+When a user approves a project, the platform calls
+`provisionWorkspaceWithRetry` which `kubectl apply`s the StatefulSet
+manifest into the user's vcluster, then `kubectl wait`s for the pod to be
+Ready. The call retries up to 8 times with backoff
+(5/15/30/60/120/180/240 s, total ~10.7 min) because k3s+calico+vcluster
+return transient `apply_failed` and `pod_not_ready` errors under churn
+and these always recover within ~30-60 s.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/projects.ts:1644` | `provisionWorkspaceWithRetry` — the retry helper |
+| `agentflow-agents/src/services/projects.ts:1597` | `WORKSPACE_PROVISION_BACKOFF_SCHEDULE_SEC` constant |
+| `agentflow-agents/src/services/projects.ts:1615` | `WORKSPACE_PROVISION_TERMINAL_ERRORS` set — short-circuits the loop |
+| `agentflow-agents/src/services/projects.ts:1576` | `wakeTenantVcluster` — cross-service call to agentflow-api, scales hibernated STS 0→1 before warmupVcluster |
+| `agentflow-api/src/services/tenant-waker.ts:49` | `wakeTenantVcluster` server-side — patches STS replicas, `kubectl wait` pod ready (120s) |
+| `agentflow-api/src/routes/internal-users.ts:377` | `POST /internal/users/:id/wake-vcluster` — secret-gated endpoint backing the cross-service call |
+| `agentflow-agents/src/mcp-servers/code-exec/index.ts:200` | `create_project` MCP tool — does the actual `kubectl apply` + `wait` |
+| `agentflow-agents/src/services/pingers/approval-retry.ts:1` | 60s pinger that re-fires `runProjectApprovalBackground` for stuck `status='approved'` rows |
+| `agentflow-agents/src/scripts/retry-failed-projects.ts:1` | Bulk script that re-approves projects stuck at `status='failed'` (legacy escape hatch) |
+| `agentflow-agents/tests/unit/workspace-provision-retry.test.ts` | Source-contract tests for the helper |
+
+## Data flow
+
+```
+user clicks Approve
+  → POST /me/projects/:id/approve
+    → runProjectApprovalBackground (services/approval.ts)
+      → provisionWorkspaceWithRetry (loop up to 8 attempts)
+          attempt N:
+            ├── pingTenantApi  (warm the vcluster apiserver)
+            ├── if ping failed:
+            │     ├── wakeTenantVcluster  → POST agentflow-api /internal/users/:id/wake-vcluster
+            │     │     (scales STS 0→1, kubectl wait pod ready up to 120s,
+            │     │      emits project_event kind=log msg=vcluster_wake …)
+            │     └── warmupVcluster      (90s ping budget)
+            └── callCodeExecTool('create_project', …)
+                  → kubectl apply manifest    (returns apply_failed on calico flap)
+                  → kubectl wait --for=ready  (returns pod_not_ready on slow image pull)
+          on failure:
+            ├── append project_event kind=workspace_provision_retry
+            │     payload={attempt, max_attempts, last_error, next_delay_sec}
+            └── sleep(next_delay_sec) and loop
+          on permanent error (invalid_project_name / kubeconfig_unavailable / quota_exceeded):
+            └── break out of loop
+      → on exhaustion:
+          ├── append project_event kind=workspace_provision_failed_terminal
+          └── throw Error('workspace_provision_failed: <code>: <detail>')
+              → caller marks projects.status='failed'
+```
+
+## DB / Env / API
+
+- Tables: `project_events` (rows with `kind` in `workspace_provision_retry`,
+  `workspace_provision_failed_terminal`, `log`)
+- Env knobs:
+  - `WORKSPACE_PROVISION_MAX_ATTEMPTS` — override default 8 attempts
+  - `WORKSPACE_PROVISION_BASE_DELAY_SEC` — scale the whole backoff ramp
+    (default 5)
+- Routes:
+  - `POST /me/projects/:id/approve` — owner-facing entry point
+  - `POST /internal/projects/:id/reapprove` — ops escape hatch
+- MCP tools:
+  - `code-exec.create_project` — the underlying kubectl call
+
+## Event contract
+
+The FE workspace status pill subscribes to per-project events and
+distinguishes:
+
+| Event kind | Spinner | Status flip | Meaning |
+|---|---|---|---|
+| `workspace_provision_retry` | keep spinning | no | informational; payload shows `next_delay_sec` for "Попытка 3/8, ещё 60с" |
+| `workspace_provision_failed_terminal` | stop spinner | yes (`failed`) | retry budget exhausted; surface "Не получилось поднять окружение" copy |
+| `log` `msg=workspace_provision_retry attempt=…` | n/a | no | legacy event for grep-based log scrapers; kept for backward compat |
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Project stuck at `status='approved'` for >5 min | `workspace_provision_retry attempt=` in project_events | nothing — pinger `approval-retry.ts:1` re-fires after 5 min grace |
+| Project flipped to `failed` after one apply timeout | `workspace_provision_failed: apply_failed` in stderr/log AND only attempt=1 event present | regression in `WORKSPACE_PROVISION_TERMINAL_ERRORS` (must NOT contain `apply_failed`) — see PR for `feat/auto-retry-workspace-provision` |
+| All new projects fail with `quota_exceeded` | `workspace_provision_failed: quota_exceeded` | `services/tenant-quota-verifier.ts` should auto-expand; manual fix via `POST /internal/tenant/:userId/expand-quota` header `x-agentflow-secret` |
+| New pods (projects, devices, vcluster control-planes) stuck `Pending`; node-wide | `FailedScheduling … Insufficient cpu` (k8s events) | NODE CPU **requests** over-committed (was 96% at ~48% real usage). Right-size padded **requests** (NOT limits) — see `## Pod CPU-request sizing` below. If still > ~85% after recycle, a 2nd node is needed (capacity decision, not code). |
+| All new projects fail with `kubeconfig_unavailable` | `workspace_provision_failed: kubeconfig_unavailable` | tenant vcluster missing kubeconfig secret — investigate vcluster syncer pod |
+| Owner's vcluster API server unreachable (TCP refused) | `vcluster_warmup_timeout: The connection to the server <tenant>.af-tenant-1:443 was refused` in `log` events alongside `workspace_provision_retry attempt=N last_error=apply_failed` | vcluster control-plane pod down or evicted. `kubectl -n af-tenant-1 get pods | grep <tenant>` then describe/logs. The retry loop will burn all 8 attempts and the project flips to `failed` ~10 min later. See qa-issues/2026-05-17-studio-vcluster-user-1-unreachable.md |
+| FE spinner never ends on failed project | no `workspace_provision_failed_terminal` event | regression — helper must emit terminal kind BEFORE throwing |
+| All apply attempts dial-timeout for a specific user (others fine) | `vcluster_wake ready=false … detail=wake_http_403` OR `wake_transport_error` in project_events `kind=log` | agentflow-api SA lost STS patch perm in `af-tenant-*` — verify `ClusterRoleBinding agentflow-api-tenant-admin` exists (`kubectl get clusterrolebinding agentflow-api-tenant-admin`). Drift between checked-in `agentflow-api/k8s/deployment.yaml` (namespaced RoleBinding only) and prod (cluster-wide). |
+| Hosted-device stuck `status='provisioning'` for tenant that hasn't been used in days | `[hosted-devices] wake_vcluster_not_ready id=… detail=pod_ready_wait_failed:` in agentflow-agents logs | vcluster pod failed readinessProbe within 120s — `kubectl -n af-tenant-<id> describe pod -l app=vcluster,release=user-<id>` to find scheduling/image-pull failure |
+
+## Pod CPU-request sizing
+
+The single ff-france node (8 cores) schedules on CPU **requests**, not usage.
+A pod's `requests.cpu` is the scheduler reservation; the runtime burst is
+bounded by `limits.cpu`. Over-padded requests block scheduling
+(`FailedScheduling: Insufficient cpu`) even when real usage is low. Sizing
+convention (right-sized 2026-05-29, capacity blocker — node was 96% requests at
+~48% usage): request = idle/resident floor + headroom; keep the limit at the
+real build-burst ceiling.
+
+| Pod type | File:line | CPU request | CPU limit | Note |
+|---|---|---|---|---|
+| hosted-device `small` | `agentflow-agents/src/routes/me-hosted-devices.ts:607` | `100m` (was 250m) | `1` | idle daemon+Chromium ~1-8m; burst bounded by limit |
+| hosted-device `medium` / `large` | same | `500m` / `1` | `2` / `4` | realistic build floors — unchanged |
+| warm hosted-pool (idle, af-pool) | `agentflow-agents/src/services/hosted-pool/manifest.ts:111` | `100m` (was 250m) | `1` | selftest-idle until claim recycle re-applies user manifest |
+| code-exec warm pod | `agentflow-agents/src/mcp-servers/code-exec/helpers/pod-pool.ts:175` | `15m` (was 25m) | `500m` | idle 0-1m; claim spike bounded by limit. **Per-pod sizing alone wasn't enough** — also cut the COUNT: per-tenant default 3→1 + cluster-wide cap `POD_POOL_GLOBAL_MAX=8` (was ~32 pods). See [Pod Pre-Warm Pool](/subsystems/pod-prewarm-pool). |
+| per-project pod | `code-exec/constants` / manifest | `25m` + 5m sidecar | (limit governs build) | already minimal — left as-is |
+| vcluster syncer (`user-N-0`) | vcluster Helm chart (NOT this repo) | 50m / 200m | — | out of repo scope; uses 20-74m |
+
+Existing pods keep their OLD request until they recycle (Pod resources are
+immutable) — the win materializes as warm pods refill (60s cron) and devices
+recycle. Never `kubectl edit` a live spec to force it (hard rule: PR→CI only,
+reversible). Full measured before/after table: `plans/autonomous/_capacity-rightsizing.md`.
+
+## Related
+
+- [code-exec MCP](/subsystems/code-exec-mcp) — the actual `kubectl apply` + `wait` caller
+- [project-lifecycle flow](/flows/project-lifecycle)
+- [create-project flow](/flows/create-project)
+- [pod-gc-pinger](/subsystems/pod-gc-pinger) — cleans up orphan Terminating pods that saturate calico
