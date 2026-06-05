@@ -28,6 +28,10 @@ Every backend route returns the same JSON envelope on error: `{ ok: false, error
 | `agentflow-landing/src/components/ErrorBoundary.tsx:73` | `reportClientError` — sendBeacon → fetch fallback |
 | `agentflow-landing/src/components/ErrorBoundary.tsx:107` | Class component — render error trap with retry / reload / copy / email / home buttons |
 | `agentflow-landing/src/lib/notify.ts:22` | `notifyOk / notifyError / notifyWarn / notifyInfo / notifyRateLimited` |
+| `agentflow-landing/src/lib/queryRetry.ts:46` | `isTransientError` — 5xx / network-drop / status-0 classifier |
+| `agentflow-landing/src/lib/queryRetry.ts:62` | `isSurfaceableError` — false for abort, pre-auth 401/403, transient |
+| `agentflow-landing/src/lib/queryRetry.ts:76` | `transientRetry` — react-query default: ≤2 retries on transient only |
+| `agentflow-landing/src/main.tsx:577` | QueryClient default wires `transientRetry` + `transientRetryDelay` |
 | `agentflow-landing/src/lib/agentsApi.ts:36` | `request()` — detects 429 and fires `notifyRateLimited(retry_after_sec)` |
 | `agentflow-landing/src/pages/NotFound.tsx:1` | Styled `/`-catchall 404 page (search + quick links + SVG) |
 | `agentflow-landing/src/main.tsx:649` | `<Route path="*" element={<ErrorBoundary><NotFound /></ErrorBoundary>}>` |
@@ -76,6 +80,8 @@ Every backend route returns the same JSON envelope on error: `{ ok: false, error
 | Rate-limit toast doesn't show countdown | (no log; check `retry_after_sec` in payload) | `agentflow-landing/src/lib/agentsApi.ts:50` |
 | 404 page shows homepage | `<Route path="*">` regression | `agentflow-landing/src/main.tsx:649` |
 | Uncaught throw leaks stack to client | `unhandled_route_error` | `agentflow-agents/src/server.ts:350` |
+| Error banner flashes then vanishes on a polled cabinet page (transient blip) | grep `transientRetry` / `isError &&` in `agentflow-landing/src` | `agentflow-landing/src/lib/queryRetry.ts:76` (QueryClient default retries transient 5xx/network so a freshly-mounted poll stays `pending` instead of flipping `isError` for one cycle) |
+| Build view "Подключаюсь… пробую ещё" flashes on a single status-poll miss | `missStreak` | `agentflow-landing/src/components/projects/LiveBuildView.tsx:136` (needs ≥2 consecutive misses) |
 
 ## Wire shape (canonical)
 

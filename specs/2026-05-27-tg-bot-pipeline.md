@@ -52,7 +52,10 @@ project.kind === 'tg_bot' ?
   │          │
   │          ├── send_message('@BotFather', '/newbot')
   │          ├── poll get_messages → "How are we going to call it?"
-  │          ├── send name (sanitised, ≤64 chars)
+  │          ├── proposeBotDisplayName(brief) via useModel(TEXT_SMALL)
+  │          │     → short brand (2-4 words, ≤32 chars). Fallback to
+  │          │       sanitiseBotName(projectName) on LLM fail / empty brief.
+  │          ├── send display name (LLM brand OR sanitised fallback)
   │          ├── poll get_messages → "Now let's choose a username"
   │          ├── send `af_<slug>_bot` (≤32 chars), retry +nn on collision
   │          ├── poll get_messages → parse token + @username
@@ -83,7 +86,9 @@ project.kind === 'tg_bot' ?
 | Approve returns 409 + `no_tg_account` | `[tg-bot-creator] no active tg account for owner` | Owner needs to link TG via `/cabinet/integrations/telegram`, then POST `/me/projects/:id/connect-telegram`. |
 | Approve returns 502 + `botfather_no_reply` | `[tg-bot-creator] poll timeout waiting for BotFather` | tg-mcp down / account banned. Check `TG_MCP_URL` + `list_accounts`. |
 | Approve returns 502 + `username_unavailable` | `[tg-bot-creator] giving up on username after 5 retries` | All collision attempts taken — owner brief implies a generic name. Retry creates new candidates. |
+| Bot username is a long transliterated sentence (e.g. `bot_dlya_zapisi_na_strizhku_bot`) | LLM `validateProposedUsername` returns null → fallback to `af_<slug>_bot` | LLM router ignored the prompt cap. The validator now rejects stems >16 chars or >1 underscore (`tg-bot-creator.ts:135-170`). Tighten the prompt examples if a vertical keeps falling through. |
 | Approve returns 502 + `botfather_flood_wait` | `[tg-bot-creator] flood_wait, sleeping` | Telegram rate-limited the owner account; we sleep+retry 2x then give up. |
+| Bot display name in TG search shows raw brief snippet ("Бот для записи на массаж, /start и /book…") | `[tg-bot-creator] proposeBotDisplayName failed` | LLM router missing for owner / brief empty / validator rejected output. Falls back to sanitiseBotName(projectName). Verify `useModel(TEXT_SMALL)` provider configured for the owner. PRs #932 + #933. |
 | Bot created but `python bot.py` never starts | `pgrep -f 'python bot.py'` empty in pod | Daemon brief amendment not deployed; verify computer-mcp PR landed. |
 | Re-running connect-telegram on a project that already has BOT_TOKEN | (none — idempotent no-op) | Returns existing `bot_username`. |
 

@@ -1,0 +1,107 @@
+---
+title: "Accounts Pult V2 — entity browser, contact resolution, persisted history"
+description: "Generic per-account entity browsing, name→contact resolution in the command loop, and durable command history — all MCP-first and platform-generic on top of the V1 accounts-pult backend."
+---
+
+# Accounts Pult V2 — entity browser + contact resolution + history
+
+## TL;DR
+V2 adds three backend surfaces on top of the V1 `/cabinet/accounts` backend:
+(1) a **generic entity browser** — list a connected account's dialogs / channels
+/ contacts / gigs / wants and read one entity's message thread; (2) **contact
+resolution** so the command loop turns «напиши Косте» into a concrete
+`@username`/id before drafting a send; (3) **persisted command history** reusing
+the copilot store so a reload replays the transcript and the loop keeps context.
+Still MCP-first and platform-generic — every entity-kind is one data row in a
+registry (`PLATFORM_ENTITY_REGISTRY`), zero `if (platform === …)` in routes/core.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-accounts.ts:98` | `GET /me/accounts/:accountId/entities?kind=&q=&limit=` |
+| `agentflow-agents/src/routes/me-accounts.ts:127` | `GET /me/accounts/:accountId/entities/:kind/:entityId/messages?limit=` |
+| `agentflow-agents/src/routes/me-accounts.ts:156` | `GET /me/accounts/:accountId/thread?limit=` — persisted history |
+| `agentflow-agents/src/services/account-entities/index.ts:37` | `PLATFORM_ENTITY_REGISTRY` (the only place a kind→MCP-tool binding lives) |
+| `agentflow-agents/src/services/account-entities/index.ts:83` | `fetchEntities` — resolve kind → `callTool` → normalise; degrade to `[]` |
+| `agentflow-agents/src/services/account-entities/index.ts:124` | `fetchEntityThread` — open one openable entity → message history |
+| `agentflow-agents/src/services/account-entities/index.ts:62` | `defaultEntityKind` — first openable kind for a `?kind=`-less request |
+| `agentflow-agents/src/services/account-entities/telegram.ts:138` | `TELEGRAM_ENTITY_KINDS` — dialogs/channels/contacts/groups/bots via `get_dialogs`, thread via `get_messages` |
+| `agentflow-agents/src/services/account-entities/telegram.ts:196` | `kind:'groups'` ("Группы") — filters `get_dialogs` rows on `Boolean(d.is_group)` (filter at `telegram.ts:206`) |
+| `agentflow-agents/src/services/account-entities/telegram.ts:215` | `kind:'bots'` ("Боты") — filters via `isBotDialog` (filter at `telegram.ts:225`) |
+| `agentflow-agents/src/services/account-entities/telegram.ts:99` | `isBotDialog(d)` — true when peer `username.endsWith('bot')`; Telethon exposes `is_channel`/`is_user`/`is_group` but no per-dialog `is_bot`, so the username suffix is the heuristic |
+| `agentflow-agents/src/services/account-entities/kwork.ts:89` | `KWORK_ENTITY_KINDS` — dialogs (`list_dialogs`), gigs (`list_my_kworks`), exchange (`list_wants`), thread via `get_dialog` |
+| `agentflow-agents/src/services/account-entities/types.ts` | `Entity` / `EntityMessage` / `EntityKindDef` contracts |
+| `agentflow-agents/src/services/account-contact-resolver.ts:111` | `resolveContact` — fan to `get_dialogs`, fuzzy-rank name/username |
+| `agentflow-agents/src/services/account-contact-resolver.ts:74` | `supportsContactResolution` — platform-data-driven (telegram today) |
+| `agentflow-agents/src/services/account-command.ts:92` | `RESOLVE_CONTACT_TOOL` synthetic in-loop tool name |
+| `agentflow-agents/src/services/account-command.ts:95` | `resolveContactToolSpec` injected into the tool surface when supported |
+| `agentflow-agents/src/services/account-thread.ts:27` | `accountThreadId` → `acct:<platform>:<account_id>` |
+| `agentflow-agents/src/services/account-thread.ts:47` | `ensureAccountThread` — idempotent per-account thread row |
+| `agentflow-agents/src/services/account-thread.ts:104` | `loadAccountThread` — owner-scoped replay (UI + loop seed) |
+
+## Data flow
+```
+ENTITIES  GET /me/accounts/telegram:4/entities?kind=dialogs
+            → requireSession (owner=session.sub)
+            → resolveOwnedAccount("telegram:4")  // owner-scope verify
+            → fetchEntities(platform=telegram, accountId=4, kind=dialogs)
+                → getEntityKind → def.source.argsFrom → mcpDirect.callTool(
+                    'telegram','get_dialogs',{owner_user_id,account_id,limit})
+                → def.source.normalize(raw) → Entity[]
+            → { ok, kind, entities:[{platform,account_id,kind,id,title,
+                subtitle,meta,unread}] }
+
+THREAD    GET /me/accounts/telegram:4/entities/dialogs/<peer>/messages
+            → fetchEntityThread → def.thread → get_messages
+            → { ok, kind, entity_id, messages:[{id,role:me|them,text,ts,meta}] }
+
+RESOLVE   POST /me/accounts/telegram:4/command { text:"напиши Косте привет" }
+            → runAccountCommand injects resolve_contact into tools[]
+            → model calls resolve_contact{query:"Костя"}
+            → resolveContact → get_dialogs → fuzzy-rank → candidates[]
+            → model picks @username → drafts send_message → owner approval gate
+
+HISTORY   POST …/command also: ensureAccountThread(acct:telegram:4) +
+            seed loop from loadAccountThread + append every turn.
+          GET …/thread → loadAccountThread → { ok, account_id, messages }
+```
+
+## DB / Env / API
+- Tables: REUSE `copilot_threads` / `copilot_messages` (no migration), thread id
+  `acct:<platform>:<account_id>`, `agent_slug='account-pult'`. Entities are live
+  MCP reads — never persisted.
+- Routes: `GET /me/accounts/:accountId/entities`,
+  `GET /me/accounts/:accountId/entities/:kind/:entityId/messages`,
+  `GET /me/accounts/:accountId/thread`.
+- MCP tools: telegram `get_dialogs` / `get_messages`; kwork `list_dialogs` /
+  `get_dialog` / `list_my_kworks` / `list_wants`. Bridge =
+  `mcpDirect.callTool(server, tool, args, { ownerUserId })`.
+- Telegram entity kinds — `dialogs`, `channels`, `contacts`, `groups`, `bots`
+  (#1109) — all share ONE `get_dialogs` round-trip; each kind is a pure
+  client-side filter over the same `RawDialog[]` (`is_channel` / `is_user` /
+  `is_group` / `username.endsWith('bot')`). No extra MCP call per kind.
+- Kwork tools key on `account_session_secret_key` (default `KWORK_SESSION_JSON`),
+  not `owner_user_id` — owner is pinned into the MCP URL `?owner=`.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Entities list empty for a live account | (no log — silent degrade) returns `{ok:true,entities:[]}` | `services/account-entities/index.ts:106` (catch → `[]`) |
+| 404 on entities | `account_not_found` | `routes/me-accounts.ts:103` (owner-scope miss) |
+| 400 on entities | `unknown_kind` | `services/account-entities/index.ts:87` (kind not in registry) |
+| Thread read returns `[]` after reload | thread owned by another user | `services/account-thread.ts:115` (userId guard) |
+| `resolve_contact` returns no candidates | (silent — loop asks owner to clarify) | `services/account-contact-resolver.ts:145` (score ≥ 0.3 cut) |
+
+## Verify
+```
+GET /me/accounts/telegram:4/entities?kind=dialogs   → real chats
+GET /me/accounts/telegram:4/entities/dialogs/<peer>/messages   → real messages
+POST /me/accounts/telegram:4/command {text:"напиши Косте"} then
+GET  /me/accounts/telegram:4/thread   → the turn is replayed
+node --import tsx --test tests/account-entities.test.ts tests/account-contact-resolver.test.ts
+```
+
+## Related
+- [Accounts Control Pult (backend, V1)](/subsystems/accounts-pult) — list + action log + command loop
+- [Kwork integration](/subsystems/kwork-integration)
+- [Generic integrations](/subsystems/generic-integrations)

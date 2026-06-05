@@ -40,6 +40,30 @@ Callers that pass explicit `params.model` win over env (`legacy-callwithfallback
 
 Tenant runtime pods (spawned per project) are seeded with `ANTHROPIC_LARGE_MODEL=claude-sonnet-4-6` hardcoded at `services/tenant-bootstrap.ts:341-342` — those pods will NOT inherit the agentflow-agents flip until that hardcode is updated (backlog).
 
+## `flow` alias multi-provider failover (T1.10, 2026-06-03)
+
+The `flow` alias resolves to a **TEXT_LARGE chain**, not a single pinned provider. Ordering is owned by `llm_provider_configs` (priority DESC), so the live chain is:
+
+| Pri | Provider | Role |
+|---|---|---|
+| 30 | `db:codexsale` (codex.sale) | primary — intermittently flaps |
+| 20 | `db:designapi-text` | first fallback |
+| 15 | `db:claudecodeapi` | second fallback |
+| 10 | `db:claude-oauth` | last resort |
+
+There is **no `preferredProvider` hard-pin** for `flow` — codex.sale leads purely by priority, so when it flaps the `useModel` loop advances down the chain on its own. The loop fails over on a thrown error AND on `healthy()===false`, and only raises `AiRouterError` (listing every attempt) when the whole chain is exhausted. The chain ordering and which providers are enabled is an owner-tunable DB concern: `UPDATE llm_provider_configs SET priority=… / enabled=…` + `POST /admin/llm-providers/refresh`. No code change needed to reorder.
+
+### Flapping-aware unhealthy cache (always-on)
+
+When codex.sale throws, the loop records it into the per-provider unhealthy cache (`markUnhealthy`, 60s TTL, `agentflow-agents/src/services/ai-router/health-probe.ts:120`). On the **next** `flow` call within that TTL the candidate is moved to the back of the queue (`agentflow-agents/src/ai-router/registry.ts:187`), so the call goes straight to designapi instead of replaying the 3-attempt transient-retry storm against the flapping primary. After the TTL the provider is retried — the cache self-heals. This is **always on**, independent of `PICK_HEALTHY_ENABLED` (that env still only gates the pre-call probe). Cached-unhealthy providers are demoted, never removed: if the entire chain is cached-unhealthy they are still tried as a last resort so a transient cluster-wide blip surfaces a clean `AiRouterError`, not a false `no_provider`.
+
+Verified locally (codex.sale forced to throw 503):
+
+```
+[ai-router] provider db:codexsale failed, falling through type=TEXT_LARGE owner=platform err=503 Сервис временно недоступен
+MODEL_RETURNED=db:designapi-text   # served from the next provider, no error to the caller
+```
+
 ## Response cache (exact-match)
 
 `response-cache.ts` хеширует канонический payload `{modelType, model, temperature, system, messages, tools, tool_choice, max_tokens}` через SHA-256 и пишет/читает строку из `llm_response_cache`. Кешируются только детерминированные пути: TEXT_* при явном `temperature===0` и OBJECT_* (любые). IMAGE/VIDEO/TTS/embedding/streaming — пропускаются на гейте `isCacheable`. TTL — 7 дней (read-time фильтр + cleanup sweep). На `hit` пропускается upstream + `agent_usage` (чтобы не дублировать billing); на `miss` — обычный fallback chain через `useModel`, ответ кладётся в кеш. Опт-ин через env флаг — выключенный cache no-op'ит и оба пути работают как раньше.
@@ -125,6 +149,9 @@ return result
 | Budget exceeded — agent застрял | `BudgetExceededError` или `budget_cap_hit` | `ai-router/instrumented.ts:112` |
 | Ни один provider не отвечает | `AiRouterError: no_provider_for_model` | `ai-router/registry.ts:158` (useModel) |
 | Все рейт-лимитнули | `ai_router_all_candidates_failed` | `ai-router/registry.ts:158` (fallback chain) |
+| `flow` primary (codex.sale) flaps — fell through to designapi | `provider db:codexsale failed, falling through` | `ai-router/registry.ts:287` — expected behaviour; chain advanced. If it falls through on EVERY call, codex.sale is down longer than the 60s unhealthy TTL — check upstream codex.sale status. |
+| `flow` chain re-hits a dead codex.sale on every call (retry storm) | repeated `provider db:codexsale failed, falling through` with `<400ms` between, never reaching designapi cache | `ai-router/registry.ts:187` — flapping-aware skip not demoting; confirm `health-probe.markUnhealthy` ran (the loop calls it on throw at `registry.ts:279`). |
+| All four `flow` providers down | `AiRouterError: all_providers_failed for TEXT_LARGE: db:codexsale=…; db:designapi-text=…; db:claudecodeapi=…; db:claude-oauth=…` | `ai-router/registry.ts:158` — every provider in the chain threw. Rotate keys / check `llm_provider_configs.enabled`. |
 | DB provider не подтянулся | `refresh_db_providers_failed` | `llm-providers/db-driven.ts:454` |
 | Owner-scoped provider не виден | `provider_owner_mismatch` | `ai-router/registry.ts:158` (filter clause) |
 | Stream aggregate упал в середине | `aggregate_openai_stream_failed` | `llm-providers/db-driven.ts:80` |

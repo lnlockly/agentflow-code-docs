@@ -1,0 +1,109 @@
+---
+title: "Cabinet home (agent-centric, concept §5.1)"
+description: "The /cabinet home: greeting + live status, two primary CTAs, «Твои агенты» hero, a «Твои возможности» guided capabilities map, a compact Balance+Projects strip, recent activity, and a first-run hero."
+---
+
+# Cabinet home
+
+## TL;DR
+
+The `/cabinet` home answers «что у меня работает и что сделать дальше». It
+leads with a greeting + a one-line live status, two primary CTAs (Нанять
+агента → `/cabinet/agents`, Собрать проект → `/projects`), then the hero
+block **«Твои агенты»** — the same running-agent rows as the Агенты hub,
+served from the shared `MyAgentsList` over `GET /me/devices` +
+`GET /me/hosted-devices`. Below it sits the **«Твои возможности»** guided
+strip (`CapabilitiesMap variant="strip"`), then a compact metrics strip
+(Баланс USDF → billing, Проекты live → `/projects`) and a lighter
+recent-activity feed. When the user has **no agents and no projects**, the
+body leads with the same `CapabilitiesMap` as a **hero** («С чего начать?»)
+so onboarding lives here, not on a separate page.
+
+### Capabilities map («Твои возможности / С чего начать»)
+
+`CapabilitiesMap` (one component, two variants) renders four guided
+capability cards — each is icon + plain title + one-line «что это даёт» +
+a 1-2-3 mini-step recipe + a CTA into the real flow:
+
+| Card | What it gives | CTA → |
+|---|---|---|
+| Собрать проект | сайт/бот/приложение с превью | `/projects` |
+| Нанять агента | AI делает рутину (автопостинг, входящие, мониторинг) | `/cabinet/agents` |
+| Облако 24/7 | агент работает без твоего компьютера | `/cabinet/devices/hosted/new` |
+| Подключить компьютер | AI-агент на твоём Mac/ПК | `/cabinet/devices` |
+
+`variant="hero"` (first run) renders bigger with the «С чего начать?» title
++ subtitle; `variant="strip"` (returning) is denser and titled «Твои
+возможности». This replaced the prior 3-card `FirstRunChooser`.
+
+This replaced the prior home (full-width Balance hero + 2 stat tiles + 4
+quick-action cards + activity feed), which the owner disliked — see
+`CABINET-CONCEPT.html` §1.1 (audit) + §5.1 (target mockup).
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/pages/CabinetDashboard.tsx:94` | `useMyAgents()` drives the status line + first-run gate |
+| `agentflow-landing/src/pages/CabinetDashboard.tsx:152` | one-line status (running agents · actions today), idle fallback |
+| `agentflow-landing/src/pages/CabinetDashboard.tsx:156` | `isFirstRun` = no agents AND no live/total projects |
+| `agentflow-landing/src/pages/CabinetDashboard.tsx:191` | first-run hero — `<CapabilitiesMap variant="hero" />` |
+| `agentflow-landing/src/pages/CabinetDashboard.tsx:205` | «Твои агенты» hero — `<MyAgentsList limit={5} />` |
+| `agentflow-landing/src/pages/CabinetDashboard.tsx:209` | returning strip — `<CapabilitiesMap variant="strip" />` |
+| `agentflow-landing/src/pages/CabinetDashboard.tsx:212` | compact metrics strip — `<HomeWidgetsRow liveProjects={…} />` |
+| `agentflow-landing/src/pages/CabinetDashboard.tsx:281` | `CAPABILITIES` (build / hire / hosted / connect) + `CapabilitiesMap` |
+| `agentflow-landing/src/components/dashboard/MyAgentsList.tsx:70` | `useMyAgents()` — owns device queries + dedupe + `runningCount` |
+| `agentflow-landing/src/components/dashboard/MyAgentsList.tsx:122` | `MyAgentsList` presentational list (loading/error/empty/rows, `limit`) |
+| `agentflow-landing/src/components/dashboard/MyAgentsList.tsx:166` | `AgentRow` / `HostedAgentRow` (moved out of `CabinetAgentsHub`) |
+| `agentflow-landing/src/pages/CabinetAgentsHub.tsx` | hub now imports `useMyAgents` + `MyAgentsList` (no duplicate rows) |
+| `agentflow-landing/src/components/dashboard/HomeWidgetsRow.tsx:45` | compact Balance + Projects strip (was the full-width Balance card) |
+| `agentflow-landing/src/styles/cabinet-dashboard.css` | `.cab-home*`, `.cab-cta`, `.cab-metric*`, `.cab-cap*` (capabilities map), `.cab-activity*` |
+
+## Data flow
+
+```
+CabinetDashboard (/cabinet)
+  useMyAgents() ─┬─ GET /me/devices        (devicesApi.list)
+                 └─ GET /me/hosted-devices (fetchHostedDevices)
+                    → dedupe daemon mirror → { local, hosted, runningCount, hasAny }
+  projectsQuery ── GET /me/projects?limit=200 → liveProjects (running|approved|awaiting_approval)
+  activityQuery ── GET /me/activity-feed?limit=10 → actionsToday (created_at < 24h)
+  balance ──────── GET /me/balance (inside HomeWidgetsRow) → USDF chip
+
+  status line = [runningCount>0 ? «N агентов работают»] · [actionsToday>0 ? «сегодня M действий»]  (idle fallback)
+  isFirstRun  = settled && !hasAny && totalProjects===0  → <CapabilitiesMap variant="hero"/>
+                                            else          → strip <CapabilitiesMap variant="strip"/> under «Твои агенты»
+```
+
+`MyAgentsList` is shared by the home and the Агенты hub. React Query
+dedupes the `['cabinet-devices']` / `['cabinet-hosted-devices']` keys, so
+calling `useMyAgents()` on both surfaces hits cache, not the network twice.
+
+## DB / Env / API
+
+- Routes consumed: `GET /me/devices`, `GET /me/hosted-devices`,
+  `GET /me/projects`, `GET /me/activity-feed`, `GET /me/balance`,
+  `GET /auth/me`.
+- Env: none new. API base is `VITE_AGENTS_URL` (default
+  `http://localhost:4100`).
+- i18n keys: `cabinet.home.*` (status, cta, metric, see_all, activity_quiet,
+  start.*, **cap.*** — hero_title/hero_sub/title + per-card
+  title/what/step1-3/cta) across `src/i18n/{ru,en,zh}.json`.
+- Links out: `/cabinet/agents`, `/projects`, `/account/billing`,
+  `/cabinet/devices`, `/cabinet/devices/hosted/new`,
+  `/cabinet/devices/:id/live`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Home shows first-run chooser for an existing user | (no log — both `/me/devices` and `/me/projects` returned empty) | `CabinetDashboard.tsx:156` (`isFirstRun` gate) |
+| «Твои агенты» empty while hub shows agents | `cabinet.agents.empty` rendered | `MyAgentsList.tsx:122` (shared `hasAny`) |
+| Balance chip stuck on «—» | `/me/balance` returned null/non-finite | `HomeWidgetsRow.tsx:56` |
+| Status line always idle | `runningCount` 0 (no online local / running cloud) | `MyAgentsList.tsx:95` |
+
+## Related
+
+- [Cabinet navigation IA](/subsystems/cabinet-nav-ia)
+- [Devices unified](/subsystems/devices-unified)
+- [Projects create flow](/subsystems/projects-create-flow)
