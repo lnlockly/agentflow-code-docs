@@ -1,0 +1,111 @@
+---
+title: "Project create — Claude builds from scratch (default path)"
+description: "POST /me/projects has Claude build the whole project in a VS Code pod from BRIEF.md — no kind classifier, no template scorer, no approve step."
+---
+
+# Project create — Claude builds from scratch
+
+## TL;DR
+
+The DEFAULT `POST /me/projects` path (2026-06-05) creates the project with
+`kind='claude_build'` / `runtime_class='workspace'` / `status='building'` and
+hands the brief to **Claude running in the project's VS Code pod**, which builds
+the whole project FROM SCRATCH — chooses the stack, writes every file, installs
+deps, runs a dev server. There is **no kind classification, no template scorer,
+and no approve step**. The legacy kind/template/approve pipeline (see
+[`subsystems/projects`](/subsystems/projects/)) stays reachable behind the
+explicit `legacy_template_flow:true` opt-in for back-compat.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/projects.ts:558` | `createProjectSchema.legacy_template_flow` — opt back into the old kind/template/approve flow. Default (unset) = claude-build. |
+| `agentflow-agents/src/routes/projects.ts:876` | `handleClaudeBuildCreate` — the default create handler: idempotency probe, slug, personal-team attach, INSERT `kind='claude_build'`/`runtime_class='workspace'`/`status='building'`, fire `runClaudeBuildBackground` via `setImmediate`. NO `analyzeBrief` / `pickBestTemplateForBrief` / template_url. |
+| `agentflow-agents/src/routes/projects.ts:1124` | `useLegacyTemplateFlow` gate — `!legacy_template_flow` short-circuits into `handleClaudeBuildCreate` before the tg_bot routing + scorer block. |
+| `agentflow-agents/src/services/project-claude-build.ts:374` | `runClaudeBuildBackground` — fire-and-forget orchestrator: provision pod → ensureProjectIde → provisionProjectIdePodTools → seed BRIEF.md → kick build → events. |
+| `agentflow-agents/src/services/project-claude-build.ts:230` | `seedBriefMd` — writes `BRIEF.md` (raw brief) + `.agentflow/build-prompt.txt` (staged prompt) via the `write_file` tool. |
+| `agentflow-agents/src/services/project-claude-build.ts:143` | `buildClaudeBuildCommand` — pure shell: install Claude Code (idempotent), launch a DETACHED one-shot `claude -p "$(cat <prompt>)"` in the `build` tmux session, source the flow env. |
+| `agentflow-agents/src/services/project-claude-build.ts:297` | `kickClaudeBuild` — one idempotent `exec` that launches the `build` session; `building:true` only when the `af_claude_build_started` marker is echoed. |
+| `agentflow-agents/src/services/project-claude-build.ts:79` | `CLAUDE_BUILD_SESSION='build'` — the detached autonomous build session (distinct from the attachable `work` session). |
+| `agentflow-agents/src/services/projects/provision.ts:293` | `preWarmWorkspaceForProject` — reused, template-free: provisions the workspace pod + persists `workspace_project_name='proj-<slug>'`. |
+| `agentflow-agents/src/services/project-ide.ts:253` | `ensureProjectIde` — reused: brings up code-server in the same pod. |
+| `agentflow-agents/src/services/project-ide-pod-tools.ts:349` | `provisionProjectIdePodTools` — reused: writes `.agentflow/flow.env` (per-user `af_live_*` + flow facade base) the build session sources. |
+| `agentflow-agents/src/services/runtime-class.ts` | `claude_build` → `workspace` mapping. |
+| `agentflow-agents/src/routes/projects.ts:2204` | IDE route `POD_BACKED` set now includes `building` so the owner can open the editor and `tmux attach -t build` to watch the live build. |
+| `agentflow-agents/tests/project-claude-build.test.ts:1` | 12 unit tests (mock pod exec/ide + the spawn). |
+
+## Data flow
+
+```
+client → POST /me/projects { brief }                 (legacy_template_flow unset)
+   │
+   ▼
+handleClaudeBuildCreate
+   ├─ idempotency probe (owner|claude_build|team|brief, 60s window)
+   ├─ slug + ensurePersonalTeam
+   ├─ INSERT projects(kind='claude_build', runtime_class='workspace',
+   │                  status='building', template_url=NULL)
+   ├─ appendProjectEvent × 2 (brief, project_created mode='claude_build')
+   └─ setImmediate(runClaudeBuildBackground)
+   ▼
+return 201 { project:{ status:'building', kind:'claude_build', … } }   ← <2s
+
+(after response flushes)
+
+runClaudeBuildBackground:
+   1. preWarmWorkspaceForProject  → pod up, workspace_project_name='proj-<slug>'  (NO clone)
+   2. ensureProjectIde            → code-server up in the same pod
+   3. provisionProjectIdePodTools → .agentflow/flow.env (per-user af_live_* + flow facade)
+   4. seedBriefMd                 → write_file BRIEF.md + .agentflow/build-prompt.txt
+   5. kickClaudeBuild             → exec: install claude, tmux new-session -d -s build
+                                      → claude --dangerously-skip-permissions -p "$(cat build-prompt)"
+   6. emit claude_building (status stays 'building')
+
+preview-reconciler (existing) → dev server answers on port → status 'building' → 'running'
+```
+
+## DB / Env / API
+
+- Tables: `projects.kind='claude_build'`, `projects.runtime_class='workspace'`,
+  `projects.status='building'` (text columns, no CHECK → no migration).
+  `template_url` / `template_repo_full` stay NULL on this path.
+- Env: none new. The build session sources `ANTHROPIC_BASE_URL=<flow facade>` +
+  the per-user `af_live_*` key from `.agentflow/flow.env` (written by pod-tools).
+  Model is the logical `flow` alias — no hardcoded model, no real provider key.
+- Routes: `POST /me/projects { brief }` → 201 `{ project:{ status:'building',
+  kind:'claude_build', runtime_class:'workspace' } }`. `legacy_template_flow:true`
+  → old kind/template/approve flow. `GET /me/projects/:id/ide` opens for
+  `status='building'`; `tmux attach -t build` watches the live build.
+- Events: `project_created` (mode='claude_build'), `claude_build_started`,
+  `brief_seeded`, `claude_building`, `build_failed`.
+- MCP tools: `write_file` (seed BRIEF.md), `exec` (install + launch build).
+
+## Status lifecycle
+
+```
+building → running → done
+   │
+   └─ failed   (provision / pod-tools / seed / kick failure)
+```
+
+No `awaiting_approval`, no `approved` on this path. The `building` row is live
+from the first response; the preview-reconciler promotes to `running` when the
+dev server answers, the same promotion path the template flow uses.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Project stuck at `building`, no pod | `pre_warm_workspace_failed` then `build_failed error=workspace_provision_failed` | `project-claude-build.ts:374` (step 1) / `projects/provision.ts:293` |
+| `building` but no flow env → Claude hits api.anthropic.com | `build_failed error=pod_tools_failed` | `project-claude-build.ts` step 3 / `project-ide-pod-tools.ts:349` |
+| Pod up, BRIEF.md never written | `build_failed error=seed_brief_failed` | `project-claude-build.ts:230` (`write_file` returned `!ok`) |
+| Build never launches | `build_failed error=claude_build_kick_failed` / stdout `af_claude_install_failed` (claude CLI absent) / `af_claude_no_tmux` (tmux missing) | `project-claude-build.ts:297` / `buildClaudeBuildCommand:143` |
+| Editor opens but no live build to attach | `kickClaudeBuild` returned `building:false` | check `exec` stdout for `af_claude_build_started` |
+| Got the old template flow instead of claude-build | request carried `legacy_template_flow:true` | `routes/projects.ts:1124` |
+
+## Related
+
+- [`subsystems/projects`](/subsystems/projects/) — the legacy kind/template/approve flow, now opt-in (`legacy_template_flow:true`).
+- [`subsystems/project-vscode-ide`](/subsystems/project-vscode-ide/) — the per-project code-server + attachable `work` Claude session this path provisions.
+- [`subsystems/project-ide-tools`](/subsystems/project-ide-tools/) — the `.agentflow/flow.env` + MCP wiring the build session sources.
