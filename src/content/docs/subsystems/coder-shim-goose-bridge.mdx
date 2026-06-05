@@ -44,8 +44,12 @@ injection boundary.
 | `agentflow-agents/src/coder-shim/goose-runner.ts:110` | `buildCoderPrompt` — frames the raw brief as an imperative "implement the brief by EDITING the cloned files at CWD" directive; branches on `kind` (HTTP vs tg_bot), never a slug |
 | `agentflow-agents/src/coder-shim/goose-runner.ts:143` | `buildGooseArgs` — `run --with-builtin developer --no-session --max-turns N --system <guardrail> -t <framed-prompt>`; `-t` is `buildCoderPrompt`, `--system` is `buildCoderSystemPrompt`; never a concrete model id |
 | `agentflow-agents/src/coder-shim/goose-runner.ts:194` | `runGooseArgv` — array-argv spawn (one process path for coder + recipe + schedule) |
+| `agentflow-agents/src/coder-shim/pipeline.ts:37` | `buildReport` (pure) — goose exit + dev-server result + probe → CloneStatusReport (hard install/spawn failure → ok:false) |
 | `agentflow-agents/src/coder-shim/pipeline.ts:31` | `buildReport` (pure) — goose exit + probe → CloneStatusReport (carries `package_manager`+`dev_pid`) |
+| `agentflow-agents/src/coder-shim/pipeline.ts:145` | `runCoderTask` — clone → goose config → `runGoose` → `startDevServer` (HTTP kinds) → probe → report |
 | `agentflow-agents/src/coder-shim/pipeline.ts:114` | `runCoderTask` — clone → goose config → `runGoose` → `startDevServer` (HTTP kinds) → probe → report |
+| `agentflow-agents/src/coder-shim/dev-server.ts:206` | `startDevServer` — read package.json, pick package manager from lockfile, install deps, `freePort` (kill prior dev-server on this port — auto-retry idempotency), spawn `<pm> run dev\|start` detached on `0.0.0.0:<port>`; returns `dev_pid` + `package_manager` (PR #970) |
+| `agentflow-agents/src/coder-shim/dev-server.ts:39` | `pickPackageManager` / `installArgs` / `pickStartScript` / `startArgs` (pure planners) — pnpm>yarn>npm precedence; prefer `dev` over `start`; forward `--port/--host` per pm, tokenised argv |
 | `agentflow-agents/src/coder-shim/dev-server.ts:69` | `detectPackageManager`/`buildInstallArgs`/`buildDevCommand`/`buildServeCommand` (pure) + `startDevServer` — install deps, start dev/start cmd DETACHED on `0.0.0.0:<port>` so the served process outlives the coder task (otherwise `port_reachable:false` → no ingress → preview 503). `buildDevCommand` detection order: real bundler `dev`/`start` (Next `-H/-p`, Vite `--host/--port`) → `Procfile web:` → static `serve` (a `serve`-wrapper script or `serve` dep → `npx serve -s -l <port> .`) |
 | `agentflow-agents/src/coder-shim/dev-server.ts:206` | `probeWorkspace` (exported) — reads package.json scripts + lockfiles + `hasNextDep`/`hasTypescriptDep`/`hasServeDep` + a root `Procfile web:` (`parseProcfileWeb`, `dev-server.ts:49`); reused by the build gate so the workspace is read once |
 | `agentflow-agents/src/coder-shim/dev-server.ts:183` | `installDeps` (extracted from `startDevServer`) — install ONCE up front so the build gate + dev server share `node_modules`. `startDevServer` gained `skipInstall`+`probe` to avoid a second install |
@@ -73,6 +77,7 @@ injection boundary.
 | `agentflow-agents/coder-shim-image/Dockerfile:1` | image: node 22 + bridge + goose from the fork |
 | `agentflow-agents/coder-shim-image/entrypoint.sh:1` | env check + `node dist/coder-shim/main.js` |
 | `agentflow-agents/.github/workflows/build-coder-shim.yml:1` | self-hosted build → `ghcr.io/<owner>/agentflow-coder-shim` |
+| `agentflow-agents/tests/coder-shim.test.ts:1` | 71 unit tests (protocol/scope/runner incl. `buildCoderSystemPrompt`/clone-status/report/resolver + recipe allowlist/argv/cron + dev-server planners + dev-server failure-branch reports) |
 | `agentflow-agents/tests/coder-shim.test.ts:1` | 85 unit tests (incl. `extractSourceError` on real `next build`/`tsc` fixtures) (protocol/scope/runner incl. `buildCoderSystemPrompt`/clone-status/report/resolver + recipe allowlist/argv/cron) |
 
 ## Data flow
@@ -95,6 +100,11 @@ coder-shim bridge.handleCoderDispatch
    │       "implement the brief by EDITING the cloned files at CWD". Without the
    │       --system guardrail the model plans, says "ready to proceed" and exits 0
    │       with the workspace untouched — headless `goose run` has no second turn)
+   │    startDevServer (HTTP kinds): read package.json, pick pm from lockfile,
+   │       <pm> install, then spawn `<pm> run dev|start --port <port> --host
+   │       0.0.0.0` DETACHED (unref) so it keeps serving — headless `goose run`
+   │       exits after editing and leaves NO running server. install_failed /
+   │       dev_spawn_failed short-circuit to ok:false (project → failed + tail).
    │    HTTP kinds (skipped for tg_bot):
    │      probeWorkspace → detectPackageManager → installDeps ONCE (non-frozen)
    │      BUILD-VALIDATE + SELF-HEAL (build-validate.ts):
@@ -105,9 +115,9 @@ coder-shim bridge.handleCoderDispatch
    │        still broken → ok:false error:'build_failed' (project → failed)
    │      build clean → startDevServer(skipInstall) — spawn <pm> run dev
    │        (Next: -H 0.0.0.0 -p <port>; Vite: --host/--port) DETACHED + unref
-   │    probe 127.0.0.1:<port>  (only when the dev server started)
+   │    probe 127.0.0.1:<port>  (HTTP kinds; skipped for tg_bot / only when the dev server started)
    │  POST /internal/projects/:id/clone-status {ok, port, port_reachable,
-   │     package_manager, dev_pid, pod_ip, ...}
+   │       dev_pid, package_manager, pod_ip, ...}
    ▼  WS task_complete  (or task_error)
 backend internal.ts clone-status → flips status, wires Service/Ingress, preview_url
 ```
@@ -174,6 +184,8 @@ charset-validated before reaching the scheduler.
 | Coder pod never connects | `[coder-shim] FATAL: missing required env` | entrypoint env check — `AF_API_KEY`/`AF_DEVICE_ID` unset on the pod |
 | goose binary missing | `[coder-shim] FATAL: goose binary not on PATH` | image build — goose download step failed |
 | clone-status never posts | `internal_secret_unset` returned by `postCloneStatus` | `AF_INTERNAL_API_SECRET` not on the pod |
+| Project stuck provisioning + preview 503, goose edited the files | `clone-status posted ... ok=true http=...`, clone_status event `port_reachable:false`, `dev_pid:null` | Pre-PR #970: `runCoderTask` only PROBED the port — nothing installed deps or started `next dev`/`vite`, so the probe always missed, the backend skipped `wirePreviewIngress`, and the preview 503'd. Fixed: `dev-server.ts:startDevServer` installs + spawns the dev-server detached on `0.0.0.0:<port>` before the probe. Verify: clone_status now carries `dev_pid` + `package_manager` and `port_reachable:true`. **Needs the coder-shim image rebuilt on merge.** |
+| HTTP project → failed with an install tail | clone_status event `error:'install_failed'` (or `dev_spawn_failed`) + `detail` = npm/pnpm output | `<pm> install` exited non-zero in the project pod — read the `detail` tail (peer-dep conflict, network, lockfile drift). `buildReport` flips ok:false so the operator sees the real cause instead of a silent 503. |
 | Project stuck provisioning, goose ran, preview 503 | clone_status `{ok:true, port_reachable absent, dev_pid:null, expose:null}` | the dev server never started — `startDevServer` returned `{devPid:null,error}` (read `install_failed:*` / `no_dev_or_start_script` / `no_package_json` in the report detail) OR did not bind `0.0.0.0:<port>` in the 60s probe window. `dev-server.ts` |
 | Project promoted to `running` but the page returns HTTP 500 (silent broken build) | served page 500 `ModuleParseError: Unexpected character '@' (1:0)` / `Module parse failed` / `x Expression expected … @tailwind base;`; `next build` in `/workspace/<slug>` exits 1 `Build failed because of webpack errors` | goose's edit broke the webpack/TS build (e.g. a CSS `@tailwind`/`@import` directive pasted into a `.tsx`/`.js` module, a dangling import, a clobbered postcss/next/tsconfig). `next dev` compiles lazily so the runtime probe saw the server up + `/` 200 and promoted anyway. Fixed (this PR): `pipeline.ts:219` build-validate gate runs `next build`/`tsc --noEmit` BEFORE `ok:true`; on failure feeds the compile tail to a goose heal-pass (`build-validate.ts:157` `buildHealPrompt`) and retries ≤`maxHealAttempts` (2); still broken → `ok:false error:'build_failed'` so the project is `failed` (visible) not a running-500. `buildCoderSystemPrompt` (`goose-runner.ts:93`) also bans CSS-in-JS. Repro on `lnlockly/agentflow-nextjs-starter` (project #1599, slug 8355a532, 2026-05-29). **Needs the coder-shim image rebuilt (`build-coder-shim.yml`) on merge.** |
 | Build-validate fails-closed but the self-heal NEVER recovers it (project marked `failed` after the heal budget) | clone-status `detail` is a webpack INTERNAL stack: `… (/workspace/.../node_modules/next/dist/compiled/webpack/bundle5.js:28:130607) … neo-async/async.js …`; no `./app/...` source ref in the heal prompt | the heal pass was fed the raw `runBuildCheck.tail` whose last 4k chars were webpack/Node internal frames (`at Module._resolveFilename (node:internal/…)`), not the source error — goose can't map a bundler stack to an editable file, so every retry no-ops. Real failure: project #1601 «Лингва Про» landing (goose device, 2026-05-29), goose edited `app/page.tsx`+`layout.tsx`+`globals.css`, `next build` failed, heal no-op'd ×N, project `failed`. Fixed (this PR): `build-validate.ts:220` `extractSourceError` strips the internal frames + surfaces the `Failed to compile`/`./app/page.tsx`/`Module not found`/`error TS####` lines BEFORE `buildHealPrompt` embeds them; `maxHealAttempts` default bumped 2→3. Verified on 4 real `next build`/`tsc` fixtures (`tests/fixtures/build-errors/`): the webpack-loader-stack tail that ended in `node:internal/modules/cjs/loader` now extracts to `Failed to compile` + `./app/page.tsx` + `Cannot find module`. **Needs the coder-shim image rebuilt (`build-coder-shim.yml`) on merge.** |
