@@ -94,7 +94,7 @@ Research.tsx
   blank path stays discoverable.
 - `AgentWorkspace.tsx` now passes `agent.category` + `agent.topics` into
   `AgentChatPanel`. Researcher agents get an in-persona greeter on empty
-  chat ("Привет, я Ленин.") with three "Спроси меня про <topic>" buttons
+  chat ("Привет, я Ленин.") with three `Спроси меня про <topic>` buttons
   sourced from `character.topics`. The chat also renders a seed-loading
   banner while `GET /agents/:slug/knowledge` count is still climbing.
 - Backend: `publicAgent` (`agentflow-agents/src/routes/agents.ts`) now

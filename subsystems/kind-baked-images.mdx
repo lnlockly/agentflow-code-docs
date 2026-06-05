@@ -5,6 +5,10 @@ description: "Per-kind layered Docker images so warm pods boot with the right de
 
 # Kind-Baked Workspace Images
 
+:::caution[Deprecated — старая архитектура]
+Этот раздел про старую архитектуру с per-kind images для warm pod pool (`tg_profile_bundle` / `landing` / `spa` / etc.). Новый flow использует один generic Next.js daemon image + `git clone` шаблона при approve — описан в [`subsystems/projects`](/subsystems/projects/) (approved 2026-05-25).
+:::
+
 ## TL;DR
 
 Warm pod pool used to spawn a single kind-agnostic image. Approving a

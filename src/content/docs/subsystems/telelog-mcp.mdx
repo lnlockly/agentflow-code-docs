@@ -1,0 +1,104 @@
+---
+title: "agentflow-telelog-mcp"
+description: "MCP server exposing TeleLog (funstatbot.info) Telegram social graph DB as 12 LLM tools"
+---
+
+# agentflow-telelog-mcp
+
+## TL;DR
+
+Wraps the TeleLog API (`funstatbot.info`) — a crawled Telegram user/group/message database — as an MCP stdio server with 12 tools. Agents use it to enrich leads, find who wrote about a topic, and map social graphs without touching MTProto directly.
+
+## Files
+
+| Path | Role |
+|------|------|
+| `agentflow-telelog-mcp/src/index.ts` | Entry point, MCP server init, tool registration |
+| `agentflow-telelog-mcp/src/client.ts` | `TeleLogClient` — typed HTTP wrapper around funstatbot.info REST API |
+| `agentflow-telelog-mcp/src/error.ts` | Error normalisation helpers |
+| `agentflow-telelog-mcp/src/tools/tl-lead-enrich.ts` | Compound enrichment — main entry tool |
+| `agentflow-telelog-mcp/src/tools/tl-text-search.ts` | Full-text search across all messages |
+| `agentflow-telelog-mcp/src/tools/tl-user-info.ts` | Profile + name history by numeric ID |
+| `agentflow-telelog-mcp/src/tools/tl-user-groups.ts` | Group membership list |
+| `agentflow-telelog-mcp/src/tools/tl-user-messages.ts` | Recent messages by user |
+| `agentflow-telelog-mcp/src/tools/tl-user-message-count.ts` | Message count |
+| `agentflow-telelog-mcp/src/tools/tl-group-info.ts` | Group/channel profile |
+| `agentflow-telelog-mcp/src/tools/tl-group-members.ts` | Members list |
+| `agentflow-telelog-mcp/src/tools/tl-common-groups.ts` | Common groups between two users |
+| `agentflow-telelog-mcp/src/tools/tl-search-by-username.ts` | Lookup by @username |
+| `agentflow-telelog-mcp/src/tools/tl-search-by-name.ts` | Lookup by display name |
+| `agentflow-telelog-mcp/src/tools/tl-resolve-usernames.ts` | Batch @username → numeric ID |
+
+## Data flow
+
+```
+Agent
+  → tl_lead_enrich(@username)
+      ├─ tl_resolve_usernames   → numeric user_id
+      ├─ tl_user_info           → profile, name history, stats
+      ├─ tl_user_groups         → group membership list
+      └─ tl_user_messages       → recent activity
+  → returns enriched JSON for CRM / AI analysis
+```
+
+For broad research:
+```
+Agent → tl_text_search("keyword") → [{user, message, group, timestamp}]
+```
+
+## DB / Env / API
+
+- External API: `https://funstatbot.info` (TeleLog)
+- Auth: Bearer JWT in `Authorization` header
+- Env:
+  - `TELELOG_JWT` — required. Get from funstatbot.info account
+  - `TELELOG_BASE_URL` — optional override (default `https://funstatbot.info`)
+
+## 12 Tools
+
+| Tool name | Input | Returns |
+|-----------|-------|---------|
+| `tl_lead_enrich` | `username`, `include_messages?`, `include_full_stats?` | Full CRM profile JSON |
+| `tl_text_search` | `input`, `page?`, `pageSize?` | Matching messages + author + group |
+| `tl_user_info` | `user_id`, `full_stats?` | Profile, name history, activity stats |
+| `tl_user_groups` | `user_id`, `page?` | Groups the user belongs to |
+| `tl_user_messages` | `user_id`, `page?` | Recent messages |
+| `tl_user_message_count` | `user_id` | Message count per group |
+| `tl_group_info` | `group_id` | Group profile |
+| `tl_group_members` | `group_id`, `page?` | Member list |
+| `tl_common_groups` | `user_id_1`, `user_id_2` | Shared groups |
+| `tl_search_by_username` | `username` | Users + groups using that handle |
+| `tl_search_by_name` | `name` | Users matching display name |
+| `tl_resolve_usernames` | `usernames[]` | `[{username, user_id}]` |
+
+## Setup (Claude Desktop / Claude Code)
+
+```json
+{
+  "mcpServers": {
+    "telelog": {
+      "command": "node",
+      "args": ["/path/to/agentflow-telelog-mcp/dist/index.js"],
+      "env": {
+        "TELELOG_JWT": "eyJ..."
+      }
+    }
+  }
+}
+```
+
+Build: `cd agentflow-telelog-mcp && npm install && npm run build`
+
+## Failure modes
+
+| Symptom | Log signature | Where to fix |
+|---------|--------------|--------------|
+| Server exits at startup | `TELELOG_JWT env var is required` | Set env var in MCP host config |
+| Tool returns empty results | `tl_lead_enrich: resolve returned no IDs` | Username doesn't exist in TeleLog DB |
+| 401 errors | `TeleLogError: 401` | JWT expired — refresh from funstatbot.info |
+| tl_lead_enrich partial data | `lead_enrich: skipping messages` | `include_messages=false` (default) |
+
+## Related
+
+- [agentflow-tg-mcp](/subsystems/tg-mcp) — live MTProto operations (send messages, get dialogs)
+- GitHub: `lnlockly/agentflow-telelog-mcp` (private)

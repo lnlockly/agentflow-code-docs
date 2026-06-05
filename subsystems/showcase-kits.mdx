@@ -1,0 +1,102 @@
+---
+title: "Showcase Kits"
+description: "Curated one-click automations at /showcase — clone a flow, mint a hosted device, hint at missing integrations in 90s."
+---
+
+# Showcase Kits
+
+## TL;DR
+
+A showcase kit is a small static bundle (`graphs`, `integrations`, optional `hosted`) that POST `/me/showcase/:slug/deploy` materialises into real per-user rows: a `flows` row per template, a `hosted_devices` row when the kit needs a runtime, and a `missing_integrations` list when a provider is `status='never'` so the UI can route the caller to `/account/integrations` and back. Kits live as static TS data in `agentflow-agents/src/services/showcase-kits.ts` — no DB migration, no separate listings table. The catalog is served by `GET /me/showcase` and rendered by `agentflow-landing/src/pages/Showcase.tsx` at the `/showcase` route.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/showcase-kits.ts:1` | 8 kit definitions + helpers (`listShowcaseKits`, `getShowcaseKit`). |
+| `agentflow-agents/src/routes/me-showcase.ts:1` | `GET /me/showcase`, `GET /me/showcase/:slug`, `POST /me/showcase/:slug/deploy`. |
+| `agentflow-agents/src/server.ts` | Mount line for `meShowcaseApp`. |
+| `agentflow-agents/tests/showcase-kits.test.ts` | Happy path + missing integration + unknown slug. |
+| `agentflow-landing/src/pages/Showcase.tsx:1` | `/showcase` grid. |
+| `agentflow-landing/src/pages/ShowcaseKitDashboard.tsx:1` | `/showcase/:slug/dashboard` — post-deploy status panel. |
+| `agentflow-landing/src/components/showcase/DeployKitModal.tsx:1` | Component picker + status badges + deploy CTA. |
+| `agentflow-landing/src/lib/showcaseApi.ts:1` | Owner-keyed fetch wrappers. |
+
+## The 8 kits (canonical slugs)
+
+| Slug | Persona | Graphs | Integrations | Hosted preset |
+|---|---|---|---|---|
+| `kwork-money-loop` | Freelancer / agency | `kwork-lead-funnel-basic` | `kwork` | — |
+| `b2b-tg-florist` | Offline biz (flowers, coffee, barber) | `tg-cold-mailer-basic` | `telegram_app` | `tg-operator` (medium) |
+| `tg-channel-machine` | Channel author 5–50k subs | `tg-cold-mailer-basic` | `telegram_app` | `tg-poster-operator` (small) |
+| `k8s-audit-service` | DevOps freelancer | — | — | `devops-concierge` (large) |
+| `student-tutor-bot` | School tutor | `kwork-lead-funnel-basic` | `telegram_app` | `coder-tg-bot` (small) |
+| `designer-video-pitch` | Freelance designer | — | — | `video-screencast-remotion` (small) |
+| `landing-3-minutes` | Vibe-coder testing a hypothesis | — | — | — (links to `/projects?kind=landing`) |
+| `tg-warm-rassylka` | MLM operator with a contact base | `tg-contact-scan-basic`, `tg-send-1-3` | `telegram_app` | — |
+
+Graph slugs are resolved against `services/studio-flow-templates.ts:listStudioFlowTemplateDefinitions()`. Preset slugs are resolved against `agent_presets.slug` (seeded from `presets/<slug>.json` on boot). If a slug is missing on prod the deploy returns the row in `errors[]` rather than 500'ing.
+
+## Data flow
+
+```
+[user clicks "Развернуть" on /showcase]
+   │
+   ▼
+POST /me/showcase/:slug/deploy { name?, skip_integrations? }
+   │
+   ├── lookup kit in showcase-kits.ts (404 if unknown)
+   │
+   ├── for each graph:
+   │     POST /me/flows  (internal app.fetch, same headers)
+   │       → returns { flow.slug }   (slug pattern: <template>--<hash>)
+   │
+   ├── for each integration:
+   │     GET /me/integrations → status check
+   │       missing[] when status !== 'connected'
+   │
+   ├── if kit.hosted is set AND missing[] is empty (or skip_integrations=true):
+   │     POST /me/hosted-devices { kind:'daemon', size, marketplace_preset_slug }
+   │       → returns { device.id }
+   │
+   ▼
+{ ok, deployments: { flow_slugs, hosted_device_ids, missing_integrations }, errors, next_url }
+   │
+   ▼
+landing: toast + redirect to next_url
+   next_url = /account/integrations?return_to=/showcase/<slug>   when missing[]
+            | /showcase/<slug>/dashboard                          when all wired
+```
+
+## DB / Env / API
+
+- **Tables read:** `flows`, `hosted_devices`, `agent_presets`, `project_secrets` (via `/me/integrations`).
+- **Tables written:** `flows` (clone), `hosted_devices` + paired `user_devices` (daemon).
+- **No new tables.** Kit registry is static TS data, same pattern as `studio-flow-templates.ts`.
+- **Routes:**
+  - `GET  /me/showcase` — list 8 kits with resolved component status (does NOT check the caller's integrations; that happens at deploy time).
+  - `GET  /me/showcase/:slug` — single kit + resolved component refs.
+  - `POST /me/showcase/:slug/deploy` — body `{ name?: string, skip_integrations?: boolean }`.
+- **Auth:** `requireSession` (cookie or `x-api-key`). All writes scoped to `session.sub`.
+- **Internal calls:** `app.fetch(new Request(...))` reuses the same Hono app so the original session middleware runs against the cloned request headers. No duplicate provisioning logic.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Deploy returns 404 | `[showcase] unknown_kit slug=` | `services/showcase-kits.ts` — slug not in `SHOWCASE_KITS`. |
+| Deploy returns `ok:true` but `errors[]` non-empty | `[showcase] flow_clone_failed kit=` | Studio template slug stale; sync with `studio-flow-templates.ts`. |
+| Deploy returns `missing_integrations` non-empty | `[showcase] missing_integrations user=` | User has no row in `project_secrets` for the provider; UI sends them to `/account/integrations`. |
+| Hosted device stuck in `provisioning` > 5 min | `[hosted-devices] apply failed id=` | `routes/me-hosted-devices.ts` kubectl apply tier — same failure path as marketplace deploy. |
+| Preset slug not found | `[hosted-devices] deploy preset_not_found slug=` | `presets/<slug>.json` not seeded on prod; check `bootstrap-presets` log on pod start. |
+
+## Anti-slop note
+
+Kit copy is Russian and avoids the banned vocabulary (no «реально», «просто», «буквально», em-dash dividers, three-item lists, «не Х. Y.» antithesis). The hosted runtime is called «облачный компьютер», the integration secret pane stays «интеграции».
+
+## Related
+
+- [Marketplace → Hosted Deploy](/subsystems/marketplace-hosted-deploy)
+- [Generic Integrations](/subsystems/generic-integrations)
+- [Hosted Daemon](/subsystems/hosted-daemon)
+- [Flows: Marketplace Hire](/flows/marketplace-hire)
