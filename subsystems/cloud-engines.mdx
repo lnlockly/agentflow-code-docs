@@ -1,0 +1,63 @@
+---
+title: "Cloud Engines (Goose adapter + device-install)"
+description: "Per-device engine selection: template='goose' provisions the coder-shim image that drives `goose run` against the platform LLM gateway, canary-gated."
+---
+
+# Cloud Engines (Goose adapter + device-install)
+
+## TL;DR
+AgentFlow wraps interchangeable coder engines per pod. The Goose adapter lives in
+`src/coder-shim/goose-runner.ts`: it renders `~/.config/goose/config.yaml`
+(OpenAI-compatible provider → platform LLM gateway, model alias `flow`, never a
+concrete model id) and spawns `goose run` headless. Engine selection is
+**per-device**: `hosted_devices.template` (migration 0078 adds `'goose'`) maps to
+a daemon image in `services/daemon-images.ts::resolveDaemonImage`. Provisioning a
+goose device is **canary-gated** behind `FF_GOOSE_CANARY` so random users can't
+land on the unverified engine. The thin device-bridge that speaks the devices-ws
+protocol is documented separately ([coder-shim Goose device-bridge](/subsystems/coder-shim-goose-bridge)).
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/coder-shim/goose-runner.ts:27` | `buildGooseConfig()` — `~/.config/goose/config.yaml` body |
+| `agentflow-agents/src/coder-shim/goose-runner.ts:90` | `buildCoderSystemPrompt()` — stops "plan-then-exit" + lifts to app builder |
+| `agentflow-agents/src/coder-shim/goose-runner.ts:337` | `buildGooseArgs()` — `goose run` argv |
+| `agentflow-agents/src/coder-shim/goose-runner.ts:388` | `runGooseArgv()` — thin spawn (also `runGoose`) |
+| `agentflow-agents/src/coder-shim/pipeline.ts:21` | wires clone → goose → dev-server → probe → report |
+| `agentflow-agents/src/services/daemon-images.ts:75` | `resolveDaemonImage(template)` — per-device image |
+| `agentflow-agents/src/services/daemon-images.ts:50` | `GOOSE_DAEMON_IMAGE_DEFAULT = ghcr.io/lnlockly/agentflow-coder-shim:latest` |
+| `agentflow-agents/src/services/daemon-images.ts:24` | `DEVICE_TEMPLATES` includes `'goose'` |
+| `agentflow-agents/src/routes/me-hosted-devices/crud.ts:68` | canary gate — `template:'goose'` blocked unless `isGooseCanaryEnabled()` |
+| `agentflow-agents/src/db/migrations/0078_hosted_device_template_goose.sql:27` | CHECK adds `'goose'` to `hosted_devices.template` |
+
+## Data flow
+```
+POST /me/hosted-devices { template:'goose' }
+   → canary gate (FF_GOOSE_CANARY) — else error 'goose_canary_disabled'
+   → row hosted_devices.template='goose'
+   → resolveDaemonImage('goose') → agentflow-coder-shim image
+   → pod boots coder-shim device-bridge
+        pipeline.ts: clone → buildGooseConfig (provider=openai, model=flow)
+                     → goose run --system <coder prompt> → dev-server → probe → report
+   gateway pickFlowUpstream resolves `flow` → concrete model
+```
+
+## DB / Env / API
+- Tables: `hosted_devices.template` (enum now `coder|assistant|universal|goose`, migration 0078).
+- Env: `FF_GOOSE_CANARY` (gate goose provisioning), `FF_DAEMON_IMAGE` (override default image; `=goose` flips new pods), `OPENAI_API_KEY` (passed at runtime, never written into config.yaml).
+- Goose config: `GOOSE_PROVIDER: openai`, `GOOSE_MODEL: flow`, `GOOSE_MODE: auto`.
+- Route: `POST /me/hosted-devices` (`me-hosted-devices/crud.ts`).
+- Image: `ghcr.io/lnlockly/agentflow-coder-shim:latest` (also openclaw/picoclaw variants).
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| goose device creation rejected | `error:'goose_canary_disabled'` / message `template:goose is gated to canary provisioning` | set `FF_GOOSE_CANARY=1`; `agentflow-agents/src/routes/me-hosted-devices/crud.ts:73` |
+| goose plans then exits without editing files | run exits 0, workspace untouched | system-prompt + `GOOSE_MODE: auto`, `agentflow-agents/src/coder-shim/goose-runner.ts:90` |
+| coder task fails | report `error:'goose_failed'` (detail = goose tail) | `agentflow-agents/src/coder-shim/pipeline.ts:86` |
+| wrong/legacy image on a device | `resolveDaemonImage` fell through | `agentflow-agents/src/services/daemon-images.ts:75` |
+
+## Related
+- [coder-shim Goose device-bridge](/subsystems/coder-shim-goose-bridge) — the devices-ws bridge half
+- [JSON App Manifests](/subsystems/json-app-manifests)
+- [LLM Router](/subsystems/llm-router) — resolves the `flow` alias

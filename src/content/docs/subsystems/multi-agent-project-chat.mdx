@@ -1,0 +1,100 @@
+---
+title: "Multi-agent project chat"
+description: "Maestro dispatch + worker delegation pipeline behind POST /me/projects/:id/chat"
+---
+
+# Multi-agent project chat
+
+## TL;DR
+`POST /me/projects/:id/chat` routes every message to the owner's single Maestro (`Виртуоз`)
+agent through a per-project Eliza session. PR #748 added a dispatch directive that
+forces Maestro to fan-out 2-4 `team-manager.delegate_to_agent_sync` calls
+(researcher -> designer -> coder -> qa) instead of replying with a single text. PR #749
+followed with version-bumped session cache keys + an empty-reply 502 surface so a stale
+directive does not silently swallow the turn. The pipeline still fails when the per-user
+Eliza runtime cannot resolve its `world / server-ownership` row, returning HTTP 405 from
+`SERVICE:MESSAGE` and yielding `text_len=0, tool_calls=0` in maestro-chat logs.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/project-maestro-chat.ts:79` | `DISPATCH_DIRECTIVE_VERSION` constant — bump invalidates Eliza session cache |
+| `agentflow-agents/src/services/project-maestro-chat.ts:549` | Inline dispatch directive (fan-out rules + worker pipeline) |
+| `agentflow-agents/src/services/project-maestro-chat.ts:843` | Stale-session 404 retry path (PR #749) |
+| `agentflow-agents/src/services/project-maestro-chat.ts:999` | Empty-reply log surfacing |
+| `agentflow-agents/src/routes/workspace-chat.ts` | HTTP handler — surfaces `empty_reply` as 502 |
+| `agentflow-agents/src/services/eliza-session-cache.ts` | Project-scoped session keys (`agentId:userId:projectKey`) |
+| `agentflow-agents/src/scripts/seed-canonical-roles.ts:24` | Name-anchored existence check (PR #749 dupe fix) |
+| `agentflow-agents/src/scripts/cleanup-playwright-seed-dupes.ts` | One-shot tombstoning of dupes |
+| `agentflow-agents/presets/coder-spa.json` | `WRITE_FILE` first-action mandate |
+| `agentflow-agents/presets/researcher.json:28` | `tavily.search` first-action mandate |
+| `agentflow-agents/presets/cheap-draft-designer.json:24` | Draft generation first-action mandate |
+| `agentflow-agents/presets/implementation-architect.json:24` | `write_file design.md` first-action mandate |
+
+## Data flow
+
+```
+client POST /me/projects/:id/chat
+   |
+   v
+runMaestroProjectChat(ownerUserId, projectId, text)
+   |
+   +- per-(user, project) mutex
+   +- find Maestro: agents WHERE owner_user_id=? AND name='Виртуоз'
+   +- ensureRegistered lazy-register in runtime
+   +- composeProjectContext (full on first turn, delta after)
+   +- elizaCreateSession({ agentId, userId, projectId: `${id}:v${VERSION}` })
+   +- elizaSend(prompt + dispatch_directive)
+   |     |
+   |     v
+   |   per-user Eliza runtime in af-tenant-<id>
+   |     |
+   |     +- bootstrap.SETTINGS provider checks world ownership
+   |     |    -> FAIL: "No world found for user during onboarding"
+   |     |    -> service.processMessage throws Method Not Allowed
+   |     |
+   |     +- (happy path) Anthropic plugin call
+   |          -> tool_use blocks for team-manager.delegate_to_agent_sync
+   |
+   +- runAgentTurn (parses tool_calls + text)
+   +- if empty: appendProjectEvent('log', 'maestro_empty_reply')
+   +- 502 empty_reply to client
+```
+
+## DB / Env / API
+- Tables: `agents` (with `state='tombstoned'` filter everywhere), `project_events`, `plan_tasks`, `team_members`.
+- Env: `RUNTIME_BASE_URL` (peruser runtime resolver), `ANTHROPIC_API_KEY` (east-api-3 proxy).
+- Routes: `POST /me/projects/:id/chat`, `POST /me/agents/:slug/invoke` (bypasses Maestro).
+- MCP tools: `team-manager.delegate_to_agent_sync`, `team-manager.execute_in_team`, `architect.list_my_agents`, `code-exec.{exec, write_file, edit_file, upload_to_storage}`.
+
+## Worker reality check (direct invoke bypassing Maestro)
+
+`POST /me/agents/:slug/invoke` runs the worker directly through the same Eliza runtime
+without going through Maestro's dispatch logic — useful for confirming a worker is alive.
+
+Verified 2026-05-23 against user 258 (`af_live_link24_qa_…`):
+
+| Run | Agent | Result |
+|---|---|---|
+| 772 | `researcher-10ffe8` | `text_len>0`, `tools=['tavily.search']`, exits with "Нет ключа Tavily" honest fail (no Tavily key in user 258 secrets) |
+| 773 | `cheap-draft-designer-1f37da` | Returns plan + asks for `project_name` (missing from input — preset wins, asks before generating) |
+| 774 | `coder-spa-79cc45` | `timeout_after_240000ms` — workspace pod `proj-7605p6e2` not provisioned, code-exec.exec hangs |
+
+So workers themselves execute. The break is upstream at Maestro session / Eliza world-ownership.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Chat returns 502 immediately | `maestro_empty_reply: stream ended with no text` | Investigate runtime; usually Eliza world bootstrap |
+| Runtime never replies to Maestro | `#Виртуоз  [SERVICE:MESSAGE] Error processing message (error=Method Not Allowed)` | Eliza world / `server_ownership` row missing for user |
+| Settings provider crashes | `[PLUGIN:BOOTSTRAP:PROVIDER:SETTINGS] No world found for user during onboarding` | Provision world via Eliza API or bootstrap plugin patch |
+| Maestro single-shot (no delegate calls) | `turn_done … tool_calls:0 text_len>0` | Dispatch directive ignored; bump `DISPATCH_DIRECTIVE_VERSION` |
+| Stale Eliza session reuses old directive | `eliza_send_session_404_retry` then `text_len:0` | PR #749 retry path; verify `cacheProjectKey` includes version |
+| Canonical-role seed dupes | `playwright-screencast-op-XXXXXX` rows multiply per tick | `node dist/scripts/cleanup-playwright-seed-dupes.js`; PR #749 name-anchor fix |
+| Coder times out | `timeout_after_240000ms` on `coder-spa-*` run | Verify `kubectl -n af-tenant-<id> get pod project-<project>-0-…` exists |
+| Coder returns `files_written=[]` | `coder_did_nothing` in graph-executor logs | Coder hit MCP read-only loop; `tool_choice='any'` must stay until write_file |
+
+## Related
+- [Projects create flow](/subsystems/projects-create-flow) — upstream brief intake + plan
+- [Runtime supervisor](/subsystems/runtime-supervisor) — per-project pod lifecycle
+- [Foundation bridge](/subsystems/foundation-bridge) — initial scaffold (before coder turn)

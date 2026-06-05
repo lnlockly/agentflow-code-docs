@@ -23,6 +23,57 @@ existing `referral_earnings` ledger.
 | `agentflow-landing/src/pages/OnboardingPage.tsx:235` | `useMockOrApi` helper — real fetch with mock fallback |
 | `agentflow-landing/src/pages/OnboardingPage.tsx:260` | `useMockOrApi(['quests'], MOCK_QUESTS, '/me/quests')` |
 | `agentflow-landing/src/main.tsx:483` | `<Route path="/start" element={<OnboardingPage />} />` |
+title: "Onboarding Quests — /start"
+description: "Real-product quest catalog with server-side auto-completion hooks and USDF rewards"
+---
+
+# Onboarding Quests
+
+## TL;DR
+
+`/start` (frontend page `OnboardingPage.tsx`) walks a new user through real
+first actions and credits a small USDF reward for each. Quests are listed
+from `GET /me/quests`; rewards land as `referral_earnings` rows
+(type='quest') that the user sweeps with `POST /me/earnings/claim`. New
+quests (2026-05-24) are completed server-side from the action sites — the
+frontend cannot self-claim them by calling `/complete`.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/db/seed-quests.ts:23` | Quest catalog (id, reward, sort order) |
+| `agentflow-agents/src/services/quest-events.ts:1` | `maybeCompleteQuest(userId, questId)` idempotent helper |
+| `agentflow-agents/src/routes/gamification.ts:141` | `GET /me/quests`, `POST /me/quests/:id/complete` |
+| `agentflow-agents/src/routes/gamification.ts:222` | `POST /me/quests/preview-opened/:projectId` (open_preview hook) |
+| `agentflow-agents/src/routes/projects.ts:1187` | `POST /me/projects` → grants `create_first_project` |
+| `agentflow-agents/src/routes/projects.ts:2799` | `POST /me/projects/:id/approve` → grants `approve_first_plan` |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:312` | `POST /me/hosted-devices` 201 → grants `connect_device` |
+| `agentflow-agents/src/services/devices-ws.ts:399` | Daemon WS `hello_ack` → grants `connect_device` |
+| `agentflow-agents/src/routes/me-matrix.ts:194` | `POST /me/matrix/send` 200 → grants `send_chat_message` |
+| `agentflow-agents/src/routes/tg-accounts.ts:139` | `POST /me/tg-accounts/confirm-code` (status=active) → grants `connect_telegram` |
+| `agentflow-agents/src/routes/marketplace.ts:1195` | `POST /me/marketplace/:slug/hire` → grants `try_marketplace` |
+| `agentflow-agents/tests/quest-events.test.ts:1` | Idempotency test for `maybeCompleteQuest` |
+| `agentflow-landing/src/pages/OnboardingPage.tsx:135` | Quest meta + icons + action route map |
+
+## Quest catalog
+
+| id | reward (USDF) | trigger | repeatable |
+|---|---|---|---|
+| `install_pwa` | 0.50 | client `appinstalled` event | no |
+| `connect_device` | 1.00 | daemon WS handshake OR `POST /me/hosted-devices` 201 | no |
+| `create_first_project` | 2.00 | `POST /me/projects` row inserted | no |
+| `approve_first_plan` | 0.50 | `POST /me/projects/:id/approve` returns ok:true | no |
+| `open_preview` | 0.50 | `POST /me/quests/preview-opened/:projectId` (owner-only, preview_url non-empty) | no |
+| `send_chat_message` | 0.50 | `POST /me/matrix/send` returns 200 | no |
+| `connect_telegram` | 0.50 | `POST /me/tg-accounts/confirm-code` status=active | no |
+| `try_marketplace` | 0.50 | `POST /me/marketplace/:slug/hire` success | no |
+| `screenshot_proof` | 1.00 | client `/complete` after TG bot ping | no |
+| `first_project` | 2.00 | legacy self-claim (deprecated by `create_first_project`) | no |
+| `invite_1` / `invite_3` | 0 / 5.00 | referral count thresholds | no |
+| `write_review` | 1.00 | client `/complete` with `{rating, text}` | no |
+
+Starter payout total (excluding referrals): 8.00 USDF.
 
 ## Data flow
 
@@ -45,6 +96,29 @@ useMockOrApi behavior:
   • queryFn tries apiGet(path)  → real data overwrites mock on success
   • on apiGet throw → returns mockData → page silently keeps placeholder
   • staleTime: 30s
+                            user action
+                                │
+                                ▼
+  POST /me/projects                              ──┐
+  POST /me/projects/:id/approve                  ──┤
+  POST /me/hosted-devices  (201)                 ──┤
+  WS  /_devices/connect    (hello_ack)           ──┼─► maybeCompleteQuest(userId, '<id>')
+  POST /me/matrix/send     (200)                 ──┤        │
+  POST /me/tg-accounts/confirm-code (active)     ──┤        │
+  POST /me/marketplace/:slug/hire                ──┤        ▼
+  POST /me/quests/preview-opened/:projectId      ──┘   ┌────────────┐
+                                                       │ user_quests│ (idempotent insert)
+                                                       └─────┬──────┘
+                                                             │ first time
+                                                             ▼
+                                                  ┌──────────────────┐
+                                                  │ referral_earnings│  type='quest', claimed=false
+                                                  └─────────┬────────┘
+                                                            │
+                                            user sweeps via POST /me/earnings/claim
+                                                            │
+                                                            ▼
+                                                     creditUser(USDF)
 ```
 
 ## DB / Env / API
@@ -58,6 +132,19 @@ useMockOrApi behavior:
   - `POST /me/quests/:questId/complete` — body `{ proofUrl? }`
   - Errors: `404 quest_not_found`, `409 already_completed` (non-repeatable + already done)
 - Mock constants live in `OnboardingPage.tsx` and only render when the API throws
+- Tables: `quest_definitions`, `user_quests`, `referral_earnings`,
+  `projects`, `project_collaborators`.
+- Env: none new — reuses `REFERRAL_BASE_URL` and DB.
+- Routes added or extended:
+  - `POST /me/quests/preview-opened/:projectId` (new)
+  - `POST /me/projects` — hooks `create_first_project`
+  - `POST /me/projects/:id/approve` — hooks `approve_first_plan`
+  - `POST /me/hosted-devices` — hooks `connect_device`
+  - `POST /me/matrix/send` — hooks `send_chat_message`
+  - `POST /me/tg-accounts/confirm-code` — hooks `connect_telegram`
+  - `POST /me/marketplace/:slug/hire` — hooks `try_marketplace`
+  - WS `/_devices/connect` — hooks `connect_device`
+- MCP tools: none.
 
 ## Failure modes
 
@@ -72,3 +159,36 @@ useMockOrApi behavior:
 
 - [Funnel analytics](/subsystems/funnel-analytics) — fires `onboarding_completed` event on first quest claim flow
 - Spec: `agentflow-landing/docs/specs/2026-05-15-analytics-funnel-reminders-v2.md` (referenced for the event taxonomy)
+| Quest hook silently no-ops | `[quest-events] maybeCompleteQuest failed:` | `src/services/quest-events.ts:95` |
+| `connect_device` not granted on hosted-device create | `[hosted-devices] apply failed` | `src/routes/me-hosted-devices.ts:300` |
+| `open_preview` rejected with `preview_not_ready` | check `projects.preview_url` is non-empty | `src/routes/gamification.ts:222` |
+| Reward credited twice | should be impossible — `user_quests (user_id, quest_id)` is unique | `src/db/schema.ts` userQuests definition |
+| Quest visible in UI but never grantable | quest id present in `seed-quests.ts` but no hook call site | grep `maybeCompleteQuest(.*'<id>')` |
+
+## Adding a new quest (3-step checklist)
+
+1. Add a row to `QUESTS` in `agentflow-agents/src/db/seed-quests.ts`
+   (id, title, titleRu, reward, sortOrder).
+2. Run the seeder against the prod DB:
+   `kubectl -n franchise-factory exec deploy/agentflow-agents -- npx tsx src/db/seed-quests.ts`.
+3. Call `maybeCompleteQuest(userId, '<id>')` from the route handler that
+   represents the real action. Use `void` so the primary response is not
+   blocked. Add an icon + i18n entry + route in
+   `agentflow-landing/src/pages/OnboardingPage.tsx`.
+
+## Anti-spoof rules
+
+- `connect_device` requires a valid WS handshake (auth check happens in
+  `devices-ws.ts` before `bindConnection`) or a real `hosted_devices` row
+  pinned to the user's vcluster.
+- `create_first_project` only fires after the row is in `projects` —
+  paywall + idempotency happen first.
+- `open_preview` requires ownership/collaborator membership AND
+  `preview_url` non-empty in the DB.
+- `send_chat_message` only fires on bridge 200 — bridge errors do not credit.
+- All grants are idempotent through the `user_quests` unique key.
+
+## Related
+
+- [Earnings Dashboard](/subsystems/earnings-dashboard)
+- [Projects Create Flow](/subsystems/projects-create-flow)

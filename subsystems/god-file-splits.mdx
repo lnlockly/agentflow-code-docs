@@ -1,0 +1,94 @@
+---
+title: "God-file splits — behavior-preserving barrels"
+description: "Four oversized source files were split into domain-module folders, each fronted by a barrel that re-exports the original public surface so every import path stays unchanged."
+---
+
+# God-file splits
+
+## TL;DR
+Four oversized files were broken into per-domain module folders, each fronted by
+a **barrel** (the original file path or its `index`) that re-exports the same
+public surface. The splits are **behavior-preserving** — pure reorganization, no
+logic change — and every `import { … } from '<old path>'` call-site resolves
+unchanged. If you `grep` for a symbol and land on a barrel re-export, follow it
+into the matching module under the sibling folder.
+
+## The four splits
+
+| PR | Old god-file | New module folder | Barrel (kept import path) |
+|---|---|---|---|
+| #652 (landing) | `agentflow-landing/src/lib/agentsApi.ts` | `agentflow-landing/src/lib/agentsApi/` (29 modules) | `agentflow-landing/src/lib/agentsApi/index.ts:1` |
+| #1105 (agents) | `agentflow-agents/src/db/schema.ts` (monolith) | `agentflow-agents/src/db/schema/` (24 modules) | `agentflow-agents/src/db/schema.ts:1` (re-export barrel) |
+| #1108 (agents) | `agentflow-agents/src/services/projects.ts` (monolith) | `agentflow-agents/src/services/projects/` (7 modules) | `agentflow-agents/src/services/projects.ts:2` (re-export barrel) |
+| #1111 (agents) | `agentflow-agents/src/services/flow-executor.ts` (monolith) | `agentflow-agents/src/services/flow-executor/` (10 modules) | `agentflow-agents/src/services/flow-executor.ts:2` (re-export barrel) |
+
+## Files (with line refs)
+
+### #652 — `agentsApi` (landing)
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/lib/agentsApi/index.ts:1` | Barrel — `export * from './client'/'chat'/'accounts'/'approvals'/…`. No flat `agentsApi.ts` remains; the folder `index` is the resolved import target. |
+| `agentflow-landing/src/lib/agentsApi/accounts.ts` | Пульт account reads + `streamAccountCommand` / `approveAccountCommand` |
+| `agentflow-landing/src/lib/agentsApi/approvals.ts` | `getApprovals` + confirm/edit/reject calls (approval queue) |
+| `agentflow-landing/src/lib/agentsApi/client.ts` | Shared fetch wrapper / base-URL resolution every module imports |
+
+Import sites stay `import { X } from '.../lib/agentsApi'` (e.g.
+`src/sections/llm-cabinet/tabs/AliasesTab.tsx`) — TS resolves the folder `index`.
+
+### #1105 — `db/schema.ts` (agents)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/db/schema.ts:1` | Barrel comment + `export * from './schema/*.js'` for all 24 domain modules — keeps `drizzle.config.ts`, the migration runner, and the drift test working unchanged |
+| `agentflow-agents/src/db/schema/_shared.ts` | Common column helpers / enums imported by the domain modules |
+| `agentflow-agents/src/db/schema/kwork.ts` | kwork tables (e.g. `kwork_want_responses`) |
+| `agentflow-agents/src/db/schema/approvals.ts` | `entityApprovalQueue` etc. |
+
+### #1108 — `services/projects.ts` (agents)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/projects.ts:2` | Barrel — **explicit** re-export list (not `export *`) to keep the public surface byte-for-byte; a few former file-local helpers gained an `export` for cross-module use but are intentionally NOT surfaced here |
+| `agentflow-agents/src/services/projects/bootstrap.ts` | `createProjectForUser` + initial `status:'draft'` row |
+| `agentflow-agents/src/services/projects/events.ts` | `appendProjectEvent` / `emitPipelineBridgeEvent` |
+| `agentflow-agents/src/services/projects/maestro.ts` | `runMaestroProposeBackground` / `runMaestroOwnerReplyBackground` / `runHubBroadcast` |
+| `agentflow-agents/src/services/projects/{provision,tenant,execution,landing-gate}.ts` | provisioning / tenant / execution / landing-gate slices |
+
+### #1111 — `services/flow-executor.ts` (agents)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/flow-executor.ts:2` | Barrel — re-exports the original public surface unchanged (module list in the header comment) |
+| `agentflow-agents/src/services/flow-executor/core.ts` | `topoSort` / `renderTemplate` / `renderArgs` / `evalBranch` (re-export at barrel line 41) |
+| `agentflow-agents/src/services/flow-executor/dispatcher.ts` | `runStep` node dispatch (barrel line 84) |
+| `agentflow-agents/src/services/flow-executor/execute.ts` | top-level graph run loop (topological order, `cycle_detected` failure) |
+| `agentflow-agents/src/services/flow-executor/{basic,af,tg,dialog-soul}-nodes.ts` | per-family node implementations behind `FF_FLOWS=1` |
+
+> #1111 lands on branch `refactor/split-flow-executor` (`0cc07cb4`); the public
+> surface and barrel are final. Refresh the barrel line refs here if the merge
+> commit re-numbers them.
+
+## Data flow
+
+These splits change **file topology only** — the runtime call graph is
+identical. A symbol's resolution path gains one hop through the barrel:
+
+```
+import { createProjectForUser } from '.../services/projects.js'
+   └─ services/projects.ts (barrel)  export { createProjectForUser } from './projects/bootstrap.js'
+        └─ services/projects/bootstrap.ts   ← actual implementation
+```
+
+## DB / Env / API
+- No new tables, env vars, routes, or MCP tools. Behavior-preserving.
+- `schema.ts` split (#1105) is explicitly drift-test-clean — the Drizzle
+  introspection drift test and `drizzle.config.ts` read the barrel unchanged.
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `grep` for a symbol lands on a re-export, not the impl | line is `export { X } from './<sub>/<mod>.js'` | follow the re-export into the sibling module folder |
+| New import resolves `undefined` after a split | symbol not re-exported from the barrel (projects.ts uses an explicit list, not `export *`) | add the export to the relevant barrel (`projects.ts:2` / `flow-executor.ts:2`) |
+| drizzle drift / migration runner can't find a table | a `schema/*.ts` module not re-exported from `schema.ts` | add `export * from './schema/<mod>.js'` to `db/schema.ts:1` |
+
+## Related
+- [accounts-pult-entities](/subsystems/accounts-pult-entities) — backed by `db/schema/` tables
+- [approval-queue](/subsystems/approval-queue) — `entityApprovalQueue` lives in `db/schema/approvals.ts`
+- [project-foundations](/subsystems/project-foundations) — the projects-service surface fronted by `services/projects.ts`

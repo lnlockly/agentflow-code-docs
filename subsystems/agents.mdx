@@ -1,0 +1,223 @@
+---
+title: "Agents — provision + taxonomy"
+description: "How agent rows land in Postgres, and the invariant that DB column `category` mirrors `character.category` so frontend taxonomy gates fire."
+---
+
+# Agents — provision + taxonomy
+
+## TL;DR
+
+An agent is one row in the `agents` table. Most agents are spawned through `provisionAgent` (`src/services/agent-provision.ts:63`) which takes a `CharacterInput`, normalises plugins/system/secrets via `buildCharacter`, inserts the row, then creates + starts the agent in the remote Eliza runtime. Frontend gates key off the top-level columns (`category`, `keywords`, …) — not off the JSONB `character` blob — so those columns **must** mirror the corresponding fields from the preset / input character at insert time.
+
+## The invariant
+
+> **`agents.category` (column) === `character.category` (JSONB field)** for every fresh insert.
+
+The same rule applies to `agents.keywords`. If the input has no `category`, the column is explicitly `NULL` (not `undefined`, which drizzle would drop). If the input carries garbage (non-string, non-array), the row falls back to `NULL` / `[]` — defence-in-depth so a bogus preset cannot corrupt the column.
+
+`CharacterInput` (`src/services/character.ts:35`) does **not** list `category` or `keywords` as known fields — those are preset-level taxonomy, mirrored onto the DB row by the insert path. `buildCharacter` does not propagate them into its return value either; only `provisionAgent` and the per-insert path in `routes/agents/limits-hire.ts:174` (hire-from-preset) handle the mirror.
+
+## Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/agent-provision.ts:63` | `provisionAgent` — shared insert path for `POST /agents`, MCP `architect.create_agent`, `me-presets`, `projects.ts`, seed scripts. |
+| `agentflow-agents/src/services/agent-provision.ts:81` | `rawInput.category` typeof-guarded read → `presetCategory: string \| null` → set on the row. |
+| `agentflow-agents/src/services/agent-provision.ts:96` | `rawInput.keywords` array filter → strings only → set on the row. |
+| `agentflow-agents/src/db/schema.ts:79` | `category text` column (no enum; validation in `services/agent-taxonomy.ts`). |
+| `agentflow-agents/src/db/schema.ts:80` | `keywords text[] NOT NULL DEFAULT '{}'`. |
+| `agentflow-agents/src/db/schema.ts:183` | `agents_category_idx` partial index (WHERE category IS NOT NULL) for taxonomy queries. |
+| `agentflow-agents/src/routes/agents/limits-hire.ts:162` | Hire-from-preset path — independent insert (does NOT call `provisionAgent`); also mirrors `category` + `keywords`. |
+| `agentflow-agents/src/routes/marketplace.ts:1009` | Fork path — mirrors `base.category`. |
+| `agentflow-agents/src/scripts/bootstrap-marketplace.ts:318` | Platform-owned bootstrap insert. (Does NOT set category — bootstrap rows are admin-curated post-hoc.) |
+| `agentflow-agents/src/services/template-showcase-seed.ts:75` | Showcase platform-owned seed insert. (Same as bootstrap — admin curates taxonomy after.) |
+| `agentflow-agents/src/routes/me.ts:94` | Maestro singleton — internal; no category. |
+| `agentflow-landing/src/components/agents/AgentWorkspace.tsx:151` | Frontend gate: `agent?.category === 'researcher'` → renders knowledge sidebar. **This is the gate the invariant unblocks.** |
+| `agentflow-agents/tests/unit/agent-provision-category.test.ts` | Source-contract regression suite for the mirror. |
+
+### `routes/agents.ts` is now a thin composer
+
+The marketplace AI-agents routes split out of the old 2,165-line god-file into
+cohesive sub-modules. `routes/agents.ts` keeps the same default export
+(`server.ts` mounts it unchanged via `app.route('/', agentsApp)`) and re-exports
+`summaryAgent`, `slugToMcpToolName`, `buildMcpToolDescription`,
+`buildMcpInputSchema`, `checkAgentLimits`. It registers each sub-module's
+`register(app)` in the original declaration order, so every path + method +
+middleware chain stays byte-identical.
+
+| Module | Routes |
+|---|---|
+| `routes/agents/shared.ts` | `publicAgent`, `summaryAgent`, `characterSchema`, `createSchema` (no routes — shared mappers). |
+| `routes/agents/crud.ts` | `POST /agents`, `POST /me/agents/import-from-github`, `POST /me/agents/fork`, `GET /agents`, `GET /agents/:slug`. |
+| `routes/agents/settings-state.ts` | `GET/POST /agents/:slug/settings`, `GET/PATCH /agents/:slug/state`, `DELETE /agents/:slug/state/:plugin`. |
+| `routes/agents/chat.ts` | `POST /agents/:slug/chat`, `POST /agents/:slug/chat/abort`. |
+| `routes/agents/invoke.ts` | `POST /agents/:slug/invoke`, `POST /agents/:slug/invoke_stream`. |
+| `routes/agents/messages.ts` | `GET /agents/:slug/messages`. |
+| `routes/agents/share.ts` | `POST /agents/:slug/share`, `GET /agents/:slug/shares`, `DELETE /agents/:slug/share/:shareSlug`, `GET /shared/:shareSlug`. |
+| `routes/agents/lifecycle.ts` | `POST /agents/:slug/redeploy`, `DELETE /agents/:slug`. |
+| `routes/agents/mcp-tools.ts` | `GET /me/agents/mcp-tools` + `slugToMcpToolName` / `buildMcpToolDescription` / `buildMcpInputSchema`. |
+| `routes/agents/limits-hire.ts` | `GET/PATCH /me/agents/:slug/limits`, `POST /me/agents/hire`, `GET /me/agents`. |
+
+## Data flow — preset hire
+
+```
+me-presets POST /me/from-preset/:slug
+       │
+       ▼
+load preset JSON (presets/<slug>.json)
+       │  preset.category === 'researcher'
+       ▼
+provisionAgent({ character: preset as never, … })
+       │
+       ▼ src/services/agent-provision.ts:63
+buildCharacter(input, secrets, …)
+       │   ⮕ drops category / keywords from JSON payload
+       │   ⮕ returns { name, bio, system, settings, plugins, … }
+       ▼
+db.insert(agents).values({
+  …,
+  character,                       // JSONB — has system, plugins, settings
+  category: presetCategory,        // ← mirror from input.character.category
+  keywords: presetKeywords,        // ← mirror from input.character.keywords
+})
+       │
+       ▼
+GET /me/agents/:slug → row.category === 'researcher'
+       │
+       ▼
+AgentWorkspace.tsx:151 → KnowledgeSidebar renders
+```
+
+## DB / Env / API
+- Tables: `agents` (columns of interest: `category text`, `keywords text[]`)
+- Indices: `agents_category_idx`, `agents_owner_category_rating_idx`
+- Env: none (taxonomy is JSON-driven)
+- Routes touching the mirror: `POST /me/from-preset/:slug`, `POST /me/marketplace/:slug/hire`, `POST /me/marketplace/:slug/fork`, `POST /agents` (architect MCP)
+- MCP tools: `architect.create_agent` (via `mcp-servers/architect.ts`)
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Researcher agent has no knowledge sidebar | (frontend) `agent.category === 'researcher'` returns `false` for a row where `character.category === 'researcher'` | Check the insert path that created it — mirror missing. |
+| New row lands with `category=NULL` despite preset taxonomy | `psql -c "SELECT id, slug, category, character->>'category' FROM agents WHERE category IS NULL AND character ? 'category'"` returns rows | `services/agent-provision.ts:81` — verify the typeof guard and the `values({…})` call still pass `category:`. |
+| TS error after touching `provisionAgent` insert payload | `tsc` complains about `presetCategory: string \| null` | The type pin in the helper variable is intentional — keep it. |
+
+## Backfill
+
+When the mirror was first added, existing rows in prod needed a one-off backfill:
+
+```sql
+UPDATE agents
+SET category = character->>'category'
+WHERE (character ? 'category') AND (category IS NULL OR category = '');
+```
+
+Run **after** the code fix is deployed (otherwise the next preset hire re-introduces a `NULL` for any row created in the gap).
+
+## Listing endpoints — `/agents` vs `/me/agents`
+
+Two routes return the caller's owned agents:
+
+| Route | Envelope | Row shape | Use case |
+|---|---|---|---|
+| `GET /agents` | `{ ok, items: [...] }` | `publicAgent` — slim: id/slug/name/state/engine/secret_keys | Legacy sidebar, MyAgentsV2 page |
+| `GET /me/agents` | `{ ok, agents: [...], count }` | `summaryAgent` — rich: bio/topics/emoji/category/keywords/owner_id/published/hire_count/rating | Cabinet tile, profile listing, picker dropdowns |
+
+Both filter `state != 'tombstoned'` and `owner_user_id = session.sub`. The hire endpoint (`POST /me/agents/hire`) stamps `ownerUserId = sub` on the new row, so "owned" and "hired" collapse into the same WHERE predicate — no JOIN against a separate namespace table.
+
+Files:
+- `agentflow-agents/src/routes/agents/crud.ts:150` — `GET /agents` handler (`publicAgent` shape).
+- `agentflow-agents/src/routes/agents/shared.ts:48` — `publicAgent(row, keyIds)` slim mapper.
+- `agentflow-agents/src/routes/agents/shared.ts:107` — `summaryAgent(row)` rich mapper.
+- `agentflow-agents/src/routes/agents/limits-hire.ts:249` — `GET /me/agents` handler.
+- `agentflow-agents/tests/routes/me-agents-list.test.ts` — shape + filter contract tests (15 cases).
+- `agentflow-landing/src/pages/CabinetDashboard.tsx:119` — frontend consumer.
+
+## Secrets — provision + upsert
+
+Per-agent secrets live in `agent_secrets` (PK = `agent_id`, one row per agent, all keys sealed together as a single AES-256-GCM payload — see `services/seal.ts::sealSecrets`). Plaintext never touches disk; the master key is env `AGENTS_MASTER_KEY` (base64, 32 bytes).
+
+Two write paths:
+
+| Path | When | File |
+|---|---|---|
+| Bulk seal on agent create | First insert via `provisionAgent` | `agentflow-agents/src/services/agent-provision.ts:233` |
+| Incremental upsert (one or more keys) | Owner-facing edits from the workspace Settings panel | `agentflow-agents/src/routes/me-agents-secrets.ts` |
+
+`PATCH /me/agents/:slug/secrets` reads the existing sealed row, unseals into `Record<string, string>`, layers the new keys on top, re-seals, and `onConflictDoUpdate(agentSecrets.agentId)`. Required because the PK is `agent_id` (single row) — naive insert hits unique-violation on every retry. Returns `{ ok, set, failed, secret_keys }`. Validation: ASCII key regex (`/^[A-Za-z_][A-Za-z0-9_]{0,119}$/`), value ≤16 KiB. 404 on slug not owned, 410 on tombstoned, 500 if existing payload unsealable (key rotated — refuses to overwrite).
+
+Both `publicAgent` (returned by `GET /agents`, `GET /agents/:slug`) and the `/agents/:slug/settings` payload include `required_secrets` (mirrors `agents.requiredSecrets` jsonb column from the hire-from-preset contract) and — on the settings endpoint — `secret_keys` (the `keyIds` array from `agent_secrets`, so the workspace panel renders ✓ Set badges without an extra round-trip).
+
+Files:
+- `agentflow-agents/src/routes/me-agents-secrets.ts` — the upsert route.
+- `agentflow-agents/src/routes/agents/shared.ts:94` — `publicAgent` carries `required_secrets`.
+- `agentflow-agents/src/routes/agents/settings-state.ts:25` — `/agents/:slug/settings` carries `required_secrets` + `secret_keys`.
+- `agentflow-agents/src/services/seal.ts:31` — `sealSecrets` envelope shared with the provision path.
+- `agentflow-agents/tests/unit/me-agents-secrets-route.test.ts` — 14 source-contract assertions.
+- `agentflow-landing/src/components/agents/AgentSettingsPanel.tsx:325` — frontend consumer.
+
+### Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Panel says "сохранение пока недоступно" (404) | (frontend) network panel shows 404 on `PATCH /me/agents/:slug/secrets` | Confirm `meAgentsSecretsApp` is imported AND `app.route('/', meAgentsSecretsApp)` is registered in `src/server.ts`. |
+| Save returns 500 `existing_secrets_unreadable` | `existing_secrets_unreadable` in response body | Master key rotated since the row was sealed. Either restore the old `AGENTS_MASTER_KEY` for a one-off re-seal script, or delete + re-create the agent. |
+| Panel shows zero rows after hire | (frontend) `required_secrets` is `[]` in `/agents/:slug/settings` response | Preset's `requiredSecrets` field is missing — fix in `presets/<slug>.json` then re-run `bootstrap-marketplace`. |
+
+## Chat attachments — owner directive 2026-05-17
+
+`POST /agents/:slug/chat` accepts an optional `attachments[]` array alongside `text`. Each entry is `{ filename, mime, data_base64 }`. Images render as Anthropic vision content blocks on the first user message of the turn; text files are inlined inside `<attachment filename="…">` envelopes. Vision needs the big model — turns route through `useModel(ModelType.TEXT_LARGE)` which is already vision-capable (no hardcoded model).
+
+### Policy
+
+| Class | MIME allow-list | Per-file cap |
+|---|---|---|
+| Image | `image/png`, `image/jpeg`, `image/webp` | 5 MB decoded |
+| Text | `text/plain`, `text/markdown`, `application/json` | 200 KB decoded |
+
+Per-turn cap: 6 attachments. Raw POST body cap: 8 MB (returns `413 payload_too_large` above that — covers a 5 MB image plus base64 inflation plus headers).
+
+### Persistence — placeholder, not bytes
+
+`chat_messages.content` stores only `[file: shot.png 320 KB]` lines next to the user's text. The actual base64 bytes only live in the LLM context for that turn, so DB rows stay small and history reload doesn't re-ship megabytes to the browser. A `meta.attachments[]` summary (filename / mime / kind / bytes) is persisted alongside so admin tooling can audit what was attached.
+
+### UI rendering — inline images, no raw `[file: …]` text
+
+`AgentChatPanel` reads `meta.attachments[]` off the stored row and renders each entry inline on the user bubble:
+
+- `kind: 'image'` with a `data_url` → `<img>` thumbnail at max 240×240 (`object-fit: contain`), wrapped in an anchor that opens the full image in a new tab.
+- `kind: 'image'` without `data_url` (history reload — backend doesn't round-trip the bytes) → filename chip with size.
+- `kind: 'text'` (md / json / txt) → filename chip with size.
+
+The `data_url` is only populated on the optimistic just-sent bubble: the composer builds `data:${mime};base64,${data_base64}` from the staged payload before sending, so the user sees their image instantly without waiting for the server echo. On reload the chip path takes over.
+
+`storedToTurn` strips the trailing `[file: name 320 KB]` placeholder lines from the bubble text when real attachments rehydrate — otherwise the bubble would show both the chip AND the raw text (owner flagged this 2026-05-17 as «глупо»). The persistence layer keeps the placeholder so plain-text history exports stay self-describing.
+
+### Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/chat-attachments.ts` | Pure module: `parseAttachments`, `buildPersistedUserContent`, `buildUserMessageContent`. No I/O. |
+| `agentflow-agents/src/routes/agents/chat.ts` (the `POST /agents/:slug/chat` handler) | Zod `chatAttachmentSchema`, payload-size guard, route wiring into `runChatTurnNative`. |
+| `agentflow-agents/src/services/chat-tooluse.ts` | `ChatTurnParams.attachments` surface; first-user-message projection via `buildUserMessageContent`. |
+| `agentflow-agents/tests/unit/chat-attachments.test.ts` | 28 source-contract tests (parser, projections, route + tooluse wiring greps). |
+| `agentflow-landing/src/lib/chatAttachments.ts` | Frontend mirror: client-side staging + `FileReader` → base64. |
+| `agentflow-landing/src/components/agents/AgentChatPanel.tsx` (composer + bubble) | 📎 attach button, chip strip, picker, inline `<img>` rendering, `[file: …]` placeholder strip. |
+| `agentflow-landing/tests/chat-attachments-render.test.mjs` | Static-source contract: bubble must read `meta.attachments[]`, build a `data:` URL out of staged base64, render `<img>` at 240px, fall back to chip on history reload. |
+| `agentflow-landing/src/lib/agentsApi.ts::openChat` | Optional `attachments?: ChatAttachmentPayload[]` parameter on the SSE call. |
+
+### Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Owner reports 413 from `/agents/:slug/chat` after attaching a screenshot | `payload_too_large` in JSON body, or content-length ≥ 8 MB | `MAX_REQUEST_BYTES` in `src/services/chat-attachments.ts` — raise if the owner spec changes. |
+| `attachment_unsupported_mime` returned for a `.md` file | `attachment_unsupported_mime` in chat response body | Browser tagged the file as `application/octet-stream`. Frontend accepts `.md` via the `accept` attribute but the backend needs the real MIME — surface a hint to rename the file or fix the upload pipeline. |
+| Agent ignores an attached image | `[chat-tooluse] start agent=… tools=…` line WITHOUT a follow-up vision-block response | Confirm `useModel(ModelType.TEXT_LARGE)` resolves to a vision-capable provider; some BYOK Anthropic keys default to older models. |
+| Chat history loads slowly after attach turns | `chat_messages.content` row contains raw base64 instead of a placeholder | Regression in `buildPersistedUserContent`. The route MUST persist the placeholder, never the raw body. |
+| Bubble shows raw `[file: red.png 70 B]` text instead of an image | grep `[file:` against the rendered DOM of a user bubble | `AgentChatPanel.tsx::storedToTurn` is not calling `stripAttachmentPlaceholders` when `meta.attachments[]` rehydrates, or the bubble isn't reading `t.attachments`. Owner originally flagged 2026-05-17. |
+
+## Related
+- [Souls Collective](/subsystems/souls) — souls have their own taxonomy in `data.soul` graph nodes, separate from `agents.category`.
+- [Auth and Access](/subsystems/auth-and-access)
+- [Architecture overview](/architecture/overview)

@@ -1,6 +1,7 @@
 ---
 title: "Projects Dashboard"
 description: "/projects — marketplace-tier dashboard with hero strip, user-stats widget, farm banner, products CTA, and the project grid."
+description: "/projects — Lovable/v0-style prompt-first creation hero + inline live-build streaming view + polished project cards."
 ---
 
 # Projects Dashboard
@@ -16,6 +17,19 @@ the grid stays warm with active project status.
 The Balance / Marketing / Referrals "control-center" widgets in the
 original spec did not ship here — they live in `Account.tsx` and the
 referrals stack instead. This page kept the lighter widget set.
+`/projects` is a prompt-first creation surface (2026-05-29 rebuild,
+UX-OVERHAUL §2). The page leads with a big centered prompt hero ("Опиши,
+что хочешь создать…") + example chips + one bold CTA — the "wow" first
+moment. On submit it does NOT navigate away: it swaps the hero for an
+inline `LiveBuildView` that streams the REAL project lifecycle (ordered
+animated steps + embedded preview iframe). Existing projects render below
+as polished preview-thumbnail cards. All `.plov-*` styling.
+
+It reuses the working creation API EXACTLY (the old `CreateProjectModal`
+path): `createProject(brief)` → fire-and-forget hosted-device claim +
+`approveProject` → poll `GET /me/projects/:id`. Only the UI changed.
+Generic — no per-kind / per-slug branching; the backend resolves runtime
+kind + template from the brief.
 
 ## Files
 
@@ -28,6 +42,21 @@ referrals stack instead. This page kept the lighter widget set.
 | `agentflow-landing/src/pages/ProjectsDashboard.tsx:664` | `ProductsBanner` inline component |
 | `agentflow-landing/src/components/dashboard/UserStatsStrip.tsx:29` | `UserStatsStrip` component (fetches `/me/stats`) |
 | `agentflow-landing/src/styles/projects-premium.css` | All `.pdp-*` styles |
+| `agentflow-landing/src/pages/ProjectsDashboard.tsx:232` | `create` mutation → `createProject(brief)` |
+| `agentflow-landing/src/pages/ProjectsDashboard.tsx:209` | `runPostCreateBackground` — hosted-device claim + `approveProject` (fire-and-forget) |
+| `agentflow-landing/src/pages/ProjectsDashboard.tsx:268` | Renders `LiveBuildView` after a successful create |
+| `agentflow-landing/src/pages/ProjectsDashboard.tsx:357` | `HeroCreate` — prompt + chips + CTA |
+| `agentflow-landing/src/pages/ProjectsDashboard.tsx:455` | `ProjectCardTile` — polished card w/ preview-thumb iframe |
+| `agentflow-landing/src/components/projects/LiveBuildView.tsx:73` | `phaseForStatus` — status → lifecycle phase |
+| `agentflow-landing/src/components/projects/LiveBuildView.tsx:141` | poll `getProject(projectId)` every `POLL_MS` (2500ms) |
+| `agentflow-landing/src/components/projects/LiveBuildView.tsx:177` | `queued` — capacity-gated calm state (no dead end) |
+| `agentflow-landing/src/components/projects/LiveBuildView.tsx:281` | embedded preview iframe (status=running/done + preview_url) |
+| `agentflow-landing/src/styles/projects-lovable.css` | All `.plov-*` styles (uses `--af-*` tokens) |
+
+Note: the old grid/list mission-control components (`FoldersSidebar`,
+`DashboardToolBar`, `BulkActionBar`, `ProjectListRow`,
+`components/projects/EmptyState`, `store/projectsStore`) are no longer
+imported by this page after the rebuild.
 
 ## Data flow
 
@@ -61,6 +90,45 @@ contacts/refs in the active-state copy is currently hardcoded (`340` /
 - LocalStorage keys: `af_farm_visited` — first visit to `/farm` flips the FarmBanner copy
 - No new env vars
 - Tailwind/CSS file: `projects-premium.css` (`.pdp-*` class prefix)
+HeroCreate prompt submit
+  └─► POST /me/projects { brief }            (createProject)        ─► { id, slug }
+        └─ setBuilding({ id, brief })  →  render LiveBuildView
+        └─ runPostCreateBackground(id) (fire-and-forget):
+             GET  /me/hosted-devices         (claim daemon if none)
+             POST /me/hosted-devices         (size=small kind=daemon preset=simple)
+             POST /me/projects/:id/approve   (kicks clone + dispatch)
+
+LiveBuildView (poll loop, 2500ms until status done|failed)
+  └─► GET /me/projects/:id (getProject — folds events[])
+        status → phase:
+          draft|awaiting_approval → "Готовлю проект"
+          approved|awaiting_clone → "Подбираю шаблон"
+          provisioning            → "Пишу код"
+          running                 → "Поднимаю превью" + <iframe preview_url>
+          done                    → open workspace CTA
+          failed                  → inline error + retry
+        early phase > 45s         → calm "в очереди на сборку" card (no dead end)
+
+Grid: GET /me/projects?limit=200   (react-query refetchInterval=15_000)
+```
+
+`provisioning` / `awaiting_clone` are runtime-only statuses the backend
+lifecycle writes (per workspace CLAUDE.md); the `ProjectDetail['status']`
+TS union on the landing branch may be narrower, so `phaseForStatus` takes
+a plain `string`.
+
+## DB / Env / API
+
+- Routes consumed (under the agents base url):
+  - `POST /me/projects { brief }` — create (returns `{ id, slug, title, status }`)
+  - `POST /me/projects/:id/approve` — kicks clone + dispatch
+  - `GET /me/hosted-devices` + `POST /me/hosted-devices` — auto-claim a warm-pool daemon
+  - `GET /me/projects/:id` — live poll (folds `events[]`, `preview_url`, `status`)
+  - `GET /me/projects?limit=200` — the card grid
+  - `GET /me/projects/create-status` — paid-tier locked banner
+- LocalStorage: none new
+- Env: none new
+- CSS: `projects-lovable.css` (`.plov-*` prefix), tokens from `dark-tokens.css` (`--af-*`)
 
 ## Failure modes
 
@@ -78,3 +146,15 @@ contacts/refs in the active-state copy is currently hardcoded (`340` /
 - [Farm](/subsystems/farm) — `FarmBanner` deep-links to it
 - [Products Hub](/subsystems/products-hub) — `ProductsBanner` deep-links to it
 - [Projects Frontend](/subsystems/projects-frontend) — pre-redesign architecture
+| Build view shows dead spinner forever | `QUEUED_AFTER_MS` not reached / poll error | `LiveBuildView.tsx:177` — `queued` card renders after 45s in an early phase; capacity-gated pods are expected to sit Pending (PRODUCTION-READINESS §5 capacity blocker) |
+| Preview iframe blank on `running` | `showPreview && previewUrl` false | `LiveBuildView.tsx:173` — `preview_url` not populated yet; reconciler hasn't promoted. The step list keeps moving |
+| Create button stuck disabled | `canSubmit` false | `ProjectsDashboard.tsx` — brief < 5 chars OR `createStatus.locked` (paid gate) |
+| Card status pill unreadable on bright cover | n/a (CSS) | `projects-lovable.css` `.plov-card__status` — dark base layered under tint; inline `linear-gradient(tint,tint), rgba(10,10,12,.78)` |
+| Build view never resolves after `failed` | `plov-build-error` testid renders | `LiveBuildView.tsx:199` — error card + retry; poll stops on `done|failed` |
+
+## Related
+
+- [Create project flow](/flows/create-project) — the lifecycle this view streams
+- [Project lifecycle](/flows/project-lifecycle) — status transitions + preview-reconciler
+- [Preview deploy](/flows/preview-deploy) — how `preview_url` gets populated
+- [Projects Frontend](/subsystems/projects-frontend) — workspace + redirect surfaces

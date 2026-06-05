@@ -1,0 +1,87 @@
+---
+title: "Tavily MCP"
+description: "JSON-RPC MCP server exposing Tavily search/extract/news web-research tools to agents, with BYOK fallback to platform env key."
+---
+
+# Tavily MCP
+
+## TL;DR
+
+Agentflow MCP server that wraps the Tavily Search API. Three tools — `search`, `extract`, `news` — let agents pull ranked web results, raw article bodies, and time-windowed news. Key resolution is per-owner first (`user_provider_keys` row, AES-256-GCM sealed) then a platform env fallback (`TAVILY_API_KEY`). When both miss, every tool returns `tavily_key_not_configured` without an HTTP call.
+
+## Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/mcp-servers/tavily.ts:30-37` | `TavilyCtx` shape — only `ownerUserId` flows in from the route. |
+| `agentflow-agents/src/mcp-servers/tavily.ts:39` | `TAVILY_BASE = 'https://api.tavily.com'` upstream constant. |
+| `agentflow-agents/src/mcp-servers/tavily.ts:48-72` | `resolveTavilyKey` — DB row first, env fallback second. Catches DB errors so a broken connection still hits env. |
+| `agentflow-agents/src/mcp-servers/tavily.ts:76-100` | `tavilyPost` — fetch helper with `AbortSignal.timeout(30_000)` and 500-char truncated error body. |
+| `agentflow-agents/src/mcp-servers/tavily.ts:104-194` | `search` tool handler — trims `content` to 1200 chars and returns `key_source`. |
+| `agentflow-agents/src/mcp-servers/tavily.ts:196-247` | `extract` tool handler — caps `raw_content` per URL at 8000 chars. |
+| `agentflow-agents/src/mcp-servers/tavily.ts:249-294` | `news` tool handler — wraps `/search` with `topic=news`, default 7-day window. |
+| `agentflow-agents/src/mcp-servers/tavily.ts:298-304` | `handleTavilyMcp` — Hono entrypoint mounted at `/internal/mcp/tavily/?owner=<userId>`. |
+| `agentflow-agents/src/mcp-servers/tavily.ts:307-315` | `callTavilyTool` — direct invocation helper used by tests and mcp-direct. |
+| `agentflow-agents/src/mcp-servers/tavily.test.ts:1-199` | `node --test` unit coverage: registry sanity, search/extract/news happy paths, missing-key branch. |
+
+## Data flow
+
+```
+Agent (graph-executor / Eliza runtime)
+   │
+   │ JSON-RPC tools/call → POST /internal/mcp/tavily/?owner=<userId>
+   ▼
+handleTavilyMcp (tavily.ts:298)
+   │
+   ├── handleJsonRpcMcp dispatch → tool.handler(args, { ownerUserId })
+   │
+   ├── resolveTavilyKey(ownerUserId)
+   │     ├── SELECT user_provider_keys WHERE provider='tavily' AND category='research'
+   │     │   → unsealValue(sealed_value) via services/git-token-store.ts
+   │     └── fallback: process.env.TAVILY_API_KEY
+   │
+   ├── if no key → { ok: false, error: 'tavily_key_not_configured' }  (no fetch)
+   │
+   └── tavilyPost('/search' | '/extract', key, body)
+          │ AbortSignal.timeout(30_000)
+          ▼
+       Tavily API → trimmed envelope back to caller
+```
+
+## DB / Env / API
+
+**DB:**
+- `user_provider_keys` row keyed by `(user_id, provider='tavily', category='research', is_active=true)`. Lowest `rotation_priority` wins. `sealed_value` is AES-256-GCM blob, unsealed by `services/git-token-store.ts#unsealValue`.
+
+**Env:**
+- `TAVILY_API_KEY` — platform-wide fallback when the owner has no BYOK row. **Not present in prod** as of 2026-05-15 (`kubectl -n franchise-factory exec deploy/agentflow-agents -- env | grep -i tavily` returned no match).
+- `AGENTS_MASTER_KEY` — base64-32 master used by the unseal helper.
+
+**Routes:**
+- `POST /internal/mcp/tavily/?owner=<userId>` — JSON-RPC MCP transport, mounted in `server.ts`.
+
+**MCP tools:**
+- `search({ query, max_results?, topic?, search_depth?, include_answer?, include_domains?, exclude_domains?, days? })`
+- `extract({ urls, extract_depth? })`
+- `news({ query, days?, max_results? })`
+
+All three return `{ ok: false, error: 'tavily_key_not_configured', hint? }` when neither a BYOK row nor `TAVILY_API_KEY` resolves.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Tool returns `error: 'tavily_key_not_configured'` to the agent | `tavily_key_not_configured` (literal string in handler) | Set `TAVILY_API_KEY` in agentflow-agents deployment, or insert a `user_provider_keys` row for the owner (`provider='tavily', category='research'`). **Confirmed missing in prod 2026-05-15** — no key set, every owner needs BYOK or platform-wide rollout. See `tavily.ts:152-159`. |
+| BYOK lookup throws but tool still works via env | `[tavily] user-key lookup failed:` | DB connectivity or `git-token-store.ts#unsealValue` error. Inspect `agentflow-agents` logs. Source: `tavily.ts:66`. |
+| Tool returns `error: 'tavily_request_failed'` with non-2xx `status` | `tavily_request_failed` | Upstream Tavily error or key invalid. `detail` carries the first 500 chars of upstream body. Source: `tavily.ts:172-173`. |
+| Tool returns `error: 'empty_query'` | `empty_query` | Caller passed `query: ''` after trim. Validate agent prompt. Source: `tavily.ts:150`. |
+| Tool returns `error: 'no_urls'` from `extract` | `no_urls` | Agent supplied empty array. Source: `tavily.ts:218`. |
+| Upstream parse error | `parse_failed` | Tavily returned 2xx with non-JSON body. Source: `tavily.ts:98`. |
+| 30s timeout | `AbortError` from `tavilyPost` | Tavily slow on `extract advanced`. Source: `tavily.ts:85` (`AbortSignal.timeout(30_000)`). |
+
+## Related
+
+- [Architecture overview](/architecture/overview)
+- [LLM router](/subsystems/llm-router)
+- [code-exec MCP](/subsystems/code-exec-mcp)
+- [Auth & access](/subsystems/auth-and-access)
