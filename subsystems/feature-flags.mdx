@@ -84,7 +84,34 @@ Returns every row sorted by key.
 | Admin write rejected with `bad_key` | `bad_key` HTTP 400 | Key must match `/^[a-z][a-z0-9._-]{0,127}$/` |
 | Admin write rejected with `missing_value` | HTTP 400 `missing_value` | Body must include a `value` field (any JSON shape) |
 
+## Known flags
+
+| Key | Type | Default | Consumer | Purpose |
+|---|---|---|---|---|
+| `graph_executor.enabled` | bool | `true` (seed) | `services/projects-pipeline.ts` | Master switch for the graph-executor path. |
+| `graph_executor.kinds` | string[] | `["landing","tg_bot","tg_profile_bundle","tg_farm"]` | `services/projects-pipeline.ts` | Per-kind allowlist. |
+| `projects.create_locked` | bool | `false` | `routes/projects.ts:POST /me/projects` + `GET /me/projects/create-status` | When `true`, non-admin `POST /me/projects` returns `403 workflow_creation_locked` with Russian academy-launch message. Admins (`isAdminUser`) bypass. Used for the May 15 academy gate (PR #249). |
+
+### Flipping `projects.create_locked`
+
+```bash
+# Lock workflow creation for non-admins
+curl -X PATCH \
+  -H "authorization: Bearer $JWT" -H "content-type: application/json" \
+  -d '{"value":true}' \
+  https://agents.agentflow.website/admin/feature-flags/projects.create_locked
+
+# Unlock
+curl -X PATCH \
+  -H "authorization: Bearer $JWT" -H "content-type: application/json" \
+  -d '{"value":false}' \
+  https://agents.agentflow.website/admin/feature-flags/projects.create_locked
+```
+
+Frontend reads `GET /me/projects/create-status` on mount (30s staleTime) so the UI never has to guess from a 403. Existing projects + agent chat stay reachable while locked.
+
 ## Related
 
 - [Graph executor](/architecture/graph-executor) — first consumer; `graph_executor.enabled` + `graph_executor.kinds` replace `FF_GRAPH_EXECUTOR` / `FF_GRAPH_EXECUTOR_KINDS`.
 - [Auth + access](/subsystems/auth-and-access) — `requireSession` + `requireAdmin` gate the admin endpoints.
+- [CryptoBot billing](/subsystems/cryptobot-billing) — prestart factor lives in env, but the academy launch gate (`projects.create_locked`) is a feature flag.

@@ -21,6 +21,11 @@ Self-hosted Dendrite homeserver на k3s + кастомный React UI пове�
 | `agentflow-agents/k8s/dendrite-config.yaml:11` | ConfigMap с inline `dendrite.yaml` |
 | `agentflow-landing/public/.well-known/matrix/server:1` | `{"m.server": "matrix.agentflow.website:443"}` |
 | `agentflow-landing/public/.well-known/matrix/client:1` | `{"m.homeserver": {"base_url": "..."}}` |
+| `agentflow-agents/src/routes/chat.ts` *(Phase 2)* | `POST /me/chat/token` SSO bridge |
+| `agentflow-agents/src/routes/me-chat-contacts.ts` *(Phase 4.A)* | `GET /me/chat/contacts` — contact picker source for `NewChatDialog` |
+| `agentflow-agents/src/services/matrix-bridge.ts` | Auto-provision + deterministic password + Matrix id derivation helpers |
+| `agentflow-landing/src/chat/ChatPage.tsx` *(Phase 3)* | `/chat` route component |
+| `agentflow-landing/src/chat/ChatClientContext.tsx` *(Phase 3)* | matrix-js-sdk wrapper |
 | `agentflow-agents/src/routes/chat.ts` | `POST /me/chat/token` SSO bridge |
 | `agentflow-landing/src/chat/ChatPage.tsx` | `/chat` route component |
 | `agentflow-landing/src/chat/matrixApi.ts` | thin Matrix client (sync, send, upload, mxcToHttp) |
@@ -77,6 +82,7 @@ Browser /chat
 
 ### Routes (новые на agentflow-agents)
 - `POST /me/chat/token` — issue Matrix access_token (auto-provision на первом вызове)
+- `GET /me/chat/contacts?q=&limit=` — list other AF users with derived Matrix id for the contact picker. Excludes caller + soft-deleted rows. `limit` defaults to 50, capped at 200. `q` filters `display_name`/`first_name`/`slug` via `ILIKE`. Returns `{ ok, contacts: [{ af_user_id, matrix_user_id, display_name, slug, avatar_url }] }`.
 - `POST /me/chat/rooms` *(phase 3+)* — create room with current user as admin
 - `POST /me/chat/invite` *(phase 3+)* — invite by AF user_id
 
@@ -185,6 +191,7 @@ kubectl -n franchise-factory logs -l app=agentflow-agents --tail=200 | grep '\[c
 - Voice/video calls (требует TURN-сервера)
 - Mobile apps (phase 6, отдельный repo)
 - Telegram/Discord/WhatsApp bridges (phase 5, `mautrix-*`)
+- Spaces hierarchies
 
 ## AgentFlow Space (Discord-style folder)
 

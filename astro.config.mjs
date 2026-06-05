@@ -139,6 +139,7 @@ export default defineConfig({
             { label: 'Templates Marketplace', slug: 'flows/templates-marketplace' },
             { label: 'Diploma Outreach + Build', slug: 'flows/diploma-outreach-and-build' },
             { label: 'Graph Execution', slug: 'flows/graph-execution' },
+            { label: 'Studio Automate Run', slug: 'flows/studio-automate-run' },
             { label: 'Desktop-agent attach', slug: 'flows/desktop-agent-attach' },
             { label: 'Tutorial Recording', slug: 'flows/tutorial-recording' },
           ],
