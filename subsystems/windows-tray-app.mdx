@@ -1,0 +1,99 @@
+---
+title: "Windows tray app"
+description: "Pystray-based system-tray app mirroring the Mac menu-bar — local agents + cloud goals + budget."
+---
+
+# Windows tray app
+
+## TL;DR
+Lightweight Windows-side counterpart to `macapp/`. Built on `pystray` + native menu. Surfaces
+local daemon status, agent slots, the last 5 cloud goals, daily budget, plus quick actions
+(open cabinet, restart daemon, autostart on login). Implementation lives under
+`agentflow-computer-mcp/src/agentflow_computer_mcp/winapp/`; the `winapp/` root dir holds
+the README + bundled icon assets so PyInstaller picks them up automatically.
+
+**v0.5.0 ships the tray with the installer.** `agentflow-desktop-setup.exe` now bundles
+a second PyInstaller onefile `agentflow-tray.exe` alongside the daemon. The wizard:
+
+1. copies `agentflow-tray.exe` into `%LOCALAPPDATA%\AgentFlow\`,
+2. writes `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\AgentFlowTray = "<path>"`,
+3. spawns the tray immediately (detached process).
+
+After install the user sees the AgentFlow icon in the system tray without opening
+a terminal — parity with the Mac DMG menu-bar app. A wizard checkbox «Запускать иконку
+в трее при старте Windows» (default ON) controls the Run-key write + the immediate spawn.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/winapp/__main__.py:36` | `python -m agentflow_computer_mcp.winapp` argparse entry (run / install / uninstall) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/winapp/tray.py:39` | `run()` — boots pystray, wires the polling thread |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/winapp/menu.py:69` | `build_menu` — pure-data menu builder (testable without pystray) |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/winapp/state.py:22` | `TrayState` dataclass — header text + agents/goals/budget tuples |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/winapp/daemon_probe.py:30` | `probe()` → `(DaemonStatus, agents)`; collapses `DaemonUnavailable` to `"unsupported"` on win32 |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/winapp/cloud.py:34` | `fetch_goals` / `fetch_budget` over the existing `cli.rest_client` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/winapp/autostart.py:67` | `install/uninstall/read` for `HKCU\…\Run\AgentFlowTray` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/winapp/actions.py:18` | `open_cabinet`, `restart_daemon`, `kill_agent`, `quit_tray` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/winapp/icon.py:21` | HiDPI PNG loader (16/32/48-px), synthetic violet square fallback |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/winapp/assets/logo-{16,32,48}.png` | bundled tray icon assets |
+| `agentflow-computer-mcp/winapp/README.md` | repo-root pointer + quickstart |
+| `agentflow-computer-mcp/docs/specs/2026-05-23-windows-tray-app.md` | full spec |
+| `agentflow-computer-mcp/tests/winapp/test_tray_menu.py` | menu structure assertions (3 daemon states) |
+| `agentflow-computer-mcp/tests/winapp/test_autostart.py` | Run-key install/uninstall with mocked `winreg` |
+| `agentflow-computer-mcp/tests/winapp/test_rest_client.py` | goals + budget payload parsing |
+| `agentflow-computer-mcp/installer/tray_entry.py:21` | PyInstaller entry for `agentflow-tray.exe`; delegates to `winapp.__main__:main` |
+| `agentflow-computer-mcp/installer/agentflow-setup.spec:88` | second `EXE()` block — builds `agentflow-tray.exe` from the same Analysis+PYZ as the setup wizard |
+| `agentflow-computer-mcp/installer/setup_gui.py:312` | `install_tray_binary` / `register_tray_autostart` / `launch_tray` — wizard post-install steps |
+| `agentflow-computer-mcp/installer/setup_gui.py:46` | `TRAY_RUN_KEY` / `TRAY_RUN_VALUE` constants for the Run-key write |
+| `agentflow-computer-mcp/tests/installer/test_pyinstaller_bundle.py` | static checks: spec lists both EXE targets, wizard wires tray helpers |
+
+## Data flow
+
+```
++---------------------+        +---------------------+
+| poll thread (30 s)  |        | pystray main thread |
+|                     |        |                     |
+| daemon_probe.probe()|        |  icon.run()         |
+| cloud.fetch_goals() |        |  click → action()   |
+| cloud.fetch_budget()|        |       │             |
+|         │           |        |       v             |
+|         v           |        | restart_daemon →    |
+|     TrayState ──────┼────────┤  subprocess          |
+|                     |        |       │             |
+|         │           |        |       v             |
+|    rebuild_menu() ──┼────────► icon.update_menu()  |
++---------------------+        +---------------------+
+```
+
+## DB / Env / API
+- Tables: none (state held in memory).
+- Env: `AGENTFLOW_API_KEY` (or `~/.agentflow/auth.json`) — read by `cli.rest_client.resolve_api_key`.
+- Routes hit: `GET /me/autonomous/goals`, `GET /me/autonomous/budget` on `agentflow.website/_agents`.
+- Local IPC: `cli.socket_client.call("list" | "pause", ...)` — UNIX socket today, Windows named pipe pending (#94).
+- Registry: `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\AgentFlowTray`.
+  - Source-mode (pip install): `"<pythonw>" -m agentflow_computer_mcp.winapp` (written by `winapp.autostart.install`).
+  - Installer-mode (v0.5.0+): `"<LOCALAPPDATA>\AgentFlow\agentflow-tray.exe"` (written by `installer/setup_gui.py:register_tray_autostart`).
+
+### v0.5.0 autostart registry table
+
+| Key | Value | Writer |
+|---|---|---|
+| `HKCU\…\Run\AgentFlowTray` | `"%LOCALAPPDATA%\AgentFlow\agentflow-tray.exe"` | `setup_gui.register_tray_autostart` |
+| Scheduled Task `AgentFlowDesktop` | `"%LOCALAPPDATA%\AgentFlow\agentflow-desktop.exe" --daemon` | `setup_gui.register_scheduled_task` |
+
+Both writers are idempotent (Run-key uses `SetValueEx`, schtasks uses `/F`).
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Header stuck on "Локальные команды требуют Windows-pipe — в работе" | `"Windows: локальный socket пока не поддерживается"` (raised in `cli/socket_client.py:28`) | ship Windows named-pipe variant (#94) |
+| Tray header reads "Демон не запущен" on macOS while daemon is up | `socket not found:` from `cli/socket_client.py:30` | check `/tmp/agentflow.sock`, `agentflow daemon start` |
+| Goals submenu shows "Не авторизован" | `NotAuthenticated` in `cli/rest_client.py:42` | `agentflow login --api-key …` |
+| Autostart install raises `UnsupportedPlatform` | `"autostart only works on Windows"` (`winapp/autostart.py:34`) | run on Windows or inject `opener=` for tests |
+| pystray missing in the venv | `pystray not installed:` (`winapp/tray.py:43`) | `pip install pystray Pillow` |
+
+## Related
+- [Desktop / Computer-Agent bridge](/subsystems/computer-mcp)
+- [Multi-agent runtime](/subsystems/multi-agent-runtime) (one host → N agent slots; tray surfaces this list)
+- [Autonomous goals](/subsystems/autonomous-goals) (REST endpoints the tray polls)
+- [Desktop auto-updater](/subsystems/desktop-auto-updater) (sibling subsystem in the same package)

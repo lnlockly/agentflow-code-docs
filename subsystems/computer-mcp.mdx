@@ -39,6 +39,58 @@ Reverse-tunnel выбран чтобы обойти NAT/firewall на сторо
 | `agentflow-landing/src/pages/cabinet/DeviceDetail.tsx:(line TBD)` | `/cabinet/devices/:id` — scope editor + sessions list + revoke button. |
 | `agentflow-landing/src/components/devices/DeviceLiveSession.tsx:(line TBD)` | Live session viewer: SSE subscribe to `/me/devices/:id/sessions/:sid/stream`, chat-like timeline of screenshot thumbs + actions + results. |
 | `agentflow-agents/packages/shared-types/devices.ts:(line TBD)` | TS contract types: `Device`, `DeviceScope`, `ToolCallReq`, `ToolCallRes`. Agent B publishes first, Agent C imports. |
+title: "Desktop / Computer-Agent bridge"
+description: "Server side of the agentflow-desktop daemon: WS tunnel, task dispatch, MJPEG proxy."
+---
+
+# Desktop / Computer-Agent bridge
+
+## TL;DR
+Server bridge for `agentflow-desktop` (the on-Mac daemon). Maintains a long-lived WS tunnel
+per device, dispatches high-level tasks (`task_dispatch`), persists `task_action / task_complete /
+task_error` to `device_action_log`, and proxies the daemon's local MJPEG capture to cabinet as
+`multipart/x-mixed-replace`.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/devices-ws.ts:212` | `attachDevicesWs` mounts WS on `/_devices/connect` |
+| `agentflow-agents/src/services/devices-ws.ts:411` | `handleClientTaskFrame` fans out task/stream frames |
+| `agentflow-agents/src/services/devices-ws.ts:514` | `persistTaskRow` writes `device_action_log` |
+| `agentflow-agents/src/services/device-tasks.ts:72`  | `taskEvents` EventEmitter for SSE/MJPEG fan-out |
+| `agentflow-agents/src/services/device-tasks.ts:87`  | `acquireStream / releaseStream` ref-counter |
+| `agentflow-agents/src/services/device-task-stream.ts:77` | `subscribe(deviceId, taskId\|null, send)` wraps `taskEvents` |
+| `agentflow-agents/src/services/device-task-stream.ts:135` | `publish(deviceId, event)` mirrors back to `taskEvents` |
+| `agentflow-agents/src/services/device-task-stream.ts:225` | `loadRecentEvents` replays last N rows from `device_action_log` |
+| `agentflow-agents/src/services/device-task-history.ts:1` | `groupTaskHistoryRows` + `loadDeviceTaskHistory` — flattens log rows into per-task history |
+| `agentflow-landing/src/pages/CabinetDeviceDetail.tsx`     | Tabbed device root page (История · Разрешения · Live) |
+| `agentflow-landing/src/pages/CabinetDeviceLive.tsx:TaskComposer` | 409 retry with 2/4/8s backoff + install-card on final failure |
+| `agentflow-landing/src/pages/CabinetDeviceLive.tsx:LiveScreenFeed` | "ожидаю первый кадр…" skeleton until `<img>.naturalWidth > 0` |
+| `agentflow-agents/src/services/device-registry.ts`  | connection pool + `computer.*` tool dispatch |
+| `agentflow-agents/src/routes/me-devices/task-dispatch.ts:483`     | `POST /me/devices/:id/dispatch_task` |
+| `agentflow-agents/src/routes/me-devices/tasks.ts:173`     | `GET /me/devices/:id/tasks/stream` (device-wide SSE) |
+| `agentflow-agents/src/routes/me-devices/tasks.ts:288`     | `GET /me/devices/:id/tasks/:task_id/stream` (per-task SSE) |
+| `agentflow-agents/src/routes/me-devices/tasks.ts:372`     | `GET /me/devices/:id/live_stream` (MJPEG proxy) |
+| `agentflow-agents/src/routes/me-telegram.ts` `resolveAccountId` | resolves the Telethon `account_id` from the System-A `list_accounts` list (NOT `chat_tg_links`); honors an explicit `account_id` for multi-account; defaults to first `status='active'`. |
+| `agentflow-agents/src/routes/me-telegram.ts` `dispatchSend/Dialogs/Messages/Search/React/Whoami/Accounts` | the `af_telegram_*` REST surface — back daemon's `af_send_telegram_message` + `af_telegram_*` |
+| `agentflow-agents/src/services/tg-account-source.ts` `listTelegramAccountsForOwner` / `pickUsableTelegramAccount` | System-A account list (MCP `list_accounts`) used by `resolveAccountId`. |
+| `agentflow-agents/src/routes/me-matrix.ts:192`      | `POST /me/matrix/send` (alias `/me/matrix/post`) — backs daemon's `af_post_matrix_room` |
+| `agentflow-agents/src/services/kind-registry.ts:18` | `desktop_agent` added to `PROJECT_KINDS` |
+| `agentflow-agents/src/services/kind-registry.ts:24` | `desktop_agent` added to `USER_FACING_PROJECT_KINDS` |
+| `agentflow-agents/migrations/2026-05-22a-device-tasks.sql` | `task_id` + `kind` columns on `device_action_log` |
+| `agentflow-agents/migrations/2026-05-22d-device-task-queue.sql` | `device_tasks` queue table (dispatch during WS blackout) |
+| `agentflow-agents/src/routes/me-devices/shared.ts:QUEUE_TRUST_WINDOW_MS` | 60s window during which queue-when-WS-gone is permitted |
+| `agentflow-agents/src/routes/me-devices/shared.ts:shouldQueueForOfflineDevice` | pure helper — `last_seen` ≤60s old → queue, else 409 |
+| `agentflow-agents/packages/shared-types/devices.ts:132` | `WsMessage` task/stream variants |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_client.py:171` | `_handle_task_dispatch` queues task into `DriverState` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_client.py:186` | `_handle_stream_subscription` toggles the capture-loop flag |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/ws_client.py:80` | `WSClient.publish` thread-safe outbound bridge |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/state.py:44` | `DriverState.publish_outbound` + `task_action` mirror |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/streamer.py:84` | `CaptureLoop._maybe_publish_ws` emits `stream_frame` ≤10 fps |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/loop.py` | AI loop emits `task_complete` on done / max-iters, `task_error` on exception |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/desktop_cli.py:48` | `_start_ws_bridge` runs WS client inside `agentflow-desktop run` |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/health.py:1` | `HealthRegistry` — thread-safe daemon ws_status + failure counter |
+| `agentflow-computer-mcp/src/agentflow_computer_mcp/driver/viewer.py:202` | `GET /api/health` returns the daemon health snapshot |
 
 ## Data flow
 
@@ -171,3 +223,227 @@ computer.clipboard.write(text)
 - [Subsystems: MCP bridge / Code Exec MCP](/subsystems/code-exec-mcp)
 - [Subsystems: Presets](/subsystems/presets)
 - [Subsystems: Marketplace](/subsystems/marketplace)
+Cabinet                 agentflow-agents (pod)                  agentflow-desktop (Mac)
+   │                            │                                       │
+   │ POST /dispatch_task        │                                       │
+   ├───────────────────────────►│                                       │
+   │   {task, scope?}           │ insert device_sessions row            │
+   │                            │ recordTaskSession(taskId, sessId)     │
+   │                            │ ws.send({task_dispatch, id, task})    │
+   │                            ├──────────────────────────────────────►│
+   │ 202 {task_id}              │                                       │
+   │◄───────────────────────────│                                       │
+   │                            │                                       │ run AI loop
+   │                            │ ws.recv({task_action, task_id, ...})  │
+   │                            │◄──────────────────────────────────────│
+   │                            │ taskEvents.emit('task_action:dev')    │
+   │                            │ persistTaskRow → device_action_log    │
+   │                            │                                       │
+   │ GET /tasks/:tid/stream     │                                       │
+   ├───────────────────────────►│                                       │
+   │  SSE event=action          │                                       │
+   │◄───────────────────────────│                                       │
+   │                            │                                       │ ... → task_complete
+   │                            │◄──────────────────────────────────────│
+   │  SSE event=complete (close)│                                       │
+   │◄───────────────────────────│                                       │
+   │                            │                                       │
+   │ GET /live_stream           │                                       │
+   ├───────────────────────────►│ acquireStream(dev)                    │
+   │                            │  └─► ws.send({subscribe_stream})      │
+   │                            ├──────────────────────────────────────►│
+   │                            │                                       │ capture 15 fps
+   │                            │ ws.recv({stream_frame, frame_b64})    │
+   │                            │◄──────────────────────────────────────│
+   │ multipart/x-mixed-replace  │                                       │
+   │◄───────────────────────────│                                       │
+   │ (client disconnect)        │ releaseStream(dev) → 0                │
+   │                            │  └─► ws.send({unsubscribe_stream})    │
+   │                            ├──────────────────────────────────────►│
+```
+
+## DB / Env / API
+- Tables:
+  - `user_devices` — owner, scope, status, secret hash, enrollment token
+  - `device_sessions` — one per dispatched task; agent_id `'desktop-task'`
+  - `device_action_log` — `task_id` + `kind` (`tool_call|task_action|task_complete|task_error`)
+  - `device_tasks` — queue rows used when WS map empty but `user_devices.last_seen` ≤60s old. Daemon drains via `GET /me/devices/:id/queued_tasks` after `hello_ack`. Statuses: `queued|dispatched|failed`
+- Env: `API_KEY_HMAC_SECRET` (or `AUTH_JWT_SECRET` fallback for `:apikeys` salt)
+- Routes:
+  - `POST /me/devices/:id/dispatch_task` → 202 `{task_id, session_id}` (live path) **or** 202 `{task_id, session_id: null, queued: true}` (queued during WS blackout, `last_seen` ≤60s old) **or** 409 `device_offline` (`last_seen` null or >60s old)
+  - `GET  /me/devices/:id/queued_tasks` → 200 `{ok, tasks: [{id, payload, created_at}]}` — daemon-only drain endpoint, atomically flips `queued`→`dispatched`
+  - `GET  /me/devices/:id/tasks/stream` → SSE (device-wide)
+  - `GET  /me/devices/:id/tasks/:task_id/stream` → SSE (per-task, closes on complete/error)
+  - `GET  /me/devices/:id/tasks/history?limit=50` → 200 `{ok, items: [{task_id, brief, started_at, ended_at, cost_usd, status}]}` — newest first; powers the cabinet "История" tab via `services/device-task-history.ts`
+  - `GET  /me/devices/:id/live_stream` → `multipart/x-mixed-replace; boundary=frame`
+  - `POST /me/telegram/send` → 200 `{ok, message_id}` / 503 `tg_account_not_linked` / 503 `tg_unreachable` / 400 `account_id_not_owned` / 502 MCP error. Body `{chat_id, text, account_id?}`. `chat_id="me"` routes to Saved Messages. Account resolution now reads the System-A Telethon list (`list_accounts`), NOT `chat_tg_links` — see "id-space" note below. Optional `account_id` targets a specific connected account (multi-account); defaults to the first `status='active'`.
+  - `GET  /me/telegram/accounts` → 200 `{ok, accounts:[…], default_account_id}` — list the caller's connected MTProto accounts so the agent can pick which `account_id` to act as.
+  - `GET  /me/telegram/{dialogs,messages,search,whoami}` + `POST /me/telegram/react` — all accept an optional `account_id` (query for GET, body for POST) and resolve via the System-A list.
+
+> **id-space (the fix).** Two "connect Telegram" systems coexist:
+> System A (real MTProto agent) — `/me/tg-accounts/*` → Telethon session in
+> tg-mcp `accounts` table, identified by integer `accounts.id`. System B
+> (mautrix chat puppeting) — `/me/chat/tg/*` → `chat_tg_links` with a string
+> `primary_login_id` (a bridge login_id). Until 2026-06-02 the `af_telegram_*`
+> surface resolved its `account_id` from `chat_tg_links.primary_login_id`, a
+> DIFFERENT id-space, so accounts connected the real way (System A) had no
+> `chat_tg_links` row and always 503'd, and only ONE "primary" account was
+> ever addressable. It now resolves from the Telethon `list_accounts` list
+> (`resolveAccountId` → `listTelegramAccountsForOwner`), supports multiple
+> accounts via `account_id`, and leaves System-B chat puppeting untouched.
+  - `POST /me/matrix/send` (alias `POST /me/matrix/post`) → 200 `{ok, event_id}` / 404 `room_not_found` / 502 `bridge_error` / 502 `matrix_bridge_unreachable`. Body `{room_id, text}`. Posts as the caller's Dendrite puppet via `issueMatrixTokenForAfUser`.
+- WS protocol additions (`WsMessage` in `packages/shared-types/devices.ts`):
+  - S→C: `task_dispatch`, `subscribe_stream`, `unsubscribe_stream`
+  - C→S: `task_action`, `task_complete`, `task_error`, `stream_frame`
+- Project kind: `desktop_agent` is user-facing and bypasses the spa-collapse path.
+- Local viewer (daemon-side, `http://127.0.0.1:8765`):
+  - `GET /api/health` → `{ws_status, last_hello_at, last_failure, consecutive_failures}`. `ws_status` is one of `connecting | connected | reconnecting | dead`. Read this from cabinet diagnostics or `curl` to tell "reconnecting" apart from "truly dead".
+
+### SSE pub/sub contract
+
+`deviceTaskStream` (in `services/device-task-stream.ts`) is the single subscription primitive used by both `/tasks/stream` and `/tasks/:task_id/stream`. It wraps the existing `taskEvents` EventEmitter and adds:
+
+- **Filtering** — `subscribe(deviceId, taskId | null, send)` either fans out every event for a device, or just one task.
+- **History replay** — `loadRecentEvents(deviceId, taskId | null, limit=100)` reads the last N rows of `kind IN ('task_action','task_complete','task_error')` from `device_action_log` joined through `device_sessions.device_id`. SSE handlers replay those before subscribing, so the cabinet timeline is non-empty on open.
+- **Unified payload** — `TaskStreamEvent` carries a `kind` discriminator (`task_action | task_complete | task_error`), `device_id`, `task_id`, `ts`. Action variant adds `action`, `detail?`, `screenshot_b64?`, `screenshot_url?`. Complete variant adds `answer`, `iterations?`, `tokens_used?`, `cost_usd?`. Error variant adds `error`.
+
+The SSE writer in `routes/me-devices/tasks.ts:writeTaskStreamEvent` emits each event twice: once as a named SSE event (`action` / `complete` / `error`) carrying the legacy camelCase shape the existing cabinet (`CabinetDeviceLive.tsx:319-322`) listens for, and once as a default `message` event carrying the unified `{kind, …}` payload for new consumers. Per-task subscriptions auto-close after `task_complete` or `task_error`.
+
+## Auto-start guarantees (updated 2026-05-22)
+
+| OS | Boot trigger | Restart policy | linger needed | Notes |
+|---|---|---|---|---|
+| macOS (launchd) | `RunAtLoad=true` in `com.agentflow.desktop.plist` | `KeepAlive{Crashed:true, SuccessfulExit:false}`, `ThrottleInterval=10` | N/A | `ProcessType=Background` + `LowPriorityIO=true` added to prevent Jetsam kills under memory pressure. `launchctl bootstrap gui/<uid>` on install. |
+| Linux (systemd user) | `WantedBy=default.target` + `systemctl --user enable --now` | `Restart=on-failure`, `RestartSec=10`, `StartLimitIntervalSec=0` | Yes — `loginctl enable-linger <user>` (best-effort; installer warns if it requires sudo) | Without linger the unit starts only after the user's first login session. |
+| Windows (Task Scheduler) | `AtLogon` (current user) **+** `AtStartup` (system boot) | `RestartCount=5`, `RestartInterval=PT1M` via `ScheduledTaskSettingsSet` | N/A | `RunLevel=Limited` — daemon does not require admin. Python detection falls back `python` → `py -3`; links to download page if neither found. |
+
+### selftest subcommand
+
+`agentflow-desktop selftest` is the recommended liveness probe. It checks:
+1. `capture_screen_fast` — screen capture backend works (required).
+2. `capture_screen (png)` — full PNG capture (required).
+3. `window_list` / `clipboard_read` — OS permissions in place (required).
+4. `read_terminal` — optional; FAIL here does not fail the overall exit code.
+5. `auth_file` — `~/.agentflow/auth.json` present and contains `api_key` (required).
+6. `scope_file_parseable` — `~/.agentflow/computer-scope.toml` parseable TOML (required).
+7. `ws_endpoint_reachable` — TCP + TLS handshake to the WS host succeeds (required).
+
+Exit 0 = PASS; exit 1 = one or more required checks failed.
+Both `install.sh` and `install.ps1` call `agentflow-desktop selftest` at the end of installation.
+
+Source: `agentflow-computer-mcp/src/agentflow_computer_mcp/desktop_cli.py:225` (`cmd_selftest`).
+
+## Install onboarding (2026-05-22)
+
+The cabinet's offline-state card (`/cabinet/devices/:id/live`) auto-mints
+an API key on open and inlines it into the install one-liner, so the
+user pastes a single line and the daemon enrols with no further input.
+
+Flow:
+
+1. `OfflineState` mounts → calls `devicesApi.mintInstallToken()` →
+   `POST /me/api-keys/install-token` (route file
+   `agentflow-agents/src/routes/me-api-keys.ts`). Returns the raw
+   `af_live_*` key once; backend persists only the HMAC hash into the
+   shared `api_keys` table with `name = 'Desktop install <uuid>'`.
+2. UI renders `AGENTFLOW_API_KEY=af_live_… curl -fsSL …/install/computer-mcp.sh | bash`
+   with reveal/hide, copy, regenerate buttons.
+3. `install.sh` / `install.ps1` bridge `AGENTFLOW_API_KEY` → `AF_KEY`
+   for the existing `auth.json` writer. `AF_DEVICE_ID` / `AF_DEVICE_TOKEN`
+   are now optional — the daemon enrols on first launch with just the
+   key.
+
+Revoke a stale install token via the normal cabinet API-keys page —
+they show up alongside the user's other keys.
+
+Files:
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-api-keys.ts` | `POST /me/api-keys/install-token` mint endpoint |
+| `agentflow-agents/src/server.ts:790` | route mount (between `meDevicesApp` and `meTelegramApp`) |
+| `agentflow-landing/src/pages/CabinetDeviceLive.tsx:OfflineState` | calls mint, renders command, reveal/regenerate UX |
+| `agentflow-landing/src/lib/devicesApi.ts:mintInstallToken` | client wrapper |
+| `agentflow-computer-mcp/install.sh:30` | `AGENTFLOW_API_KEY` → `AF_KEY` bridge |
+| `agentflow-computer-mcp/install.ps1:20` | same for Windows |
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `dispatch_task` returns 409 | none — synchronous response | check `/me/devices/:id` status; daemon offline AND `last_seen` >60s old (else the queue path takes over) |
+| `dispatch_task` returns 202 `queued:true` but daemon never picks up | none — DB row stays `status='queued'` | inspect `SELECT * FROM device_tasks WHERE status='queued' AND created_at < NOW() - INTERVAL '5 min'`; daemon never reconnected (Mac asleep / network down) — manual fix is to mark row `failed` or delete |
+| Task progress missing from cabinet SSE | `[devices-ws] persist_task_row_failed` | DB connection / migration not applied |
+| Synthetic session row appears | none — silent fallback | daemon resumed task across pod restart (expected) |
+| MJPEG returns headers but no frames | `[device] online ... tools=0` | daemon hasn't subscribed yet OR daemon never pushes `stream_frame` |
+| `subscribe_stream` never sent | `streamSubscriberCount` flips 0→1 silently if connection missing | device offline; daemon must come online + cabinet re-opens stream |
+| Live viewport black until page reload (cabinet user reports "have to refresh"); fixed 2026-05-22 | look for `[device] resync subscribe_stream device=... pending=N`; if MISSING after `[device] online` while a live tab is open, the daemon never received the re-arm | `services/devices-ws.ts:hello` calls `resyncStreamSubscription(deviceId, send)`; if absent, the daemon stays unsubscribed across reconnects (heartbeat timeout, sleep/wake) |
+| Daemon ignores `task_dispatch` | `ws task_dispatch id=... task=...` missing from `agentflow-desktop` log | upgrade daemon to ≥0.2.1 (PR auto/ws-client-task-dispatch-2026-05-22 wired routing) |
+| `task_action` SSE silent though daemon is online | `current_task_id` empty inside `DriverState` | local-input path: viewer's `POST /task` now assigns `local-*` id via `enqueue_task` — old viewer builds put raw strings and never tag the task |
+| `af_telegram_*` / `af_send_telegram_message` returns 503 `tg_account_not_linked` | none — synchronous response | caller has NO connected MTProto account; connect via `POST /me/tg-accounts/add-phone` + `/confirm-code` (System A). NB resolution is via the Telethon `list_accounts` list, NOT `chat_tg_links` — see id-space note. |
+| `af_telegram_*` returns 503 `tg_unreachable` | none — synchronous response | tg-mcp pod down / `list_accounts` MCP call threw. Check the tg-mcp deployment. |
+| `af_telegram_*` returns 400 `account_id_not_owned` | none — synchronous response | explicit `account_id` is not in the caller's connected accounts. Call `GET /me/telegram/accounts` to list valid ids. |
+| `af_post_matrix_room` returns 502 `matrix_bridge_unreachable` | `[chat-tg] ... token issue failed` (pattern reused) | Dendrite down or `MATRIX_AUTH_KEY` rotated; user re-login via Element SSO |
+| Cabinet timeline empty after `/tasks/stream` connect | `[device-task-stream] history_load_failed` | SQL replay failed; the live path still works — check `device_action_log` join with `device_sessions` and migration `2026-05-22a-device-tasks.sql` |
+| History tab on `/cabinet/devices/:id` empty though tasks ran | `[device-task-history] load_failed` | SQL join failed — verify `device_action_log` has `task_id` populated and `kind` set (migration `2026-05-22a-device-tasks.sql`); the dispatch endpoint now inserts a `task.dispatch` row with `args.brief` so history is non-empty from the moment a task is queued |
+| Cabinet composer shows "Mac офлайн" right after a task finished | `POST /me/devices/:id/dispatch_task` → 409 | Mid-reconnect race — daemon's WS dropped on heartbeat timeout between tasks. The cabinet composer (`CabinetDeviceLive.tsx:TaskComposer`) now retries up to 3× with 2/4/8s backoff before surfacing the error |
+| `<img src="…/live_stream">` viewport black with no overlay for >2s | none (client-side only) | The cabinet renders a "ожидаю первый кадр…" skeleton until `<img>.naturalWidth > 0`; if you see the bare black viewport, you're on an old build — check `LiveScreenFeed` for the `firstFrame` state |
+| New SSE consumer reads `data` but sees only `action/complete/error` | none — wire-shape issue | bind to default `message` event for the unified `{kind, …}` payload; named events ship the legacy camelCase shape |
+| Daemon Jetsam-killed on Mac at night (device goes offline) | `agentflow-desktop` absent from `launchctl list` | Re-run `install.sh` (adds `ProcessType=Background` + `LowPriorityIO=true` to plist) |
+| Linux daemon not running after reboot | `systemctl --user status agentflow-desktop` → not found | Run `sudo loginctl enable-linger $USER`; without linger user units don't start at boot |
+| Windows daemon missing after cold boot (not user logon) | Task Scheduler history → task never ran | Re-run `install.ps1` (adds `AtStartup` trigger alongside `AtLogon`) |
+| `agentflow-desktop selftest` fails `ws_endpoint_reachable` | TCP connection refused or TLS error | Check firewall / VPN; endpoint is `wss://agentflow.website/_agents/_devices/connect` |
+| Reconnect loop plateaus at 60s; cabinet reads "Mac offline" for a full minute after a single packet drop | `ws session ended:` followed by `reconnecting in 60.` | Fixed 2026-05-22 (`feat/daemon-ws-resilience`): backoff cap now 30s, resets to 1s after a successful `hello_ack`, `open_timeout` raised from 10s → 30s. See `ws_client.py:WS_OPEN_TIMEOUT_S` + `RECONNECT_BACKOFF_CAP_S`. |
+| Daemon stuck in reconnect cycles; cabinet can't tell "reconnecting" from "process dead" | `ws degraded — restart recommended (5 consecutive failures)` | Curl `http://127.0.0.1:8765/api/health` and inspect `ws_status` + `consecutive_failures`. Daemon does not self-kill; rely on launchd / systemd / Task Scheduler `KeepAlive`. |
+| Cabinet Action Timeline shows a task as "running" for hours after the WS bridge silently dropped | `[device-task-timeout] closed=` (when sweeper fires) | `agentflow-agents/src/services/device-task-timeout-worker.ts` runs every 60s, picks `device_sessions` rows older than 15 min with no `task_complete` / `task_error` row, writes a synthetic `task_error` with `error: 'task_timeout_no_progress'`, fans out via SSE. Cabinet also has a client-side guard that flips bucket.status to 'error' if startedAt < now - 15 min (`CabinetDeviceLive.tsx:STUCK_AFTER_MS`). |
+| `dispatch_task` returns 500 `secret_not_configured` on install-token mint | `[me-api-keys] install_token_insert_failed` | `API_KEY_HMAC_SECRET` or `AUTH_JWT_SECRET` not exported on the agents pod — verify with `kubectl exec deploy/agentflow-agents -- env \| grep HMAC` |
+
+## Performance (streamer, updated 2026-05-22)
+
+PR lnlockly/agentflow-computer-mcp#8 applied three optimisations to `driver/streamer.py` and `platform/mac.py`:
+
+| Optimisation | Before | After | Effect |
+|---|---|---|---|
+| `width_cap` | 1400px | 1280px | ~17% fewer pixels through Pillow resize |
+| JPEG `quality` | 68 | 58 | ~25% smaller frame at negligible visual loss for monitoring UX |
+| blake2b-8 content-hash dedup | every frame emitted | identical hash → skip WS emit | static desktop: ~660 KB/s → ~0 KB/s |
+| Adaptive back-off | fixed 10 fps emit | doubles interval on publish failure (max 1s), restores on success | prevents WS queue pile-up under backpressure |
+
+Measured frame size on a 5K Retina display: **28 KB** (was ~50 KB). Dedup eliminates ≥50% of WS emits when screen content is unchanged (regression-tested in `tests/test_streamer_perf.py`).
+
+## «Доступы» tab (2026-05-23)
+
+`CabinetDeviceDetail` now hosts a dedicated «Доступы» sub-tab driven by
+`DeviceAppWhitelist` (`agentflow-landing/src/components/devices/DeviceAppWhitelist.tsx`).
+The tab surfaces `scope.allow_apps[]` as delete-chips with an add-modal
+for adding new app names or bundle IDs. Empty list renders «Доступ ко
+всем приложениям»; non-empty list always shows a warning banner —
+«daemon будет работать ТОЛЬКО с этими приложениями. Остальные блокируются.»
+
+Add and remove flows hit `POST /me/devices/:id/scope` with the full
+merged `DeviceScope` (`...current, allow_apps: nextList`) and rely on
+React-Query optimistic updates (`qc.setQueryData` on the
+`['cabinet-device', id]` key) that revert on failure. The legacy
+ChipsInput for `allow_apps` inside the «Устройство» scope form stays in
+place for compatibility but is no longer the primary UX surface.
+
+| Path | Role |
+|---|---|
+| `agentflow-landing/src/components/devices/DeviceAppWhitelist.tsx:1` | new component |
+| `agentflow-landing/src/components/devices/DeviceAppWhitelist.tsx:55` | `persist(next)` — optimistic update + revert pattern |
+| `agentflow-landing/src/pages/CabinetDeviceDetail.tsx:34` | `import { DeviceAppWhitelist }` |
+| `agentflow-landing/src/pages/CabinetDeviceDetail.tsx:127` | tab state union extended with `'whitelist'` |
+| `agentflow-landing/src/pages/CabinetDeviceDetail.tsx:350-370` | tab button + mount point |
+| `agentflow-landing/tests/components/DeviceAppWhitelist.test.mjs:1` | smoke test — 8 assertions on contract |
+
+### Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Chip delete flickers and comes back | network 5xx on `/me/devices/:id/scope` | `DeviceAppWhitelist.persist` revert path |
+| Daemon ignores whitelist | none on client | `agentflow-computer-mcp` enforcer ignores `allow_apps` |
+| Add-modal accepts whitespace-only input | none | client validator at `handleAdd` |
+
+## Related
+- [Cabinet Device — «Автономно» tab](/subsystems/cabinet-device-autonomous-tab) — sibling tab on the same page
+- [Workspace provisioning](/subsystems/workspace-provisioning) — vcluster per user pattern
+- [Auth and access](/subsystems/auth-and-access) — api-key middleware + HMAC scheme reused here

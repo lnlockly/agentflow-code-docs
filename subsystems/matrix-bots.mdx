@@ -1,13 +1,13 @@
 ---
 title: "Matrix Bots"
-description: "Five platform service bots running inside Element/Dendrite at chat.agentflow.website."
+description: "Ten platform service bots running inside Element/Dendrite at chat.agentflow.website."
 ---
 
 # Matrix Bots
 
 ## TL;DR
 
-Five service bots (`@af-helper`, `@af-research`, `@af-image`, `@af-claude`, `@af-tg-poster`) are registered on the Dendrite homeserver via shared-secret registration and run a per-bot `/sync` long-poll loop inside `agentflow-agents`. Each bot has its own message handler: a static help menu, a URL→TL;DR summariser, a text→image generator, a Claude chat, and a Telegram-poster (v1 stub). Triggered on DM or `@mention`; gated by `MATRIX_BOTS_ENABLED=1`.
+Eleven service bots (`@af-helper`, `@af-research`, `@af-image`, `@af-claude`, `@af-tg-poster`, `@af-poster`, `@af-spec`, `@af-ops`, `@af-news`, `@af-translator`, `@af-casino`) are registered on the Dendrite homeserver via shared-secret registration and run a per-bot `/sync` long-poll loop inside `agentflow-agents`. Handlers cover a static help menu, URL→TL;DR summarisation, text→image generation, Claude chat, Telegram posting (v1 stub), multi-network cross-posting (`@af-poster` — TG + VK in v1, IG deferred), spec-from-brief writing, the owner-only ops console with constrained tool-use (see @af-ops below), a daily 09:00 Moscow-time digest (`@af-news` — AI / crypto / AgentFlow team commits), on-demand + per-room auto translation (`@af-translator` — `/translate <text>`, slash- and auto-modes), and a Coin Flip game with commit-reveal RNG (`@af-casino` — see [Matrix Casino](/subsystems/matrix-casino)). Triggered on DM or `@mention`; gated by `MATRIX_BOTS_ENABLED=1`. Full per-bot pages live under [`subsystems/matrix-bots/`](/subsystems/matrix-bots/af-translator).
 
 ## Files (with line refs)
 
@@ -26,7 +26,13 @@ Five service bots (`@af-helper`, `@af-research`, `@af-image`, `@af-claude`, `@af
 | `agentflow-agents/src/services/matrix-bots/handlers/image.ts:1` | `@af-image` — `parseImageRequest` → `useModel(IMAGE)` → `uploadMedia` → `sendImage` |
 | `agentflow-agents/src/services/matrix-bots/handlers/claude.ts:1` | `@af-claude` — `recentMessages(10)` context → `useModel(TEXT_LARGE)`, Mode C prefix + 👍 attach |
 | `agentflow-agents/src/services/matrix-bots/mode-c.ts:1` | Mode C — owner taps 👍 on a bot suggestion, backend re-sends as owner via `issueMatrixTokenForAfUser` |
-| `agentflow-agents/src/services/matrix-bots/handlers/tg-poster.ts:1` | `@af-tg-poster` — v1 stub (DM-only, `/help` works, `/connect-tg` / `/channels` / `/post` return "coming soon") |
+| `agentflow-agents/src/services/matrix-bots/handlers/tg-poster.ts:1` | `@af-tg-poster` — v2 wizard (`/login`, `/cancel`, `/accounts`, `/post @channel <text>`) wired into bridge provisioning + cross-poster TG dispatch |
+| `agentflow-agents/src/services/matrix-bots/handlers/poster.ts:1` | `@af-poster` — DM-only multi-network composer. Parses `to: tg+vk Привет`, caches plain-text composes for 5 min, dispatches via cross-poster engine |
+| `agentflow-agents/src/services/cross-poster/parser.ts:1` | `parseCompose`, `parseNetworksList` — `to:` directive grammar |
+| `agentflow-agents/src/services/cross-poster/tg.ts:1` | TG dispatch — reads `chat_tg_links.account_labels.default_channel` + `primary_login_id`, calls `mcpDirect.callTool('telegram', 'send_message', ...)` |
+| `agentflow-agents/src/services/cross-poster/vk.ts:1` | VK dispatch — `wall.post` via owner's `chat_vk_links.access_token`, per-error human hints (code 5/9/15/214) |
+| `agentflow-agents/src/services/cross-poster/ig.ts:1` | IG dispatch — v1 stub, always returns deferred reason (Business-account requirement) |
+| `agentflow-agents/src/services/cross-poster/dispatcher.ts:1` | Sequential per-network fanout + `formatStatus` Russian renderer |
 | `agentflow-agents/scripts/register-matrix-bots.mjs:1` | One-shot CLI mirroring `ensureAllBots`, runnable inside the pod for manual provisioning |
 | `agentflow-agents/src/server.ts:115` | `import { startMatrixBotsRunner }` |
 | `agentflow-agents/src/server.ts:373` | `void startMatrixBotsRunner()` (under `RUN_WORKERS`) |
@@ -89,7 +95,9 @@ agentflow-agents pod (RUN_WORKERS=true)
 | `@af-research` | yes | yes | open |
 | `@af-image` | yes | yes | open |
 | `@af-claude` | yes | yes | open |
-| `@af-tg-poster` | yes only | ignored | DM-only by design |
+| `@af-tg-poster` | yes only | ignored | DM-only + `@user-<digits>:<serverName>` mxid gate (owner-only) |
+| `@af-poster` | yes only | ignored | DM-only + `@user-<digits>:<serverName>` mxid gate (owner-only) |
+| `@af-translator` | yes | yes | open — also auto-dispatches in rooms with `auto_mode=true`, see [af-translator](/subsystems/matrix-bots/af-translator) |
 
 ## Failure modes
 
@@ -102,9 +110,77 @@ agentflow-agents pod (RUN_WORKERS=true)
 | Bot keeps trying to summarise the same old URL after restart | (no error) | `next_batch` cursor stale; clear with `UPDATE matrix_bots SET next_batch=NULL WHERE slug='af-research'` |
 | `@af-image` returns "Image generation failed" | `designapi image 503: model_not_found` | designapi account/group has no image channel — pivot to a working account or BYOK |
 | `@af-research` replies "page has no readable article body" | (no error — visible reply) | Source has no Readability-friendly main; this is expected for SPAs / login walls |
-| TG-poster commands say "coming soon" | (no error — visible reply) | Expected — v1 stub. Phase 5 will wire mautrix-telegram provisioning |
+| `@af-tg-poster /post` replies `not_logged_in` | `[af-tg-poster] post_start` followed by a `not linked` cross-poster error | Owner runs `/login` first to attach a TG account via the bridge wizard |
+| `@af-tg-poster /post` replies `channel_not_admin` | reply contains `channel_not_admin` | Owner's primary TG login lacks post rights on that peer — add it to channel admins or pick another channel |
+| `@af-tg-poster /post` replies `rate_limit` | reply contains `rate_limit` | Telegram floodwait / 429 surfaced via tg-mcp — retry after a minute |
+| `@af-tg-poster /login` fails immediately | `[af-tg-poster] login_failed` | mautrix-tg bridge unreachable, secrets drift, or `MAUTRIX_TG_PROVISIONING_SECRET` empty. Check pod env + bridge readiness |
+| `@af-tg-poster` ignores non-owner DM | `[af-tg-poster] sender_not_authorized` | Expected — owner-only auth gate (same `parseOwnerMxid` as `@af-poster`) |
 | `M_USER_IN_USE` on register but login also 403 | `matrix_bot_register_rejected_400_M_USER_IN_USE` | Password drift — either rotate `MATRIX_BOT_KEY` back, or hit `/_dendrite/admin/resetPassword/{user}` to align |
 | Sync loop hot-loops on error | `[matrix-bots] sync error, backing off` | Inspect the inner `err` field; exponential backoff caps at 60s and resumes automatically |
+
+## @af-image — multi-model slash commands
+
+`@af-image` exposes three command families. They mix freely:
+
+| Family | Verbs | Effect |
+|---|---|---|
+| Aspect | `/wide`, `/tall`, `/square` | Sets the output size (`1792x1024`, `1024x1792`, `1024x1024`). Default is square. |
+| Model | `/dalle3`, `/flux`, `/gpt-image` | Sets the DesignAPI model id (`dall-e-3`, `flux-pro`, `gpt-image-1`). Default is router-picked from `IMAGE_MODEL_CASCADE`. |
+| Help | `/help`, `/start` | Returns the full command list + supported model ids. |
+
+The user picks one command per message. Mixing two slashes in one body (e.g. `/dalle3 /wide ...`) is not supported — the leading slash wins. Model commands always render at square aspect; for a wide DALL·E image, use `/dalle3` first, then re-render with `/wide`.
+
+When a model command is set, the handler passes `model` to `useModel(ModelType.IMAGE, …)`. On DesignAPI rejection (typical signal: `model_not_found` / `group_no_image_access`) the handler retries once without the `model` field so the router walks its cascade, then posts a `Модель <name> временно недоступна, использую дефолт.` notice in the room. Hard failures still surface as `Image generation failed: …`.
+
+| File | Role |
+|---|---|
+| `agentflow-agents/src/services/matrix-bots/lib.ts:274` | `IMAGE_MODEL_COMMANDS` map (slash verb → DesignAPI model id) |
+| `agentflow-agents/src/services/matrix-bots/lib.ts:284` | `ASPECT_COMMANDS` map (slash verb → size) |
+| `agentflow-agents/src/services/matrix-bots/lib.ts:305` | `parseImageRequest` (returns `{prompt, size, model}`) |
+| `agentflow-agents/src/services/matrix-bots/handlers/image.ts:24` | `buildHelpText` — `/help` body sourced from the map above |
+| `agentflow-agents/src/services/matrix-bots/handlers/image.ts:102` | model-aware `useModel(IMAGE, …)` call + graceful fallback |
+| `agentflow-agents/tests/matrix-bots-lib.test.ts:184` | model-selector unit tests (`/dalle3`, `/flux`, `/gpt-image`, aliases) |
+| `agentflow-agents/tests/matrix-bots-image-help.test.ts:1` | `buildHelpText` surface tests (model list + every command family) |
+
+DesignAPI is the only image provider routed through here (memory `feedback_use_designapi`). The `IMAGE_MODEL_COMMANDS` map is the single source of truth — to add a new model the operator picks a verb, adds a row, and the `/help` body picks it up on next deploy.
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Picked model rejected, dropped to default | reply contains `временно недоступна, использую дефолт` | DesignAPI account has no access to that model — pivot the model or top up. The cascade still rendered the prompt so this is a graceful path. |
+| `/dalle3` etc. silently treated as plain prompt | (no log — handler still renders with default model) | Slash command was malformed — confirm leading `/` and a space before the prompt. |
+
+## @af-research follow-ups — 📄 / 🔗 / 💾 reactions
+
+After @af-research posts a TL;DR, it pre-attaches three reactions on its own message. Owner taps one to drive a follow-up without re-pasting the URL:
+
+| Reaction | Action |
+|---|---|
+| 📄 | Longer expansion (TEXT_LARGE, 8-12 sentences with one counter-argument + practical takeaway). |
+| 🔗 | 5 related resources / sub-topics (TEXT_SMALL numbered list). |
+| 💾 | Save article into the owner's knowledge base — ingests into the most recent `category='researcher'` agent (fallback: most recent agent of any category). Reply confirms `agent_slug` + chunk count. |
+
+Reactions on the af-research bot's sync stream are dispatched through `parseAnnotationReaction(ev)` from `mode-c.ts:90` → `handleResearchFollowup` in `src/services/matrix-bots/handlers/research-followups.ts:213`. Auth boundary: only `@user-<digits>:<serverName>` mxids may trigger (same `parseOwnerMxid` gate Mode C uses). Bot self-reactions, TG puppets, and non-followup emojis fail closed.
+
+Payload cache: TL;DR payload (`url`, `title`, `summary`, `articleText`) is keyed by the TL;DR event id in a 200-entry FIFO `Map`. Cache miss (runner restart) replies «Не нашёл оригинал TL;DR в кеше — пришли ссылку ещё раз» instead of failing silently.
+
+Idempotency: `(roomId|originalEventId|sender|key)` recorded in a 200-entry `Set` — re-delivered reactions never double-post.
+
+Save-to-KB target resolution lives in `findIngestTargetAgent(afUserId)` and reuses the same `ingestForAgent` / `chunkText` / `resolveAgentUuid` helpers `/me/agents/:slug/knowledge/url` uses, so saved articles show up in retrieval immediately.
+
+| Failure | Log signature for grep | Where to fix |
+|---|---|---|
+| Reactor isn't an AF owner | `[af-research-followup] sender_not_authorized` | Expected — only owners drive follow-ups |
+| Cache miss after runner restart | `[af-research-followup] payload_missing` | Owner re-pastes URL — payload cache is in-process |
+| Owner has no agents to ingest into | `[af-research-followup] save_failed_no_agent` | Create an agent in /agents — KB ingest is per-agent |
+| Reaction attached but follow-up never lands | `[af-research-followup] followup_error` | Inspect inner `err` — LLM / DB exception, retry safe |
+| Reactions not visible on TL;DR | `[af-research] reaction_attach_failed` | Matrix 5xx during attach loop — TL;DR still posts |
+
+Files:
+- `agentflow-agents/src/services/matrix-bots/handlers/research-followups.ts:1` — module
+- `agentflow-agents/src/services/matrix-bots/handlers/research.ts:140` — attaches 3 reactions after TL;DR + populates payload cache
+- `agentflow-agents/src/services/matrix-bots/runner.ts:148` — reaction dispatch in af-research's `/sync` loop
+- `agentflow-agents/src/services/matrix-bots/mode-c.ts:90` — generic `parseAnnotationReaction`
+- `agentflow-agents/tests/research-followups.test.ts:1` — 16 unit tests (pure helpers + dispatcher auth/dedup paths)
 
 ## Mode C — send-as-owner via reaction
 
@@ -135,6 +211,60 @@ Auth scope: only `@user-<digits>:<serverName>` mxids may trigger. Bridge bots, T
 | Token issue fails | `[mode-c] token_issue_failed` | Same root causes as `/me/chat/tg/login` — bridge env misconfig |
 | Owner send fails | `[mode-c] owner_send_failed` | Inspect `err` — typically `send_403` if user is not joined to room |
 
+## Mode C / Whispers cabinet
+
+Owners on phones can't always tap 👍 in the room — and Mode-C suggestions scroll off Element fast when a TG-bridged chat is active. The cabinet page `/cabinet/whispers` collects every pending `💡 Предложение` from @af-claude across all rooms the owner is in, so they can review and approve in one screen.
+
+### Backend
+
+`GET /me/chat/whispers/pending` (`src/routes/me-chat-whispers.ts:47`) scans @af-claude's joined rooms (cap 80), pulls the last ~80 events per room, keeps `m.room.message` events whose body starts with `SUGGESTION_PREFIX` (`💡 Предложение: `), then subtracts every event id the owner has already 👍-reacted to in the same window. Returns up to 50 newest-first.
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-chat-whispers.ts:47` | `GET /me/chat/whispers/pending` |
+| `agentflow-agents/src/services/matrix-bots/mode-c.ts` (verify line for `SUGGESTION_PREFIX`) | Source of the `💡 Предложение: ` prefix |
+| `agentflow-landing/src/pages/CabinetWhispers.tsx` (verify line) | Frontend renderer |
+| `agentflow-landing/src/main.tsx:641` | Route mount `/cabinet/whispers` |
+
+### Response shape
+
+```jsonc
+{
+  "ok": true,
+  "suggestions": [
+    {
+      "room_id": "!abc:agentflow.website",
+      "event_id": "$xyz",
+      "body": "сообщение без префикса",
+      "ts": 1716370000000,
+      "room_name": "TG: Иван",
+      "peer_display_name": "Иван",
+      "is_dm": true
+    }
+  ]
+}
+```
+
+The cabinet renders each suggestion as a card; tapping ✅ posts a 👍 reaction from the owner (same Mode-C contract — runner spots the reaction on next `/sync` and forwards as owner).
+
+### Auth + bounds
+- `requireSession` — cookie/bearer.
+- Owner mxid is derived as `@user-<afUserId>:<serverName>` (same shape Mode C accepts).
+- `ROOMS_HARD_CAP=80`, `MESSAGES_PER_ROOM=80`, `RESULT_CAP=50` (`me-chat-whispers.ts:31-33`) — caps the scan so a chatty owner doesn't OOM the worker.
+- Fast-fail with empty list if `MATRIX_HOMESERVER_INTERNAL` / `MATRIX_SERVER_NAME` unset, or no `af-claude` bot row exists.
+
+### Apps-launcher tile
+The cabinet's apps launcher gets a "Шёпоты Claude" tile that links to `/cabinet/whispers` (verify path in `agentflow-landing/src/pages/CabinetDashboard.tsx`).
+
+### Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Cabinet always empty | response `suggestions:[]` despite known 💡 messages | `matrix_bots WHERE slug='af-claude'` returned no row — re-run `ensureAllBots` by restarting agentflow-agents |
+| Cabinet empty for an owner with bridged rooms | (no log — fetch silently returns null body) | `MATRIX_HOMESERVER_INTERNAL` env unset or pod can't reach Dendrite |
+| Suggestion still shown after owner 👍 in Element | (no log) | The owner's reaction was outside the 80-event window. Re-react inside `MESSAGES_PER_ROOM` or raise the cap |
+| 502 / unauthenticated | `requireSession` reject | Owner session expired — re-login on landing |
+
 ## Voice → text via ElevenLabs Scribe (@af-claude)
 
 When `@af-claude` receives an `m.room.message` with `msgtype: m.audio` (Telegram voice notes forwarded through mautrix-telegram, or native Matrix voice messages from Element), the handler:
@@ -160,17 +290,266 @@ Env: `ELEVENLABS_API_KEY` (already injected via `agentflow-agents-env` Secret; a
 | Transcript fails with HTTP error | `[claude-stt] transcription_failed` with `http_<status>` | Check ElevenLabs balance / API status |
 | MXC download fails | `[claude-stt] transcription_failed` with `download_<status>` | Bot token expired or media server unreachable; transient |
 
+## @af-ops — owner remote-control bot
+
+Seventh bot, distinct from the chat siblings: a Claude-with-tools console that lets the owner DM the AgentFlow cluster from Element on a phone. Auth-gated to `@user-<digits>:<serverName>` mxids only — anyone else gets `[af-ops] sender_not_authorized` logged and dropped.
+
+### Tool-use loop
+
+`src/services/matrix-bots/handlers/ops.ts` runs a max-10-iteration loop around `useModel(ModelType.TEXT_LARGE, { tools: OPS_TOOLS, … })`. After each model turn:
+
+1. If the response has `tool_use` blocks, dispatch each through `ops-tools.ts` and append a `role: 'user'` `tool_result` block back into messages.
+2. If the response is text-only → ship that to the room, end.
+3. If the loop hits iteration 10 → one no-tools wrap-up call so the model has to answer with what it has.
+
+The handler never throws to the runner — any exception lands as a one-line failure reply in the room instead.
+
+### Tools + guards
+
+| Tool | What it does | Guard |
+|---|---|---|
+| `bash` | Runs a one-liner inside the agentflow-workers pod | Prefix allow-list (kubectl get/describe/logs/top, gh pr/run/repo/api, git read-only, curl GET, echo/uname/date/df/free/ps) + deny pattern set (rm, kubectl delete/exec/set/apply, sudo, redirect, curl -X POST, git push) + subshell `$()` / backtick refuse |
+| `ssh_ff_france` | Same allow-list, executed on the cluster node via `ssh ff-france '<cmd>'` | Same guard as `bash` |
+| `pg_query` | Resolves `agentflow-postgres` pod via label selector, then `psql -U agentflow -d agentflow -At -c '<sql>'` | `guardSqlReadOnly`: must start with SELECT/WITH/EXPLAIN/SHOW; refuses INSERT/UPDATE/DELETE/DROP/TRUNCATE/ALTER/CREATE/etc + multi-statement scripts |
+| `gh_pr_merge` | `gh pr merge <N> -R <repo> --squash --admin` | Repo must match `^lnlockly/agentflow-[a-z0-9-]+$` |
+| `matrix_read_room` | Reads recent events via `recentMessages` so the bot can answer "что в #lobby обсуждают" | room_id must start with `!`, limit ≤ 100 |
+
+Every refusal returns `{error: 'refused:<reason>'}` JSON so the model can re-plan rather than crash. Output bytes capped at 60 KB per tool call; timeouts default 60 s, max 180 s.
+
+### Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/matrix-bots/ops-tools.ts:1` | Five tool implementations + `guardShellCommand` / `guardSqlReadOnly` / `guardPrMergeRepo` |
+| `agentflow-agents/src/services/matrix-bots/handlers/ops.ts:1` | Tool-use loop, auth gate via `parseOwnerMxid` |
+| `agentflow-agents/src/services/matrix-bots/lib.ts:18` | `'af-ops'` in `BOT_SLUGS` |
+| `agentflow-agents/src/services/matrix-bots/register.ts:48` | `DISPLAY_NAMES['af-ops'] = 'AF Ops'` |
+| `agentflow-agents/src/services/matrix-bots/runner.ts:66` | `HANDLERS['af-ops'] = handleOpsMessage` |
+| `agentflow-agents/src/services/matrix-onboarding.ts:184` | `BOT_DM_NAMES` / `BOT_DM_INTROS` entries |
+| `agentflow-agents/tests/ops-tools.test.ts:1` | 42 guard tests (allow + refuse) |
+
+### Bootstrap (operator)
+
+1. **SSH key** — the workers pod needs `~/.ssh/id_ed25519_ff_france` + matching public key in `ff-france:~/.ssh/authorized_keys`. Mount via a `Secret` named `agentflow-workers-ssh-key`. Until that lands, `ssh_ff_france` returns `Permission denied (publickey)`.
+2. **CLI prerequisites** — `kubectl`, `gh`, `git`, `curl`, `psql` already exist in the agentflow-workers image (matrix-bots-runner uses them in other handlers).
+3. **First run** — restart `deploy/agentflow-agents`. `ensureAllBots()` provisions `@af-ops:agentflow.website` via shared-secret register on first boot.
+4. **Verification** — DM the bot in Element: "сколько подов agentflow-agents". Expect a fenced output block from `kubectl -n franchise-factory get pod -l app=agentflow-agents -o name | wc -l`.
+
+### Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Bot ignores non-owner sender | `[af-ops] sender_not_authorized` | Expected — auth gate |
+| Tool refused unexpectedly | `[af-ops] tool_call` with `isError:true` and `refused:no_allow_prefix` | Add verb to `SHELL_ALLOW_PREFIXES` after security review |
+| SSH fails with Permission denied | tool_call result `stderr` contains `Permission denied (publickey)` | Mount `agentflow-workers-ssh-key` Secret + add pubkey on ff-france |
+| Postgres pod resolution fails | tool_call `pg_query` result with `pod not found` | Check `kubectl -n franchise-factory get pod -l app=agentflow-postgres` returns a row |
+| Loop hits iteration cap | `[af-ops] tool_call` repeats 10× then "Не успел свести в ответ" | Owner narrows the request |
+
+## @af-poster — multi-network cross-poster
+
+DM-only composer. Owner types one message, bot fans it out to every linked network. Same auth gate as `@af-ops` (`@user-<digits>:<serverName>` only).
+
+### Compose syntax
+
+| Form | Result |
+|---|---|
+| `to: tg Привет` | TG only |
+| `to: vk Привет` | VK wall only |
+| `to: tg+vk Привет` | both |
+| `to: all Привет` | every linked network (TG + VK + IG) |
+| Plain text (no `to:`) | bot caches the body for 5 min, asks "Куда?" — owner replies with `tg` / `vk` / `tg+vk` / `all` |
+
+### Networks (v1 reality check)
+
+| Network | v1 status | How it dispatches |
+|---|---|---|
+| TG | live | Reads `chat_tg_links.account_labels.default_channel` (owner labels their channel in cabinet) + `primary_login_id` (cast to numeric `account_id`), calls `mcpDirect.callTool('telegram', 'send_message', { owner_user_id, peer, text, account_id })`. No raw TG API client. |
+| VK | live | Reads every linked `chat_vk_links` row for the owner, POSTs `wall.post` per row with the stored `access_token`. Token must have `wall` scope; VK error 15 surfaces a friendly hint. |
+| IG | deferred (v2) | Always returns `IG: Instagram Graph API требует Business аккаунт + Content Publishing API. Отложено до v2.`. v2 plan: mautrix-meta + IG Business Content Publishing. |
+
+### Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Bot ignores non-owner DM | `[af-poster] sender_not_authorized` | Expected — owner-only auth gate |
+| TG: «не настроен канал по умолчанию» | reply contains `default_channel` | Set `account_labels.default_channel` in `chat_tg_links` (cabinet → Telegram → "Канал по умолчанию") |
+| TG: missing account | reply contains `аккаунт не привязан` | Owner links a TG account via mautrix-telegram wizard |
+| VK: `error 15` | reply contains `scope \`wall\`` | Re-issue access_token with `wall` scope, update `chat_vk_links.access_token` |
+| VK: `error 5` | reply contains `протух` | Token expired — re-link VK in cabinet |
+| IG always deferred | reply contains `Отложено до v2` | Expected v1 — wait for v2 IG Business integration |
+
+## @af-tg-poster — v2 login + post
+
+Single-purpose Telegram bot: provision a TG account via the mautrix-telegram bridge wizard, then publish to any channel the owner's primary TG login can post into. DM-only, owner-only (same `parseOwnerMxid` gate as `@af-poster` / `@af-ops`).
+
+### Commands
+
+| Command | Effect |
+|---|---|
+| `/login` (alias `/connect`, `/connect-tg`) | Calls `bridgeLoginStart(cfg, mxid, 'phone')`, remembers the issued `login_id` + first step descriptor in an in-memory `Map<roomKey, WizardState>` (cap 50, FIFO). Reply prompts for the phone number. |
+| Plain text reply during wizard | Treated as the value for `wiz.fieldId`, submitted via `bridgeLoginStep`. Walks phone → code → optional 2FA password until `step.type === 'complete'`, then drops the wizard state. |
+| `/cancel` | Calls `bridgeLoginCancel` and clears in-memory wizard state. Idempotent — no active wizard returns a friendly hint. |
+| `/accounts` (alias `/channels`) | Calls `bridgeWhoami` for the owner's mxid and renders one bullet per `login.id`. |
+| `/post <channel> <text>` | Resolves channel via `parsePostCommand`, calls `postToTelegram(ownerUserId, text, { channelOverride: channel })`. Channel can be `@name`, `name`, or a numeric peer id. On success: `✅ Posted to <channel>`. On failure: `classifyPostError` maps the cross-poster string to one of `not_logged_in` / `channel_not_admin` / `rate_limit` or passes verbatim. |
+| `/help` (alias `/start`) | Static Russian command menu. |
+
+### State + persistence
+
+Wizard state lives in process memory only. A pod restart drops the in-flight wizard; the owner re-runs `/login` and the bridge issues a fresh `login_id`. bridgev2 itself is the source of truth for completed logins (queryable via `/accounts`), so post-completion state survives restarts naturally.
+
+The cross-poster path (`/post`) reuses `postToTelegram` from `src/services/cross-poster/tg.ts:111`. A new optional `channelOverride` field on the deps object skips the `account_labels.default_channel` lookup so `@af-tg-poster` can target any channel without forcing the owner to relabel their default. `primary_login_id` still feeds `account_id` so tg-mcp picks the right MTProto session.
+
+### Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/matrix-bots/handlers/tg-poster.ts:1` | v2 handler — wizard state machine, `/post`, `/accounts`, `/cancel`, owner auth gate |
+| `agentflow-agents/src/services/matrix-bots/lib.ts:340` | `parsePostCommand` — `<channel> <text>` splitter shared with v1 |
+| `agentflow-agents/src/services/matrix-bots/mode-c.ts:60` | `parseOwnerMxid` — mxid → AF user id auth boundary |
+| `agentflow-agents/src/services/cross-poster/tg.ts:111` | `postToTelegram` now accepts `deps.channelOverride` for explicit channel targeting |
+| `agentflow-agents/src/services/mautrix-tg-bridge.ts:177` | `bridgeLoginStart` / `bridgeLoginStep` / `bridgeLoginCancel` / `bridgeWhoami` — bridge HTTP client used by the wizard |
+| `agentflow-agents/tests/matrix-bots/af-tg-poster.test.ts:1` | 24 pure-helper tests (`parsePostCommand`, mxid mapping, wizard step descriptor, prompt picker, error classifier) |
+
+### Wire (data flow)
+
+```
+DM in Element (owner mxid `@user-N:agentflow.website`)
+  ↓
+runner /sync → handleTgPosterMessage
+  ↓
+parseOwnerMxid → ownerUserId (auth gate)
+  ↓
+switch command:
+  /login → bridgeLoginStart      → store WizardState[roomId,owner]
+  text   → bridgeLoginStep        → advance / complete / drop
+  /post  → postToTelegram(channelOverride) → mcpDirect('telegram','send_message')
+  /accounts → bridgeWhoami
+```
+
+## @af-news — daily 09:00 digest
+
+Ninth bot. Posts an AI / crypto / AgentFlow-team morning digest into every Matrix room it has been invited to, once per day. Runs alongside the per-bot `/sync` loop as a detached `setInterval` scheduler — no Bull queue, no extra worker pod. Disable via `MATRIX_NEWS_DISABLED=1` (kill-switch) or by setting `chat_news_room_subscriptions.enabled=false` for a single room.
+
+### Slash commands
+
+| Command | Effect |
+|---|---|
+| `/news now` | One-shot digest right now, bypassing the per-day idempotency log. |
+| `/news off` | `UPDATE chat_news_room_subscriptions SET enabled=false WHERE room_id=?` — bot stays in the room but stops posting. |
+| `/news on` | Re-enable. |
+| `/news topics ai,crypto` | Replace the per-room `topics` array with canonical ids (`ai`, `crypto`, `af-team`). Unknown topics are silently dropped; empty result asks the user for valid ids instead of overwriting. |
+| `/help`, `/start` | Static Russian command menu. |
+
+`parseCommand` accepts both `/news <sub>` and the bare `/<sub>` shape so DM ergonomics match `@af-helper`.
+
+### Invite handler
+
+When the runner accepts an invite (existing auto-join path) and the slug is `af-news`, it calls `handleNewsRoomJoined` which:
+
+1. Upserts a `chat_news_room_subscriptions` row with `enabled=true` and the default topic set (`ai`, `crypto`, `af-team`).
+2. Sends a Russian welcome message describing the commands and the 09:00 cadence.
+
+A room that was disabled and then re-invited is silently re-enabled with the previously stored topics, so the owner does not lose their topic filter.
+
+### Daily scheduler
+
+`startNewsDigestScheduler` runs a 60-second `setInterval`. On each tick:
+
+1. Compute `localSlot(now, MATRIX_NEWS_TZ)` (default `Europe/Moscow`).
+2. If `hour !== MATRIX_NEWS_HOUR || minute !== MATRIX_NEWS_MINUTE` (defaults `9` / `0`) → no-op.
+3. Else fan out to every `enabled=true` row. Per-room idempotency is enforced via `INSERT ... ON CONFLICT DO NOTHING` on `chat_news_log (room_id, digest_date)` so a duplicate tick or runner restart cannot re-post.
+
+### Digest composition
+
+- AI / crypto sections: a single `useModel(ModelType.TEXT_LARGE, …)` prompt asking for 2-3 fresh items per category in Russian. The model is the freshness oracle here — we deliberately do not maintain RSS fetchers.
+- AgentFlow-team section: pulls public commit lists for `lnlockly/agentflow-agents` and `lnlockly/agentflow-landing` via `GET https://api.github.com/repos/<repo>/commits?since=<ISO>` (unauthenticated, 60 req/h per-IP). Top 5 commit subjects + short SHA + html_url are dropped into the prompt and the LLM repacks them into 2-4 lines of user-facing copy.
+
+### Files
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/matrix-bots/handlers/news.ts:1` | All handler logic — invite welcome, slash commands, scheduler, digest composer, GitHub commit fetcher |
+| `agentflow-agents/src/services/matrix-bots/lib.ts` (`BOT_SLUGS`, `NEWS_TOPICS`, `parseNewsCommand`) | Canonical bot list + topic enum + command parser |
+| `agentflow-agents/src/services/matrix-bots/register.ts` (`DISPLAY_NAMES['af-news']`) | First-provision display name `🗞 News by AgentFlow` |
+| `agentflow-agents/src/services/matrix-bots/runner.ts` (`HANDLERS['af-news']`, invite welcome hook, `startNewsDigestScheduler` boot) | Dispatch registration + scheduler bootstrap |
+| `agentflow-agents/src/services/matrix-onboarding.ts` (`BOT_DM_NAMES['af-news']`, `BOT_DM_INTROS['af-news']`) | First-bounce DM intro copy |
+| `agentflow-agents/migrations/2026-05-22e-af-news-subscriptions.sql:1` | `chat_news_room_subscriptions` + `chat_news_log` (UNIQUE `(room_id, digest_date)`) |
+| `agentflow-agents/src/db/schema.ts` (`chatNewsRoomSubscriptions`, `chatNewsLog`) | Drizzle table definitions |
+| `agentflow-agents/tests/matrix-bots/af-news.test.ts:1` | 18 pure-helper unit tests (parser, topic filter, TZ slot, prompt builder, GitHub fetcher) |
+
+### Env
+
+| Var | Default | Effect |
+|---|---|---|
+| `MATRIX_NEWS_TZ` | `Europe/Moscow` | IANA timezone used to compute the local slot. |
+| `MATRIX_NEWS_HOUR` | `9` | Hour-of-day the digest fires (0-23 in `MATRIX_NEWS_TZ`). |
+| `MATRIX_NEWS_MINUTE` | `0` | Minute-of-hour. |
+| `MATRIX_NEWS_DISABLED` | unset | When `=1` the scheduler is a no-op even though the bot row is registered. Kill switch without taking the runner down. |
+| `MATRIX_BOT_KEY` | (shared) | Same HMAC key every other bot uses; `af-news` is just another slug in the cluster-wide derivation. No separate key. |
+
+### DB
+
+```sql
+CREATE TABLE chat_news_room_subscriptions (
+  id BIGSERIAL PRIMARY KEY,
+  room_id TEXT NOT NULL UNIQUE,
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  topics TEXT[] NOT NULL DEFAULT ARRAY['ai','crypto','af-team'],
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE chat_news_log (
+  id BIGSERIAL PRIMARY KEY,
+  room_id TEXT NOT NULL,
+  digest_date DATE NOT NULL,
+  event_id TEXT,
+  sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (room_id, digest_date)
+);
+```
+
+### Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Bot ignores invites silently | `join failed` (runner-level) | Matrix server unreachable / token revoked — same root cause as other bots |
+| Welcome never lands | `[af-news] welcome failed` | `sendText` or `upsertSubscription` failed; inspect inner `err`. Room stays in DB so cron fanout still works |
+| `/news off` keeps posting | `[af-news] skip already_posted` would NOT fire; instead room appears in `listEnabledRooms` | Verify `enabled=false` in `chat_news_room_subscriptions` — owner may have run `/news on` after |
+| Daily digest never fires | `[af-news] scheduler started` not in logs | `MATRIX_NEWS_DISABLED=1` is set, or the news bot row never registered (check `ensureAllBots` failure list) |
+| Two digests on the same day | (would only happen if UNIQUE constraint missing) | `psql -c "SELECT room_id, digest_date, count(*) FROM chat_news_log GROUP BY 1,2 HAVING count(*)>1"` — if rows exist the migration was applied with index broken; re-run `2026-05-22e-af-news-subscriptions.sql` |
+| AF-team section says "вчера тихо" but commits exist | `[af-news] commits fetch failed` with `429` / `403` | GitHub IP rate-limit; the digest still posts (degraded) and recovers next day automatically |
+| Compose fails | `[af-news] compose failed` | LLM provider 5xx; degraded fallback body is posted so the owner sees an explicit hint to retry with `/news now` |
+| Unknown topic accepted | (would not happen — `parseNewsCommand` filters) | If it does, regression in `isNewsTopic` — run `tests/matrix-bots/af-news.test.ts` |
+
+### Mode-C / owner-gate interactions
+
+`@af-news` is **not** an owner-gated bot — anyone in a room can run `/news off` or `/news topics`. The subscription is per-room, not per-user, and the bot is informational. This matches `@af-helper` and `@af-research`, both of which also accept commands from any participant.
+
+## @af-translator — `/translate <text>` + per-room auto-mode
+
+Tenth bot. Direct mode: `/translate <text>`, `/translate ja: hello`, `/translate en→fr Hello`. Auto mode: per-room toggle (`/translate auto on`) makes the bot translate every non-bot, non-command message for each participant whose preferred language differs from the detected source. Per-user preferences live in `chat_translator_user_prefs.mxid`. Idempotency via `chat_translator_log` PRIMARY KEY on `(room_id, event_id, target_lang)`. Throttle: rolling per-room window (`MATRIX_TRANSLATOR_AUTO_RATE_LIMIT_SEC`, default 5s).
+
+| File | Role |
+|---|---|
+| `agentflow-agents/src/services/matrix-bots/handlers/translator.ts:1` | Welcome, slash commands, auto-mode dispatch, throttle |
+| `agentflow-agents/src/services/matrix-bots/lib.ts:421` | `TRANSLATOR_LANGUAGES` + `parseTranslateCommand` |
+| `agentflow-agents/migrations/2026-05-22f-chat-translator.sql:1` | Three tables (`chat_translator_room_settings`, `_user_prefs`, `_log`) |
+| `agentflow-agents/tests/matrix-bots/af-translator.test.ts:1` | 25 unit tests (parser, JSON, target-resolver, fan-out, throttle) |
+
+Full page: [subsystems/matrix-bots/af-translator](/subsystems/matrix-bots/af-translator).
+
 ## Non-goals (v1)
 
-- `@af-tg-poster` is a stub. Real channel posting via mautrix-telegram comes with the chat Phase 5 wizard hookup.
+- `@af-poster` is the multi-network production path (TG + VK). `@af-tg-poster` is the single-network specialist — owners use it when they want to post to a specific channel without juggling `to:` directives or default-channel labels.
+- `@af-poster` IG dispatch is a stub; see "Networks (v1 reality check)" row above.
 - No E2EE — bots stay out of encrypted rooms; messages there appear as `m.room.encrypted` and the runner silently skips them.
 - ~~No room-create on bot side. Users invite the bot via Element's Start Chat.~~ As of 2026-05-21 the **Element SSO bounce** reads `matrix_bots.access_token` for each enabled row and calls `POST /createRoom` per bot the first time a user lands in Element. See [Element Web SSO bounce](/subsystems/element-web) (Phase 3b) for the gate (`users.chat_onboarded_at`) and failure modes.
-- No metrics export — `last_synced_at` per row is the only health signal until prom-client wiring lands.
+- ~~No metrics export — `last_synced_at` per row is the only health signal until prom-client wiring lands.~~ Shipped 2026-05-22 — see [Matrix Monitoring](/subsystems/matrix-monitoring) for the `/metrics` endpoint, prom-client families (`matrix_bots_events_total`, `matrix_bots_handler_duration_seconds`, `matrix_bots_ready`), and Grafana dashboard.
 
 ## Related
 
 - [Element Web SSO bounce](/subsystems/element-web) — consumes `matrix_bots.access_token` for first-bounce DM invites + welcome room
 - [Matrix Chat](/subsystems/matrix-chat) — SSO bridge, Dendrite deploy, frontend
 - [Matrix TG Bridge](/subsystems/matrix-tg-bridge) — mautrix-telegram provisioning wizard (phase 5)
+- [Matrix Monitoring](/subsystems/matrix-monitoring) — Prometheus metrics + Grafana dashboard for the bot runner
 - [LLM Router](/subsystems/llm-router) — `useModel(TEXT_SMALL/TEXT_LARGE/IMAGE)` providers
 - [Chat-stack Smoke](/runbooks/chat-smoke-e2e) — Playwright E2E that pins login + DM-reply behaviour

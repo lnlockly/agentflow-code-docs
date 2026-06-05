@@ -115,6 +115,29 @@ Source of color keys: https://github.com/element-hq/element-web/blob/develop/doc
 | `branding.auth_footer_links` | `[AgentFlow → /, Поддержка → /support]` | Footer of auth screens |
 | `branding.welcome_background_url` | *omitted* | `chat-welcome-bg.jpg` does not exist on landing — landing SPA returns HTML for unknown paths. Add asset, then re-enable. |
 
+### Custom Home page (no room selected)
+
+Element fetches `embedded_pages.home_url` and renders it in place of the upstream "Welcome to Element" panel when the user has no room open. We keep the file in the same `element-web-config` ConfigMap (`data.home.html`, `k8s/element-web-config.yaml:157`) and mount it at `/app/home.html` so nginx serves it from the chat origin — `home_url` is therefore the relative string `"home.html"` (set at `k8s/element-web-config.yaml:147`).
+
+#### 2026-05-22 rewrite — onboarding inside Element
+
+The home page now ships a full onboarding surface so first-bounce users land somewhere actionable instead of an empty Element shell:
+
+- **Hero card** with one-line value + `Начать с @af-helper →` primary CTA.
+- **3-step onboarding** (sign-in → pick a bot → start chatting), each step is a card with a `cta` linking to a bot or cabinet page.
+- **6 bot tiles** for `@af-helper`, `@af-claude`, `@af-image`, `@af-research`, `@af-spec`, `@af-ops`.
+- **Quicklinks** to cabinet pages (devices, whispers, proxies, etc).
+
+All bot links use the in-Element route shape `chat.agentflow.website/#/user/@<bot>:agentflow.website` (NOT `matrix.to`) so Element opens the DM in-place instead of bouncing through `matrix.to` and prompting "open in another client?". External links (cabinet, docs) go to `https://agentflow.website/...`.
+
+#### `<base target="_top">` is load-bearing
+
+`home.html` renders **inside Element's `<iframe>`** because that's how `embedded_pages.home_url` works. Without `<base target="_top">` (`k8s/element-web-config.yaml:167`), every `<a>` click would try to repaint the tiny home iframe instead of navigating the top frame — bot tiles would render "page not found" inside the iframe. The base tag forces every link to `target="_top"` by default; the Element router then handles the `#/user/...` route.
+
+Styling matches the `custom-AgentFlow Dark` theme: background `#0a0a0c`, accent `#a6f25c`, Inter font. Copy is plain Russian, no marketing words, no «бесплатно».
+
+Editing: bump the `home.html` block under `data:` in `k8s/element-web-config.yaml`, re-apply ConfigMap, rollout-restart deploy/element-web. Nothing in the Element image changes.
+
 ### Localization defaults
 
 `setting_defaults.language: "ru"`, `setting_defaults.default_country_code: "RU"`, top-level `default_country_code: "RU"`. New sessions land on Russian UI.
@@ -151,14 +174,11 @@ print('compound keys:', len(t.get('compound', {})))"
 
 #### Editing the palette
 
-The ConfigMap is NOT applied by the `deploy.yml` GitHub Action — k8s manifests outside of agentflow-agents itself need a manual apply:
+Edit `k8s/element-web-config.yaml`, push to `main`, and let CI handle the rollout. The `Detect changed Matrix manifests` step in `.github/workflows/deploy.yml` runs `git diff HEAD~1 HEAD -- k8s/element-web*.yaml` on every push; when the diff is non-empty, the next step runs `kubectl apply -f <file>` and `kubectl rollout restart deploy/element-web`.
 
-```
-scp k8s/element-web-config.yaml ff-france:/tmp/
-ssh ff-france 'kubectl apply -f /tmp/element-web-config.yaml \
-  && kubectl -n franchise-factory rollout restart deploy/element-web \
-  && kubectl -n franchise-factory rollout status deploy/element-web --timeout=90s'
-```
+For drift recovery (eg the cluster fell behind during an incident), use the workflow dispatch with `apply_matrix_manifests=true` to force a re-apply of every Element/Dendrite/Mautrix manifest regardless of the diff.
+
+Manual `scp + kubectl apply` is a manual-deploy violation (`feedback_agentflow_no_hotfix_only_cicd`). File an incident if CI is broken instead of routing around it.
 
 ## Phase 3: SSO bounce (shipped 2026-05-21)
 
@@ -324,6 +344,72 @@ Element Web with #lobby:agentflow.website visible
 - Bounce page is `Cache-Control: no-store` so a logged-in → logged-out user can't replay a stale seeded response.
 - `from=` attribution param is stripped to `\p{L}\p{N}\-_. ` and capped at 40 chars.
 
+## Phase 3d: Session-restore recovery shim (shipped 2026-05-22)
+
+Element shows «Восстановление сеанса не удалось» / «Session restore failed» when localStorage carries stale matrix-js-sdk state from a prior device (we mint a new device per bounce, so old devices stay registered until 7d TTL). Users see a dialog they can't close, so the chat loop dies.
+
+Fix: a tiny recovery script (`/sso/recovery.js`) is injected into every Element HTML response via nginx `sub_filter` on the `element-web` Ingress. The script polls the DOM for the error dialog text, wipes matrix-js-sdk IndexedDB + localStorage, and bounces through `/sso/element-sso` for a fresh device.
+
+### Files (with line refs)
+
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/element-sso.ts:483` | `RECOVERY_SCRIPT` body — detect + wipe + bounce loop |
+| `agentflow-agents/src/routes/element-sso.ts:554` | `GET /me/chat/recovery.js` handler, 5-min cache |
+| `agentflow-agents/k8s/element-web.yaml:116` | nginx `configuration-snippet` with `sub_filter` |
+| `agentflow-agents/k8s/element-web.yaml:119` | the `sub_filter '</body>'` rewrite injecting `<script src="/sso/recovery.js" async>` |
+
+### Wire
+
+```
+Browser opens https://chat.agentflow.website/
+   │
+   ▼
+nginx-ingress → element-web pod (nginx)
+   │  response: text/html
+   ▼
+nginx sub_filter (ingress controller) rewrites </body> →
+   '<script src="/sso/recovery.js" async></script></body>'
+   (requires `allow-snippet-annotations: true` on the controller's ConfigMap)
+   │
+   ▼
+Browser parses HTML, fetches /sso/recovery.js
+   │
+   ├─ Routed via element-web-sso Ingress → /me/chat/recovery.js
+   ▼
+agentflow-agents serves RECOVERY_SCRIPT (cache-control: public, max-age=300)
+   │
+   ▼
+Script arms once (`window.__afRecoveryArmed`), then polls every 1.5s, up to 20 attempts
+   if body innerText contains any of:
+     • «Восстановление сеанса не удалось»
+     • «Session restore failed»
+     • «Your session has expired»
+     • «incompatible with a newer version»
+     • «несовместим с ней»
+   →  wipe localStorage keys starting with mx_/mxjssdk_/matrix-/dm_/im.vector.
+   →  indexedDB.deleteDatabase('matrix-js-sdk:crypto' | 'matrix-js-sdk:riot-web-sync' |
+                              'matrix-js-sdk:rust-sdk-meta' | 'matrix-js-sdk:rust-sdk' | 'logs')
+   →  location.replace('/sso/element-sso')
+   (2s safety timer always fires the bounce even if IndexedDB hangs)
+```
+
+### Idempotency + bounds
+
+- `window.__afRecoveryArmed` flag prevents double-arming across navigations.
+- 20 attempts × 1.5s ≈ 30s watchdog budget. After that the interval clears and the script becomes a no-op for the page lifetime.
+- Cache: 5 min `public, max-age=300` — short enough for hot-fix rollouts, long enough not to hammer the route.
+
+### Verify
+
+```
+curl -sI https://chat.agentflow.website/sso/recovery.js
+# expect 200, content-type application/javascript, cache-control max-age=300
+
+curl -s https://chat.agentflow.website/ | grep recovery.js
+# expect: <script src="/sso/recovery.js" async></script></body>
+```
+
 ## Failure modes
 
 | Symptom | Log signature for grep | Where to fix |
@@ -335,6 +421,7 @@ Element Web with #lobby:agentflow.website visible
 | Login screen lets users type any homeserver | `disable_custom_urls` flipped to false | Same ConfigMap |
 | Login fails with `M_FORBIDDEN` | n/a (Dendrite-side) | Check `dendrite` pod logs, registration shared-secret + appservice config |
 | Theme reverts to upstream dark | `default_theme: "dark"` in ConfigMap | Restore `default_theme: "custom-AgentFlow Dark"` and verify `setting_defaults.custom_themes[].name == "AgentFlow Dark"` (Element prepends `custom-` automatically) |
+| Home shows "Welcome to Element" instead of AF copy | `embedded_pages.home_url` missing or 404 on `/home.html` | `kubectl -n franchise-factory get cm element-web-config -o jsonpath='{.data.home\.html}'` should print HTML; if 404, the volume `items[]` entry for `home.html` is missing in `k8s/element-web.yaml` |
 | Auth screen shows Element logo | `branding.auth_header_logo_url` empty or pointing at `logos/element-logo.svg` | Set to `https://agentflow.website/favicon.svg` |
 | "Get Element on iOS" banner appears | `mobile_guide_toast` true or `mobile_builds` missing | Set `mobile_guide_toast: false`, `mobile_builds: {ios:null, android:null, fdroid:null}` |
 | SSO bounce returns 401 unauthenticated | `unauthenticated` from `requireSession` | Cookie `Domain=` missing — verify `SESSION_COOKIE_DOMAIN` env in `k8s/agentflow-agents.yaml` |
@@ -345,17 +432,25 @@ Element Web with #lobby:agentflow.website visible
 | SSO redirects user into wrong account | `restoreSessionFromStorage` succeeds with stale localStorage | Element didn't clear old session — user must Sign Out inside Element once, then re-hit `/sso/element-sso` |
 | Bot DMs missing after first chat open | `[chat-onboard] dm_invite failed` | `src/services/matrix-onboarding.ts:botDmInvite` — check the bot's `matrix_bots.access_token` is still valid (`/whoami` round-trip) |
 | User can't see #welcome | `[chat-onboard] welcome create failed` or `welcome invite failed` | `src/services/matrix-onboarding.ts:ensureWelcomeRoom`. Manual recovery: hit alias resolve, then invite from af-helper |
+| User can't see #lobby | `[element-sso] lobby join failed` with `lobby_join_failed_404` | Lobby room not provisioned. See [Matrix Chat → Lobby room](/subsystems/matrix-chat#lobby-room-lobbyagentflowwebsite). Restart agentflow-agents to trigger `ensureLobbyRoomAtBoot` |
 | TG-manager widget missing in Element Settings → Integrations | `[chat-onboard] widgets write failed` | `src/services/matrix-onboarding.ts:registerTgManagerWidget`. The user's access_token may have been invalidated mid-bounce; next bounce overwrites |
 | Side effects re-running on every bounce | `[element-sso] chat_onboarded_at update failed` | `src/routes/element-sso.ts` — DB write block; check Postgres connectivity |
 | `matrix_bots` table empty → no DMs created | `[chat-onboard] onboarding done` with `dms:0` | Restart agentflow-agents — `ensureAllBots` re-seeds on boot (`src/services/matrix-bots/register.ts`) |
+| Element ConfigMap edit didn't land in prod | CI log shows `[matrix-manifests] no changes — skipping.` despite obvious diff | `actions/checkout` `fetch-depth: 2` regression, or commit squashed file. Re-run via `workflow_dispatch` with `apply_matrix_manifests=true`. Source: `.github/workflows/deploy.yml` step `Detect changed Matrix manifests` |
+| Element pod stuck on old image after merge | `kubectl rollout history deploy/element-web` shows no new revision | `kubectl apply` in CI succeeded but no spec change. Bump a label or trigger `workflow_dispatch` with `apply_matrix_manifests=true` to force restart |
+| Recovery dialog appears repeatedly, no auto-recovery | curl returns 404 on `/sso/recovery.js` | Ingress `configuration-snippet` was not applied — verify `nginx.ingress.kubernetes.io/configuration-snippet` annotation on `Ingress/element-web` and that the controller has `allow-snippet-annotations: true` in its ConfigMap |
+| `sub_filter` rewrite missing from response body | `curl -s https://chat.agentflow.website/ \| grep recovery.js` returns empty | nginx-ingress controller deployed with snippets disabled — re-enable via the controller ConfigMap, or fall back to baking the script into Element via a custom image |
+| Recovery loops on bounce → recovery → bounce | browser console: `__afRecoveryArmed` set, then `/sso/element-sso` lands back on a page that re-triggers `SIGNALS` text | The seed HTML from `element-sso.ts` failed to write localStorage (third-party storage partition). Open chat in a top-level window, not an iframe |
+| Home page tile opens `Not found` inside Element iframe | n/a — visible only | `<base target="_top">` missing from `home.html`. All anchors must escape the iframe — keep the tag at `k8s/element-web-config.yaml:167` |
+| Home page tile opens `matrix.to` instead of in-Element DM | n/a | A bot tile was authored with a `https://matrix.to/#/@bot:server` href. Replace with `https://chat.agentflow.website/#/user/@bot:agentflow.website` so Element's router handles it in-place |
 
 ## Operator runbook
 
 **Update Element version:**
 ```
-# Bump image tag in k8s/element-web.yaml, then:
-scp k8s/element-web.yaml ff-france:/tmp/
-ssh ff-france 'kubectl apply -f /tmp/element-web.yaml && kubectl -n franchise-factory rollout status deploy/element-web --timeout=2m'
+# Bump image tag in k8s/element-web.yaml and push to main.
+# .github/workflows/deploy.yml detects the diff, applies the manifest,
+# and waits on the rollout. No ssh required.
 ```
 
 **Edit runtime config without rebuild:**

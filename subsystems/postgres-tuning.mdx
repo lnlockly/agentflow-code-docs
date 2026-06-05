@@ -1,0 +1,92 @@
+---
+title: "Postgres tuning"
+description: "Connection hygiene, hot-path indexes, and the weekly cleanup CronJob for agentflow-postgres."
+---
+
+# Postgres tuning
+
+## TL;DR
+agentflow-postgres is a single 1-replica Deployment in `franchise-factory` ns
+serving every AgentFlow database (the main `agentflow` DB + per-tenant
+`eliza_user_<id>` DBs + `dendrite`, `lobechat`, `glitchtip` etc). P0 symptoms
+on 2026-05-23 were 85 active connections (75 idle) and stuck advisory locks
+blocking 10 waiters in `eliza_user_1`. Fix: server-side
+`idle_session_timeout`, LRU cap on the Eliza per-tenant pool cache, hot-path
+composite index on `project_events`, weekly cleanup CronJob.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/k8s/postgres-tuning-config.yaml` | ConfigMap with `tuning.conf` overrides (shared_buffers, idle timeouts, lock_timeout) |
+| `agentflow-agents/k8s/postgres-tuning-patch.yaml` | Strategic-merge patch — raises pod memory to 2Gi, mounts the ConfigMap, postStart hook adds `include_dir` to `postgresql.conf` |
+| `agentflow-agents/k8s/postgres-cleanup-cron.yaml` | Weekly `CronJob` at Sunday 03:00 UTC, runs `cleanup-postgres-bloat.sh` |
+| `agentflow-agents/scripts/cleanup-postgres-bloat.sh` | DELETE old `kind='log'` events, VACUUM ANALYZE top tables, reap idle advisory-lock holders |
+| `agentflow-agents/migrations/2026-05-23e-postgres-hot-indexes.sql` | Adds `idx_project_events_project_kind_id`, sets per-table autovacuum to 5%/2% |
+| `agentflow-agents/src/services/eliza-world-bootstrap.ts:71` | Per-tenant `pg.Pool` cache — LRU-capped at 16 to stop unbounded socket growth |
+| `agentflow-agents/src/db/client.ts:12` | Main app pool — `postgres-js` `max: 10` per replica |
+
+## Data flow
+
+```
+app pod (agentflow-agents, 1 replica)
+  ├── postgres-js pool max:10           ──┐
+  └── pg.Pool per tenant (max:2, LRU 16)  │
+                                          ▼
+               agentflow-postgres Deployment (Pod, 2Gi mem, 2 CPU)
+               ├── tuning.conf via /etc/postgresql/conf.d/  (include_dir)
+               └── PVC agentflow-postgres-data (4Gi used)
+```
+
+No PgBouncer in front: the `k8s/pgbouncer.yaml` manifest exists in the repo
+but is not applied because total connection count is already under control
+post-tuning. Revisit if `count(*) FROM pg_stat_activity` regresses above 120.
+
+## DB / Env / API
+- Tables touched by the cleanup CronJob:
+  - `project_events` — DELETE WHERE `kind IN ('log','tick','heartbeat','progress')` AND `created_at < NOW() - INTERVAL '7 days'`
+  - `agent_events` — DELETE WHERE `created_at < NOW() - INTERVAL '14 days'`
+  - `chat_messages` — DELETE WHERE session silent > 30 days
+- Tables with tuned autovacuum: `project_events`, `chat_messages`, `agent_events` (scale_factor 0.05 / 0.02)
+- ConfigMap: `agentflow-postgres-tuning` (ns `franchise-factory`)
+- ConfigMap: `agentflow-postgres-cleanup-script` (script body — re-create from `scripts/cleanup-postgres-bloat.sh` whenever it changes)
+- CronJob: `agentflow-postgres-cleanup` — `0 3 * * 0` UTC
+- Existing daily backups: `agentflow-postgres-backup` (hourly), `agentflow-postgres-backup-full` (04:00 UTC)
+- Postgres role: `agentflow / PJSwYHDhdKDdG3zEAfBFlOzWLJJhPY2k` (in `agentflow-postgres-creds` secret)
+- Image: `pgvector/pgvector:pg17` (extensions installed: plpgsql, fuzzystrmatch, pgcrypto, vector)
+
+### Active settings after rollout
+
+| GUC | Default | New value | Why |
+|---|---|---|---|
+| `shared_buffers` | 128MB | 512MB | Working set fits in RAM, fewer disk reads |
+| `effective_cache_size` | 4GB | 1500MB | Matches actual pod memory limit |
+| `work_mem` | 4MB | 16MB | pgvector kNN scans were spilling to disk |
+| `idle_session_timeout` | 0 | 600000 (10 min) | Reaps leaked Eliza pool sockets |
+| `idle_in_transaction_session_timeout` | 0 | 60000 (1 min) | Catches buggy commits |
+| `lock_timeout` | 0 | 30000 | Prevents advisory-lock pile-up |
+| `statement_timeout` | 0 | 120000 | Last-resort runaway-query kill |
+| `log_min_duration_statement` | -1 | 500 | Slow-query log without pg_stat_statements |
+| `log_lock_waits` | off | on | Surface advisory-lock contention in logs |
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Many connections idle, app eventually FATAL "too many connections" | `FATAL: sorry, too many clients already` | Check `idle_session_timeout` is set; restart agentflow-agents pod; raise `MAX_TENANT_POOLS` in `eliza-world-bootstrap.ts:75` |
+| Advisory lock waiters pile up, queries stuck > 1 min | `LOG: process N still waiting for ExclusiveLock on advisory lock` (via `log_lock_waits`) | `cleanup-postgres-bloat.sh` reaper, or `kubectl exec ... psql -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE state='idle' AND query LIKE '%advisory%';"` |
+| pgvector kNN spills to disk | `LOG: temporary file: path "base/pgsql_tmp/..."` | raise `work_mem` above 16MB in `postgres-tuning-config.yaml` |
+| Pod OOMKilled after rollout | `OOMKilled` in pod status | shared_buffers + work_mem * max_connections exceeds 2Gi limit; lower one |
+| postStart hook never adds include_dir | `cleanup` cron container logs `tuning.conf` settings not active | exec into pod, manually append `include_dir = '/etc/postgresql/conf.d'` to `/var/lib/postgresql/data/pgdata/postgresql.conf`, then `pg_ctl reload` |
+| CronJob fires but no DELETE happens | CronJob `Pending` due to CPU | check node CPU with `kubectl top nodes`; cordon the saturated node or raise CPU request granularity |
+
+## Out of scope (intentionally skipped)
+
+- **PgBouncer** — manifest exists at `k8s/pgbouncer.yaml` but not applied. Total connection count drops to ~30 after the tuning + LRU cap, so the extra hop isn't worth it. Apply when peak load exceeds 150 connections.
+- **`project_events` partitioning** — table is 35 MB / 31K rows. Partitioning helps at the 10M-row mark.
+- **`pg_stat_statements`** — needs a `shared_preload_libraries` change and a Postgres restart. Tracked in a follow-up. For now `log_min_duration_statement=500` gives us slow-query visibility.
+- **Disk cleanup at the host level** — node `/` is 82% full but only 1.5 GB of that is Postgres data. The rest is k3s state, container images, and tenant pod volumes. Separate runbook.
+
+## Related
+- [Projects create flow](/subsystems/projects-create-flow) — uses `project_events` heavily
+- [Foundation bridge](/subsystems/foundation-bridge) — top writer of `agent_runs`
+- [Autonomous loop](/subsystems/autonomous-loop) — heaviest writer of `agent_events`
