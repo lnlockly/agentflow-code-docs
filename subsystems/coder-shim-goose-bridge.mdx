@@ -1,0 +1,547 @@
+---
+title: "coder-shim — Goose device-bridge"
+description: "Thin WS bridge that speaks AgentFlow's devices-ws protocol and drives `goose run` instead of the opencode/aider coder subprocess."
+---
+
+# coder-shim — Goose device-bridge
+
+## TL;DR
+Master-plan v3 replaces the daemon's opencode/aider coder subprocess with
+**Goose** (`block/goose`, forked as `lnlockly/agentflow-goose`). `coder-shim` is the
+thin device-bridge that speaks AgentFlow's existing devices-ws protocol on one side
+and runs `goose run` on the other, so the backend (`devices-ws.ts`) and ~20 cabinet
+pages stay unchanged. Phase-0 spike verified: goose builds brief-derived files,
+serves over HTTP, ~111 MiB peak RSS (`plans/autonomous/_goose-spike.md`). Opt-in via
+`FF_DAEMON_IMAGE` — when unset the resolver keeps the coder image (reversible).
+
+Rollout is **per-device**, not global. A device created with `template:'goose'`
+runs the coder-shim image deterministically (the resolver checks the template
+before the `FF_DAEMON_IMAGE` override), so one isolated canary can be verified
+without flipping the global default for live users. Other templates are
+untouched; delete the goose device → the runtime is gone.
+
+**tg_bot runtime (PR feat/coder-shim-tgbot-runtime):** a `tg_bot` project is no
+longer build-only — but the platform does NOT run pip/python. **GOOSE installs
+the deps and launches the bot itself**, as part of its coder task, the same way
+it builds + serves an HTTP app while the platform only probes the port (owner
+directive 2026-05-30: the agent does the work, not the platform). The split:
+- **Image** ships python3 + a prebuilt aiogram venv (`/opt/botvenv`) with its bin
+  PREPENDED to `PATH`, so goose's plain `pip install -r requirements.txt` +
+  `python bot.py` resolve to the venv (pip can write — no PEP-668; install is a
+  fast no-op when aiogram is present).
+- **Platform** injects `BOT_TOKEN` (+ `BOT_USERNAME`/`OWNER_TG_ID`) into goose's
+  env (`pipeline.ts` step 2) so goose can write `.env`; it does not write the
+  file or launch anything.
+- **Goose** (the tg_bot branch of `buildCoderPrompt`) fills the handlers, writes
+  `.env` from `$BOT_TOKEN`, `pip install`s, launches `nohup python bot.py &`
+  DETACHED (survives the goose session, keeps polling), and self-verifies via
+  `pgrep` + `getMe`.
+- **Platform probe** (`tg-runtime.ts` `verifyTgBot`, step 4t) gates promotion: a
+  `python *.py` process goose detached must be running in the workspace AND
+  Telegram `getMe` must validate the token (yielding the AUTHORITATIVE
+  `bot_username`). Fail-closed — `bot_token_missing` / `bot_not_running` /
+  `getme_failed` → `ok:false`, so a bot goose did not actually launch is `failed`,
+  never a silent `running`. Mirrors `probePort` for the HTTP path.
+
+The detached bot keeps polling for the pod lifetime (the daemon pod is
+long-lived); a dedicated bot-runtime pod is a follow-up (a build pod is not a
+long-lived service host).
+
+The shim exposes **two** direct-tools: `agent_dev_brief` (project coder) and
+`agent_run_recipe` (device use-cases — the cabinet "what should this device do?"
+picker). `agent_run_recipe` runs a bundled Goose recipe (`recipes/devices/<id>.yaml`)
+immediately, or schedules it when a `cron` is supplied (cloud recipes like C2
+morning-digest). Scheduling registers with `goose schedule add` for list
+visibility AND — under the `FF_BRIDGE_SCHEDULER` flag — with an **in-process
+cron in the long-lived bridge** (`scheduler.ts`) that actually FIRES the recipe
+on each due minute with its persisted params (a headless pod has no goose
+scheduler daemon, so register-only left `Last Run: Never`; PR #1027). The recipe
+manifest is the allowlist + the injection boundary.
+
+## Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/coder-shim/protocol.ts:68` | `buildHello`/`buildHeartbeat`/`buildTaskComplete`/`buildTaskError`/`parseFrame` mirror `WsMessage` |
+| `agentflow-agents/src/coder-shim/protocol.ts:66` | `RECIPE_TOOL='agent_run_recipe'`; `CODER_SHIM_TOOLS` advertises both tools |
+| `agentflow-agents/src/coder-shim/protocol.ts:137` | `isRecipeDispatch` — `task_dispatch` with `tool='agent_run_recipe'` + id |
+| `agentflow-agents/src/coder-shim/scope.ts:49` | `validateScope` — required-field + slug + template-ref (argv-injection) guards |
+| `agentflow-agents/src/coder-shim/recipes.ts:78` | `loadManifest` — read+cache the bundled `manifest.json` allowlist |
+| `agentflow-agents/src/coder-shim/recipes.ts:94` | `normalizeCron` — 5/6-field cron only; normalize 5→6 for Goose; reject illegal |
+| `agentflow-agents/src/coder-shim/recipes.ts:115` | `validateRecipeDispatch` — recipe-id allowlist + param-key whitelist + cron guard |
+| `agentflow-agents/src/coder-shim/recipes.ts:161` | `buildRecipeRunArgs` — `run --no-session --max-turns N --recipe <file> --params k=v ...` (array) |
+| `agentflow-agents/src/coder-shim/recipes.ts:192` | `buildScheduleArgs` — `schedule add --schedule-id … --cron … --recipe-source <file>` |
+| `agentflow-agents/src/coder-shim/goose-runner.ts:27` | `buildGooseConfig` — openai provider → platform gateway, model alias `flow`, `GOOSE_MODE: auto` (headless tool auto-apply) |
+| `agentflow-agents/src/coder-shim/goose-runner.ts:85` | `buildCoderSystemPrompt` — the `--system` headless guardrail. Three fixes: (1) bans ending the turn after planning/reading, mandates editor-tool writes + grep self-verify before finishing (the "goose plans then exits" fix, PR #966); (2) reframes the job from template-FILL to from-scratch app BUILD — PLAN (pages/routes/data-model/endpoints) then build module-by-module, with a route-completeness self-grep (every redirect/link target must have a real route file) + real DB wiring off `DATABASE_URL` (the single-page-stub fix); (3) **pages-before-infrastructure ordering** + OUTPUT-DISCIPLINE / tool-calls-only rules — the `flow` model otherwise writes a `lib/` data layer then stops, or narrates a "What I changed" summary with 0 tool calls. No slug/model id |
+| `agentflow-agents/src/coder-shim/goose-runner.ts:195` | `buildCoderPrompt` — frames the raw brief as an imperative "Implement … by BUILDING it out — creating new files and EDITING existing ones … create every page, route, and API handler … DB off `DATABASE_URL`" directive (not "edit one page"); mandates every `redirect()`/`<Link>` target resolve (no 404); branches on `kind` (HTTP vs tg_bot), never a slug. **`opts.edit` branch (edit channel):** for an already-built project, emits a MINIMAL in-place edit prompt instead — read existing files first, apply ONLY the change request, preserve all other content/routes/styling + prior edits, do NOT regenerate from template defaults or reintroduce placeholder/`{{SLOT:*}}`/`data-slot` markers (the build framing otherwise wiped brief content on edits) |
+| `agentflow-agents/src/coder-shim/goose-runner.ts:236` | `buildGooseArgs` — `run --with-builtin developer --no-session --max-turns N --system <guardrail> -t <framed-prompt>`; `-t` is `buildCoderPrompt`, `--system` is `buildCoderSystemPrompt`; never a concrete model id |
+| `agentflow-agents/src/coder-shim/goose-runner.ts:287` | `runGooseArgv` — array-argv spawn (one process path for coder + recipe + schedule) |
+| `agentflow-agents/src/coder-shim/pipeline.ts:64` | `buildReport` (pure) — goose exit + probe → CloneStatusReport (carries `package_manager`+`dev_pid`). tg_bot: gates on the `tg` liveness-probe outcome — live → `ok:true port:0 kind:tg_bot` + getMe @handle; not live → `ok:false` with the probe error (no `tg` arg → legacy passthrough) |
+| `agentflow-agents/src/coder-shim/pipeline.ts:183` | `runCoderTask` — clone → goose config (tg_bot: token injected) → `runGoose` → HTTP: `startDevServer`+probe; tg_bot: `verifyTgBot` liveness probe (step 4t) → report |
+| `agentflow-agents/src/coder-shim/dev-server.ts:33` | `detectPackageManager`/`buildInstallArgs`/`buildDevCommand` (pure) + `startDevServer` — install deps, start dev/start cmd DETACHED on `0.0.0.0:<port>` so the served process outlives the coder task (otherwise `port_reachable:false` → no ingress → preview 503) |
+| `agentflow-agents/src/coder-shim/dev-server.ts:128` | `probeWorkspace` (exported) — reads package.json scripts + lockfiles + `hasNextDep`/`hasTypescriptDep`; reused by the build gate so the workspace is read once |
+| `agentflow-agents/src/coder-shim/dev-server.ts:183` | `installDeps` (extracted from `startDevServer`) — install ONCE up front so the build gate + dev server share `node_modules`. `startDevServer` gained `skipInstall`+`probe` to avoid a second install |
+| `agentflow-agents/src/coder-shim/build-validate.ts:56` | `buildCheckCommand` (pure) — pick the compile check: `<pm> run build` (`next build`, ground truth) → `<pm> run typecheck` → `npx tsc --noEmit` → null. **For a Next build it appends `--no-lint` (#23, `hasNextDep`+`skipLint`; caller reads `FF_BUILD_NO_LINT` default ON):** the gate verifies COMPILATION, not style — a STRICT foundation's `sort-keys`/`import-order` ESLint otherwise fails `next build` on goose's edits + burns the heal budget on un-fixable style errors → a working app marked `build_failed` (proj 1642). The served `next start` never lints; Next 15.5+/16 drop build-lint. Per-PM separator: npm `run build -- --no-lint`, pnpm/yarn `run build --no-lint`. Non-Next builds untouched. No slug/model id |
+| `agentflow-agents/src/coder-shim/build-validate.ts:137` | `runBuildCheck` — spawn the compile check to completion; captures a HEAD slice + a rolling TAIL slice (not tail-only) so a long webpack stack can't push the `Failed to compile`/`./app/<file>` source ref (printed near the TOP) out of view; `ok` only on exit 0. Never throws (timeout/spawn-error → `ok:false`) |
+| `agentflow-agents/src/coder-shim/build-validate.ts:51` | `combineHeadTail` (pure) — reconstruct build output from the head+tail slices: head-only when it fit the cap, else `head + "…[truncated]…" + tail`. Keeps the early source error AND the final exit lines. Unit-tested |
+| `agentflow-agents/src/coder-shim/build-validate.ts:370` | `healBudget` (pure) — scale goose heal passes by source-file count: base 3 → 5 at ≥6 files → 6 at ≥12, capped 6; never below base. Lets the build + route gates COMPOUND passes toward compile-ok for a dozen-file app while a small landing stays cheap. Unit-tested |
+| `agentflow-agents/src/coder-shim/build-validate.ts:385` | `countSourceFiles` — bounded walk over `app/src/pages/components/lib` (skips node_modules/.next/dotdirs, caps at 60) → the complexity proxy `healBudget` reads |
+| `agentflow-agents/src/coder-shim/build-validate.ts:254` | `extractSourceError` (pure) — pulls the ACTIONABLE source error out of a raw `next build`/`tsc` tail (now fed the head+tail combined output, so the early source ref survives a long stack): keeps `Failed to compile`, `./<src>` refs + their message + a bounded context window, `error TS####`; strips `node_modules/.../next/dist/compiled/...` (bundle5/LoaderRunner), Node `at … node:internal …` frames, `Require stack:` blocks. Falls back to the de-noised tail when no source signal. No slug/model id |
+| `agentflow-agents/src/coder-shim/build-validate.ts:274` | `buildHealPrompt` (pure) — runs the tail through `extractSourceError` FIRST (so goose gets the file:line, not the webpack internal stack), then frames it; tells goose to OPEN the named file + fix the line; names `@tailwind`-in-JS / dangling-import / config-break causes; bans CSS-in-JS. No brief re-send, no slug/model id |
+| `agentflow-agents/src/coder-shim/build-validate.ts:305` | `buildHealArgs` (pure) — `run --with-builtin developer --no-session --max-turns N --system <guardrail> -t <healPrompt>`; model from config.yaml, never argv |
+| `agentflow-agents/src/coder-shim/build-validate.ts:308` | `buildRouteHealPrompt` (pure) — heal prompt for the route-resolve gate: names each failing route + terminal status, tells goose to CREATE the missing page or repoint the redirect/link WITHOUT reverting brief content, prefer rendering `/` directly over redirecting. No slug/model id |
+| `agentflow-agents/src/coder-shim/route-resolve.ts:38` | `deriveRoutes` (pure) — map app-router `page.*` leaves + pages-router files → navigable STATIC routes; strips route-groups `(x)`, skips dynamic `[id]`/catch-all + `api/` + `_app`/`_document`/`404`/`500`. Always yields `/`. Unit-tested |
+| `agentflow-agents/src/coder-shim/route-resolve.ts:105` | `discoverRoutes` — walk `app/`+`src/app/` (`page.*`) and `pages/`+`src/pages/` on disk → `deriveRoutes`. Skips `node_modules`/`.next`/dotfiles |
+| `agentflow-agents/src/coder-shim/route-resolve.ts:133` | `probeRoutes` — GET each route on `127.0.0.1:<port>`, chase `Location` redirects MANUALLY (`redirect:'manual'`, ≤5 hops, 8s/hop) so a `redirect("/x")` to a missing `/x` records the target's terminal 404, not the 3xx. A redirect-loop → 508; fetch-throw → null |
+| `agentflow-agents/src/coder-shim/route-resolve.ts:181` | `failingRoutes` (pure) — a route passes only on a terminal 2xx; 4xx/5xx + a leftover 3xx (unresolvable redirect, e.g. App-Router `redirect()` 307 with no Location) FAIL; a null status (server-not-up, gated by the `/` probe) is NOT counted. Unit-tested |
+| `agentflow-agents/src/coder-shim/expected-routes.ts:191` | `deriveExpectedPlan` — one FAIL-OPEN `flow` call → the pages a brief IMPLIES + CRUD entities (`{routes, entities}`). Any error/timeout/unparseable → empty plan → gate degrades to declared-only. Never throws. LLM = only `flow` |
+| `agentflow-agents/src/coder-shim/expected-routes.ts:54` | `parseExpectedPlan`/`normalizeExpectedRoute`/`mergeRouteSets` (pure) — extract `{routes,entities}` from the `flow` JSON (tolerates fences/prose), normalise each route (leading `/`, drop dynamic `[id]`/`api`/auth-denylist, cap 8), union declared+expected. Unit-tested |
+| `agentflow-agents/src/coder-shim/expected-routes.ts:110` | `classifyRouteFailures` (pure) — HARD (any 5xx, `/`, or a DECLARED route that errors → block promotion) vs SOFT (an EXPECTED-only page that 404s → heal-nudge, does NOT block, so an LLM-predicted page goose structured elsewhere can't sink a working app). Unit-tested |
+| `agentflow-agents/src/coder-shim/expected-routes.ts:156` | `buildExpectedRouteHealPrompt` (pure) — carries the BRIEF + entities so the heal pass CREATEs a missing page with real content + completes CRUD incl the DELETE goose often leaves half-built |
+| `agentflow-agents/src/coder-shim/pipeline.ts:396` | ROUTE-RESOLVE GATE (step 4d, Next.js only) — after `next start` + the `/` probe, derive the brief's expected pages (`deriveExpectedPlan`, fail-open) → probe **EXPECTED ∪ DECLARED** (`mergeRouteSets`) → `failingRoutes`; failures feed a `buildExpectedRouteHealPrompt` goose pass (CREATE the missing page + full CRUD) → rebuild (devDeps re-installed, must compile) → restart → re-probe, ≤ adaptive `maxHeal`. After the budget `classifyRouteFailures`: HARD remaining → `ok:false error:'route_unresolved'` (failed); SOFT-only (brief page still missing) → promote + log. Heals goose UP to the full app past its single-pass ceiling. Generic — brief-derived, no slug; tg_bot/Vite skip it |
+| `agentflow-agents/src/coder-shim/pipeline.ts:219` | BUILD-VALIDATE + SELF-HEAL loop (step 4b) — after goose edits + a single install, run the compile check; on failure feed the SOURCE error (via `extractSourceError`) to a goose heal-pass and retry up to an ADAPTIVE budget (`healBudget`: base 3 → 5-6 for multi-file apps, shared with the route gate). `ok:true`/promote ONLY on a clean build; still-broken → `ok:false error:'build_failed'` with the compile tail so the project is marked `failed` (visible) not a silent running-500 |
+| `agentflow-agents/src/coder-shim/project-db.ts:48` | `hasDbDependency` (pure) — true if package.json (deps+devDeps) pulls a DB client (`pg`/`postgres`/`drizzle-orm`/`@prisma/client`/`kysely`/`slonik`/`knex`/`sequelize`/`typeorm`). Static landings have none → skipped. Unit-tested |
+| `agentflow-agents/src/coder-shim/project-db.ts:58` | `buildDatabaseUrl`/`dbPortFor`/`upsertEnvVar`/`pickMigrateCommand` (pure) — loopback URL `postgres://postgres@127.0.0.1:<port>/postgres`; per-preview-port DB port (`40000+previewPort%20000`, no collisions/stable across restarts); merge a `.env` var without clobber; pick the migrate cmd (npm `db:push`/`db:migrate` script > `prisma db push` > `drizzle-kit push` > null→raw `.sql`). Unit-tested |
+| `agentflow-agents/src/coder-shim/project-db.ts:185` | `detectDbNeed` — read package.json + grep src for `DATABASE_URL` usage → `{needs, deps, scripts, hasDrizzleConfig, hasPrismaSchema}`. needs = a DB dep OR code reading `DATABASE_URL` (catches the #1614 shape where goose hand-rolls `lib/db.ts` without a matching dep) |
+| `agentflow-agents/src/coder-shim/project-db.ts:245` | `startEmbeddedDb` — idempotent: if `127.0.0.1:<dbPort>` already accepts (a prior task's detached DB survived a restart/edit), reuse it; else spawn `pglite-launcher.js` DETACHED with the IMAGE's node, CWD=data-dir (so `killProjectDevServer` leaves it up), wait for the socket. `injectDatabaseUrl` writes `.env`+`.env.local`; `runMigrations` runs the picked cmd then raw `.sql` (best-effort, non-fatal) |
+| `agentflow-agents/src/coder-shim/pglite-launcher.ts:33` | standalone entrypoint — `PGlite.create(dataDir)` (file-backed Postgres-in-WASM) + `PGLiteSocketServer` on `127.0.0.1:<port>`; SIGTERM/SIGINT → clean stop. Resolves `@electric-sql/pglite*` from `/app/node_modules` (image deps); the project speaks only the wire protocol so its node_modules needs no pglite. **PR #1033:** `maxConnections:64` (the default 1 destroyed every served-`pg.Pool` socket past the first), `uncaughtException`/`unhandledRejection` guards (a stray socket error no longer exits the listener), and `patchSslReject` — peeks the leading 8 bytes (paused-mode `read(8)`+`unshift`, so the non-SSL path is byte-for-byte unchanged) and replies `'N'` to an SSLRequest so an SSL client fails fast instead of hanging. **PR #1034:** writes `<dataDir>/pglite-launcher.pid` on start (removed on clean exit) so the supervisor can SIGTERM it for a clean `db.close()` on pod termination (durability) |
+| `agentflow-agents/src/coder-shim/db-supervisor.ts:1` | **`DbSupervisor` + `recordDb`/`readDbRegistry`/`dbRegistryPath` (PR #1033) — keeps each project's embedded PGlite ALIVE for the RUNNING served app.** The pipeline `recordDb`s every provisioned DB to `<workspace>/.coder-shim-dbs.json`; the supervisor (constructed in the long-lived bridge, like the recipe scheduler) re-reads the registry every 15s and respawns (idempotent `startEmbeddedDb`) any DB whose port stopped accepting, and `ensureAll()` re-hydrates every DB on a pod restart. Default ON; `FF_DB_SUPERVISOR=0` disables. No-op for pods with no DB-backed project (empty registry). **`stopAll()` (PR #1034)** — on pod shutdown SIGTERMs each launcher (via its pidfile) and waits for the ports to close, so PGlite `db.close()`s cleanly and the PVC data dir stays reopenable. Unit-tested (registry round-trip / upsert / corrupt-file) |
+| `agentflow-agents/src/coder-shim/pipeline.ts:303` | EMBEDDED DB PROVISION (step 4a-db) — after install, before the build gate: `detectDbNeed`; if it needs a DB (+ HTTP kind, `port>0`) `startEmbeddedDb` → inject `DATABASE_URL` into `gooseEnv`+`devServerEnv`+`.env` → `runMigrations` BEFORE the build (a dashboard may query at build time). Non-fatal on DB-start failure (a DB-backed 500 is caught by the route gate). Generic; static landings + tg_bot skip it. **Also installs the project's `pg` client up front** (PR #1024): when the DB is provisioned and `hasDbDependency(dbNeed.deps)` is false (goose wrote a `DATABASE_URL` layer but imported `pg` without declaring it), run `buildAddArgs(pm, ['pg'])` → `pnpm add pg` so the DB-backed build passes FIRST-TRY (no heal pass spent) AND the route persists at runtime (PGlite is pg-wire-compatible). Idempotent (skipped when a client is already declared); a non-`pg` client goose chose is still caught by the 4b build-heal generic missing-dep install. Greppable: `[coder-shim] db-provision: pnpm add pg → exit=`. Verified: real `pg` INSERT → `PERSISTED_ROWS` from PGlite over `DATABASE_URL` |
+| `agentflow-agents/src/coder-shim/goose-runner.ts:168` | `buildCoderSystemPrompt` "KEEP THE PROJECT BUILDING" clause — bans CSS at-rules in JS/TS modules + broken imports + clobbered build config (belt-and-suspenders with the programmatic build gate) |
+| `agentflow-agents/src/coder-shim/clone-status.ts:29` | `buildCloneStatusBody` — matches `internal.ts` `cloneStatusSchema`; secret in header only. Now carries `kind` (sent on tg_bot reports so the backend recognises the non-HTTP case even when getMe returned no @handle) |
+| `agentflow-agents/src/coder-shim/tg-runtime.ts:22` | `buildGetMeUrl`/`parseGetMe` (pure) — Telegram `getMe` URL + response parse → `{ok, username?}`; getMe validates the token + returns the live @handle WITHOUT consuming the getUpdates long-poll (no 409 with the bot's own polling). Unit-tested |
+| `agentflow-agents/src/coder-shim/tg-runtime.ts:64` | `confirmBotLive` — poll getMe until the token confirms live (or attempts run out); yields the authoritative @handle. Never throws |
+| `agentflow-agents/src/coder-shim/tg-runtime.ts:95` | `isBotProcessAlive` (read-only `/proc` walk) — is a `python *.py` process goose detached (nohup) running with CWD = the project dir? getMe alone only proves the TOKEN is valid, not that a process polls getUpdates in THIS pod, so this is the "goose actually launched it" signal. Linux-only; false off-pod. Mirrors `killProjectDevServer`'s walk |
+| `agentflow-agents/src/coder-shim/tg-runtime.ts:140` | `verifyTgBot` — the platform liveness PROBE (NOT a launcher): `isBotProcessAlive` (process goose launched) AND `confirmBotLive` (getMe) → `{live, botUsername}`. Fail-closed: `bot_token_missing`/`bot_not_running`/`getme_failed` → `live:false`. The platform never runs pip/python — goose does. Never throws |
+| `agentflow-agents/src/coder-shim/pipeline.ts:275` | tg_bot token injection (step 2) — for a `tg_bot` scope carrying a token, `gooseEnv` gets `BOT_TOKEN` (+ `BOT_USERNAME`/`OWNER_TG_ID`) so goose can write `.env` + `python bot.py` reads it at boot. The PLATFORM supplies the secret; GOOSE wires it. No-op for HTTP kinds |
+| `agentflow-agents/src/coder-shim/pipeline.ts:650` | tg_bot liveness probe (step 4t) — `else if (isNonHttpKind)` branch: goose already installed+launched the bot (see `buildCoderPrompt`), so this runs `verifyTgBot` then `buildReport({tg})`. Live → `ok:true port:0 kind:tg_bot bot_username:<getMe>`; not live → `ok:false` with the probe error (fail-closed, never stamps `running`). Generic, kind-based, no slug |
+| `agentflow-agents/src/coder-shim/goose-runner.ts:213` | `buildCoderPrompt` tg_bot branch — instructs goose (PART 1) to fill the handlers from the brief + drop the `SLOT:brief.start_greeting` placeholder, and (PART 2) to write `.env` from `$BOT_TOKEN`, `pip install -r requirements.txt`, launch `nohup python bot.py > bot.out 2>&1 &` DETACHED (never foreground — it polls forever), and self-verify via `pgrep -af bot.py` + `curl …/getMe`, reporting the `result.username`. Generic, no slug/model id |
+| `agentflow-agents/src/coder-shim/bridge.ts:53` | `CoderShimBridge` — connect, hello, hello_ack secret rotation, heartbeat 15s, task routing |
+| `agentflow-agents/src/coder-shim/bridge.ts:82` | `getManifest` — cache the allowlist; fail-closed (null → reject) if the bundle is missing/malformed |
+| `agentflow-agents/src/coder-shim/bridge.ts:239` | `handleRecipeDispatch` — validate → run-once (`runGooseArgv`) or schedule → task_complete/error. Cron branch ALSO registers the entry with the in-process `BridgeScheduler` (with persisted params) when `FF_BRIDGE_SCHEDULER` is on |
+| `agentflow-agents/src/coder-shim/bridge.ts` `recipeEnv` | env for a recipe subprocess — `OPENAI_API_KEY` + `GOOSE_DISABLE_KEYRING` + `AGENTFLOW_API_KEY`(←`AF_API_KEY`)/`AGENTFLOW_BASE_URL`(←`<apiUrl>/_agents`) so the `af_*` MCP extension starts and outbound (Telegram/memory) actually sends. Used by both run-once + scheduled-fire |
+| `agentflow-agents/src/coder-shim/bridge.ts` `fireScheduledRecipe` | the autonomous trigger — reconstructs the run-recipe from a persisted `ScheduleEntry` and runs `buildRecipeRunArgs` (params included) via `runGooseArgv`; returns ok → scheduler stamps `lastRunOk` |
+| `agentflow-agents/src/coder-shim/scheduler.ts:1` | **in-process recipe scheduler (the c5/b7 autonomous-fire fix, PR #1027).** `cronFieldMatches`/`cronMatches` (pure, unit-tested — star/list/range/step, 5+6-field, dom/dow OR-semantics, UTC minute-granular); `BridgeScheduler` — `load()` re-hydrates from `<workspace>/.coder-shim-schedules.json`, `upsert()` persists, `start()` ticks every 20s and fires due entries at most once per wall-clock minute (`lastFiredMinute` de-dupe), `fire` callback runs the recipe + stamps `lastRunAt`/`lastRunOk`. Constructed only when `FF_BRIDGE_SCHEDULER` is on |
+| `agentflow-agents/coder-shim-image/vendor/agentflow-mcp-server/` | vendored compiled dist of `agentflow-mcp-server` (af_* tools) — COPYed to `/opt/agentflow-mcp-server` so the recipe `agentflow` stdio extension can spawn it. The dist is ESM; deps (`@modelcontextprotocol/sdk` + `zod`) resolve from `/app/node_modules` via a `node_modules` symlink ADJACENT to the MCP dir (`/opt/agentflow-mcp-server/node_modules -> /app/node_modules`, PR #1029) — **NOT** `NODE_PATH` (ESM `import` ignores NODE_PATH; that was the #1027 bug). Provenance + re-vendor recipe in `VENDOR.md` (committed past the `dist` gitignore via a `!` exception) |
+| `agentflow-agents/src/coder-shim/main.ts:24` | entrypoint — env → bridge (`recipesDir`=`RECIPES_DIR` ?? `/app/recipes/devices`) |
+| `agentflow-agents/src/coder-shim/queued.ts:39` | `queuedRowToFrame` / `parseQueuedTasksResponse` / `buildQueuedTasksUrl` — cross-replica queued-task drain (BUG A) |
+| `agentflow-agents/src/coder-shim/bridge.ts:213` | `startQueuedPoll` / `drainQueuedTasks` — poll `GET /me/devices/:id/queued_tasks` every 10s, route through live handlers; `inFlight` guard de-dupes a live frame + a polled row |
+| `agentflow-agents/src/coder-shim/health.ts:31` | `startHealthServer` — serves `/api/health` on `:8765` so the STS readiness probe passes |
+| `agentflow-agents/coder-shim-image/recipes/devices/manifest.json:1` | vendored allowlist (from fork `lnlockly/agentflow-goose`); COPYed to `/app/recipes/devices` |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:93` | `DeviceTemplate` — `'coder'\|'assistant'\|'universal'\|'goose'` (goose = per-device canary) |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:142` | `resolveDaemonImage` — `template==='goose'` → coder-shim FIRST (deterministic, isolated); else `FF_DAEMON_IMAGE` override; else coder (hotfix) |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:427` | `isGooseCanaryEnabled` — `FF_GOOSE_CANARY` gate; create path 403s `goose_canary_disabled` unless set |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:418` | `createSchema.template` enum now includes `'goose'`; warm-pool claim skipped for goose (pool pods are coder-baked) |
+| `agentflow-agents/src/services/project-clone.ts` `resolveBuildCoderTemplate` | `FF_BUILD_CODER=goose` → build daemons run goose coder-shim; scoped to the build path (computer-use device provisioning untouched). Reversible by unsetting the flag |
+| `agentflow-agents/src/services/project-clone.ts` `pickDaemonDevice({requireTemplate})` | build-coder=goose requires a `template='goose'` daemon; never reuses the user's coder computer-use daemon for a build |
+| `agentflow-agents/src/services/project-clone.ts` `triggerProjectClone` | provisions a dedicated goose build-daemon on demand (via `provisionDaemonOnDemand`) when no goose daemon exists |
+| `agentflow-agents/src/db/migrations/0077_hosted_device_template_goose.sql:1` | widens `hosted_devices_template_check` to allow `'goose'` |
+| `agentflow-agents/coder-shim-image/Dockerfile:1` | image: node 22 + bridge + goose from the fork + **pnpm@9 + yarn@1.22 baked globally** (`npm i -g` → `/usr/local/bin`, on the non-root `pn` user's PATH) so a lockfile-selected manager resolves NATIVELY at every spawn site (install / `next build` / `next dev` / migrations) — node:22-slim ships only npm + corepack, so without this a `pnpm-lock.yaml` foundation `spawn pnpm ENOENT`s. + **python3 + a prebuilt venv `/opt/botvenv`** (aiogram>=3.4 + python-dotenv, chowned to `pn`); the venv bin is PREPENDED to `PATH` so goose's plain `pip install` + `python bot.py` resolve to it. `BOT_VENV=/opt/botvenv`. The image only PROVIDES the runtime — goose installs+launches |
+| `agentflow-agents/coder-shim-image/entrypoint.sh:1` | env check + `node dist/coder-shim/main.js` |
+| `agentflow-agents/.github/workflows/build-coder-shim.yml:1` | self-hosted build → `ghcr.io/<owner>/agentflow-coder-shim` |
+| `agentflow-agents/tests/coder-shim.test.ts:1` | 146 unit tests (incl. scheduler `cronFieldMatches`/`cronMatches` (star/list/range/step, 5+6-field, dom/dow OR) + `BridgeScheduler` fire-once-per-minute/persist/skip-not-due/remove) (incl. tg-runtime `buildGetMeUrl`/`parseGetMe` + `buildReport` tg_bot live/not-live gates + `buildCoderPrompt` tg_bot launch-instructions + clone-status `kind`) (incl. `extractSourceError` on real `next build`/`tsc` fixtures + route-resolve `deriveRoutes`/`failingRoutes`/`buildRouteHealPrompt` + project-db `hasDbDependency`/`dbPortFor`/`upsertEnvVar`/`pickMigrateCommand` + `buildCoderPrompt` edit-mode) (protocol/scope/runner incl. `buildCoderSystemPrompt`/clone-status/report/resolver + recipe allowlist/argv/cron) |
+
+## Data flow
+```
+backend project-clone.ts
+  dispatchOrQueueDeviceTask({ tool:'agent_dev_brief', scope:{template_repo_full,
+    slug, project_id, brief, port, kind, bot_token?} })
+   │ WS task_dispatch   (devices-ws protocol — UNCHANGED)
+   ▼
+coder-shim bridge.handleCoderDispatch
+   │  validateScope → runCoderTask:
+   │    git clone --depth 1 -- <repo> /workspace/<slug>
+   │    write ~/.config/goose/config.yaml (provider=openai, model=$GOOSE_MODEL,
+   │       OPENAI_HOST=$AF_API_URL, OPENAI_BASE_PATH=_agents/llm/v1/chat/completions,
+   │       GOOSE_MODE=auto)
+   │    goose run --with-builtin developer --no-session --max-turns N
+   │         --system <buildCoderSystemPrompt> -t <buildCoderPrompt(brief,kind,port)>
+   │      (--system = headless guardrail: never end the turn after only planning,
+   │       BUILD the whole app — decompose brief into pages/routes/data-model/
+   │       endpoints, CREATE every one (no redirect/link to a route that doesn't
+   │       exist), wire a real DB off DATABASE_URL, grep-verify routes + brief
+   │       content before finishing; -t = imperative "BUILD the application …
+   │       CREATE every page, route, API handler, and DB schema at CWD". Without
+   │       the --system guardrail the model plans, says "ready to proceed" and
+   │       exits 0 with the workspace untouched — headless `goose run` has no
+   │       second turn; without the BUILD framing it fills one page and leaves a
+   │       404 to routes it never created)
+   │    HTTP kinds (skipped for tg_bot):
+   │      probeWorkspace → detectPackageManager → installDeps ONCE (non-frozen)
+   │      EMBEDDED DB PROVISION (step 4a-db, project-db.ts):
+   │        detectDbNeed (DB dep OR code reads DATABASE_URL) → if needs+port>0:
+   │        startEmbeddedDb (spawn pglite-launcher DETACHED → PGlite-over-socket
+   │        on 127.0.0.1:<dbPort>, file-backed, idempotent reuse) → inject
+   │        DATABASE_URL into gooseEnv+devServerEnv+.env → runMigrations
+   │        (db:push/db:migrate npm script > prisma db push > drizzle-kit push >
+   │        raw .sql) BEFORE the build. static landings + tg_bot skip it
+   │      BUILD-VALIDATE + SELF-HEAL (build-validate.ts):
+   │        buildCheckCommand → runBuildCheck (`next build`/`tsc --noEmit`)
+   │        compiles EVERY route up front → catches the broken build `next dev`
+   │        would only 500 on lazily. fail → goose heal-pass (buildHealArgs with
+   │        buildHealPrompt(compile tail)) → re-check, retry ≤ maxHealAttempts(3)
+   │        still broken → ok:false error:'build_failed' (project → failed)
+   │      build clean → startDevServer(skipInstall) — spawn <pm> run dev
+   │        (Next: -H 0.0.0.0 -p <port>; Vite: --host/--port) DETACHED + unref
+   │    tg_bot: GOOSE installs + launches the bot itself (platform does NOT run
+   │      pip/python). Step 2 injects BOT_TOKEN into goose's env; the tg_bot
+   │      buildCoderPrompt tells goose to: fill handlers from brief → write .env
+   │      from $BOT_TOKEN → `pip install -r requirements.txt` (venv on PATH) →
+   │      `nohup python bot.py > bot.out 2>&1 &` DETACHED (survives session) →
+   │      self-verify (pgrep + getMe). Then the platform PROBES (step 4t,
+   │      tg-runtime.ts verifyTgBot): isBotProcessAlive (python *.py in workspace)
+   │      AND getMe (token live + @handle) →
+   │      live → ok:true port:0 kind:tg_bot bot_username:<getMe>;
+   │      bot_token_missing/bot_not_running/getme_failed → ok:false (fail-closed)
+   │    probe 127.0.0.1:<port>  (only when the dev server started)
+   │    ROUTE-RESOLVE GATE (step 4d, Next.js only, route-resolve.ts):
+   │      discoverRoutes(/workspace/<slug>) → probeRoutes (chase redirects) →
+   │      failingRoutes. compile proves the build; the `/` probe accepts a 3xx —
+   │      so GET every declared static route; a terminal 4xx/5xx (incl. `/` after
+   │      its redirect) → goose route-heal (buildRouteHealPrompt) → rebuild →
+   │      restart → re-probe, ≤ maxHealAttempts(3). still failing →
+   │      ok:false error:'route_unresolved' (project → failed, not a running-404)
+   │  POST /internal/projects/:id/clone-status {ok, port, port_reachable,
+   │     package_manager, dev_pid, pod_ip, ...}
+   ▼  WS task_complete  (or task_error)
+backend internal.ts clone-status → flips status, wires Service/Ingress, preview_url
+```
+
+### agent_run_recipe (device use-cases)
+```
+cabinet picker (PR #543) → POST /me/devices/:id/dispatch_task
+  { tool:'agent_run_recipe', scope:{ recipe:<id>, params:{k:v}, cron? } }
+   │ WS task_dispatch  (devices-ws, UNCHANGED)
+   ▼
+coder-shim bridge.handleRecipeDispatch
+   │  loadManifest(/app/recipes/devices) → validateRecipeDispatch:
+   │    recipe ∈ manifest allowlist + path-safe id?
+   │    params ∩ recipe's declared param keys (drop the rest)?
+   │    cron valid (5/6 fields, digits + */,- only) → normalize 5→6?
+   │  ensureGooseConfig (provider=openai, model=$GOOSE_MODEL=flow)
+   │  cron set?
+   │    YES → goose schedule add --schedule-id <dev>-<id> --cron <6f> --recipe-source <file>
+   │          (for `goose schedule list` visibility) AND, when FF_BRIDGE_SCHEDULER:
+   │          BridgeScheduler.upsert({scheduleId, recipeId, file, params, cron})
+   │          → persisted to <workspace>/.coder-shim-schedules.json
+   │          → task_complete "scheduled: <id> (<schedule-id>) — in-process cron armed"
+   │    NO  → goose run --no-session --max-turns N --recipe <file> --params k=v ...
+   │          → task_complete (tail) / task_error
+   ▼  WS task_complete / task_error  (no clone-status — a recipe is not a build)
+
+In-process scheduler fire (FF_BRIDGE_SCHEDULER, the autonomous trigger):
+   BridgeScheduler tick (every 20s) → cronMatches(entry.cron, now-UTC)?
+     → fireScheduledRecipe(entry): goose run --recipe <file> --params k=v …
+       (env = recipeEnv: OPENAI_API_KEY + AGENTFLOW_API_KEY/BASE_URL → af_* MCP
+        extension at /opt/agentflow-mcp-server sends Telegram/memory)
+     → stamp lastRunAt/lastRunOk + persist. Fires at most once per wall-clock minute.
+```
+Injection boundary: the recipe id is the only thing that becomes a file path
+(`recipes/devices/<id>.yaml`, id matched `^[a-z0-9-]+$` AND found in the manifest);
+params ride as single argv elements (`--params k=v`), never a shell string; cron is
+charset-validated before reaching the scheduler.
+
+## DB / Env / API
+- Tables: none new. Consumes `projects` via `/internal/projects/:id/clone-status`.
+- Per-project DB (step 4a-db): `DATABASE_URL` is **injected by the pipeline at
+  runtime**, not a static secret — `postgres://postgres@127.0.0.1:<dbPort>/postgres?sslmode=disable`
+  pointing at an embedded **PGlite** (Postgres-in-WASM, file-backed at
+  `/workspace/<slug>/.pglite-data`) served over a TCP socket by `pglite-launcher.js`.
+  The pod can't `apt install postgres` and we keep everything on our own infra
+  (no external managed DB), so this embedded path is the chosen default. Deps
+  `@electric-sql/pglite` + `@electric-sql/pglite-socket` ship in the image.
+  `dbPort` is `pickDbPort(dbPortFor(previewPort), dataDir)` — our own port on
+  reuse, but it hops to a free port when a FOREIGN project's PGlite already holds
+  the base port (concurrent builds on one daemon, PR #1034), preventing
+  cross-project data bleed.
+- **Durability (owner decision 2026-05-30 — PGlite STAYS, durable via the project
+  PVC; no switch to cluster-PG):** `.pglite-data` lives under `/workspace`, the STS
+  `volumeClaimTemplates` 10Gi local-path PVC (`renderDaemonManifest`), so the data
+  FILES survive a pod restart / image roll / reschedule. **But PGlite-WASM ABORTS
+  reopening a data dir left by an UNCLEAN shutdown** (`[pglite] fatal: Aborted()`),
+  and PGlite is spawned DETACHED (own group) so the kubelet's SIGTERM never reaches
+  it. So durability requires a CLEAN `db.close()` on pod termination (PR #1034):
+  `pglite-launcher` writes `<dataDir>/pglite-launcher.pid`; `DbSupervisor.stopAll()`
+  (awaited by `bridge.shutdownGracefully()` from the entrypoint's SIGTERM handler,
+  within the 60s terminationGracePeriod) SIGTERMs each launcher so it `db.close()`s
+  → the dir stays reopenable → on the next boot `DbSupervisor.ensureAll()` re-spawns
+  PGlite and the rows are intact. **Verified LIVE (proj 1646 @b17270b2, 2026-05-30):**
+  served `POST /api/reservations` → 201 → graceful `kubectl delete pod` →
+  `db-supervisor: respawned embedded DB … on :43646` (no Aborted) →
+  `SELECT … reservations` returns the row → survives. **Residual:** an UNGRACEFUL
+  kill (OOM / SIGKILL / node crash) still leaves the dir unreopenable — a PGlite-WASM
+  limitation; the graceful pod lifecycle (rolling update / reschedule / drain) is
+  covered. Data is otherwise lost only if the PVC itself is deleted (project teardown).
+- Env (pod side, all already on the daemon pod): `AF_API_KEY`, `AF_API_URL`
+  (default `https://agentflow.website`), `AF_DEVICE_ID`, `AF_DEVICE_TOKEN`,
+  `AF_ENROLLMENT_TOKEN`, `AF_INTERNAL_API_SECRET`, `GOOSE_MODEL` (default `flow`),
+  `GOOSE_MAX_TURNS`, `GOOSE_TIMEOUT_MS`, `BUILD_WALL_CLOCK_MS` (overall build
+  budget, default 25 min / `1500000`; `0` disables — see Failure modes),
+  `GOOSE_DISABLE_KEYRING=1`, `WORKSPACE_ROOT`,
+  `RECIPES_DIR` (default `/app/recipes/devices` — the bundled manifest + recipe yaml),
+  `BOT_VENV` (default `/opt/botvenv` — the prebuilt python venv with aiogram +
+  python-dotenv; its bin is on `PATH` so goose's `python`/`pip` resolve to it).
+  For a tg_bot scope the pipeline injects `BOT_TOKEN` (+ `BOT_USERNAME`,
+  `OWNER_TG_ID` when set) into goose's env so goose writes `.env` + `bot.py`
+  reads the token. `OWNER_TG_ID` gates the bot's `/admin` panel; it is optional —
+  the user-facing `/start`/`/help`/`/faq`/`/order` handlers work without it.
+- Env (server side): `FF_DAEMON_IMAGE` — `goose` → coder-shim image; full ref →
+  verbatim; unset → coder (2026-05-28 hotfix path). **NOW SET TO `goose` IN PROD
+  (`k8s/agentflow-agents.yaml`, goose-only mission Phase 1, 2026-06-02).** Scope is
+  narrow despite the "GLOBAL" name: this only changes the DEFAULT image for new
+  on-demand cloud hosted devices created via `POST /me/hosted-devices` WITHOUT an
+  explicit `template`. It does NOT touch (a) project BUILDS — those already pin
+  goose via `FF_BUILD_CODER` and `provisionDaemonOnDemand({template:'goose'})`,
+  resolving goose regardless of this flag; (b) the WARM POOL —
+  `services/hosted-pool/manifest.ts` hardcodes `agentflow-daemon:latest` and never
+  reads `FF_DAEMON_IMAGE`; (c) existing running pods — the
+  `daemon-image-reconciler` that would rollout-restart them is OFF
+  (`DAEMON_IMAGE_RECONCILE_ENABLED` unset → default false). Reversible:
+  `kubectl set env deploy/agentflow-agents FF_DAEMON_IMAGE-` → new cloud devices
+  revert to `DAEMON_IMAGES.coder`.
+- Env (pod side): `FF_DB_SUPERVISOR` — default ON; set to `0`/`false`/`no`/`off`
+  to disable the embedded-DB keep-alive supervisor (`db-supervisor.ts`). When on
+  (the default), each project's PGlite is respawned if it dies and re-hydrated on
+  a pod restart, so a DB-backed SERVED app keeps persisting. Reversible; no-op
+  when no project on the pod provisioned a DB.
+- Env (pod side): `FF_BRIDGE_SCHEDULER` — `1`/`true`/`yes` arms the in-process
+  recipe scheduler (`scheduler.ts`) that ACTUALLY fires scheduled recipes (a
+  headless pod has no goose scheduler daemon). Off by default → the bridge only
+  calls `goose schedule add` (register-only, never fires) — the legacy path,
+  byte-for-byte. ISOLATED per-pod flag; set it on one canary device to verify,
+  do not flip it fleet-wide until the matrix row is green.
+- Env (pod side): `AGENTFLOW_API_KEY` / `AGENTFLOW_BASE_URL` — the recipe
+  `agentflow` stdio extension's `env_keys`. The bridge's `recipeEnv()` injects
+  them from `AF_API_KEY` + `<apiUrl>/_agents` when not already set on the pod, so
+  the bundled `/opt/agentflow-mcp-server` extension starts and outbound steps
+  send. `AGENTFLOW_API_KEY` MUST be an `af_live_*` token or the MCP server
+  refuses to start. The extension resolves its deps via a `node_modules` symlink
+  adjacent to the MCP dir (`/opt/agentflow-mcp-server/node_modules ->
+  /app/node_modules`, PR #1029) — **NOT** `NODE_PATH`, which the ESM loader
+  ignores (the #1027 bug: `ERR_MODULE_NOT_FOUND @modelcontextprotocol/sdk`).
+- Env (server side): `FF_GOOSE_CANARY` — `1`/`true`/`yes` enables provisioning
+  `template:'goose'` hosted devices (the isolated per-device canary). When unset,
+  `POST /me/hosted-devices {template:'goose'}` returns 403 `goose_canary_disabled`.
+  This gate only controls *creating new* goose devices; `resolveDaemonImage` keys
+  off the stored row, so an already-provisioned goose device keeps its image even
+  if the flag is later unset.
+- Env (server side): `FF_BUILD_CODER` — `goose` routes **project builds** onto the
+  goose coder-shim instead of the legacy aider coder, WITHOUT a global
+  `FF_DAEMON_IMAGE` flip (computer-use device provisioning stays on coder/desktop).
+  Read by `resolveBuildCoderTemplate()` in `project-clone.ts`. When `=goose`,
+  `triggerProjectClone` picks a daemon with `template='goose'` (never the user's
+  coder computer-use daemon) and, if none exists, provisions a dedicated goose
+  build-daemon on demand. Unset/any-other value → builds keep the legacy `coder`
+  daemon (reversible). Scoped to the build path only. Pairs with the
+  `provisionDaemonOnDemand` fallback (warm-pool-independent).
+- API: `POST /me/hosted-devices {kind:'daemon', template:'goose'}` → goose device
+  (canary-gated). All other create-path behaviour is unchanged.
+- WS: connects to `wss://<AF_API_URL host>/_agents/_devices/connect` with
+  `x-api-key` / `x-device-id` / `x-device-secret` (or `x-enrollment-token` on
+  first run). The `/_agents` prefix is mandatory — the central ingress routes
+  `/_agents(/|$)(.*)` to the agentflow-agents service and strips the prefix, so
+  the server's mount at `/_devices/connect` (`devices-ws.ts:228`) only sees a
+  prefixed public URL. A bare `wss://.../_devices/connect` falls through to the
+  landing proxy, which answers the upgrade with HTTP 200 and no `101` — the shim
+  loops `reconnecting in 4.0s` and the device stays `offline`.
+- LLM: routes through the platform gateway `flow`→codex.sale; model is the alias
+  `flow`, never a concrete id (gateway `pickFlowUpstream` resolves it).
+- Goose source: forked at `lnlockly/agentflow-goose`. Image bundles goose via the
+  Dockerfile `GOOSE_DOWNLOAD_BASE`/`GOOSE_RELEASE_TAG` build-args (defaults to
+  upstream `stable` until the fork cuts a release).
+
+## Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Multiple projects stuck `provisioning` forever on ONE device, no `clone_status`, goose procs present, device looks "wedged"/zombie | pod `lastState.terminated.reason=OOMKilled` exitCode 137; previous-container log shows several `queued poll drained 1 task(s)` → `coder task project=<a>` … `project=<b>` … `project=<c>` then `ws closed; reconnecting` → restart (the #31 zombie loop; builds 1659+1660+1661 ran concurrently → OOMKilled) | the daemon ran builds CONCURRENTLY: `drainQueuedTasks` runs on a 10s `setInterval` AND on every WS reconnect, so it RE-ENTERS while a prior ~20-min build is still awaiting, and the atomic queued endpoint hands each overlapping drain a fresh row → N concurrent goose+`next build`+PGlite → pod OOM → every in-flight build dies with no clone_status → on restart re-drain → OOM loop. (`inFlight` only dedups the SAME task id, never caps cross-task concurrency. The WS-reconnect is a SYMPTOM of the OOM restart, not the cause.) Fixed (PR #1052): `bridge.ts` `makeSerial()` promise-chain mutex runs coder builds ONE AT A TIME across both the live-frame and queued-poll paths — overlapping dispatches queue in the chain (cheap) and run in turn, so peak memory is a single build. Log when serialized: `build project=X queued behind project=Y … serialized to avoid OOM`. Complementary backend follow-ups: scheduler health-gate (don't assign to a wedged device) + idempotent re-dispatch. **Needs the coder-shim image rebuilt + the wedged daemon restarted onto it.** |
+| Coder pod never connects | `[coder-shim] FATAL: missing required env` | entrypoint env check — `AF_API_KEY`/`AF_DEVICE_ID` unset on the pod |
+| goose binary missing | `[coder-shim] FATAL: goose binary not on PATH` | image build — goose download step failed |
+| clone-status never posts | `internal_secret_unset` returned by `postCloneStatus` | `AF_INTERNAL_API_SECRET` not on the pod |
+| Build + goose-fill OK but preview never promotes: `port_reachable:false`, dev server exits immediately on a pnpm foundation | clone_status `{ok:true, error:null, dev_pid:<n>, port_reachable:false, package_manager:'pnpm', next_status:'failed'}`; `.coder-shim-dev.log` shows `next start -- -H 0.0.0.0 -p <port>` → `Invalid project directory provided, no such directory: /workspace/<slug>/-H` | `buildDevCommand` emitted `<pm> run start -- -H 0.0.0.0 -p <port>`. **npm consumes that `--`; pnpm/yarn forward it THROUGH to the script**, so `next start` reads `--`/`-H` as a positional directory arg, exits, the port never binds → promote fails port_reachable. Surfaced once pnpm was baked into the image (project 1637, goose had FILLED the brief — Эспрессо/Капучино/prices in `app/(default)/page.tsx` — so it's NOT goose-quality). Fixed: `dev-server.ts` `buildDevCommand` emits the `--` separator ONLY for npm; pnpm/yarn get flags directly (PR fix/coder-shim-pnpm-dev-flags). Verified in-pod: `pnpm run start -H 0.0.0.0 -p <port>` → HTTP 200. **Needs the coder-shim image rebuilt (`build-coder-shim.yml`) on merge.** |
+| Build dies with `spawn pnpm ENOENT` (install/build/dev) on a pnpm/yarn-lockfile foundation | clone_status `{error:'install_failed', detail:'install_failed:pnpm:timeout'}` (install) OR `{error:'build_failed', detail:'build_spawn_failed: spawn pnpm ENOENT'}` (build gate, install already OK ~500M node_modules); on the pod `command -v pnpm` = MISSING, registry reachable | the coder-shim image (node:22-slim) shipped only npm + corepack, NOT standalone pnpm/yarn. A `pnpm-lock.yaml` foundation (e.g. `cruip/open-react-template`) → every spawn site that runs the lockfile's manager — install (`installDeps`), build (`next build` via `pnpm run build`), `next dev`/`next start`, migrations — `spawn pnpm ENOENT`. `runToCompletion` resolves `null` on a spawn error so install was mislabeled `:timeout`. Fixed in two layers: `dev-server.ts` `resolveInstaller` (corepack/npm fallback for install, PR #1019) + `coder-shim-image/Dockerfile` bakes `pnpm@9 + yarn@1.22` globally so ALL spawn sites resolve natively (PR fix/coder-shim-bake-pnpm). Repro projects 1635 (install) + 1636 (build gate), 2026-05-30. **Needs the coder-shim image rebuilt (`build-coder-shim.yml`) on merge.** |
+| Project stuck provisioning, goose ran, preview 503 | clone_status `{ok:true, port_reachable absent, dev_pid:null, expose:null}` | the dev server never started — `startDevServer` returned `{devPid:null,error}` (read `install_failed:*` / `no_dev_or_start_script` / `no_package_json` in the report detail) OR did not bind `0.0.0.0:<port>` in the 60s probe window. `dev-server.ts` |
+| Build dies at install on a pnpm/yarn-lockfile foundation: `install_failed:pnpm:timeout` (often "timeout" with NO real timeout — fails fast) | clone_status `{ok:false, error:'install_failed', detail:'install_failed:pnpm:timeout'}`; on the pod `command -v pnpm` = MISSING (node + npm + corepack + yarn present), `node_modules` never created, `registry.npmjs.org` reachable (HTTP 200) | the coder-shim image ships node + npm + corepack but NO standalone `pnpm`/`yarn` binary. A `pnpm-lock.yaml` foundation (e.g. `cruip/open-react-template`, vertical_fallback_restaurant_food) → `detectPackageManager`→'pnpm' → `installDeps` spawned bare `pnpm install` → ENOENT. `runToCompletion` resolves `null` on a spawn error, the SAME as a SIGKILL timeout, so the failure is mislabeled `:timeout`. The build dies at install BEFORE goose's brief edits reach a served preview. Repro: project 1635 «Тёплый Угол» (2026-05-30, FF_BUILD_CODER=goose live). Fixed (PR fix/coder-shim-install-pm-fallback): `dev-server.ts` `resolveInstaller` maps the lockfile manager onto an executable one — native if on PATH → else `corepack <pm> install` (corepack provisions pnpm/yarn, respects the lockfile) → else npm; `installDeps` retries once on a null exit + has an npm last-resort + `COREPACK_ENABLE_DOWNLOAD_PROMPT=0`; install cap bumped 4m→10m (`INSTALL_TIMEOUT_DEFAULT_MS`). **Needs the coder-shim image rebuilt (`build-coder-shim.yml`) on merge.** |
+| Every Tailwind/TS Next.js build fails: `build_failed` (webpack-internal stack the self-heal can't fix) or a promoted-but-500 preview | `next build` tail (clone_status `detail`) ends `Error: Cannot find module 'tailwindcss'` / `Cannot find module 'autoprefixer'` at `getPostCssPlugins (.../webpack/config/blocks/css/plugins.js)`; on the pod `ls node_modules/tailwindcss` is missing and `npm config get omit` returns `dev`. (Without a source ref the heal pass then gutted `app/globals.css` `@tailwind` directives + the `tailwindcss` postcss plugin trying to fix the unparseable stack, leaving `:root{}` raw CSS → `next-flight-css-loader` `Module parse failed: Unexpected token (1:0)`.) | The coder-shim pod runs `NODE_ENV=production`, under which every package manager omits `devDependencies`. Next.js/Vite build tooling (`tailwindcss`, `autoprefixer`, `postcss`, `typescript`) ships as `devDependencies` by template convention, so `next build` can't resolve the postcss plugin. Fixed: `dev-server.ts:81` `buildInstallArgs` forces dev deps back in regardless of `NODE_ENV` — `--include=dev` (npm), `--prod=false` (pnpm), `--production=false` (yarn). The static-starter path never hit this (no `next build` step), which is why the goose gate — run against the static fallback — missed it; the real Next.js template path (`lnlockly/agentflow-nextjs-starter`, projects #1606/#1608/#1609 2026-05-29) is the first to exercise it. **Needs the coder-shim image rebuilt (`build-coder-shim.yml`) on merge.** |
+| `next build` compiles clean but the served preview 500s on `@tailwind` (devDeps already installed) | served page 500 `Module parse failed: Unexpected character '@' (1:0)` at `next-flight-css-loader` on `app/globals.css` `> @tailwind base;`, yet `next build` in the same workspace exits 0 `Compiled successfully`. The dev-server log shows `next dev` started under the pod's `NODE_ENV=production`. | `next dev` is a DEVELOPMENT server; run under `NODE_ENV=production` (the pod's ambient env) it wires a broken CSS pipeline — PostCSS does not transform `globals.css`, so `@tailwind` reaches `next-flight-css-loader` raw. Verified: same workspace `next dev` 500s under `NODE_ENV=production`, while a production `next build && next start` serves 200 (project #1610, slug z3v6102l, 2026-05-29). Fixed (PR fix/coder-shim-nextjs-preview-serve): a Next.js project that passed the `next build` gate is served via `next start` (production, reusing the gate's `.next`) — `buildDevCommand` `productionStart` / `pipeline.ts` `nextProductionServe`. The non-Next dev path uses `NODE_ENV=development` so a Vite dev server isn't poisoned by the same env. **Needs the coder-shim image rebuilt (`build-coder-shim.yml`) on merge.** |
+| Served preview 500s on `:root{}` / empty postcss `plugins:{}` after a goose heal | served page 500 `Module parse failed: Unexpected token :root`; on the pod `cat postcss.config.mjs` shows `plugins: {}` (empty) or a missing `tailwindcss` plugin, and `app/globals.css` lost its `@tailwind` directives — config mtime is AFTER clone | goose garbled a build-config file (commonly emptying `postcss.config.mjs` `plugins` while chasing an unparseable webpack error during a heal pass). The brief content lives in `app/`/components, never the build config, so the `--system` "do not garble build config" plea is both unnecessary AND insufficient. Fixed deterministically: `pipeline.ts` `snapshotConfigs` records the template's `PROTECTED_CONFIG_FILES` (`postcss.config.*`, `next.config.*`, `tailwind.config.*`, `tsconfig.json`) right after clone, and `restoreConfigs` (via `dev-server.ts` `pickConfigsToRestore`) rewrites any goose changed/deleted back to the baseline BEFORE the build gate. Repro project #1609 slug 4f355q5d 2026-05-29. |
+| HTTP project shown `running` with a 500-ing preview URL (server compiled but never served) | `projects.status='running'` + a public `preview_url`, but the URL 500s; clone_status `{ok:true, port_reachable:false}` | the clone-status promotion (`internal.ts`) flipped `provisioning→running` on `reported.ok` alone, ignoring `port_reachable`. A build can compile (`ok:true`) yet the dev server never serve `/` → user sees a 500 "running" preview. Fixed: for a non-tg_bot report, promotion to `running` now requires `port_reachable`; `ok:true` + unreachable → `failed` (visible). tg_bot reports (sentinel port 0) are exempt. Repro project #1609 2026-05-29. |
+| Project promoted to `running` but the page returns HTTP 500 (silent broken build) | served page 500 `ModuleParseError: Unexpected character '@' (1:0)` / `Module parse failed` / `x Expression expected … @tailwind base;`; `next build` in `/workspace/<slug>` exits 1 `Build failed because of webpack errors` | goose's edit broke the webpack/TS build (e.g. a CSS `@tailwind`/`@import` directive pasted into a `.tsx`/`.js` module, a dangling import, a clobbered postcss/next/tsconfig). `next dev` compiles lazily so the runtime probe saw the server up + `/` 200 and promoted anyway. Fixed (this PR): `pipeline.ts:219` build-validate gate runs `next build`/`tsc --noEmit` BEFORE `ok:true`; on failure feeds the compile tail to a goose heal-pass (`build-validate.ts:157` `buildHealPrompt`) and retries ≤`maxHealAttempts` (2); still broken → `ok:false error:'build_failed'` so the project is `failed` (visible) not a running-500. `buildCoderSystemPrompt` (`goose-runner.ts:93`) also bans CSS-in-JS. Repro on `lnlockly/agentflow-nextjs-starter` (project #1599, slug 8355a532, 2026-05-29). **Needs the coder-shim image rebuilt (`build-coder-shim.yml`) on merge.** |
+| Build-validate fails-closed but the self-heal NEVER recovers it (project marked `failed` after the heal budget) | clone-status `detail` is a webpack INTERNAL stack: `… (/workspace/.../node_modules/next/dist/compiled/webpack/bundle5.js:28:130607) … neo-async/async.js …`; no `./app/...` source ref in the heal prompt | the heal pass was fed the raw `runBuildCheck.tail` whose last 4k chars were webpack/Node internal frames (`at Module._resolveFilename (node:internal/…)`), not the source error — goose can't map a bundler stack to an editable file, so every retry no-ops. Real failure: project #1601 «Лингва Про» landing (goose device, 2026-05-29), goose edited `app/page.tsx`+`layout.tsx`+`globals.css`, `next build` failed, heal no-op'd ×N, project `failed`. Fixed (this PR): `build-validate.ts:220` `extractSourceError` strips the internal frames + surfaces the `Failed to compile`/`./app/page.tsx`/`Module not found`/`error TS####` lines BEFORE `buildHealPrompt` embeds them; `maxHealAttempts` default bumped 2→3. Verified on 4 real `next build`/`tsc` fixtures (`tests/fixtures/build-errors/`): the webpack-loader-stack tail that ended in `node:internal/modules/cjs/loader` now extracts to `Failed to compile` + `./app/page.tsx` + `Cannot find module`. **Follow-up (PR fix/coder-shim-heal-budget):** even with extraction, a LONG `next build` could still scroll the early `Failed to compile`/`./app/<file>` block off the 4k rolling tail before extraction ran, leaving only the bundle stack (live `build_failed` on project 1622, 2026-05-30). `runBuildCheck` now keeps a HEAD slice + a rolling TAIL slice (`combineHeadTail`) so the source ref survives any stack length, and `healBudget` scales heal passes to 5-6 for multi-file apps so the gate compounds toward compile-ok. **Needs the coder-shim image rebuilt (`build-coder-shim.yml`) on merge.** |
+| Project stuck in `provisioning` for the better part of an hour, NO terminal `clone_status`, daemon WS healthy (`ws-flap-count:0`) + gateway responsive | no terminal clone_status event for 20-90 min; on the pod a goose process is alive + cycling, `.coder-shim-dev.log`/build logs show repeated heal passes; once budget trips: `[coder-shim] build budget 1500s exhausted for <slug> — stopping heal loop and finalizing` | the build + route heal loops (`pipeline.ts` 4b/4d) were bounded only by `maxHeal` (≤~6) attempts, each a full goose pass (≤`GOOSE_TIMEOUT_MS`, 10 min) + install + compile (≤`buildTimeoutMs`, 6 min). A multi-file app can run BOTH loops near-exhaustion → up to ~3h wall-clock with no terminal `clone_status`, so the project sits in `provisioning` and the user churns (#31 — the "stall" is a long heal loop, not a dead daemon). Fixed (PR fix/coder-shim-build-wall-clock-budget): `runCoderTask` computes a deadline (`computeBuildDeadline`, `BUILD_WALL_CLOCK_MS` default 25 min, `0` disables) and gates BOTH heal-loop conditions with `isBuildOverBudget`; once the budget trips, healing stops and the existing post-loop classification emits a terminal state (`build_failed` / `route_unresolved`, or promote-with-soft) → every build reaches a terminal `clone_status`. No pod sprawl, no auto-retry (won't kill a build that would have completed in-budget); a budget-failed project is visible + retryable. **Needs the coder-shim image rebuilt (`build-coder-shim.yml`) on merge.** |
+| Working app marked `build_failed` on a STRICT foundation: `next build` fails on ESLint style rules (`sort-keys`, `import/order`, `react/no-unescaped-entities`), not a compile error | clone-status `detail` shows ESLint errors (`✖ N problems`, rule names) under files, NOT `Failed to compile`/`Module not found`; the heal budget is burned re-shuffling imports/keys with no compile fix (menufic-class foundation, proj 1642) | the build gate ran the foundation's `<pm> run build` = `next build`, which lints by default; a strict foundation's style rules fail on goose's non-conforming edits even though the app COMPILES + serves. Fixed (#23): `buildCheckCommand` appends `--no-lint` for a Next build (`FF_BUILD_NO_LINT` default ON) — the gate checks compilation only; the served `next start` never lints; Next 15.5+/16 drop build-lint. Per-PM separator (npm `-- --no-lint`, pnpm/yarn `--no-lint`). **Needs the coder-shim image rebuilt on merge.** |
+| DB-backed brief build_failed: goose imports a package it didn't declare (`pg`, drizzle, …) | clone-status `detail` `Failed to compile … ./app/api/<x>/route.ts … Module not found: Can't resolve 'pg'`; reproduces every run for a persistence brief (booking form, dashboard) | goose follows the system prompt to build a `DATABASE_URL` persistence layer → writes `import 'pg'` (or drizzle/postgres) but does NOT add it to package.json, so `next build` can't resolve it. `extractSourceError` surfaces the error to the goose heal, but `buildHealPrompt` has no "missing npm package → `pnpm add`" guidance → goose path-fixes a missing PACKAGE and never recovers (project 1638, build_failed ×2). Fixed (PR fix/coder-shim-heal-add-missing-dep): the build-heal loop (`pipeline.ts`) now parses the bare package names with `build-validate.ts` `extractMissingPackages` (skips relative/`@/` alias paths) and `<pm> add`s them (`dev-server.ts` `buildAddArgs`) BEFORE the goose pass, bounded to 3 distinct packages. Generic — closes the whole missing-dep class. The embedded DB is PGlite (pg-wire-compatible via `DATABASE_URL`, `project-db.ts`), so an installed `pg` also works at runtime when `detectDbNeed` provisions it. **Two layers:** (1) generic build-heal `pnpm add <bare-pkg>` — log `[coder-shim] build-heal: pnpm add pg → exit=0` (PR #1023, LIVE on image 7a86207c). (2) TARGETED — when `detectDbNeed` starts PGlite + injects `DATABASE_URL` (`pipeline.ts` 4a-db), `pnpm add pg` into the project up front IF no client is declared (`hasDbDependency(dbNeed.deps)` false) so a DB-backed build passes FIRST-TRY and the route persists at runtime — log `[coder-shim] db-provision: pnpm add pg → exit=0` (PR #1024 / fix/coder-shim-db-provision-pg). Verified: node-postgres `pg` connects to the PGlite socket via `DATABASE_URL` and persists a reservation row. **Needs the coder-shim image rebuilt (`build-coder-shim.yml`) on merge.** |
+| DB-backed LANDING served a real 200 then a persistent 502 (the build actually FAILED `Can't resolve 'pg'`, NOT a serve-death) | events show `preview_exposed source:reconciler` THEN `clone_status ok:false build_failed` ~30s later; build `detail` ends `./lib/db.ts Module not found: Can't resolve 'pg'` (import trace `./app/api/<x>/route.ts`); project reverts to `provisioning`; daemon pod still alive | THREE compounding bugs (proj 1653 «Тёплый Угол», 2026-05-30). (a) `buildAddArgs` PRUNED devDeps: under the pod's `NODE_ENV=production` a bare `pnpm add pg` strips `tailwindcss`/`postcss`/`typescript` while adding pg → next `next build` dies `Cannot find module 'tailwindcss'`. (b) a runtime pkg imported in a `.ts` file fails the `tsc` pass `Could not find a declaration file for module 'pg'` (needs `@types/pg`). (c) goose fleshed the brief's booking block into a `DATABASE_URL` `/api/reservations` during ROUTE-heal — but route-heal had no missing-dep auto-add (only 4b build-heal did) and `detectDbNeed` ran once pre-build on the DB-less landing (no PGlite) → rebuild fails `Can't resolve pg` AND the served `/api/<x>` GET 500s the route-gate. The 200 was goose's TRANSIENT dev server, exposed by the reconciler racing the doomed pipeline. Fixed (PR #1049): `buildAddArgs` mirrors `buildInstallArgs` keep-devDeps (`--prod=false`/`--production=false`/`--include=dev`) + a `dev` flag; the missing-dep auto-add is a shared closure (BOTH heal loops) that also adds `@types/<pkg>` best-effort (one-at-a-time, `typesPackageFor`) for TS; embedded-DB provisioning is an idempotent re-runnable closure `ensureEmbeddedDbIfNeeded` called pre-build + pre-serve + in route-heal. Logs: `[coder-shim] heal: pnpm add ... → exit=0`, `[coder-shim] db ... (route-heal) → migrate ok`. Verified fixed-forward on 1653's live workspace → `next build` ✓ Compiled successfully. **Needs the coder-shim image rebuilt (`build-coder-shim.yml`) on merge.** |
+| Multi-file build fails `Cannot find module 'tailwindcss'` (or autoprefixer/postcss/typescript) AFTER a heal pass, though package.json lists it | clone-status `detail` `Failed to compile … ./app/globals.css … Error: Cannot find module 'tailwindcss'`; on the pod `ls node_modules/tailwindcss` MISSING but `node_modules/next` present, and `printenv NODE_ENV` = `production`; ALL devDeps gone, runtime deps survive | the pod runs `NODE_ENV=production`. A goose HEAL pass ran its OWN `npm install` (the model trying to fix a missing module), and under production npm PRUNED every devDependency (tailwindcss/autoprefixer/postcss/typescript) — the build toolchain. The first install (4a, `--include=dev`) had them; the build-heal loop never re-installed, so every subsequent `next build` failed on the missing toolchain → heal budget burned → `build_failed`. THE blocker for complex multi-file apps that trigger heal passes (live project 1627 dashboard, 2026-05-30). Fixed (PR fix/coder-shim-heal-reinstall-devdeps): `pipeline.ts` `gooseEnv` gets `NPM_CONFIG_PRODUCTION=false`+`NPM_CONFIG_INCLUDE=dev` (goose's own installs keep devDeps; `next build` still production), and the build-heal + route-heal loops re-run `installDeps` (devDeps forced) after each goose pass before the re-check. **Needs the coder-shim image rebuilt (`build-coder-shim.yml`) on merge.** |
+| Dev server bound `127.0.0.1` not pod IP, ingress 502 | preview 502 after `expose.ok:true` | the dev cmd ignored the `-H 0.0.0.0`/`--host` flag — check `buildDevCommand` matched the framework (Next vs Vite) and the script forwards `--` args |
+| Public preview `p-<slug>.proj.agentflow.website` 503s while the app serves 200 internally (on-demand build daemon) | backend log `invalid_pod_ip` from `wirePreviewIngress`; clone_status `pod_ip` is a pod NAME (`hd-<id>-0`) not an IP; in-pod `curl 127.0.0.1:<port>/` → 200 | **FIXED (PR #1040):** `runCoderTask` set `pod_ip` to `os.hostname()` — the StatefulSet pod NAME — which fails the backend's `wirePreviewIngress` IP regex `/^[0-9a-fA-F.:]{3,45}$/` → `invalid_pod_ip` → NO Service/Endpoints/Ingress wired → public preview 503 (the app serves 200 on the pod's own port the whole time). The legacy daemon used `POD_IP`; the goose coder-shim regressed. Fix: `resolvePodIp(process.env.POD_IP, hostnameFn)` reports the downward-API `POD_IP` (`status.podIP`, real IP, IP-regex validated) and only falls back to the hostname when POD_IP is absent. **Needs the coder-shim image rebuilt on merge.** |
+| task_error `goose_failed` | `coder task ... crashed` / report `error:'goose_failed'` | read the report `detail` (goose tail) — model/gateway/scaffold issue |
+| task_error `template_repo_full_missing` for a real repo | none (synchronous) | template ref failed `TEMPLATE_RE` (flag-shaped or non `owner/repo`/https) |
+| Recipe dispatch rejected | `recipe dispatch ... rejected: recipe_not_allowed` | unknown / path-shaped recipe id — not in `manifest.json` allowlist |
+| Recipe dispatch rejected (bad cron) | `recipe dispatch ... rejected: invalid_cron` | `scope.cron` not 5/6 cron fields of `[0-9*/,-]` — `normalizeCron` returned null |
+| Recipe never runs, all rejected | `recipe manifest load failed` | `/app/recipes/devices/manifest.json` missing/malformed in the image → fail-closed |
+| goose device pod `ImagePullBackOff` | `failed to fetch anonymous token ... 401 Unauthorized` for `lnlockly/agentflow-coder-shim` | the coder-shim image is PRIVATE; the daemon STS must carry `imagePullSecrets: [{name: ghcr-pull}]` (added in `me-hosted-devices.ts` `renderDaemonManifest`, PR #956). The secret is applied per-tenant by `tenant-bootstrap.ts` `apply_ghcr_pull`. Legacy `agentflow-daemon-*` images are public so this only bit goose devices / fresh nodes without a cached image. |
+| task_error `recipe_run_failed` | report `recipe_run_failed: <goose tail>` | goose non-zero on `goose run --recipe` — read the tail (model/gateway/recipe issue) |
+| task_error `recipe_schedule_failed` | report `recipe_schedule_failed: <tail>` | `goose schedule add` non-zero — read the tail (cron/scheduler issue) |
+| Scheduled recipe registers OK but never autonomously fires | `task_complete scheduled: ...` but `goose schedule list` shows `Last Run: Never` forever; with the in-process scheduler ON instead look for `[coder-shim] scheduler fired <id>` + `scheduler ran <id> ok=true` | **FIXED (PR #1027, flag `FF_BRIDGE_SCHEDULER`):** `bridge.ts:handleRecipeDispatch` cron branch only called `goose schedule add`, which persists the job to goose's store; the headless pod runs goose as one-shot CLI calls with NO long-lived goose scheduler loop, so nothing fired the cron. Fix = option (a): an in-process cron in the long-lived bridge (`scheduler.ts` `BridgeScheduler`) — ticks every 20s, `cronMatches()` per due minute → `runGooseArgv(buildRecipeRunArgs)` with the PERSISTED params, re-hydrated on boot from `<workspace>/.coder-shim-schedules.json`. `goose schedule add` is still called for `goose schedule list` visibility, but the in-process loop is what fires (so the visible "Last Run" is the entry's `lastRunAt`, not goose's store). Gated by `FF_BRIDGE_SCHEDULER` — off → byte-for-byte the legacy register-only path. Original repro: device 31eb3b59, c2-morning-digest, Last Run Never after 3 min, 2026-05-29. **VERIFIED end-to-end on the fa0fa9e2 image (canary hd-d23c4c38, 2026-05-30): `scheduler fired` every minute (09:24/25Z), `lastRunAt` updates (not Never), persisted params reached the run, and the recipe's af_* send delivered a real Telegram digest (msg 400220/400222).** |
+| Scheduled recipe fires with empty required params | recipe run with blank `{{niche}}`/`{{url}}` etc. | **FIXED (PR #1027):** `recipes.ts:buildScheduleArgs` still omits `--params`, but the in-process fire path uses `buildRecipeRunArgs` (which DOES include `--params`) with the params captured + persisted in the `ScheduleEntry` at schedule time, so a fired recipe gets its real `{{niche}}`/`{{url}}`. The `buildScheduleArgs` drop is now moot for firing. |
+| Outbound recipe `done` with no effect (no Telegram / no memory) — the af_* extension never started | goose log `Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@modelcontextprotocol/sdk'` / `Failed to start extension 'agentflow'`; in-pod `node /opt/agentflow-mcp-server/dist/index.js` reproduces it; `AGENTFLOW_API_KEY ... Refusing to start` if the key is not `af_live_*` | **CLOSED — #1027 bundled the dist + env, #1029 fixed dep-resolution (verified end-to-end).** #1027 COPYed the vendored dist to `/opt/agentflow-mcp-server` and `bridge.ts recipeEnv()` injects `AGENTFLOW_API_KEY`=`AF_API_KEY` + `AGENTFLOW_BASE_URL`=`<apiUrl>/_agents`. But #1027 relied on `NODE_PATH` — **ESM `import` IGNORES NODE_PATH** (only CommonJS `require` honours it), so `import '@modelcontextprotocol/sdk'` from `/opt/.../dist/index.js` threw `Cannot find package '@modelcontextprotocol/sdk'`, the extension never started, and `af_send_telegram_message` silently no-op'd (recipe HARD RULE "never crash" → exit 0; scheduler logged `ok=true` anyway). The #1027 local smoke false-passed because the test file sat inside the agents tree (ESM dir-walk found `node_modules`); the `/opt` pod layout has none. #1029 fix = symlink `/opt/agentflow-mcp-server/node_modules -> /app/node_modules` so the ESM walk finds the SDK + zod on the first hop. **Verified end-to-end on the fa0fa9e2 image (canary hd-d23c4c38, 2026-05-30):** in-pod boot → "31 tools registered" (no ERR_MODULE_NOT_FOUND); a scheduled `c2-morning-digest` (cron `*/1`) fired and its `af_send_telegram_message` DELIVERED a real digest to @agentflow_e2e_verify_bot (msg 400220 + 400222, bot-echoed). AF_API_KEY must be an `af_live_*` token. Read-only recipes (l4) were always unaffected. |
+| Goose device never connects, ws-200 loop | `ws error: Unexpected server response: 200` then `ws closed; reconnecting in 4.0s` | `main.ts` built `wsUrl` without the `/_agents` ingress prefix — the bare path hit the landing proxy (HTTP 200, no upgrade). Fixed: `wsUrl = ${wsHost}/_agents/_devices/connect`. |
+| Coder build exits 0 but workspace untouched (placeholder still served) | goose cli log ends with `todo_write`+`tree` then a plan and "ready to proceed"/"Готов перейти к правкам" and **no `▸ write`/`text_editor` tool line**; `grep -rl "<brand>" /workspace/<slug>` returns nothing | `goose-runner.ts:74` — the framed `-t` + `GOOSE_MODE: auto` were not enough: `GOOSE_MODE: auto` only auto-APPROVES tool calls, it does not stop the model ending its turn after planning, and headless `goose run` has no second turn for a human to say "go ahead". Verified live on a tenant pod 2026-05-29 (project #1592, brief #734h1m5t): goose wrote a todo, ran `tree`, printed a plan, exited 0, 0 file edits. Fixed (PR #966): `buildCoderSystemPrompt` passed via `--system` forbids ending the turn after planning/reading and mandates editor-tool writes + a grep self-verify before finishing; `buildCoderPrompt` reworded to an imperative "implement … by EDITING". Re-verified on the same brief: goose wrote `src/config/landing.config.ts` (197 lines) with full brief content (Чёрный Кот ×8, Рубинштейна ×9, prices, phone). **Needs the coder-shim image rebuilt (`.github/workflows/build-coder-shim.yml`) on merge.** |
+| Coder build runs tools but writes nothing / picks `apps__create_app` | goose cli log `Tool call started ... apps__create_app` (not `developer__text_editor`) | tool-selection drift from extension bloat (8 extensions/17 tools enabled vs goose's 5/50 recommendation). The framed prompt + `GOOSE_MODE: auto` steer it back to the developer editor tools. |
+| Complex/multi-page brief produces a single-page stub: homepage 404, no DB, declared routes never created | rendered `/` is a 404 (e.g. `app/page.tsx` is `redirect("/dashboard")` but `app/dashboard/` was never created); `grep -rl "redirect\|<Link" app/` references routes with no matching `app/<route>/page.tsx`; no `app/api/*` handlers; `lib/db.ts` hardcodes `postgres://…@localhost`; project file count ~17 vs the brief's implied ~50 | `goose-runner.ts:85`/`:195` — the prompt framed the job as "replace every placeholder/stub", i.e. FILL the template's existing files, with no instruction to CREATE new pages/routes/API handlers/schema. A dashboard brief (auth + Postgres CRUD + chart + multi-page) produced a 17-file project whose `/` redirected to a `/dashboard` it never built (gap report, `plans/autonomous/_complex-app-gap.md`, project #1614 slug 4b4z3p67 2026-05-29). Fixed (branch `feat/goose-coder-multipage-build`): `buildCoderSystemPrompt` + `buildCoderPrompt` reframed from template-FILL to from-scratch app BUILD — PLAN (pages/routes/data-model/endpoints) → build module-by-module, **pages-before-infrastructure** ordering, every redirect/link target MUST have a real route file (route-completeness self-grep), DB off the injected `DATABASE_URL` (no hardcoded localhost, real queries), plus OUTPUT-DISCIPLINE / tool-calls-only rules against the model narrating instead of writing. Verified locally (goose 1.36 → `flow` gateway) on a dashboard-class brief against `lnlockly/agentflow-nextjs-starter`: baseline 11-file single page → goose pass produced a multipage app (`app/(protected)/{dashboard,clients,settings}/page.tsx` + shared `layout.tsx` + `app/login/page.tsx` + `app/page.tsx` redirecting to `/dashboard`/`/login`); `next build` ✓ Compiled after one build-gate heal pass filled the deferred `lib/auth.ts`/`lib/data.ts`/components; all 5 routes resolve (`/ /login /dashboard /clients /settings`). CAVEATS, do not over-claim: (1) the data layer reached a DB-ready async shape with **seeded/in-memory** rows — full Postgres CRUD persistence (schema + live INSERT/SELECT) is "built last" in the prompt and did NOT land within ~2 passes' write budget; (2) the `flow` model's per-pass tool-call count is highly variable (observed 0/2/3/5/6/9 writes across runs) and some passes stall at 0 writes — single-pass headless does not reliably finish a dozen-file app. The prod build-gate self-heal (`pipeline.ts:219`) + route-resolve gate (`pipeline.ts:396`) re-invoke goose to compound progress + create any still-missing routes, so this prompt is the per-pass quality lift, not a one-shot guarantee. **Needs the coder-shim image rebuilt (`build-coder-shim.yml`) on merge.** |
+| Project promoted to `running` with a green preview but the homepage is a 404 (declared route never created) | `projects.status='running'` + a public `preview_url`, but `/` (after following its redirect) renders `404: This page could not be found`; on the pod `grep -rl "redirect\|<Link" app/` points at a route with no matching `app/<route>/page.tsx`; clone_status `{ok:true, port_reachable:true}` | the build gate proved the project COMPILES and the `/` reachability probe accepts a 3xx — so `app/page.tsx = redirect("/dashboard")` with no `app/dashboard/` passed both (the redirect is a 307, < 500). Nothing GET'd the route the redirect lands on. Real failure: dashboard brief project #1614 slug 4b4z3p67 promoted `running` with a 404 homepage (gap report `plans/autonomous/_complex-app-gap.md` blocker #3). Fixed (PR fix/coder-shim-route-resolve-gate): `pipeline.ts` step 4d ROUTE-RESOLVE GATE — `route-resolve.ts` `discoverRoutes`→`probeRoutes` (chase redirects manually so the terminal 404 is recorded, not the 3xx)→`failingRoutes`; a terminal 4xx/5xx on any declared route blocks promotion and feeds a `buildRouteHealPrompt` goose pass (create the missing page / repoint), rebuild→restart→re-probe ≤`maxHealAttempts`. Still failing → `ok:false error:'route_unresolved'` (project `failed`, not a running-404). Generic; tg_bot/Vite skip it. **Needs the coder-shim image rebuilt (`build-coder-shim.yml`) on merge.** |
+| Persistence brief (auth/CRUD/dashboard) renders but nothing saves — data never persists | a DB-backed route 500s or returns empty; pod app log shows `ECONNREFUSED 127.0.0.1:5432` / `ECONNREFUSED ::1:5432` from a `pg`/drizzle client; `printenv DATABASE_URL` empty in the served process; `lib/db.ts` falls back to `postgres://…@localhost:5432` | goose writes `pg`/drizzle/Prisma code but `DATABASE_URL` was never set and no Postgres runs in the pod (can't `apt install`, and we run no external managed DB) — every query ECONNREFUSEs (gap report blocker #2, project #1614). Fixed (PR feat/coder-shim-db-provision): `pipeline.ts` step 4a-db `project-db.ts` `detectDbNeed`→`startEmbeddedDb` runs an embedded **PGlite-over-socket** (`pglite-launcher.ts`) on `127.0.0.1:<dbPort>`, injects `DATABASE_URL` into the build/serve env + `.env`, and `runMigrations` (npm script / prisma / drizzle / raw `.sql`) before the build. The project's `pg`/drizzle client connects to the loopback URL unchanged; data persists in `/workspace/<slug>/.pglite-data` for the pod's lifetime. Verified: real `pg` INSERT/SELECT returns persisted rows. Generic — static landings (no DB signal) + tg_bot skip it. **Needs the coder-shim image rebuilt (`build-coder-shim.yml`) on merge.** |
+| Persistence brief BUILDS + migrates fine but the SERVED app's `POST /api/<x>` → HTTP 500 `ECONNREFUSED 127.0.0.1:<dbPort>` (build-time DB alive, runtime DB dead) | clone-status `db started :<dbPort> → migrate ok` + `next build` passed + served, yet the running app's API 500s; in-pod `ss -ltn` shows nothing on `:<dbPort>` and no PGlite proc, while `next start` is alive | **The embedded PGlite was started for the BUILD pass but not KEPT ALIVE into the RUNNING served phase** — spawned detached (one-shot), so once it died (OOM / a stray socket-layer error / any exit) nothing respawned it, and the detached `next start` outlived it → app up, DB dead, every query ECONNREFUSEs (proj 1646/1649 class). TWO compounding bugs: (a) no supervision; (b) `PGLiteSocketServer` `maxConnections` DEFAULTS to **1** (and caps the net.Server at 1), so a served `pg.Pool` (goose writes `new Pool({connectionString})`, default 10 sockets) has every connection past the first DESTROYED even when PGlite IS alive. Fixed (PR #1033): **`db-supervisor.ts` `DbSupervisor`** in the long-lived bridge — the pipeline `recordDb`s each provisioned DB to `<workspace>/.coder-shim-dbs.json`; the supervisor re-reads it every 15s and respawns (idempotent `startEmbeddedDb`) any DB whose port stopped accepting, and re-hydrates all on a pod restart — keeping each project's PGlite alive on its served-`DATABASE_URL` port for the pod's lifetime (default ON; `FF_DB_SUPERVISOR=0` disables). `pglite-launcher` raised to `maxConnections:64` + `uncaughtException`/`unhandledRejection` guards. Verified locally vs real `pg` 8.20: non-SSL INSERT/SELECT ok, a 10-socket `pg.Pool` → 10/10 ok. **Needs the coder-shim image rebuilt on merge.** |
+| Persisted data LOST after a pod restart — served app's table is empty / a fresh sequence; supervisor logs `db-supervisor: failed to respawn :<port> (embedded DB did not open within 20s)` and the launcher log shows `[pglite] fatal: Aborted()` | the PGlite data dir was left in an UNCLEAN state by a SIGKILL'd PGlite (pod force-deleted, OOM, node crash) — PGlite-WASM aborts reopening it, so the supervisor can't re-hydrate and the rows are gone (the FILES are on the PVC, but unreadable). Fixed for the GRACEFUL case (PR #1034): `pglite-launcher` pidfile + `DbSupervisor.stopAll()` SIGTERMs each PGlite on pod termination → `db.close()` → reopenable dir → supervisor re-hydrates on next boot (`db-supervisor: respawned embedded DB … on :<port>`, no Aborted) and the row survives. **Verified live (proj 1646: served POST 201 → graceful restart → row survives).** RESIDUAL: an ungraceful kill (OOM/SIGKILL) still corrupts — a PGlite-WASM limit; graceful lifecycle (rolling update/reschedule/drain) is covered. |
+| Served DB query fails `the server does not support SSL connections` (or HANGS) though PGlite is alive | served route 500; goose's client used `ssl:{rejectUnauthorized:false}` (a prod-gated SSL flag) against the loopback PGlite, which speaks PLAINTEXT only | the served app under `NODE_ENV=production` enabled SSL on the pg client; PGlite has no TLS. Before the fix `PGLiteSocketServer` could not parse the 8-byte SSLRequest and buffered it forever → the connection HUNG. Fixed (PR #1033) in three layers: `buildDatabaseUrl` appends `?sslmode=disable` (deterministic for clients that read the connection string — node-postgres/drizzle/prisma honour it; goose's `new Pool({connectionString})` with no explicit `ssl` connects plaintext); `buildCoderSystemPrompt` tells goose NOT to enable `ssl` for the loopback DB (covers clients that hard-code an explicit `ssl` object, which overrides the URL); `pglite-launcher` replies `'N'` to a leading SSLRequest so an SSL-requesting client gets a FAST clean error (greppable) instead of an infinite hang. **Needs the coder-shim image rebuilt on merge.** |
+| Project `running` but a page the brief asked for 404s (e.g. brief wants /dashboard + /clients, only /dashboard exists) | `curl` the preview: `/clients` → 404 though the brief named it; `find app -name page.tsx` shows goose only built a subset; project still promoted because the missing page was never "declared" | the `flow` model under-delivers a dozen-file app in one pass; the route-gate only required DECLARED routes (goose's own page files), so a brief-implied page goose never created wasn't probed → 404 on a `running` project (live project 1628: brief asked /dashboard + /clients, goose shipped only `app/page.tsx` + `app/api/clients`). Fixed (PR feat/coder-shim-brief-aware-route-gate): `expected-routes.ts` `deriveExpectedPlan` (cheap fail-open `flow` call) lists the brief's expected pages + CRUD entities; the gate requires **EXPECTED ∪ DECLARED** to resolve and heals toward the missing ones (`buildExpectedRouteHealPrompt`: CREATE the page + full CRUD incl DELETE), compounding goose up to the full app. A still-missing EXPECTED-only page is SOFT (heal-nudged, logged, does NOT block — guards against an LLM-predicted path goose structured elsewhere); HARD failures (5xx/`/`/declared) still block. If goose can't complete even when told the exact missing paths, that's the model's single-pass ceiling → signals a full planner. **Needs the coder-shim image rebuilt (`build-coder-shim.yml`) on merge.** |
+| tg_bot built but `/start` gets no reply (project `running`, bot dead) — HISTORIC, pre-fix | `projects.status='running'` + `bot_username` stamped, but a real chat `/start` is silent; the coder pod runs no `python` process and `which python3` → not found | the goose coder-shim path built `bot.py` but never RAN it: `runCoderTask` skipped the serve block for `isNonHttpKind` and reported `ok:true port:0` with no launch, and the image (node22+git+goose) had no python (the old python daemon's `_watch_and_launch_tg_bot` was lost in the goose-bridge migration). Fixed (PR feat/coder-shim-tgbot-runtime): image adds python3 + an aiogram venv on PATH; the platform injects BOT_TOKEN into goose's env; GOOSE itself writes `.env`, pip-installs, and launches `nohup python bot.py &`; the platform PROBES liveness (`verifyTgBot`) before promoting. **Needs the coder-shim image rebuilt (`build-coder-shim.yml`) on merge.** |
+| tg_bot `failed` with `bot_not_running` | clone-status `{ok:false, kind:'tg_bot', error:'bot_not_running', detail:'no python bot process running in …'}`; on the pod `pgrep -af bot.py` is empty and the goose task log shows the launch step | goose did not actually launch the bot (it stopped after editing, or `python bot.py` crashed on boot — bad import, syntax error, empty-token guard). The platform probe (`isBotProcessAlive`) found no `python *.py` process with CWD = the workspace, so it fails closed instead of promoting. Read the goose task output + the workspace `bot.out` (goose's `nohup` log) for the python traceback. |
+| tg_bot `failed` with `getme_failed` | clone-status `{ok:false, kind:'tg_bot', error:'getme_failed', detail:'Telegram getMe did not confirm…'}` | a `python bot.py` process IS running but Telegram `getMe` never returned `ok:true` — the token is invalid/revoked or the pod has no outbound to `api.telegram.org`. Fail-closed by design (don't stamp `running` behind an unusable token). Check the project's `BOT_TOKEN` secret + pod egress. |
+| tg_bot built but pip/launch failed inside goose's task | goose task log shows `pip install -r requirements.txt` non-zero, or `python bot.py` not started; the platform then reports `bot_not_running` | the install/launch are GOOSE's steps now (the platform doesn't run pip/python). A failed pip (a brief-grown extra dep that won't resolve) or a skipped launch surfaces in goose's own task output, and the downstream platform probe fails closed as `bot_not_running`. The image ships aiogram in the venv (on PATH, writable) so the base install is a fast no-op; debug extras in goose's log. |
+| tg_bot `running` (process alive) but the bot answers nothing in chat | pod `bot.out` loops `aiogram.dispatcher: Failed to fetch updates - TelegramConflictError: can't use getUpdates method while webhook is active; use deleteWebhook`; `getWebhookInfo` shows a `url` set | the bot's token has a WEBHOOK registered (a prior platform `/connect-telegram` integration, or an earlier deploy), so aiogram long-polling can't pull updates — `verifyTgBot` still promotes (process alive + getMe ok) but no message reaches a handler. Found live on the reused e2e bot (project 1633, 2026-05-30). Fix: the starter calls `await bot.delete_webhook(drop_pending_updates=True)` before `start_polling` (agentflow-tg-bot-starter PR #3) so any bot self-clears. Operator one-off: `curl …/bot$TOKEN/deleteWebhook`. |
+| Goose device create rejected | `goose_canary_disabled` (HTTP 403) | `FF_GOOSE_CANARY` not set on agentflow-agents — set it to provision the canary |
+| Goose device row INSERT fails | `hosted_devices_template_check` violation | migration `0077_hosted_device_template_goose.sql` not applied to the postgres pod |
+| Task dispatched (`clone_dispatched`, `queued:true`) but goose never runs; pod `0/1`; `device_tasks.status='queued'` forever | server `clone_dispatched ... queued=true`; pod log stops after `device_secret rotated` — no `coder task` line | cross-replica race: WS pins to one of 2 agentflow-agents replicas, the `/approve` dispatch lands on the other so `getConnection` returns null → task queued, never pushed; the stable WS never reconnects so `drainAndDispatchQueuedTasks` (hello-only) never re-fires. Fixed: `bridge.ts` polls `GET /me/devices/:id/queued_tasks` every 10s (`queued.ts:queuedRowToFrame`) and routes rows through the live handlers. |
+| Goose pod stays `0/1` NotReady though WS is connected | `kubectl get pod` READY `0/1`; readiness probe `GET /api/health:8765` → connection refused | coder-shim ran only the WS bridge — nothing served `:8765`, so the STS readiness probe never passed. Fixed: `health.ts:startHealthServer` serves `/api/health` on 8765, started from `main.ts`. |
+| Goose pod restart → WS 401, device bricked | `[coder-shim] ws error: Unexpected server response: 401` on a pod that previously connected | the one-time `AF_ENROLLMENT_TOKEN` was consumed on the first connect (server NULLs it) and the rotated `device_secret` lives only in memory; a stateless pod restart reconnects with a stale credential. Fixed: `coder-shim-image/entrypoint.sh` trades `AF_HOSTED_ROTATION_SECRET` for a fresh enrollment_token via `POST /me/hosted-devices/:id/reenroll` on every boot (mirrors the legacy daemon). |
+| Chat edit on a goose project does nothing / `workspace_not_ready` | `POST /me/projects/:id/daemon-chat` SSE `event: error {"text":"workspace_not_ready"}`; `projects.workspace_project_name` is NULL | the legacy code-exec edit loop (`project-daemon.ts` `runProjectDaemonTurn`) needs `workspace_project_name`, which the goose clone flow never sets. Fixed: when a project has `home_device_id` (goose-bound), the turn routes to `runGooseEditTurn` which re-dispatches the edit as a goose run (see Edit channel below) instead of the Claude/code-exec loop. |
+| Edit applied but the preview still shows the pre-edit page | served page unchanged after a daemon-chat edit; pod `.coder-shim-dev.log` shows a 2nd `next start` failing `EADDRINUSE` | the prior dev server still holds the port, so the rebuilt app can't rebind. Fixed: `pipeline.ts` edit mode calls `killProjectDevServer(projectDir)` (kills only PIDs whose `/proc/<pid>/cwd` is this project) before restarting. |
+| Edit dispatched but workspace gone | clone-status `{ok:false, error:'workspace_missing_for_edit'}` | the pod was recycled between build and edit, so `/workspace/<slug>` no longer exists. The pipeline fails visibly rather than silently re-cloning a blank template over the user's work — re-approve to rebuild from the brief first. |
+| Edit wipes prior content — page regenerated from the template default | after a daemon-chat edit the preview shows demo/sample content again (e.g. a placeholder brand name, unfilled `data-slot`/`{{SLOT:*}}` markers) and only the just-requested block is right; the brief content + earlier edits are gone; `git`-less diff of `app/page.tsx` shows a full rewrite, not a small change | the edit re-dispatch (`edit:true`) skips the clone but `runGoose` still used the from-scratch BUILD prompt ("create every page, replace every placeholder") → the `flow` model regenerated the file from the template default instead of editing the filled one (p-edit-loop fail). Fixed (PR fix/coder-shim-edit-loop): `goose-runner.ts` `buildCoderPrompt` `opts.edit` branch emits a MINIMAL in-place edit prompt — read existing files first, apply only the change request, preserve all other content + prior edits, do NOT regenerate from template defaults or reintroduce placeholder markers; `pipeline.ts` passes `scope.edit` through. **Needs the coder-shim image rebuilt (`build-coder-shim.yml`) on merge.** |
+| Plain chat / suggestion-approve on a goose project does nothing (no SSE) | `POST /me/projects/:id/messages` or a suggestion-approve returns but the preview never changes; logs show `[chat-iterate] no canonical coder for kind=… — falling back to legacy path` then maestro `no coder found in plan history` | only the SSE `daemon-chat` route routed to `runGooseEditTurn`; the generic `/messages` handler + `enqueueOwnerMessage` (pipeline) ran the legacy chat-iterate/maestro triage, which has no canonical coder for a goose project (p-edit-loop gap C). Fixed (PR fix/goose-edit-loop): both call `dispatchGooseEdit({projectId, homeDeviceId, text})` FIRST — for a `home_device_id`-bound project with a substantive (≥20 char) message it dispatches the goose edit via `triggerProjectClone({editText})` and returns `mode:'goose_edit'`; short messages fall through unchanged. |
+
+## Edit channel (goose projects)
+Goose-built projects are iterated from the cabinet chat (`POST /me/projects/:id/daemon-chat`). For a goose project (one with `home_device_id` set) the turn does NOT run the legacy Claude + code-exec loop — it re-dispatches the edit as another goose run in the SAME workspace:
+
+```
+POST /me/projects/:id/daemon-chat { text: "<edit instruction>" }
+  → runProjectDaemonTurn → (home_device_id set) → runGooseEditTurn
+      triggerProjectClone(id, { editText })   // reuses the dispatch machinery
+        scope { slug, project_id, brief: editText, port, kind, edit:true }
+        flips project running → provisioning (so completion is detectable)
+       │ WS task_dispatch agent_dev_brief (edit:true)
+       ▼
+   coder-shim runCoderTask (edit branch)
+        SKIP clone (workspace exists) — edits are incremental over prior state
+        goose run -t <buildCoderPrompt({edit:true})>  — the INCREMENTAL edit
+          prompt (read existing files → apply only the change → preserve the
+          rest), NOT the from-scratch BUILD prompt; same --system guardrail
+        restore PROTECTED_CONFIG_FILES, install (devDeps forced, #981),
+          build-validate + self-heal
+        killProjectDevServer(projectDir)  → startDevServer (next start)
+       │ clone-status { ok, port_reachable } → re-promote running/failed
+       ▼
+   runGooseEditTurn polls projects.status until ≠ provisioning, streams
+     progress + the refreshed preview_url over SSE.
+```
+
+Each edit accumulates over the last (same `/workspace/<slug>`), so a sequence
+"change the headline → add a reviews block → add pricing → change colours"
+keeps prior changes. This depends on the `{edit:true}` prompt branch: the
+from-scratch BUILD prompt made goose regenerate `page.tsx` from the template
+default (re-emitting demo content + unfilled `data-slot` markers, wiping the
+brief) — the incremental edit prompt tells it to read + modify in place and
+preserve everything else. A failed edit (`build_failed`) leaves the previous
+working preview up (the dev server is only killed AFTER the build gate passes).
+
+### Generic chat / triage path (not just daemon-chat)
+The SSE `daemon-chat` route is the streaming surface, but the cabinet also posts
+plain chat through `POST /me/projects/:id/messages` (route handler) and the
+suggestion-approve flow goes through `enqueueOwnerMessage` (pipeline). For a
+goose project those legacy paths had NO canonical coder in plan history, so
+their chat-iterate / maestro triage was a dead no-op
+(`[chat-iterate] no canonical coder for kind=… → falling back to legacy path`
+→ maestro `no coder found in plan history`) — a plain chat message did nothing.
+
+Both now short-circuit to the goose edit path via a shared helper
+`dispatchGooseEdit` in `project-clone.ts`:
+
+```
+POST /me/projects/:id/messages   (or enqueueOwnerMessage)
+  → dispatchGooseEdit({ projectId, homeDeviceId, text })
+      home_device_id set AND text ≥ 20 chars (OWNER_MESSAGE_SUBSTANTIAL_MIN_CHARS)?
+        → triggerProjectClone(id, { editText })   // same dispatch as runGooseEditTurn
+          emits coder_dispatched{mode:'goose_edit'} + info; returns { routed:true }
+        → handler returns { ok:true, mode:'goose_edit' }
+      else → { routed:false } → caller continues its existing routing
+```
+
+Short / non-actionable messages (greetings, "ok") stay below the threshold and
+fall through unchanged. The helper is fire-and-return (non-blocking): the
+clone-status callback re-promotes the project and the chat UI polls events — it
+does NOT block on the 7-min build the way the SSE `runGooseEditTurn` poller does.
+
+Files: `agentflow-agents/src/services/project-daemon.ts` `runGooseEditTurn`;
+`agentflow-agents/src/services/project-clone.ts` `triggerProjectClone({editText})` + `dispatchGooseEdit`;
+`agentflow-agents/src/routes/projects.ts` `/me/projects/:id/messages` (goose short-circuit);
+`agentflow-agents/src/services/projects-pipeline.ts` `enqueueOwnerMessage` (goose short-circuit);
+`agentflow-agents/src/coder-shim/pipeline.ts` edit branch;
+`agentflow-agents/src/coder-shim/dev-server.ts` `killProjectDevServer`.
+
+## Relationship to the in-daemon goose backend
+There are two ways to run goose for the coder, and they coexist:
+- **In-place (`CODE_AGENT_BACKEND=goose`)** — flips the engine inside the
+  existing Python daemon's `agent_dev_brief`, no new image. See
+  [Code-agent backend registry](/subsystems/code-agents-backend). Smallest change.
+- **coder-shim (this page)** — a standalone Node bridge + image that drops the
+  Python daemon for the coder slice entirely. The master-plan v3 target, sourced
+  from the `lnlockly/agentflow-goose` fork.
+
+Both speak the same `agent_dev_brief` dispatch contract and the same
+`/internal/projects/:id/clone-status` callback, so the backend does not care
+which one a given pod runs.
+
+## Free-form task path + headless live view (2026-05-31)
+
+Before this, a cloud daemon ran only two direct-tools — `agent_dev_brief`
+(project build) and `agent_run_recipe`. A plain `dispatch_task {task}` with **no
+`tool`** was dropped at `bridge.ts` `onMessage` ("Non-coder dispatches … are
+ignored"), so a cloud agent silently did nothing for any free-text instruction
+("run `uname -a`", "research X and write a summary").
+
+The bridge now routes an un-tooled `task_dispatch` through a free-form handler
+that runs it via goose, exactly like the recipe path: `goose run -t "<task>"`,
+developer tool enabled, `--system` headless guardrails, the user's text as a
+single `-t` argv element (shell metacharacters inert). Progress streams as
+`task_action` frames (`started`, `output`) and the model's final words land as
+`task_complete.answer`. Serialized behind the same build mutex as a project
+build so a free-form run + a concurrent build never OOM the pod.
+
+The cabinet live page gets a **headless mode**: a hosted `kind=daemon` pod has
+no Xvfb/Chromium/MJPEG, so `AgentScreen` painted a blank `<img>`. When
+`deviceKind==='hosted' && hosted.kind==='daemon'` the page renders
+`HeadlessLiveView` instead — the live task feed (RunTimeline) as the dominant
+panel plus a live pod-log terminal (`GET /me/hosted-devices/:id/logs` SSE =
+`kubectl logs -f`). A local Mac (real screen) and a `plain` hosted stub keep
+`AgentScreen`.
+
+The daemon STS now defaults `FF_BRIDGE_SCHEDULER=1` so scheduled recipes fire
+24/7 on a headless pod (reversible via a pod-level `FF_BRIDGE_SCHEDULER=0`).
+
+### Files (with line refs)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/coder-shim/freeform.ts:34` | `isFreeformDispatch` guard (task_dispatch, id+task, no recognised tool) |
+| `agentflow-agents/src/coder-shim/freeform.ts:98` | `buildFreeformArgs` — `goose run -t`, `--system`, task as one element, no model on argv |
+| `agentflow-agents/src/coder-shim/bridge.ts:376` | route un-tooled dispatch → `handleFreeformDispatch` (onMessage) |
+| `agentflow-agents/src/coder-shim/bridge.ts:438` | same routing in the queued-task drain |
+| `agentflow-agents/src/coder-shim/bridge.ts:547` | `handleFreeformDispatch` — stream task_action + task_complete, build-mutex serialized |
+| `agentflow-agents/src/coder-shim/protocol.ts` | `TaskActionFrame` + `buildTaskAction` progress builder |
+| `agentflow-agents/src/routes/me-hosted-devices.ts:730` | `schedulerLine` — `FF_BRIDGE_SCHEDULER` default-on in the daemon STS env |
+| `agentflow-landing/src/pages/CabinetDeviceLive.tsx:212` | `isHeadless` derivation; `:770` swaps AgentScreen → HeadlessLiveView |
+| `agentflow-landing/src/components/cabinet-live/HeadlessLiveView.tsx:39` | `PodLogTerminal` (logs SSE) + task feed |
+| `agentflow-landing/src/lib/devicesApi.ts` | `hostedLogsStream(hostedDeviceId)` EventSource |
+
+### Failure modes
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| Free-text task does nothing on cloud (pre-fix) | (no log — silently dropped) | `bridge.ts` onMessage free-form route |
+| Free-form run errored | `freeform task <id> crashed` | `bridge.ts` `handleFreeformDispatch` |
+| Cron recipe registers but never fires | `Last Run: Never` (goose schedule list) | set `FF_BRIDGE_SCHEDULER=1` (now default on daemon STS) |
+| Headless live shows blank screen | n/a — fixed: `isHeadless` renders task feed + log terminal | `CabinetDeviceLive.tsx:212` |
+
+
+## Related
+- [Code-agent backend registry](/subsystems/code-agents-backend) — the in-daemon `CODE_AGENT_BACKEND=goose` path
+- [hosted-daemon](/subsystems/hosted-daemon) — pod image graph, daemon variants
+- [daemon-image-reconciler](/subsystems/daemon-image-reconciler) — how `resolveDaemonImage` output reaches pods

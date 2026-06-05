@@ -1,0 +1,119 @@
+---
+title: "Proxied browser login (backend launcher + in-pod chromium runtime)"
+description: "Launches a headless chromium in the pod behind the account's sticky residential proxy, lets the owner log into the real platform via screenshot+input, then captures cookies into the credential vault."
+---
+
+# Proxied browser login (backend)
+
+> **Status: shipped 2026-06-04 (#1115).** PIECE 2 of the proxied-cloud-browser-connect design. Registry-driven + generic — per-platform login config is an existing integration-registry row plus a small `PLATFORM_VAULT_KIND` map; no `if (platform === …)` control flow, no DB schema change (the sticky proxy ref rides in `user_credentials.meta`). The owner's platform password is typed into the real login page and is **never** stored or logged.
+
+## TL;DR
+
+The connect drawer asks the backend to launch a chromium **inside the pod**, bound to the account's sticky residential proxy ([per-account proxy session](/subsystems/per-account-proxy-session)), and navigate to the platform `login_url`. The FE drives that headless browser through a **screenshot-poll + input-POST** contract (no CDP socket is exposed). When the owner finishes logging in, `confirmAndCapture` reads `context.cookies()`, builds a Playwright storage-state payload, and saves it into the **same credential vault** the `/me/integrations/:platform/connect` path writes to — so the session is minted ON the residential exit IP the connector will reuse.
+
+## Files (with line refs)
+
+### Route — `me-integrations-browser-login.ts`
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/routes/me-integrations-browser-login.ts:53` | `service()` — lazy singleton wiring `ProxiedBrowserLoginService` to `PlaywrightBrowserDriver` |
+| `agentflow-agents/src/routes/me-integrations-browser-login.ts:61` | `_setBrowserLoginServiceForTests` — driver injection seam for unit tests |
+| `agentflow-agents/src/routes/me-integrations-browser-login.ts:89` | `POST …/browser-login/start` → `startLogin` → `{ session_id, login_url, proxied, transport:'screenshot_poll', screenshot_url, input_url, status_url }` |
+| `agentflow-agents/src/routes/me-integrations-browser-login.ts:115` | `GET …/:session_id/status` → `pollStatus` → `{ status:'pending'\|'connected', connected, hint?, cookie_count? }` |
+| `agentflow-agents/src/routes/me-integrations-browser-login.ts:139` | `POST …/:session_id/confirm` → `confirmAndCapture` → captures cookies + vault-saves |
+| `agentflow-agents/src/routes/me-integrations-browser-login.ts:157` | `GET …/:session_id/screenshot` → `screenshot` (PNG base64) |
+| `agentflow-agents/src/routes/me-integrations-browser-login.ts:177` | `POST …/:session_id/input` → `input` (click / type / press / navigate; `inputSchema` discriminated union) |
+| `agentflow-agents/src/routes/me-integrations-browser-login.ts:200` | `POST …/:session_id/cancel` → `cancel` — releases the pod chromium |
+| `agentflow-agents/src/server.ts:112` | `import meIntegrationsBrowserLoginApp` |
+| `agentflow-agents/src/server.ts:894` | `app.route('/', meIntegrationsBrowserLoginApp)` |
+
+### Service — `proxied-browser-login.ts`
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/proxied-browser-login.ts:60` | `PLATFORM_VAULT_KIND` — platform → vault credential kind (the only non-registry per-platform data) |
+| `agentflow-agents/src/services/proxied-browser-login.ts:87` | `loginConfigFor(platform)` — joins the integration registry row (`login_url`, `logged_probe_js`, secret key) with the vault kind |
+| `agentflow-agents/src/services/proxied-browser-login.ts:135` | `buildStorageStatePayload` — cookies → Playwright storage-state JSON + `cookieCount` + `cookieDomains` |
+| `agentflow-agents/src/services/proxied-browser-login.ts:163` | `proxyUrlToPlaywright` — parses the NodeMaven URL into Playwright's `{ server, username, password }` |
+| `agentflow-agents/src/services/proxied-browser-login.ts:212` | `BrowserDriver` interface — the mockable chromium seam |
+| `agentflow-agents/src/services/proxied-browser-login.ts:254` | `ProxiedBrowserLoginService` — in-memory `sessions` map, idle-expiry sweep |
+| `agentflow-agents/src/services/proxied-browser-login.ts:301` | `startLogin` — resolves proxy via `proxySession.proxyUrlForAccount`, launches the driver, navigates to `login_url` |
+| `agentflow-agents/src/services/proxied-browser-login.ts:371` | `pollStatus` — runs `readyProbeJs` in the page; `connected` when the probe asserts a logged-in session |
+| `agentflow-agents/src/services/proxied-browser-login.ts:415` | `confirmAndCapture` — owner-asserted finish → cookie capture + vault save |
+| `agentflow-agents/src/services/proxied-browser-login.ts:442` | `handle.cookies()` → `buildStorageStatePayload` → `saveCredential(ownerUserId, vaultKind, payload, { meta:{ proxy_ref } })` |
+| `agentflow-agents/src/services/proxied-browser-login.ts:457` | zero-cookie guard — refuses to save an empty session |
+| `agentflow-agents/src/services/proxied-browser-login.ts:492` | `screenshot` / `input` / `cancel` session-scoped delegates |
+
+### Chromium runtime — `proxied-browser-login-driver.ts` (#1116)
+| Path | Role |
+|---|---|
+| `agentflow-agents/src/services/proxied-browser-login-driver.ts:31` | `loadChromium` — lazy `await import('playwright')` so the pod cold-start path that never opens a browser doesn't load it |
+| `agentflow-agents/src/services/proxied-browser-login-driver.ts:36` | `PlaywrightSessionHandle` — one chromium context per login session |
+| `agentflow-agents/src/services/proxied-browser-login-driver.ts:44` | `evaluate(js)` — runs the registry `logged_probe_js` (always returns a string for the service to `JSON.parse`) |
+| `agentflow-agents/src/services/proxied-browser-login-driver.ts:59` | `cookies()` → `context.cookies()` |
+| `agentflow-agents/src/services/proxied-browser-login-driver.ts:73` | `screenshot()` → `page.screenshot({ type:'png' })` base64 |
+| `agentflow-agents/src/services/proxied-browser-login-driver.ts:87` | `input(action)` — `mouse.click` / `keyboard.type` / `keyboard.press` / `page.goto` |
+| `agentflow-agents/src/services/proxied-browser-login-driver.ts:114` | `PlaywrightBrowserDriver.launch` — `chromium.launch({ headless, args:['--no-sandbox','--disable-dev-shm-usage'] })` + per-context proxy |
+| `agentflow-agents/src/services/proxied-browser-login-driver.ts:131` | `page.goto(loginUrl, { waitUntil:'domcontentloaded', timeout:25_000 })` — a slow first paint does not abort the launch |
+| `agentflow-agents/tests/proxied-browser-login.test.ts` | 263 lines — cookie capture, ready detection, vault save, all via the mockable `BrowserDriver` (no chromium) |
+| `agentflow-agents/tests/fixtures/nodemaven-env.ts` | env fixture so the proxy path is exercised without real creds |
+
+## Data flow
+
+```
+ConnectDrawer / ProxiedBrowserFlow (FE)
+  │ POST /me/integrations/kwork/browser-login/start
+  ▼
+ProxiedBrowserLoginService.startLogin(ownerUserId, 'kwork')
+  ├─ loginConfigFor('kwork') → { login_url, logged_probe_js, vaultKind }
+  ├─ accountRef = config.vaultKind
+  ├─ proxyUrl = proxySession.proxyUrlForAccount(ownerUserId, accountRef, {platform})
+  ├─ proxyRef = proxySession.proxyRefForAccount(...)            // persisted later
+  ├─ driver.launch({ loginUrl, proxy: proxyUrlToPlaywright(proxyUrl) })
+  └─ sessions.set(sessionId, { handle, config, proxyRef, ownerUserId })
+  → { session_id, login_url, proxied, screenshot_url, input_url, status_url }
+        │
+        ▼ FE poll loop
+  GET  …/screenshot   → handle.screenshot()        (PNG base64)
+  POST …/input        → handle.input({click|type|press|navigate})
+  GET  …/status       → handle.evaluate(logged_probe_js) → connected?
+        │
+        ▼ owner asserts "logged in"
+  POST …/confirm → confirmAndCapture
+        ├─ cookies = handle.cookies()
+        ├─ { payload, cookieCount } = buildStorageStatePayload(cookies, domains)
+        ├─ cookieCount === 0 → refuse (no empty session)
+        └─ saveCredential(ownerUserId, vaultKind, payload,
+                          { meta:{ proxy_ref:{ sid, country } } })
+  → connector later resolves the SAME sticky proxy + this session
+```
+
+## DB / Env / API
+
+- **Tables:** none new. Cookies land in `user_credentials` (the same vault `/connect` uses); the sticky proxy ref rides in `user_credentials.meta.proxy_ref` (`{ sid, country }`).
+- **Env:** `NODEMAVEN_PROXY_USER` / `NODEMAVEN_PROXY_PASS` / `NODEMAVEN_PROXY_GATEWAY` (proxy disabled ⇒ `proxied:false`, the browser launches direct). Playwright ships transitively via `@playwright/test` → `playwright@1.60.0`.
+- **Routes (all owner-auth via `requireSession`):**
+  - `POST /me/integrations/:platform/browser-login/start`
+  - `GET  /me/integrations/:platform/browser-login/:session_id/status`
+  - `POST /me/integrations/:platform/browser-login/:session_id/confirm`
+  - `GET  /me/integrations/:platform/browser-login/:session_id/screenshot`
+  - `POST /me/integrations/:platform/browser-login/:session_id/input`
+  - `POST /me/integrations/:platform/browser-login/:session_id/cancel`
+- **Registry contract:** a platform is login-capable iff it has an integration-registry row (`login_url` + `logged_probe_js`) AND an entry in `PLATFORM_VAULT_KIND`. Extend by adding a row, never an `if`.
+
+## Failure modes
+
+| Symptom | Log signature for grep | Where to fix |
+|---|---|---|
+| `404 unsupported_platform` on start | `unsupported_platform` | `routes/me-integrations-browser-login.ts:94` — platform missing from `PLATFORM_VAULT_KIND` or registry (`services/proxied-browser-login.ts:87`) |
+| `404 session_not_found` on status/screenshot | `session_not_found` | session expired (idle sweep at `services/proxied-browser-login.ts:274`) — restart `start` |
+| confirm refuses to save | `cookieCount === 0` guard hit | `services/proxied-browser-login.ts:457` — owner confirmed before the login set cookies; keep driving the page |
+| status never flips to `connected` | `hint:'no_ready_probe'` | `services/proxied-browser-login.ts:90` — registry row has no `logged_probe_js`; owner must use explicit confirm |
+| chromium fails to launch in pod | playwright launch error (no `--no-sandbox` parity) | `services/proxied-browser-login-driver.ts:125` — pod needs the `--no-sandbox` / `--disable-dev-shm-usage` args |
+| pod cold-start pulls playwright unnecessarily | n/a (perf) | `services/proxied-browser-login-driver.ts:31` — `loadChromium` is lazy; keep imports `import type` only |
+| `403 navigate_blocked` on a navigate action | `navigate_blocked` | `services/proxied-browser-login.ts` `isSafeNavigateUrl` refused the target — financial domain (`FINANCIAL_DOMAIN_DENYLIST`), internal/private/metadata host (`169.254.169.254`, `10.x`, bare cluster name, `.svc`/`.internal`/`.local`), or a non-http(s) scheme. Guards SSRF (browser egresses DIRECT from the pod when NodeMaven proxy is unset) + financial-cookie capture that would bypass the `start` denylist. |
+
+## Related
+- [Proxied cloud-browser connect (FE)](/subsystems/proxied-browser-connect) — the connect-drawer that drives this contract
+- [Per-account proxy session](/subsystems/per-account-proxy-session) — the residential proxy the browser launches behind
+- [kwork-connector](/subsystems/kwork-connector) — the IP-bound platform this unblocks
+- [Connector Core](/subsystems/connector-core) — where the captured session is consumed
